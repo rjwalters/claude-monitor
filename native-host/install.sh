@@ -1,33 +1,54 @@
 #!/bin/bash
-# Install Native Messaging Host for Claude Monitor
+# Install Native Messaging Host for Claude Monitor (Firefox & Chrome)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_NAME="claude_monitor"
 
-# Firefox native messaging directory
+# Browser native messaging directories (macOS)
 FIREFOX_DIR="$HOME/Library/Application Support/Mozilla/NativeMessagingHosts"
+CHROME_DIR="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
 
-# Create the manifest with correct absolute path
-cat > "$SCRIPT_DIR/$HOST_NAME.json" << EOF
+# Chrome extension ID (derived from manifest key in extension-chrome/manifest.json)
+# This ID is deterministic because we set the "key" field in the manifest
+CHROME_EXTENSION_ID="kajhnojloklkpboddbnnbobginheicnm"
+
+# Create Firefox manifest (uses shell wrapper to ensure node is in PATH)
+cat > "$SCRIPT_DIR/${HOST_NAME}_firefox.json" << EOF
 {
   "name": "$HOST_NAME",
   "description": "Claude Usage Monitor Native Host",
-  "path": "$SCRIPT_DIR/claude_monitor_host.cjs",
+  "path": "$SCRIPT_DIR/claude_monitor_host.sh",
   "type": "stdio",
   "allowed_extensions": ["claude-monitor@local"]
 }
 EOF
 
-# Create Firefox directory if needed
+# Create Chrome manifest
+cat > "$SCRIPT_DIR/${HOST_NAME}_chrome.json" << EOF
+{
+  "name": "$HOST_NAME",
+  "description": "Claude Usage Monitor Native Host",
+  "path": "$SCRIPT_DIR/claude_monitor_host.cjs",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://${CHROME_EXTENSION_ID}/"]
+}
+EOF
+
+# Install for Firefox
 mkdir -p "$FIREFOX_DIR"
-
-# Create symlink for Firefox
-ln -sf "$SCRIPT_DIR/$HOST_NAME.json" "$FIREFOX_DIR/$HOST_NAME.json"
-
-echo "Native messaging host installed for Firefox"
+ln -sf "$SCRIPT_DIR/${HOST_NAME}_firefox.json" "$FIREFOX_DIR/$HOST_NAME.json"
+echo "✓ Firefox native host installed"
 echo "  Manifest: $FIREFOX_DIR/$HOST_NAME.json"
-echo "  Host: $SCRIPT_DIR/claude_monitor_host.cjs"
+
+# Install for Chrome
+mkdir -p "$CHROME_DIR"
+ln -sf "$SCRIPT_DIR/${HOST_NAME}_chrome.json" "$CHROME_DIR/$HOST_NAME.json"
+echo "✓ Chrome native host installed"
+echo "  Manifest: $CHROME_DIR/$HOST_NAME.json"
+
 echo ""
-echo "Now reload the extension in Firefox:"
-echo "  1. Go to about:debugging#/runtime/this-firefox"
-echo "  2. Click 'Reload' on Claude Usage Monitor"
+echo "Host script: $SCRIPT_DIR/claude_monitor_host.cjs"
+echo ""
+echo "Next steps:"
+echo "  Firefox: about:debugging#/runtime/this-firefox → Reload extension"
+echo "  Chrome:  chrome://extensions → Enable Developer mode → Load unpacked"

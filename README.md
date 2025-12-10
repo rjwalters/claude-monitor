@@ -42,7 +42,7 @@ To try it:
 1. Open `chrome://extensions`
 2. Enable "Developer mode"
 3. Click "Load unpacked" and select the `extension-chrome/` folder
-4. The macOS app's "Install Native Bridge" button will set up native messaging for both browsers
+4. Run `native-host/install.sh` to set up native messaging for both browsers
 
 **If you encounter issues with the Chrome extension, please [open an issue](https://github.com/rjwalters/claude-monitor/issues)** - we're happy to fix problems as they're reported.
 
@@ -201,20 +201,25 @@ No data has been collected yet. Visit https://claude.ai/settings/usage with the 
 
 ### Native host not connecting
 
-1. Check the manifest exists:
+1. Re-run the install script (creates manifests for Firefox & Chrome):
    ```bash
+   cd native-host && ./install.sh
+   ```
+
+2. **Restart your browser** (required after installing native host)
+
+3. Check the manifest exists:
+   ```bash
+   # Firefox
    cat ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/claude_monitor.json
+   # Chrome
+   cat ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/claude_monitor.json
    ```
 
-2. Verify the host script is executable:
-   ```bash
-   ls -la native-host/claude_monitor_host.cjs
-   ```
-
-3. Test manually:
+4. Test manually:
    ```bash
    cd claude-monitor
-   node -e 'const m=JSON.stringify({type:"GET_DATA"});const b=Buffer.alloc(4);b.writeUInt32LE(Buffer.byteLength(m),0);process.stdout.write(b);process.stdout.write(m);' | node native-host/claude_monitor_host.cjs
+   node -e 'const m=JSON.stringify({type:"GET_DATA"});const b=Buffer.alloc(4);b.writeUInt32LE(Buffer.byteLength(m),0);process.stdout.write(b);process.stdout.write(m);' | ./native-host/claude_monitor_host.sh
    ```
 
 ### Extension not capturing data
@@ -246,8 +251,9 @@ pkill ClaudeMonitor
 launchctl unload ~/Library/LaunchAgents/com.claude-monitor.plist 2>/dev/null
 rm ~/Library/LaunchAgents/com.claude-monitor.plist 2>/dev/null
 
-# Remove native host
+# Remove native hosts
 rm ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/claude_monitor.json
+rm ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/claude_monitor.json 2>/dev/null
 
 # Remove data
 rm -rf ~/.claude-monitor
@@ -275,8 +281,8 @@ claude-monitor/
 │   └── popup.html/js            # Same as Firefox
 ├── native-host/                  # Native messaging host
 │   ├── claude_monitor_host.cjs  # Node.js script (SQLite)
-│   ├── claude_monitor.json      # Native host manifest
-│   └── install.sh               # Installation script
+│   ├── claude_monitor_host.sh   # Shell wrapper (ensures node in PATH)
+│   └── install.sh               # Installation script (Firefox & Chrome)
 ├── menubar-app/ClaudeMonitor/   # macOS menu bar app
 │   ├── Package.swift            # Swift package definition
 │   └── Sources/

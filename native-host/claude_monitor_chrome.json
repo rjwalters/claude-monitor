@@ -1,0 +1,7 @@
+{
+  "name": "claude_monitor",
+  "description": "Claude Usage Monitor Native Host",
+  "path": "/Users/rwalters/GitHub/claude-monitor/native-host/claude_monitor_host.cjs",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://kajhnojloklkpboddbnnbobginheicnm/"]
+}
