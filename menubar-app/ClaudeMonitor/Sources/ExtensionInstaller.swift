@@ -141,13 +141,12 @@ class ExtensionInstaller: ObservableObject {
             return bundlePath
         }
 
-        // Check common development locations
+        // Check common development locations (relative to working directory)
         let possiblePaths = [
-            // Relative to app in development
             "../../../native-host/claude_monitor_host.cjs",
             "../../native-host/claude_monitor_host.cjs",
-            // Absolute paths for development
-            "/Users/rwalters/GitHub/claude-monitor/native-host/claude_monitor_host.cjs"
+            "../native-host/claude_monitor_host.cjs",
+            "native-host/claude_monitor_host.cjs"
         ]
 
         let fm = FileManager.default
@@ -158,12 +157,6 @@ class ExtensionInstaller: ObservableObject {
             if fm.fileExists(atPath: url.path) {
                 return url.standardized.path
             }
-        }
-
-        // Try the absolute path directly
-        let absolutePath = "/Users/rwalters/GitHub/claude-monitor/native-host/claude_monitor_host.cjs"
-        if fm.fileExists(atPath: absolutePath) {
-            return absolutePath
         }
 
         return nil
