@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "ClaudeMonitor",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     dependencies: [
         .package(url: "https://github.com/stephencelis/SQLite.swift.git", from: "0.15.0")

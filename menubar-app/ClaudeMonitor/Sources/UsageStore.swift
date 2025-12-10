@@ -3,10 +3,16 @@ import SQLite
 
 struct Account: Identifiable {
     let id: String
+    let accountName: String?
     let email: String?
     let plan: String?
     let lastUpdated: Date?
     let latestPercent: Double?
+
+    /// Returns the best display name for the account
+    var displayName: String {
+        accountName ?? email ?? id
+    }
 }
 
 struct UsageRecord: Identifiable {
@@ -26,6 +32,13 @@ struct UsageDataPoint: Identifiable {
     let timestamp: Date
     let weeklyPercent: Double
     let usageDelta: Double  // How much was used since last reading (negative of the drop)
+}
+
+struct FullUsageDataPoint: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let sessionPercent: Double?
+    let weeklyAllPercent: Double?
 }
 
 class UsageStore: ObservableObject {
@@ -54,6 +67,7 @@ class UsageStore: ObservableObject {
             // Load accounts
             let accountsTable = Table("accounts")
             let id = SQLite.Expression<String>("id")
+            let accountName = SQLite.Expression<String?>("account_name")
             let email = SQLite.Expression<String?>("email")
             let plan = SQLite.Expression<String?>("plan")
             let lastUpdated = SQLite.Expression<String?>("last_updated")
@@ -81,6 +95,7 @@ class UsageStore: ObservableObject {
 
                 let account = Account(
                     id: accountId,
+                    accountName: row[accountName],
                     email: row[email],
                     plan: row[plan],
                     lastUpdated: parseDate(row[lastUpdated]),
@@ -177,6 +192,116 @@ class UsageStore: ObservableObject {
         } catch {
             print("Error loading history: \(error)")
             return []
+        }
+    }
+
+    func loadFullHistory(for accountId: String, limit: Int = 500) -> [FullUsageDataPoint] {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return []
+            }
+
+            let db = try Connection(dbPath, readonly: true)
+            let usageTable = Table("usage_history")
+            let accountIdCol = SQLite.Expression<String>("account_id")
+            let timestamp = SQLite.Expression<String>("timestamp")
+            let sessionPercent = SQLite.Expression<Double?>("session_percent")
+            let weeklyAllPercent = SQLite.Expression<Double?>("weekly_all_percent")
+
+            let query = usageTable
+                .filter(accountIdCol == accountId)
+                .order(timestamp.desc)
+                .limit(limit)
+
+            var points: [FullUsageDataPoint] = []
+
+            for row in try db.prepare(query) {
+                if let date = parseDate(row[timestamp]) {
+                    points.append(FullUsageDataPoint(
+                        timestamp: date,
+                        sessionPercent: row[sessionPercent],
+                        weeklyAllPercent: row[weeklyAllPercent]
+                    ))
+                }
+            }
+
+            // Reverse to chronological order
+            points.reverse()
+            return points
+
+        } catch {
+            print("Error loading full history: \(error)")
+            return []
+        }
+    }
+
+    func updateAccountName(accountId: String, newName: String) {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return
+            }
+
+            let db = try Connection(dbPath)
+            let accountsTable = Table("accounts")
+            let id = SQLite.Expression<String>("id")
+            let accountName = SQLite.Expression<String?>("account_name")
+
+            let account = accountsTable.filter(id == accountId)
+            try db.run(account.update(accountName <- newName))
+
+            // Reload to reflect the change
+            loadFromDatabase()
+
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to update account name: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func clearAccountData(accountId: String) {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return
+            }
+
+            let db = try Connection(dbPath)
+
+            // Delete usage history for this account
+            let usageTable = Table("usage_history")
+            let accountIdCol = SQLite.Expression<String>("account_id")
+            try db.run(usageTable.filter(accountIdCol == accountId).delete())
+
+            // Delete the account
+            let accountsTable = Table("accounts")
+            let id = SQLite.Expression<String>("id")
+            try db.run(accountsTable.filter(id == accountId).delete())
+
+            // Reload to reflect the change
+            loadFromDatabase()
+
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to clear account data: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func clearDatabase() {
+        do {
+            if FileManager.default.fileExists(atPath: dbPath) {
+                try FileManager.default.removeItem(atPath: dbPath)
+            }
+            DispatchQueue.main.async {
+                self.accounts = []
+                self.latestUsage = [:]
+                self.lastRefresh = nil
+                self.error = nil
+            }
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to clear database: \(error.localizedDescription)"
+            }
         }
     }
 

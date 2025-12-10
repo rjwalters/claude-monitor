@@ -26,6 +26,7 @@ const db = new Database(DB_FILE);
 db.exec(`
   CREATE TABLE IF NOT EXISTS accounts (
     id TEXT PRIMARY KEY,
+    account_name TEXT,
     email TEXT,
     plan TEXT,
     last_updated TEXT
@@ -50,9 +51,15 @@ db.exec(`
 `);
 
 // Prepared statements
-const insertAccount = db.prepare(`
-  INSERT OR REPLACE INTO accounts (id, email, plan, last_updated)
-  VALUES (?, ?, ?, ?)
+// Use INSERT ... ON CONFLICT to preserve existing account_name if not provided
+const upsertAccount = db.prepare(`
+  INSERT INTO accounts (id, account_name, email, plan, last_updated)
+  VALUES (?, ?, ?, ?, ?)
+  ON CONFLICT(id) DO UPDATE SET
+    account_name = COALESCE(excluded.account_name, accounts.account_name),
+    email = COALESCE(excluded.email, accounts.email),
+    plan = COALESCE(excluded.plan, accounts.plan),
+    last_updated = excluded.last_updated
 `);
 
 const insertUsage = db.prepare(`
@@ -153,30 +160,37 @@ async function processMessage(msg) {
     const data = msg.data;
     const timestamp = data.timestamp || new Date().toISOString();
 
-    // Extract percentages from sections
-    let sessionPercent = data.primaryPercent;
-    let weeklyAllPercent = null;
-    let weeklySONnetPercent = null;
-    let sessionReset = null;
-    let weeklyReset = null;
+    // Prefer flattened fields from new content.js, fall back to sections parsing
+    let sessionPercent = data.sessionPercent ?? data.primaryPercent ?? null;
+    let weeklyAllPercent = data.weeklyAllPercent ?? null;
+    let weeklySonnetPercent = data.weeklySonnetPercent ?? null;
+    let sessionReset = data.sessionReset ?? null;
+    let weeklyReset = data.weeklyReset ?? null;
 
-    if (data.sections) {
+    // Fallback: parse from sections if flattened fields not available
+    if (data.sections && (weeklyAllPercent === null || weeklySonnetPercent === null)) {
       for (const section of data.sections) {
-        if (section.title && section.title.includes('session')) {
-          sessionPercent = section.percent;
-          sessionReset = section.resetTime;
-        } else if (section.title && section.title.includes('All models')) {
-          weeklyAllPercent = section.percent;
-          weeklyReset = section.resetTime;
-        } else if (section.title && section.title.includes('Sonnet')) {
-          weeklySONnetPercent = section.percent;
+        if (section.type === 'all_models' && weeklyAllPercent === null) {
+          weeklyAllPercent = section.percentUsed;
+          if (!weeklyReset) weeklyReset = section.resetTime;
+        } else if (section.type === 'sonnet_only' && weeklySonnetPercent === null) {
+          weeklySonnetPercent = section.percentUsed;
         }
       }
     }
 
-    // Update account
-    insertAccount.run(
+    // Fallback: parse session reset from rawText if still not found
+    if (!sessionReset && data.rawText) {
+      const sessionMatch = data.rawText.match(/Resets?\s+in\s+(\d+\s*(?:hr|hour|min|day)[^\n]*)/i);
+      if (sessionMatch) {
+        sessionReset = 'in ' + sessionMatch[1].trim();
+      }
+    }
+
+    // Update account (preserves existing account_name if new one not provided)
+    upsertAccount.run(
       accountId,
+      data.accountName || null,
       data.email || null,
       data.plan || null,
       timestamp
@@ -189,7 +203,7 @@ async function processMessage(msg) {
       data.primaryPercent,
       sessionPercent,
       weeklyAllPercent,
-      weeklySONnetPercent,
+      weeklySonnetPercent,
       sessionReset,
       weeklyReset,
       JSON.stringify(data)
@@ -207,6 +221,7 @@ async function processMessage(msg) {
     const result = {
       accounts: accounts.map(a => ({
         id: a.id,
+        accountName: a.account_name,
         email: a.email,
         plan: a.plan,
         lastUpdated: a.last_updated,

@@ -132,21 +132,9 @@ class ExtensionInstaller: ObservableObject {
         }
     }
 
-    func openExtensionFolder() {
-        // Find the extension folder
-        let extensionPaths = [
-            "/Users/rwalters/GitHub/claude-monitor/extension",
-            Bundle.main.bundlePath + "/Contents/Resources/extension"
-        ]
-
-        for path in extensionPaths {
-            if FileManager.default.fileExists(atPath: path) {
-                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: path)
-                return
-            }
+    func openExtensionDownload() {
+        if let url = URL(string: "https://github.com/rjwalters/claude-monitor/releases") {
+            NSWorkspace.shared.open(url)
         }
-
-        // Fallback: show alert
-        installationStatus = "Extension folder not found"
     }
 }

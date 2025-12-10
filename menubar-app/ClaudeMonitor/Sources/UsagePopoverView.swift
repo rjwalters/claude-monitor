@@ -34,40 +34,50 @@ struct UsagePopoverView: View {
             } else if store.accounts.isEmpty {
                 SetupGuideView(installer: installer, error: nil)
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 12) {
-                        ForEach(store.accounts) { account in
-                            ClickableAccountCard(account: account, usage: store.latestUsage[account.id], store: store)
-                        }
+                VStack(spacing: 12) {
+                    ForEach(store.accounts) { account in
+                        ClickableAccountCard(account: account, usage: store.latestUsage[account.id], store: store)
                     }
-                    .padding()
                 }
+                .padding()
             }
 
             Divider()
 
             // Footer
             HStack {
-                Button("Open Usage Page") {
+                // Open Usage Page as a hyperlink
+                Button(action: {
                     if let url = URL(string: "https://claude.ai/settings/usage") {
                         NSWorkspace.shared.open(url)
                     }
+                }) {
+                    Text("Open Usage Page")
+                        .underline()
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(.accentColor)
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
 
                 Spacer()
 
                 Button("Quit") {
                     NSApp.terminate(nil)
                 }
-                .buttonStyle(.plain)
-                .foregroundColor(.secondary)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
             .padding(.horizontal)
-            .padding(.vertical, 8)
+            .padding(.vertical, 10)
         }
-        .frame(width: 320, height: 400)
+        .frame(width: 320)
+        .fixedSize(horizontal: false, vertical: true)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
@@ -82,7 +92,9 @@ struct UsagePopoverView: View {
 struct AccountCard: View {
     let account: Account
     let usage: UsageRecord?
+    var onEditTapped: (() -> Void)? = nil
     @Environment(\.colorScheme) var colorScheme
+    @State private var isNameHovering = false
 
     var cardBackground: Color {
         colorScheme == .dark
@@ -95,10 +107,23 @@ struct AccountCard: View {
             // Account header
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(account.email ?? account.id)
-                        .font(.headline)
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        if isNameHovering, let onEdit = onEditTapped {
+                            Button(action: onEdit) {
+                                Image(systemName: "pencil")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        Text(account.displayName)
+                            .font(.headline)
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                    }
+                    .onHover { hovering in
+                        isNameHovering = hovering
+                    }
                     if let plan = account.plan {
                         Text(plan)
                             .font(.caption)
@@ -231,22 +256,175 @@ struct ClickableAccountCard: View {
     let usage: UsageRecord?
     let store: UsageStore
     @State private var isHovering = false
+    @State private var isEditing = false
+    @State private var editedName = ""
 
     var body: some View {
-        Button(action: {
-            ChartWindowController.showChart(for: account, store: store)
-        }) {
-            AccountCard(account: account, usage: usage)
-        }
-        .buttonStyle(CardButtonStyle(isHovering: isHovering))
-        .onHover { hovering in
-            isHovering = hovering
-            if hovering {
-                NSCursor.pointingHand.push()
-            } else {
-                NSCursor.pop()
+        if isEditing {
+            EditableAccountCard(
+                account: account,
+                usage: usage,
+                editedName: $editedName,
+                isEditing: $isEditing,
+                onSave: { newName in
+                    store.updateAccountName(accountId: account.id, newName: newName)
+                }
+            )
+        } else {
+            Button(action: {
+                ChartWindowController.showChart(for: account, store: store)
+            }) {
+                AccountCard(
+                    account: account,
+                    usage: usage,
+                    onEditTapped: {
+                        editedName = account.accountName ?? account.displayName
+                        isEditing = true
+                    }
+                )
+            }
+            .buttonStyle(CardButtonStyle(isHovering: isHovering))
+            .onHover { hovering in
+                isHovering = hovering
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
             }
         }
+    }
+}
+
+struct EditableAccountCard: View {
+    let account: Account
+    let usage: UsageRecord?
+    @Binding var editedName: String
+    @Binding var isEditing: Bool
+    let onSave: (String) -> Void
+    @Environment(\.colorScheme) var colorScheme
+    @FocusState private var isFocused: Bool
+
+    var cardBackground: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.05)
+            : Color.black.opacity(0.03)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Editable account header
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 8) {
+                        TextField("Account name", text: $editedName)
+                            .textFieldStyle(.plain)
+                            .font(.headline)
+                            .focused($isFocused)
+                            .onSubmit {
+                                saveAndClose()
+                            }
+                            .onExitCommand {
+                                isEditing = false
+                            }
+
+                        Button(action: saveAndClose) {
+                            Image(systemName: "checkmark")
+                                .font(.caption)
+                                .foregroundColor(.green)
+                        }
+                        .buttonStyle(.plain)
+
+                        Button(action: { isEditing = false }) {
+                            Image(systemName: "xmark")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    if let plan = account.plan {
+                        Text(plan)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                Spacer()
+                if let percent = account.latestPercent {
+                    Text("\(Int(percent))%")
+                        .font(.title2)
+                        .fontWeight(.bold)
+                        .foregroundColor(colorForPercent(percent))
+                }
+            }
+
+            if let usage = usage {
+                // Session usage
+                if let sessionPercent = usage.sessionPercent {
+                    UsageRow(
+                        label: "Session",
+                        percent: sessionPercent,
+                        resetTime: usage.sessionReset
+                    )
+                }
+
+                // Weekly - All models
+                if let weeklyAll = usage.weeklyAllPercent {
+                    UsageRow(
+                        label: "Weekly (All)",
+                        percent: weeklyAll,
+                        resetTime: usage.weeklyReset
+                    )
+                }
+
+                // Weekly - Sonnet
+                if let weeklySonnet = usage.weeklySONnetPercent {
+                    UsageRow(
+                        label: "Weekly (Sonnet)",
+                        percent: weeklySonnet,
+                        resetTime: nil
+                    )
+                }
+
+                // Last updated
+                HStack {
+                    Spacer()
+                    Text("Updated \(formatDate(usage.timestamp))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding()
+        .background(cardBackground)
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.accentColor.opacity(0.5), lineWidth: 2)
+        )
+        .onAppear {
+            isFocused = true
+        }
+    }
+
+    func saveAndClose() {
+        let trimmed = editedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            onSave(trimmed)
+        }
+        isEditing = false
+    }
+
+    func colorForPercent(_ percent: Double) -> Color {
+        if percent > 95 { return Color(nsColor: .systemRed) }
+        if percent >= 90 { return Color(nsColor: .systemOrange) }
+        return .primary
+    }
+
+    func formatDate(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
 }
 
@@ -264,7 +442,6 @@ struct CardButtonStyle: ButtonStyle {
 struct SetupGuideView: View {
     @ObservedObject var installer: ExtensionInstaller
     let error: String?
-    @State private var currentStep = 1
     @Environment(\.colorScheme) var colorScheme
 
     var cardBackground: Color {
@@ -274,163 +451,70 @@ struct SetupGuideView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 16) {
-                // Icon and title
-                VStack(spacing: 8) {
-                    Image(systemName: "puzzlepiece.extension")
-                        .font(.system(size: 40))
-                        .foregroundColor(.accentColor)
+        VStack(spacing: 16) {
+            Spacer()
 
-                    Text("Setup Required")
-                        .font(.headline)
+            // Icon and title
+            VStack(spacing: 8) {
+                Image(systemName: "chart.bar.fill")
+                    .font(.system(size: 40))
+                    .foregroundColor(.accentColor)
 
-                    if let error = error {
-                        Text(error)
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                            .multilineTextAlignment(.center)
+                Text("No Usage Data")
+                    .font(.headline)
+
+                Text("Visit the Claude usage page in Firefox to start collecting data")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+
+                if let error = error {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 4)
+                }
+            }
+
+            // Action buttons
+            VStack(spacing: 12) {
+                if !installer.nativeHostInstalled {
+                    Button(action: { _ = installer.installNativeHost() }) {
+                        Label("Install Native Bridge", systemImage: "puzzlepiece.extension")
+                            .frame(maxWidth: .infinity)
                     }
-                }
-                .padding(.top, 8)
-
-                // Step 1: Native Host
-                SetupStepView(
-                    step: 1,
-                    title: "Install Native Bridge",
-                    description: "Connects Firefox extension to this app",
-                    isComplete: installer.nativeHostInstalled,
-                    isCurrent: currentStep == 1
-                ) {
-                    if installer.installNativeHost() {
-                        currentStep = 2
-                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.regular)
                 }
 
-                // Step 2: Extension
-                SetupStepView(
-                    step: 2,
-                    title: "Install Firefox Extension",
-                    description: "Captures usage data from claude.ai",
-                    isComplete: installer.extensionInstalled,
-                    isCurrent: currentStep == 2 && installer.nativeHostInstalled
-                ) {
-                    installer.openExtensionFolder()
-                }
-
-                // Step 3: Visit usage page
-                SetupStepView(
-                    step: 3,
-                    title: "Visit Claude Usage Page",
-                    description: "Open claude.ai/settings/usage in Firefox",
-                    isComplete: false,
-                    isCurrent: currentStep >= 2 && installer.nativeHostInstalled
-                ) {
+                Button(action: {
                     if let url = URL(string: "https://claude.ai/settings/usage") {
                         NSWorkspace.shared.open(url)
                     }
+                }) {
+                    Label("Open Usage Page", systemImage: "safari")
+                        .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
 
-                // Instructions
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Extension Installation:")
-                        .font(.caption)
-                        .fontWeight(.medium)
-
-                    Text("Download the .xpi file from GitHub releases and drag it into Firefox to install permanently.")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-
-                    Button("Download Extension") {
-                        if let url = URL(string: "https://github.com/rjwalters/claude-monitor/releases") {
-                            NSWorkspace.shared.open(url)
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                Button(action: { installer.openExtensionDownload() }) {
+                    Label("Get Firefox Extension", systemImage: "arrow.down.circle")
+                        .frame(maxWidth: .infinity)
                 }
-                .padding()
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(cardBackground)
-                .cornerRadius(8)
-
-                Spacer()
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
             }
-            .padding()
+            .padding(.horizontal)
+
+            Spacer()
         }
+        .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             installer.checkInstallationStatus()
-            if installer.nativeHostInstalled {
-                currentStep = 2
-            }
         }
     }
 }
 
-struct SetupStepView: View {
-    let step: Int
-    let title: String
-    let description: String
-    let isComplete: Bool
-    let isCurrent: Bool
-    let action: () -> Void
-    @Environment(\.colorScheme) var colorScheme
-
-    var cardBackground: Color {
-        colorScheme == .dark
-            ? Color.white.opacity(0.05)
-            : Color.black.opacity(0.03)
-    }
-
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                // Step number or checkmark
-                ZStack {
-                    Circle()
-                        .fill(isComplete ? Color.green : (isCurrent ? Color.accentColor : Color.secondary.opacity(0.3)))
-                        .frame(width: 28, height: 28)
-
-                    if isComplete {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundColor(.white)
-                    } else {
-                        Text("\(step)")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(isCurrent ? .white : .secondary)
-                    }
-                }
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                        .foregroundColor(isComplete ? .secondary : .primary)
-
-                    Text(description)
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-
-                Spacer()
-
-                if !isComplete && isCurrent {
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-            }
-            .padding(12)
-            .background(cardBackground)
-            .cornerRadius(8)
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(isCurrent && !isComplete ? Color.accentColor : Color.clear, lineWidth: 1)
-            )
-        }
-        .buttonStyle(.plain)
-        .disabled(isComplete)
-    }
-}

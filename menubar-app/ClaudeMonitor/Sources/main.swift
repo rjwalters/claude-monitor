@@ -55,11 +55,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func updateStatusButton() {
         guard let button = statusItem?.button else { return }
 
-        let percent: Int
-        if let primaryAccount = usageStore.accounts.first {
+        var percent: Int = 0
+
+        // Find the highest percentage across all accounts (most constrained)
+        if let primaryAccount = usageStore.accounts.first,
+           let usage = usageStore.latestUsage[primaryAccount.id] {
+            // Show the highest of session or weekly percentages (most limiting)
+            let sessionPercent = usage.sessionPercent ?? 0
+            let weeklyAllPercent = usage.weeklyAllPercent ?? 0
+            percent = Int(max(sessionPercent, weeklyAllPercent))
+        } else if let primaryAccount = usageStore.accounts.first {
             percent = Int(primaryAccount.latestPercent ?? 0)
-        } else {
-            percent = 0
         }
 
         // Create Stats-style image with "LLM" label and percentage
@@ -97,23 +103,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let style = NSMutableParagraphStyle()
             style.alignment = .left
 
-            // Draw label at y=12 (top)
+            // Draw label at y=14 (top, shifted up 2px)
             let labelAttrs: [NSAttributedString.Key: Any] = [
                 .font: labelFont,
                 .foregroundColor: labelColor,
                 .paragraphStyle: style
             ]
-            let labelRect = CGRect(x: 2, y: 12, width: width - 4, height: 7)
+            let labelRect = CGRect(x: 2, y: 14, width: width - 4, height: 7)
             let labelStr = NSAttributedString(string: labelText, attributes: labelAttrs)
             labelStr.draw(with: labelRect)
 
-            // Draw value at y=1 (bottom)
+            // Draw value at y=3 (bottom, shifted up 2px)
             let valueAttrs: [NSAttributedString.Key: Any] = [
                 .font: valueFont,
                 .foregroundColor: valueColor,
                 .paragraphStyle: style
             ]
-            let valueRect = CGRect(x: 2, y: 1, width: width - 4, height: 13)
+            let valueRect = CGRect(x: 2, y: 3, width: width - 4, height: 13)
             let valueStr = NSAttributedString(string: percentText, attributes: valueAttrs)
             valueStr.draw(with: valueRect)
 
