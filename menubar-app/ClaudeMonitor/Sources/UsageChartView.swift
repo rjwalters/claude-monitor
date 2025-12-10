@@ -7,8 +7,6 @@ struct UsageChartWindow: View {
     let fullDataPoints: [FullUsageDataPoint]
     let store: UsageStore
     @Environment(\.colorScheme) var colorScheme
-    @State private var xScaleRange: ClosedRange<Date>?
-    @State private var yScaleRange: ClosedRange<Double> = 0...100
     @State private var isEditingName = false
     @State private var editedName = ""
     @State private var isNameHovering = false
@@ -112,18 +110,8 @@ struct UsageChartWindow: View {
             } else {
                 // Weekly Usage chart with points
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Weekly Usage")
-                            .font(.headline)
-                        Spacer()
-                        Button(action: resetZoom) {
-                            Image(systemName: "arrow.counterclockwise")
-                                .font(.caption)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundColor(.secondary)
-                        .help("Reset zoom")
-                    }
+                    Text("Weekly Usage")
+                        .font(.headline)
 
                     Chart(dataPoints) { point in
                         LineMark(
@@ -145,8 +133,7 @@ struct UsageChartWindow: View {
                         .foregroundStyle(Color.blue)
                         .symbolSize(30)
                     }
-                    .chartYScale(domain: yScaleRange)
-                    .chartXScale(domain: xScaleRange ?? defaultXRange)
+                    .chartYScale(domain: 0...100)
                     .chartYAxis {
                         AxisMarks(position: .leading, values: [0, 25, 50, 75, 100]) { value in
                             AxisGridLine()
@@ -169,14 +156,7 @@ struct UsageChartWindow: View {
                             }
                         }
                     }
-                    .chartScrollableAxes(.horizontal)
                     .frame(height: 280)
-                    .gesture(
-                        MagnificationGesture()
-                            .onChanged { scale in
-                                handleZoom(scale: scale)
-                            }
-                    )
                 }
 
                 Spacer()
@@ -246,33 +226,6 @@ struct UsageChartWindow: View {
 
     var latestWeeklyPercent: Double? {
         fullDataPoints.last?.weeklyAllPercent
-    }
-
-    var defaultXRange: ClosedRange<Date> {
-        if let first = dataPoints.first?.timestamp,
-           let last = dataPoints.last?.timestamp {
-            // Add a little padding
-            let padding = max(last.timeIntervalSince(first) * 0.02, 60)
-            return first.addingTimeInterval(-padding)...last.addingTimeInterval(padding)
-        }
-        return Date()...Date()
-    }
-
-    func resetZoom() {
-        xScaleRange = nil
-        yScaleRange = 0...100
-    }
-
-    func handleZoom(scale: CGFloat) {
-        // Zoom implementation - adjust the x range based on scale
-        guard let currentRange = xScaleRange ?? Optional(defaultXRange) else { return }
-        let center = (currentRange.lowerBound.timeIntervalSince1970 + currentRange.upperBound.timeIntervalSince1970) / 2
-        let currentSpan = currentRange.upperBound.timeIntervalSince(currentRange.lowerBound)
-        let newSpan = currentSpan / Double(scale)
-
-        let newLower = Date(timeIntervalSince1970: center - newSpan / 2)
-        let newUpper = Date(timeIntervalSince1970: center + newSpan / 2)
-        xScaleRange = newLower...newUpper
     }
 
     func usageConsumedWithLabel(targetMinutes: Int) -> (String, Double) {

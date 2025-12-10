@@ -247,7 +247,13 @@ async function storeUsageData(data) {
 // Main function
 function captureUsage() {
   const data = extractUsageData();
-  if (data && data.primaryPercent > 0) {
+  // Store if we have any valid percentage data (session, weekly, or sonnet)
+  const hasValidData = data && (
+    data.sessionPercent !== null ||
+    data.weeklyAllPercent !== null ||
+    data.weeklySonnetPercent !== null
+  );
+  if (hasValidData) {
     storeUsageData(data);
   }
 }
