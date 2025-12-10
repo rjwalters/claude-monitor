@@ -1,6 +1,9 @@
 # Claude Monitor
 
-Monitor your Claude AI usage with a macOS menu bar widget. Uses a Firefox extension to collect usage data from claude.ai and displays it in your menu bar.
+Monitor your Claude AI usage with a macOS menu bar widget. Uses a browser extension to collect usage data from claude.ai and displays it in your menu bar.
+
+![Menu bar popover showing usage for multiple accounts](widget_popup.png)
+![Usage history chart with consumption trends](plot_window.png)
 
 ## Why?
 
