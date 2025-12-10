@@ -2,11 +2,14 @@ import Foundation
 import AppKit
 
 class ExtensionInstaller: ObservableObject {
-    @Published var nativeHostInstalled = false
+    @Published var firefoxNativeHostInstalled = false
+    @Published var chromeNativeHostInstalled = false
+    @Published var nativeHostInstalled = false  // True if any browser installed
     @Published var extensionInstalled = false
     @Published var installationStatus: String = ""
 
     private let firefoxNativeHostDir: URL
+    private let chromeNativeHostDir: URL
     private let appSupportDir: URL
     private let nativeHostName = "claude_monitor"
 
@@ -14,15 +17,24 @@ class ExtensionInstaller: ObservableObject {
         let home = FileManager.default.homeDirectoryForCurrentUser
         firefoxNativeHostDir = home
             .appendingPathComponent("Library/Application Support/Mozilla/NativeMessagingHosts")
+        chromeNativeHostDir = home
+            .appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts")
         appSupportDir = home.appendingPathComponent(".claude-monitor")
 
         checkInstallationStatus()
     }
 
     func checkInstallationStatus() {
-        // Check if native host manifest exists
-        let manifestPath = firefoxNativeHostDir.appendingPathComponent("\(nativeHostName).json")
-        nativeHostInstalled = FileManager.default.fileExists(atPath: manifestPath.path)
+        // Check if native host manifest exists for Firefox
+        let firefoxManifestPath = firefoxNativeHostDir.appendingPathComponent("\(nativeHostName).json")
+        firefoxNativeHostInstalled = FileManager.default.fileExists(atPath: firefoxManifestPath.path)
+
+        // Check if native host manifest exists for Chrome
+        let chromeManifestPath = chromeNativeHostDir.appendingPathComponent("\(nativeHostName).json")
+        chromeNativeHostInstalled = FileManager.default.fileExists(atPath: chromeManifestPath.path)
+
+        // Overall status - true if any browser has native host installed
+        nativeHostInstalled = firefoxNativeHostInstalled || chromeNativeHostInstalled
 
         // Check if database exists (indicates extension has sent data)
         let dbPath = appSupportDir.appendingPathComponent("usage.db")
@@ -30,18 +42,35 @@ class ExtensionInstaller: ObservableObject {
     }
 
     func installNativeHost() -> Bool {
+        // Install for both browsers
+        let firefoxResult = installFirefoxNativeHost()
+        let chromeResult = installChromeNativeHost()
+
+        checkInstallationStatus()
+
+        if firefoxResult && chromeResult {
+            installationStatus = "Native host installed for Firefox and Chrome"
+        } else if firefoxResult {
+            installationStatus = "Native host installed for Firefox"
+        } else if chromeResult {
+            installationStatus = "Native host installed for Chrome"
+        } else {
+            installationStatus = "Failed to install native host"
+        }
+
+        return firefoxResult || chromeResult
+    }
+
+    func installFirefoxNativeHost() -> Bool {
         do {
-            // Create directories
             try FileManager.default.createDirectory(at: firefoxNativeHostDir, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
 
-            // Find the native host script (bundled in app or in development location)
             guard let hostScriptPath = findNativeHostScript() else {
-                installationStatus = "Native host script not found"
                 return false
             }
 
-            // Create the native messaging manifest
+            // Firefox uses allowed_extensions with extension ID
             let manifest: [String: Any] = [
                 "name": nativeHostName,
                 "description": "Claude Usage Monitor Native Host",
@@ -54,18 +83,54 @@ class ExtensionInstaller: ObservableObject {
             let manifestPath = firefoxNativeHostDir.appendingPathComponent("\(nativeHostName).json")
             try manifestData.write(to: manifestPath)
 
-            // Make the host script executable
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o755],
-                ofItemAtPath: hostScriptPath
-            )
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hostScriptPath)
 
-            nativeHostInstalled = true
-            installationStatus = "Native host installed successfully"
+            firefoxNativeHostInstalled = true
             return true
 
         } catch {
-            installationStatus = "Installation failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func installChromeNativeHost(extensionId: String? = nil) -> Bool {
+        do {
+            try FileManager.default.createDirectory(at: chromeNativeHostDir, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: appSupportDir, withIntermediateDirectories: true)
+
+            guard let hostScriptPath = findNativeHostScript() else {
+                return false
+            }
+
+            // Chrome uses allowed_origins with extension ID
+            // The extension has a "key" in manifest.json that generates a stable ID
+            // Extension ID: akhjonljkoklbpdobdnnobgbniehcimn (generated from key)
+            let origins: [String]
+            if let extId = extensionId, !extId.isEmpty {
+                origins = ["chrome-extension://\(extId)/"]
+            } else {
+                // Default extension ID generated from our key in manifest.json
+                origins = ["chrome-extension://akhjonljkoklbpdobdnnobgbniehcimn/"]
+            }
+
+            let manifest: [String: Any] = [
+                "name": nativeHostName,
+                "description": "Claude Usage Monitor Native Host",
+                "path": hostScriptPath,
+                "type": "stdio",
+                "allowed_origins": origins
+            ]
+
+            let manifestData = try JSONSerialization.data(withJSONObject: manifest, options: .prettyPrinted)
+            let manifestPath = chromeNativeHostDir.appendingPathComponent("\(nativeHostName).json")
+            try manifestData.write(to: manifestPath)
+
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hostScriptPath)
+
+            chromeNativeHostInstalled = true
+            return true
+
+        } catch {
             return false
         }
     }

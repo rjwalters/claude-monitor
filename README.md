@@ -31,6 +31,18 @@ Download `claude_monitor-x.x.xpi` from [Releases](https://github.com/rjwalters/c
 
 Drag the `.xpi` file into Firefox to install.
 
+### 2b. Chrome Extension (Experimental)
+
+A Chrome extension is available in the `extension-chrome/` folder but is **experimental and untested**. The developer uses Firefox, so Chrome support is provided on a best-effort basis.
+
+To try it:
+1. Open `chrome://extensions`
+2. Enable "Developer mode"
+3. Click "Load unpacked" and select the `extension-chrome/` folder
+4. The macOS app's "Install Native Bridge" button will set up native messaging for both browsers
+
+**If you encounter issues with the Chrome extension, please [open an issue](https://github.com/rjwalters/claude-monitor/issues)** - we're happy to fix problems as they're reported.
+
 ### 3. Setup
 1. Click the menu bar widget
 2. Click "Install Native Bridge" (one-time setup)
@@ -247,12 +259,17 @@ rm -rf /path/to/claude-monitor
 
 ```
 claude-monitor/
-├── extension/                    # Firefox extension
+├── extension/                    # Firefox extension (MV2)
 │   ├── manifest.json            # Extension manifest
 │   ├── content.js               # Scrapes usage data from claude.ai
 │   ├── background.js            # Sends data to native host
 │   ├── popup.html/js            # Extension popup UI
 │   └── README.md
+├── extension-chrome/             # Chrome extension (MV3, experimental)
+│   ├── manifest.json            # MV3 manifest with stable extension key
+│   ├── content.js               # Same as Firefox
+│   ├── background.js            # Service worker (uses chrome.action)
+│   └── popup.html/js            # Same as Firefox
 ├── native-host/                  # Native messaging host
 │   ├── claude_monitor_host.cjs  # Node.js script (SQLite)
 │   ├── claude_monitor.json      # Native host manifest
