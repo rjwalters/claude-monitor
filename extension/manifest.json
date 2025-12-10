@@ -1,0 +1,37 @@
+{
+  "manifest_version": 2,
+  "name": "Claude Usage Monitor",
+  "version": "1.1",
+  "description": "Monitor Claude AI usage across accounts - auto-saves to ~/.claude-monitor",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "claude-monitor@local",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": ["none"]
+      }
+    }
+  },
+  "permissions": [
+    "storage",
+    "alarms",
+    "tabs",
+    "nativeMessaging",
+    "*://claude.ai/*"
+  ],
+  "background": {
+    "scripts": ["background.js"],
+    "persistent": false
+  },
+  "browser_action": {
+    "default_popup": "popup.html",
+    "default_title": "Claude Usage Monitor"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://claude.ai/settings/usage*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

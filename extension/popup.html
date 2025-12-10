@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {
+      width: 320px;
+      padding: 12px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+      margin: 0;
+    }
+    h2 {
+      margin: 0 0 12px 0;
+      font-size: 14px;
+      color: #333;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    h2 .badge {
+      font-size: 10px;
+      background: #e5e7eb;
+      padding: 2px 6px;
+      border-radius: 10px;
+      color: #6b7280;
+    }
+    .account-card {
+      background: #f9fafb;
+      padding: 10px 12px;
+      border-radius: 8px;
+      margin-bottom: 8px;
+      border: 1px solid #e5e7eb;
+    }
+    .account-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+    .account-name {
+      font-weight: 600;
+      color: #374151;
+      font-size: 12px;
+    }
+    .account-percent {
+      font-size: 18px;
+      font-weight: bold;
+    }
+    .percent-low { color: #10b981; }
+    .percent-medium { color: #f59e0b; }
+    .percent-high { color: #ef4444; }
+    .usage-bar {
+      height: 6px;
+      background: #e5e7eb;
+      border-radius: 3px;
+      overflow: hidden;
+      margin: 6px 0;
+    }
+    .usage-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.3s;
+    }
+    .fill-low { background: #10b981; }
+    .fill-medium { background: #f59e0b; }
+    .fill-high { background: #ef4444; }
+    .reset-info {
+      font-size: 11px;
+      color: #6b7280;
+    }
+    .timestamp {
+      font-size: 10px;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+    .no-data {
+      color: #9ca3af;
+      text-align: center;
+      padding: 20px 10px;
+      font-size: 12px;
+    }
+    .actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    button {
+      flex: 1;
+      padding: 8px;
+      background: #2563eb;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    button:hover {
+      background: #1d4ed8;
+    }
+    button.secondary {
+      background: #6b7280;
+    }
+    button.secondary:hover {
+      background: #4b5563;
+    }
+    .status {
+      font-size: 10px;
+      color: #9ca3af;
+      text-align: center;
+      margin-top: 8px;
+    }
+    .status.connected { color: #10b981; }
+  </style>
+</head>
+<body>
+  <h2>
+    Claude Monitor
+    <span class="badge" id="accountCount">0 accounts</span>
+  </h2>
+  <div id="content">
+    <div class="no-data">Loading...</div>
+  </div>
+  <div class="actions">
+    <button id="openUsage">Open Usage Page</button>
+    <button id="refresh" class="secondary">Refresh</button>
+  </div>
+  <div class="status" id="status">Checking native host...</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

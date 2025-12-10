@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+profiles/
+*.log
+.DS_Store
+build/
+.build/
+.swiftpm/
+*.xcodeproj/
+.claude/

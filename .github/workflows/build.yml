@@ -1,0 +1,56 @@
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build macOS App
+        run: |
+          cd menubar-app/ClaudeMonitor
+          swift build
+
+      - name: Build Extension Package
+        run: ./scripts/build-extension.sh
+
+  build-release:
+    runs-on: macos-14
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build macOS App (Release)
+        run: ./scripts/build-macos-app.sh
+
+      - name: Build Extension Package
+        run: ./scripts/build-extension.sh
+
+      - name: Upload macOS App
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeMonitor-macos
+          path: build/ClaudeMonitor.zip
+
+      - name: Upload Extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-monitor-extension
+          path: build/claude-monitor-extension.zip
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            build/ClaudeMonitor.zip
+            build/claude-monitor-extension.zip
+          draft: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
