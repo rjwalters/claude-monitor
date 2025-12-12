@@ -30,6 +30,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             updateStatusButton()
         }
 
+        // Update menubar when accounts change (e.g., reordering)
+        usageStore.onAccountsChanged = { [weak self] in
+            self?.updateStatusButton()
+        }
+
         // Create popover
         popover = NSPopover()
         popover?.contentSize = NSSize(width: 320, height: 400)

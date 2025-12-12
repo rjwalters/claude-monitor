@@ -47,6 +47,9 @@ class UsageStore: ObservableObject {
     @Published var lastRefresh: Date?
     @Published var error: String?
 
+    /// Called when accounts change (e.g., reordering) so the menubar can update
+    var onAccountsChanged: (() -> Void)?
+
     private let dbPath: String
 
     init() {
@@ -71,10 +74,13 @@ class UsageStore: ObservableObject {
             let email = SQLite.Expression<String?>("email")
             let plan = SQLite.Expression<String?>("plan")
             let lastUpdated = SQLite.Expression<String?>("last_updated")
+            let sortOrder = SQLite.Expression<Int?>("sort_order")
 
             var loadedAccounts: [Account] = []
 
-            for row in try db.prepare(accountsTable) {
+            // Order by sort_order ascending, then last_updated descending
+            let query = accountsTable.order(sortOrder.asc, lastUpdated.desc)
+            for row in try db.prepare(query) {
                 let accountId = row[id]
 
                 // Get latest percent from usage_history
@@ -131,6 +137,7 @@ class UsageStore: ObservableObject {
                 self.accounts = loadedAccounts
                 self.lastRefresh = Date()
                 self.error = nil
+                self.onAccountsChanged?()
             }
 
         } catch {
@@ -255,6 +262,54 @@ class UsageStore: ObservableObject {
         } catch {
             DispatchQueue.main.async {
                 self.error = "Failed to update account name: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func moveAccountToTop(accountId: String) {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return
+            }
+
+            let db = try Connection(dbPath)
+            let accountsTable = Table("accounts")
+            let id = SQLite.Expression<String>("id")
+            let sortOrder = SQLite.Expression<Int?>("sort_order")
+
+            // Get current accounts in order
+            let query = accountsTable.order(sortOrder.asc)
+            var accountIds: [String] = []
+            for row in try db.prepare(query) {
+                accountIds.append(row[id])
+            }
+
+            // Find and move target to front
+            guard let targetIndex = accountIds.firstIndex(of: accountId) else {
+                return
+            }
+
+            // Already at top, no need to reorder
+            if targetIndex == 0 {
+                return
+            }
+
+            // Reorder: move target to front
+            let targetId = accountIds.remove(at: targetIndex)
+            accountIds.insert(targetId, at: 0)
+
+            // Update all sort orders
+            for (index, accId) in accountIds.enumerated() {
+                let account = accountsTable.filter(id == accId)
+                try db.run(account.update(sortOrder <- index))
+            }
+
+            // Reload to reflect the change
+            loadFromDatabase()
+
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to reorder account: \(error.localizedDescription)"
             }
         }
     }

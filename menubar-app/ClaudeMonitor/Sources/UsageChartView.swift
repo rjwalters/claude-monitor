@@ -1,16 +1,63 @@
 import SwiftUI
 import Charts
 
+/// Data for a single account's chart trace
+struct AccountTrace: Identifiable {
+    let id: String
+    let name: String
+    let dataPoints: [UsageDataPoint]
+    let color: Color
+    let isPrimary: Bool
+}
+
 struct UsageChartWindow: View {
     let account: Account
     let dataPoints: [UsageDataPoint]
     let fullDataPoints: [FullUsageDataPoint]
     let store: UsageStore
+    let otherAccountsData: [AccountTrace]  // Data for other accounts
     @Environment(\.colorScheme) var colorScheme
     @State private var isEditingName = false
     @State private var editedName = ""
     @State private var isNameHovering = false
     @State private var showClearConfirmation = false
+    @State private var rangeStart: Double = 0.0  // 0-1 percentage of data range
+    @State private var rangeEnd: Double = 1.0    // 0-1 percentage of data range
+    @State private var showOtherAccounts = false
+
+    /// Filtered data points based on current range selection
+    var filteredDataPoints: [UsageDataPoint] {
+        guard dataPoints.count >= 2 else { return dataPoints }
+        let startDate = dateForRangePosition(rangeStart)
+        let endDate = dateForRangePosition(rangeEnd)
+        return dataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
+    }
+
+    /// Filtered other accounts data based on current range selection
+    var filteredOtherAccounts: [AccountTrace] {
+        guard dataPoints.count >= 2 else { return [] }
+        let startDate = dateForRangePosition(rangeStart)
+        let endDate = dateForRangePosition(rangeEnd)
+        return otherAccountsData.map { trace in
+            AccountTrace(
+                id: trace.id,
+                name: trace.name,
+                dataPoints: trace.dataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate },
+                color: trace.color,
+                isPrimary: trace.isPrimary
+            )
+        }
+    }
+
+    /// Convert range position (0-1) to actual date
+    func dateForRangePosition(_ position: Double) -> Date {
+        guard let first = dataPoints.first?.timestamp,
+              let last = dataPoints.last?.timestamp else {
+            return Date()
+        }
+        let totalInterval = last.timeIntervalSince(first)
+        return first.addingTimeInterval(totalInterval * position)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -110,28 +157,56 @@ struct UsageChartWindow: View {
             } else {
                 // Weekly Usage chart with points
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Weekly Usage")
-                        .font(.headline)
+                    HStack {
+                        Text("Weekly Usage")
+                            .font(.headline)
+                        Spacer()
+                        if !otherAccountsData.isEmpty {
+                            Button(action: { showOtherAccounts.toggle() }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: showOtherAccounts ? "eye.fill" : "eye.slash")
+                                        .font(.caption)
+                                    Text(showOtherAccounts ? "Hide others" : "Show others")
+                                        .font(.caption)
+                                }
+                                .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
 
-                    Chart(dataPoints) { point in
-                        LineMark(
-                            x: .value("Time", point.timestamp),
-                            y: .value("Usage %", point.weeklyPercent)
-                        )
-                        .foregroundStyle(Color.blue.gradient)
+                    Chart {
+                        // Other accounts (rendered first so primary is on top)
+                        if showOtherAccounts {
+                            ForEach(filteredOtherAccounts) { trace in
+                                ForEach(trace.dataPoints) { point in
+                                    LineMark(
+                                        x: .value("Time", point.timestamp),
+                                        y: .value("Usage %", point.weeklyPercent),
+                                        series: .value("Account", trace.id)
+                                    )
+                                    .foregroundStyle(trace.color)
+                                    .opacity(0.6)
+                                }
+                            }
+                        }
 
-                        AreaMark(
-                            x: .value("Time", point.timestamp),
-                            y: .value("Usage %", point.weeklyPercent)
-                        )
-                        .foregroundStyle(Color.blue.opacity(0.1).gradient)
+                        // Primary account (blue)
+                        ForEach(filteredDataPoints) { point in
+                            LineMark(
+                                x: .value("Time", point.timestamp),
+                                y: .value("Usage %", point.weeklyPercent),
+                                series: .value("Account", "primary")
+                            )
+                            .foregroundStyle(Color.blue)
 
-                        PointMark(
-                            x: .value("Time", point.timestamp),
-                            y: .value("Usage %", point.weeklyPercent)
-                        )
-                        .foregroundStyle(Color.blue)
-                        .symbolSize(30)
+                            PointMark(
+                                x: .value("Time", point.timestamp),
+                                y: .value("Usage %", point.weeklyPercent)
+                            )
+                            .foregroundStyle(Color.blue)
+                            .symbolSize(30)
+                        }
                     }
                     .chartYScale(domain: 0...100)
                     .chartYAxis {
@@ -156,7 +231,43 @@ struct UsageChartWindow: View {
                             }
                         }
                     }
-                    .frame(height: 280)
+                    .frame(height: 220)
+
+                    // Legend for other accounts
+                    if showOtherAccounts && !otherAccountsData.isEmpty {
+                        HStack(spacing: 16) {
+                            // Primary account
+                            HStack(spacing: 4) {
+                                Circle().fill(Color.blue).frame(width: 8, height: 8)
+                                Text(account.displayName)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
+                            // Other accounts
+                            ForEach(otherAccountsData) { trace in
+                                HStack(spacing: 4) {
+                                    Circle().fill(trace.color).frame(width: 8, height: 8)
+                                    Text(trace.name)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+
+                    // Range selector
+                    if dataPoints.count >= 2 {
+                        RangeSelector(
+                            dataPoints: dataPoints,
+                            otherAccountsData: showOtherAccounts ? otherAccountsData : [],
+                            rangeStart: $rangeStart,
+                            rangeEnd: $rangeEnd
+                        )
+                        .frame(height: 50)
+                    }
                 }
 
                 Spacer()
@@ -415,6 +526,145 @@ struct UsageChartWindow: View {
     }
 }
 
+struct RangeSelector: View {
+    let dataPoints: [UsageDataPoint]
+    let otherAccountsData: [AccountTrace]
+    @Binding var rangeStart: Double
+    @Binding var rangeEnd: Double
+    @Environment(\.colorScheme) var colorScheme
+
+    private let handleWidth: CGFloat = 8
+    private let minRangeWidth: Double = 0.05  // Minimum 5% of range
+
+    var dimColor: Color {
+        colorScheme == .dark
+            ? Color.black.opacity(0.5)
+            : Color.gray.opacity(0.3)
+    }
+
+    var handleColor: Color {
+        colorScheme == .dark
+            ? Color.white.opacity(0.8)
+            : Color.gray.opacity(0.8)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            let height = geometry.size.height
+            let startX = CGFloat(rangeStart)
+            let endX = CGFloat(rangeEnd)
+
+            ZStack(alignment: .leading) {
+                // Mini chart (full data)
+                Chart {
+                    // Other accounts
+                    ForEach(otherAccountsData) { trace in
+                        ForEach(trace.dataPoints) { point in
+                            LineMark(
+                                x: .value("Time", point.timestamp),
+                                y: .value("Usage %", point.weeklyPercent),
+                                series: .value("Account", trace.id)
+                            )
+                            .foregroundStyle(trace.color.opacity(0.4))
+                        }
+                    }
+
+                    // Primary account
+                    ForEach(dataPoints) { point in
+                        LineMark(
+                            x: .value("Time", point.timestamp),
+                            y: .value("Usage %", point.weeklyPercent),
+                            series: .value("Account", "primary")
+                        )
+                        .foregroundStyle(Color.blue.opacity(0.6))
+                    }
+                }
+                .chartYScale(domain: 0...100)
+                .chartXAxis(.hidden)
+                .chartYAxis(.hidden)
+
+                // Left dimmed region
+                Rectangle()
+                    .fill(dimColor)
+                    .frame(width: max(0, width * startX))
+
+                // Right dimmed region
+                Rectangle()
+                    .fill(dimColor)
+                    .frame(width: max(0, width * (1 - endX)))
+                    .position(x: width * endX + width * (1 - endX) / 2, y: height / 2)
+
+                // Selection border
+                RoundedRectangle(cornerRadius: 3)
+                    .stroke(handleColor, lineWidth: 2)
+                    .frame(width: max(handleWidth * 2, width * (endX - startX)), height: height)
+                    .position(x: width * startX + width * (endX - startX) / 2, y: height / 2)
+
+                // Left handle
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(handleColor)
+                    .frame(width: handleWidth, height: height)
+                    .position(x: width * startX + handleWidth / 2, y: height / 2)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                let newStart = max(0, min(Double(value.location.x / width), rangeEnd - minRangeWidth))
+                                rangeStart = newStart
+                            }
+                    )
+
+                // Right handle
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(handleColor)
+                    .frame(width: handleWidth, height: height)
+                    .position(x: width * endX - handleWidth / 2, y: height / 2)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                let newEnd = min(1, max(Double(value.location.x / width), rangeStart + minRangeWidth))
+                                rangeEnd = newEnd
+                            }
+                    )
+
+                // Middle drag area (for panning)
+                Rectangle()
+                    .fill(Color.clear)
+                    .frame(width: max(0, width * (endX - startX) - handleWidth * 2), height: height)
+                    .position(x: width * startX + width * (endX - startX) / 2, y: height / 2)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                let currentWidth = rangeEnd - rangeStart
+                                let delta = Double(value.translation.width / width)
+
+                                var newStart = rangeStart + delta
+                                var newEnd = rangeEnd + delta
+
+                                // Clamp to bounds
+                                if newStart < 0 {
+                                    newStart = 0
+                                    newEnd = currentWidth
+                                }
+                                if newEnd > 1 {
+                                    newEnd = 1
+                                    newStart = 1 - currentWidth
+                                }
+
+                                rangeStart = newStart
+                                rangeEnd = newEnd
+                            }
+                    )
+            }
+            .clipped()
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 4)
+                .fill(colorScheme == .dark ? Color(white: 1, opacity: 0.05) : Color(white: 0, opacity: 0.03))
+        )
+    }
+}
+
 struct UsageConsumedBox: View {
     let title: String
     let value: Double
@@ -447,6 +697,11 @@ struct UsageConsumedBox: View {
 class ChartWindowController {
     static var windows: [String: NSWindow] = [:]
 
+    // Colors for other accounts
+    static let otherAccountColors: [Color] = [
+        .orange, .green, .purple, .pink, .cyan, .yellow, .mint, .indigo
+    ]
+
     static func showChart(for account: Account, store: UsageStore) {
         // Close existing window for this account if open
         if let existing = windows[account.id] {
@@ -457,7 +712,31 @@ class ChartWindowController {
         let dataPoints = store.loadHistory(for: account.id)
         let fullDataPoints = store.loadFullHistory(for: account.id)
 
-        let chartView = UsageChartWindow(account: account, dataPoints: dataPoints, fullDataPoints: fullDataPoints, store: store)
+        // Load data for other accounts
+        var otherAccountsData: [AccountTrace] = []
+        for (index, otherAccount) in store.accounts.enumerated() {
+            if otherAccount.id != account.id {
+                let otherData = store.loadHistory(for: otherAccount.id)
+                if !otherData.isEmpty {
+                    let colorIndex = index % otherAccountColors.count
+                    otherAccountsData.append(AccountTrace(
+                        id: otherAccount.id,
+                        name: otherAccount.displayName,
+                        dataPoints: otherData,
+                        color: otherAccountColors[colorIndex],
+                        isPrimary: false
+                    ))
+                }
+            }
+        }
+
+        let chartView = UsageChartWindow(
+            account: account,
+            dataPoints: dataPoints,
+            fullDataPoints: fullDataPoints,
+            store: store,
+            otherAccountsData: otherAccountsData
+        )
         let hostingController = NSHostingController(rootView: chartView)
 
         let window = NSWindow(contentViewController: hostingController)

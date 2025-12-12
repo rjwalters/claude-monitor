@@ -4,14 +4,51 @@ struct UsagePopoverView: View {
     @ObservedObject var store: UsageStore
     @StateObject private var installer = ExtensionInstaller()
     @Environment(\.colorScheme) var colorScheme
+    @State private var showGitHubLink = false
+    @State private var titleHoverTimer: Timer?
 
     var body: some View {
         VStack(spacing: 0) {
             // Header
             HStack {
-                Text("Claude Usage")
-                    .font(.headline)
-                    .foregroundColor(.primary)
+                if showGitHubLink {
+                    Button(action: {
+                        if let url = URL(string: "https://github.com/rjwalters/claude-monitor") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "link")
+                                .font(.caption)
+                            Text("GitHub")
+                                .font(.headline)
+                        }
+                        .foregroundColor(.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { hovering in
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                            showGitHubLink = false
+                        }
+                    }
+                } else {
+                    Text("Claude Usage")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                        .onHover { hovering in
+                            if hovering {
+                                titleHoverTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { _ in
+                                    showGitHubLink = true
+                                }
+                            } else {
+                                titleHoverTimer?.invalidate()
+                                titleHoverTimer = nil
+                            }
+                        }
+                }
                 Spacer()
                 if let lastRefresh = store.lastRefresh {
                     Text(timeAgo(lastRefresh))
@@ -35,8 +72,8 @@ struct UsagePopoverView: View {
                 SetupGuideView(installer: installer, error: nil)
             } else {
                 VStack(spacing: 12) {
-                    ForEach(store.accounts) { account in
-                        ClickableAccountCard(account: account, usage: store.latestUsage[account.id], store: store)
+                    ForEach(Array(store.accounts.enumerated()), id: \.element.id) { index, account in
+                        ClickableAccountCard(account: account, usage: store.latestUsage[account.id], store: store, isFirst: index == 0)
                     }
                 }
                 .padding()
@@ -255,6 +292,7 @@ struct ClickableAccountCard: View {
     let account: Account
     let usage: UsageRecord?
     let store: UsageStore
+    var isFirst: Bool = false
     @State private var isHovering = false
     @State private var isEditing = false
     @State private var editedName = ""
@@ -271,19 +309,49 @@ struct ClickableAccountCard: View {
                 }
             )
         } else {
-            Button(action: {
-                ChartWindowController.showChart(for: account, store: store)
-            }) {
-                AccountCard(
-                    account: account,
-                    usage: usage,
-                    onEditTapped: {
-                        editedName = account.accountName ?? account.displayName
-                        isEditing = true
+            ZStack(alignment: .bottomLeading) {
+                Button(action: {
+                    ChartWindowController.showChart(for: account, store: store)
+                }) {
+                    AccountCard(
+                        account: account,
+                        usage: usage,
+                        onEditTapped: {
+                            editedName = account.accountName ?? account.displayName
+                            isEditing = true
+                        }
+                    )
+                }
+                .buttonStyle(CardButtonStyle(isHovering: isHovering))
+
+                // Move to top button (only shown on hover for non-first cards)
+                if !isFirst && isHovering {
+                    Button(action: {
+                        store.moveAccountToTop(accountId: account.id)
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.up.to.line")
+                                .font(.system(size: 9))
+                            Text("Pin to top")
+                                .font(.system(size: 10))
+                        }
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.9))
+                        .cornerRadius(4)
                     }
-                )
+                    .buttonStyle(.plain)
+                    .padding(8)
+                    .onHover { hovering in
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
+                }
             }
-            .buttonStyle(CardButtonStyle(isHovering: isHovering))
             .onHover { hovering in
                 isHovering = hovering
                 if hovering {

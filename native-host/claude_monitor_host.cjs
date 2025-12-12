@@ -29,7 +29,8 @@ db.exec(`
     account_name TEXT,
     email TEXT,
     plan TEXT,
-    last_updated TEXT
+    last_updated TEXT,
+    sort_order INTEGER DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS usage_history (
@@ -50,13 +51,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_history(timestamp DESC);
 `);
 
+// Migration: Add sort_order column if it doesn't exist
+try {
+  db.exec(`ALTER TABLE accounts ADD COLUMN sort_order INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
 // Prepared statements
-// Use INSERT ... ON CONFLICT to preserve existing account_name if not provided
+// Use INSERT ... ON CONFLICT to preserve existing account_name (user-set names are never overwritten)
 const upsertAccount = db.prepare(`
-  INSERT INTO accounts (id, account_name, email, plan, last_updated)
-  VALUES (?, ?, ?, ?, ?)
+  INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order)
+  VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0))
   ON CONFLICT(id) DO UPDATE SET
-    account_name = COALESCE(excluded.account_name, accounts.account_name),
     email = COALESCE(excluded.email, accounts.email),
     plan = COALESCE(excluded.plan, accounts.plan),
     last_updated = excluded.last_updated
@@ -80,6 +87,15 @@ const getAllAccounts = db.prepare(`
   SELECT a.*,
     (SELECT primary_percent FROM usage_history WHERE account_id = a.id ORDER BY timestamp DESC LIMIT 1) as latest_percent
   FROM accounts a
+  ORDER BY a.sort_order ASC, a.last_updated DESC
+`);
+
+const updateAccountSortOrder = db.prepare(`
+  UPDATE accounts SET sort_order = ? WHERE id = ?
+`);
+
+const getMaxSortOrder = db.prepare(`
+  SELECT COALESCE(MAX(sort_order), 0) as max_sort FROM accounts
 `);
 
 const getAccountHistory = db.prepare(`
@@ -187,7 +203,7 @@ async function processMessage(msg) {
       }
     }
 
-    // Update account (preserves existing account_name if new one not provided)
+    // Update account (account_name is never overwritten - only set on first insert or via user edit)
     upsertAccount.run(
       accountId,
       data.accountName || null,
@@ -236,6 +252,41 @@ async function processMessage(msg) {
     const limit = msg.limit || 100;
     const history = getAccountHistory.all(accountId, limit);
     sendMessage({ success: true, history });
+
+  } else if (msg.type === 'REORDER_ACCOUNT') {
+    // Move an account to the top (lowest sort_order)
+    const accountId = msg.accountId;
+    if (!accountId) {
+      sendMessage({ success: false, error: 'accountId required' });
+      return;
+    }
+
+    // Set this account to sort_order = -1 (will be lowest)
+    // Then normalize all sort orders to 0, 1, 2, ...
+    const accounts = getAllAccounts.all();
+    const targetIndex = accounts.findIndex(a => a.id === accountId);
+
+    if (targetIndex === -1) {
+      sendMessage({ success: false, error: 'Account not found' });
+      return;
+    }
+
+    // Move target to front, keep others in order
+    const reordered = [
+      accounts[targetIndex],
+      ...accounts.slice(0, targetIndex),
+      ...accounts.slice(targetIndex + 1)
+    ];
+
+    // Update sort_order for all accounts
+    const updateAll = db.transaction(() => {
+      reordered.forEach((account, index) => {
+        updateAccountSortOrder.run(index, account.id);
+      });
+    });
+    updateAll();
+
+    sendMessage({ success: true, accountId });
 
   } else {
     sendMessage({ success: false, error: 'Unknown message type' });
