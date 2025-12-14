@@ -58,6 +58,13 @@ try {
   // Column already exists, ignore
 }
 
+// Migration: Add is_synthetic column if it doesn't exist
+try {
+  db.exec(`ALTER TABLE usage_history ADD COLUMN is_synthetic INTEGER DEFAULT 0`);
+} catch (e) {
+  // Column already exists, ignore
+}
+
 // Prepared statements
 // Use INSERT ... ON CONFLICT to preserve existing account_name (user-set names are never overwritten)
 const upsertAccount = db.prepare(`
@@ -72,9 +79,72 @@ const upsertAccount = db.prepare(`
 const insertUsage = db.prepare(`
   INSERT INTO usage_history (
     account_id, timestamp, primary_percent, session_percent,
-    weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data
-  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data, is_synthetic
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
+
+// Insert synthetic reset points (for vertical line on chart)
+const insertSyntheticPoint = db.prepare(`
+  INSERT INTO usage_history (
+    account_id, timestamp, primary_percent, session_percent,
+    weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data, is_synthetic
+  ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 1)
+`);
+
+/**
+ * Parse a reset time string and calculate the actual reset timestamp
+ * Formats: "Thu 10:00 AM" (absolute) or "in 23 hr 57 min" (relative)
+ * @param {string} resetStr - The reset time string
+ * @param {string} referenceTimestamp - ISO timestamp of the reading that had this reset time
+ * @returns {Date|null} - The calculated reset time, or null if parsing failed
+ */
+function parseResetTime(resetStr, referenceTimestamp) {
+  if (!resetStr) return null;
+
+  const refDate = new Date(referenceTimestamp);
+
+  // Try relative format: "in X hr Y min" or "in X hours Y minutes"
+  const relativeMatch = resetStr.match(/in\s+(\d+)\s*(?:hr|hour)s?\s*(?:(\d+)\s*min)?/i);
+  if (relativeMatch) {
+    const hours = parseInt(relativeMatch[1], 10);
+    const minutes = relativeMatch[2] ? parseInt(relativeMatch[2], 10) : 0;
+    const resetTime = new Date(refDate.getTime() + (hours * 60 + minutes) * 60 * 1000);
+    return resetTime;
+  }
+
+  // Try absolute format: "Thu 10:00 AM" or "Thu 10:00 PM"
+  const absoluteMatch = resetStr.match(/([A-Za-z]{3})\s+(\d{1,2}):(\d{2})\s*(AM|PM)/i);
+  if (absoluteMatch) {
+    const dayName = absoluteMatch[1];
+    let hour = parseInt(absoluteMatch[2], 10);
+    const minute = parseInt(absoluteMatch[3], 10);
+    const ampm = absoluteMatch[4].toUpperCase();
+
+    // Convert to 24-hour
+    if (ampm === 'PM' && hour !== 12) hour += 12;
+    if (ampm === 'AM' && hour === 12) hour = 0;
+
+    // Find the next occurrence of this day/time relative to refDate
+    const dayMap = { 'Sun': 0, 'Mon': 1, 'Tue': 2, 'Wed': 3, 'Thu': 4, 'Fri': 5, 'Sat': 6 };
+    const targetDay = dayMap[dayName];
+    if (targetDay === undefined) return null;
+
+    // Start with refDate and find the next occurrence
+    const resetTime = new Date(refDate);
+    resetTime.setHours(hour, minute, 0, 0);
+
+    // Calculate days until target day
+    const currentDay = refDate.getDay();
+    let daysUntil = targetDay - currentDay;
+    if (daysUntil < 0) daysUntil += 7;
+    if (daysUntil === 0 && resetTime <= refDate) daysUntil = 7;
+
+    resetTime.setDate(resetTime.getDate() + daysUntil);
+    return resetTime;
+  }
+
+  return null;
+}
 
 const getLatestUsage = db.prepare(`
   SELECT * FROM usage_history
@@ -212,6 +282,47 @@ async function processMessage(msg) {
       timestamp
     );
 
+    // Check for reset: compare with previous reading
+    const prevReading = getLatestUsage.get(accountId);
+    let resetDetected = false;
+
+    if (prevReading && weeklyAllPercent !== null) {
+      const prevPercent = prevReading.weekly_all_percent;
+      // Reset detected if usage dropped by more than 5%
+      if (prevPercent !== null && prevPercent - weeklyAllPercent > 5) {
+        resetDetected = true;
+
+        // Calculate the actual reset time from the previous reading's weekly_reset
+        const resetTime = parseResetTime(prevReading.weekly_reset, prevReading.timestamp);
+
+        if (resetTime) {
+          // Insert two synthetic points to create a vertical drop on the chart
+          // Point 1: At the reset time, still at the previous usage level
+          const resetTimeISO = resetTime.toISOString();
+          insertSyntheticPoint.run(
+            accountId,
+            resetTimeISO,
+            prevReading.primary_percent,
+            prevReading.session_percent,
+            prevPercent,
+            prevReading.weekly_sonnet_percent
+          );
+
+          // Point 2: One second after reset, at 0%
+          const zeroTime = new Date(resetTime.getTime() + 1000);
+          const zeroTimeISO = zeroTime.toISOString();
+          insertSyntheticPoint.run(
+            accountId,
+            zeroTimeISO,
+            0,
+            0,
+            0,
+            0
+          );
+        }
+      }
+    }
+
     // Insert usage record
     insertUsage.run(
       accountId,
@@ -222,13 +333,15 @@ async function processMessage(msg) {
       weeklySonnetPercent,
       sessionReset,
       weeklyReset,
-      JSON.stringify(data)
+      JSON.stringify(data),
+      0  // is_synthetic = false
     );
 
     sendMessage({
       success: true,
       accountId,
       percent: data.primaryPercent,
+      resetDetected,
       dbPath: DB_FILE
     });
 

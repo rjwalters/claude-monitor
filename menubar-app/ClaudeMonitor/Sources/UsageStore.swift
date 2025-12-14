@@ -177,14 +177,16 @@ class UsageStore: ObservableObject {
             rawPoints.reverse()
 
             // Calculate deltas (usage consumed = increase in percentage)
+            // Synthetic reset points are now stored in the database, so they'll be
+            // loaded naturally and create vertical lines on the chart
             var dataPoints: [UsageDataPoint] = []
             for i in 0..<rawPoints.count {
                 let (date, percent) = rawPoints[i]
                 var delta: Double = 0
                 if i > 0 {
                     let prevPercent = rawPoints[i - 1].1
-                    // If percent went up, that's usage. If it went down (reset), ignore
                     let diff = percent - prevPercent
+                    // Only count increases as usage (resets show as drops, synthetic points handle visualization)
                     delta = diff > 0 ? diff : 0
                 }
                 dataPoints.append(UsageDataPoint(
