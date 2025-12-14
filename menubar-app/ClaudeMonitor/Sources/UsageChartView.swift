@@ -392,39 +392,11 @@ struct UsageChartWindow: View {
         let r2: Double         // R-squared (quality of fit)
     }
 
-    /// Fit a line to usage data points, only considering points in an active usage session
-    /// (i.e., where usage is monotonically increasing - stops at any reset/decrease)
-    func fitLinearModel(points: [(Date, Double)]) -> LinearFit? {
-        guard points.count >= 2 else { return nil }
-
-        // Find the active session: work backwards from most recent,
-        // include points where usage is increasing or flat
-        var activePoints: [(Date, Double)] = []
-        for i in stride(from: points.count - 1, through: 0, by: -1) {
-            let point = points[i]
-            if activePoints.isEmpty {
-                activePoints.insert(point, at: 0)
-            } else {
-                // Check if this point is part of the same session (usage should be <= next point)
-                let nextPercent = activePoints.first!.1
-                if point.1 <= nextPercent {
-                    activePoints.insert(point, at: 0)
-                } else {
-                    // Reset detected, stop here
-                    break
-                }
-            }
-        }
-
-        guard activePoints.count >= 2 else { return nil }
-
-        // Convert to x (minutes from first point) and y (percent)
-        let baseTime = activePoints.first!.0.timeIntervalSince1970
-        let xs = activePoints.map { ($0.0.timeIntervalSince1970 - baseTime) / 60.0 }
-        let ys = activePoints.map { $0.1 }
-
-        // Calculate linear regression
+    /// Helper to compute linear regression from x,y arrays
+    private func computeRegression(xs: [Double], ys: [Double]) -> (slope: Double, intercept: Double)? {
         let n = Double(xs.count)
+        guard n >= 2 else { return nil }
+
         let sumX = xs.reduce(0, +)
         let sumY = ys.reduce(0, +)
         let sumXY = zip(xs, ys).map { $0 * $1 }.reduce(0, +)
@@ -435,14 +407,86 @@ struct UsageChartWindow: View {
 
         let slope = (n * sumXY - sumX * sumY) / denom
         let intercept = (sumY - slope * sumX) / n
+        return (slope, intercept)
+    }
+
+    /// Fit a line to usage data using robust regression with 3σ outlier exclusion.
+    /// Starts from the most recent points and iteratively adds earlier points,
+    /// stopping when a point would be a statistical outlier.
+    func fitLinearModel(points: [(Date, Double)]) -> LinearFit? {
+        guard points.count >= 2 else { return nil }
+
+        // Use the most recent point as time reference (x=0 at the end)
+        let baseTime = points.last!.0.timeIntervalSince1970
+
+        // Convert all points to (x, y) where x is minutes before now (negative values)
+        let allXY: [(x: Double, y: Double)] = points.map { point in
+            let x = (point.0.timeIntervalSince1970 - baseTime) / 60.0
+            return (x, point.1)
+        }
+
+        // Start with the last 2 points
+        var includedIndices: [Int] = [allXY.count - 1, allXY.count - 2]
+
+        // Iteratively try to add earlier points
+        for i in stride(from: allXY.count - 3, through: 0, by: -1) {
+            let candidate = allXY[i]
+
+            // First check: candidate's y must be <= the earliest included point's y
+            // (usage should not decrease going forward in time)
+            let earliestIncluded = allXY[includedIndices.last!]
+            if candidate.y > earliestIncluded.y {
+                // Reset detected, stop here
+                break
+            }
+
+            // Get current included points
+            let currentXs = includedIndices.map { allXY[$0].x }
+            let currentYs = includedIndices.map { allXY[$0].y }
+
+            // Fit line to current points
+            guard let regression = computeRegression(xs: currentXs, ys: currentYs) else { break }
+
+            // Calculate residuals and standard deviation for current points
+            let residuals = zip(currentXs, currentYs).map { x, y in
+                y - (regression.slope * x + regression.intercept)
+            }
+            let meanResidual = residuals.reduce(0, +) / Double(residuals.count)
+            let variance = residuals.map { pow($0 - meanResidual, 2) }.reduce(0, +) / Double(residuals.count)
+            let stdDev = sqrt(variance)
+
+            // Calculate predicted value and residual for candidate
+            let predictedY = regression.slope * candidate.x + regression.intercept
+            let candidateResidual = candidate.y - predictedY
+
+            // Check if candidate is within 3σ (use max of stdDev and 1.0 to handle low-variance cases)
+            let threshold = max(stdDev, 1.0) * 3.0
+            if abs(candidateResidual) <= threshold {
+                // Point is consistent with the trend, include it
+                includedIndices.append(i)
+            } else {
+                // Point is an outlier, stop adding more
+                break
+            }
+        }
+
+        guard includedIndices.count >= 2 else { return nil }
+
+        // Final regression on all included points
+        let finalXs = includedIndices.map { allXY[$0].x }
+        let finalYs = includedIndices.map { allXY[$0].y }
+
+        guard let finalRegression = computeRegression(xs: finalXs, ys: finalYs) else { return nil }
 
         // Calculate R-squared
-        let meanY = sumY / n
-        let ssTotal = ys.map { pow($0 - meanY, 2) }.reduce(0, +)
-        let ssResidual = zip(xs, ys).map { x, y in pow(y - (slope * x + intercept), 2) }.reduce(0, +)
+        let meanY = finalYs.reduce(0, +) / Double(finalYs.count)
+        let ssTotal = finalYs.map { pow($0 - meanY, 2) }.reduce(0, +)
+        let ssResidual = zip(finalXs, finalYs).map { x, y in
+            pow(y - (finalRegression.slope * x + finalRegression.intercept), 2)
+        }.reduce(0, +)
         let r2 = ssTotal > 0 ? 1 - ssResidual / ssTotal : 0
 
-        return LinearFit(slope: slope, intercept: intercept, r2: r2)
+        return LinearFit(slope: finalRegression.slope, intercept: finalRegression.intercept, r2: r2)
     }
 
     /// Estimate time until a usage metric reaches 100%
