@@ -21,9 +21,43 @@ struct UsageChartWindow: View {
     @State private var editedName = ""
     @State private var isNameHovering = false
     @State private var showClearConfirmation = false
-    @State private var rangeStart: Double = 0.0  // 0-1 percentage of data range
-    @State private var rangeEnd: Double = 1.0    // 0-1 percentage of data range
+    @State private var rangeStart: Double = 0.0  // 0-1 percentage of 7-day range
+    @State private var rangeEnd: Double = 1.0    // 0-1 percentage of 7-day range
+    @State private var hasInitializedRange = false
     @State private var showOtherAccounts = false
+
+    /// The 7-day window: ends at the latest data point (or now), starts 7 days before
+    var chartDateRange: (start: Date, end: Date) {
+        // Find the latest timestamp across all data
+        var latestDate = Date()
+        if let primaryLatest = dataPoints.last?.timestamp {
+            latestDate = primaryLatest
+        }
+        for trace in otherAccountsData {
+            if let traceLatest = trace.dataPoints.last?.timestamp, traceLatest > latestDate {
+                latestDate = traceLatest
+            }
+        }
+        let sevenDaysAgo = latestDate.addingTimeInterval(-7 * 24 * 60 * 60)
+        return (sevenDaysAgo, latestDate)
+    }
+
+    /// Initial range values to show just the active account's data within the 7-day window
+    var initialRangeForActiveAccount: (start: Double, end: Double) {
+        let (windowStart, windowEnd) = chartDateRange
+        let windowInterval = windowEnd.timeIntervalSince(windowStart)
+        guard windowInterval > 0,
+              let firstData = dataPoints.first?.timestamp,
+              let lastData = dataPoints.last?.timestamp else {
+            return (0.0, 1.0)
+        }
+        // Calculate where active account's data falls within the 7-day window
+        let startPos = max(0, firstData.timeIntervalSince(windowStart) / windowInterval)
+        let endPos = min(1, lastData.timeIntervalSince(windowStart) / windowInterval)
+        // Add small padding (2% on each side)
+        let padding = 0.02
+        return (max(0, startPos - padding), min(1, endPos + padding))
+    }
 
     /// Filtered data points based on current range selection
     var filteredDataPoints: [UsageDataPoint] {
@@ -35,7 +69,7 @@ struct UsageChartWindow: View {
 
     /// Filtered other accounts data based on current range selection
     var filteredOtherAccounts: [AccountTrace] {
-        guard dataPoints.count >= 2 else { return [] }
+        guard !otherAccountsData.isEmpty else { return [] }
         let startDate = dateForRangePosition(rangeStart)
         let endDate = dateForRangePosition(rangeEnd)
         return otherAccountsData.map { trace in
@@ -49,14 +83,54 @@ struct UsageChartWindow: View {
         }
     }
 
-    /// Convert range position (0-1) to actual date
+    /// Convert range position (0-1) to actual date within 7-day window
     func dateForRangePosition(_ position: Double) -> Date {
-        guard let first = dataPoints.first?.timestamp,
-              let last = dataPoints.last?.timestamp else {
-            return Date()
+        let (windowStart, windowEnd) = chartDateRange
+        let totalInterval = windowEnd.timeIntervalSince(windowStart)
+        return windowStart.addingTimeInterval(totalInterval * position)
+    }
+
+    /// Generate midnight dates within the visible range
+    var midnightDates: [Date] {
+        let calendar = Calendar.current
+        let startDate = dateForRangePosition(rangeStart)
+        let endDate = dateForRangePosition(rangeEnd)
+
+        // Find first midnight at or after start
+        var current = calendar.startOfDay(for: startDate)
+        if current < startDate {
+            current = calendar.date(byAdding: .day, value: 1, to: current) ?? current
         }
-        let totalInterval = last.timeIntervalSince(first)
-        return first.addingTimeInterval(totalInterval * position)
+
+        var dates: [Date] = []
+        while current <= endDate {
+            dates.append(current)
+            current = calendar.date(byAdding: .day, value: 1, to: current) ?? current
+        }
+        return dates
+    }
+
+    /// Generate 4-hour marks within the visible range (excluding midnights)
+    var fourHourDates: [Date] {
+        let calendar = Calendar.current
+        let startDate = dateForRangePosition(rangeStart)
+        let endDate = dateForRangePosition(rangeEnd)
+
+        // Find first 4-hour boundary at or after start
+        let startHour = calendar.component(.hour, from: startDate)
+        let nextFourHour = ((startHour / 4) + 1) * 4
+        var current = calendar.startOfDay(for: startDate)
+        current = calendar.date(byAdding: .hour, value: nextFourHour, to: current) ?? current
+
+        var dates: [Date] = []
+        while current <= endDate {
+            let hour = calendar.component(.hour, from: current)
+            if hour != 0 {  // Skip midnights
+                dates.append(current)
+            }
+            current = calendar.date(byAdding: .hour, value: 4, to: current) ?? current
+        }
+        return dates
     }
 
     var body: some View {
@@ -187,6 +261,14 @@ struct UsageChartWindow: View {
                                     )
                                     .foregroundStyle(trace.color)
                                     .opacity(0.6)
+
+                                    PointMark(
+                                        x: .value("Time", point.timestamp),
+                                        y: .value("Usage %", point.weeklyPercent)
+                                    )
+                                    .foregroundStyle(trace.color)
+                                    .opacity(0.6)
+                                    .symbolSize(20)
                                 }
                             }
                         }
@@ -209,6 +291,7 @@ struct UsageChartWindow: View {
                         }
                     }
                     .chartYScale(domain: 0...100)
+                    .chartXScale(domain: dateForRangePosition(rangeStart)...dateForRangePosition(rangeEnd))
                     .chartYAxis {
                         AxisMarks(position: .leading, values: [0, 25, 50, 75, 100]) { value in
                             AxisGridLine()
@@ -221,14 +304,19 @@ struct UsageChartWindow: View {
                         }
                     }
                     .chartXAxis {
-                        AxisMarks(values: .automatic) { value in
-                            AxisGridLine()
+                        // Major ticks at midnight with MM/DD labels
+                        AxisMarks(values: midnightDates) { value in
+                            AxisGridLine(stroke: StrokeStyle(lineWidth: 1))
                             AxisValueLabel {
                                 if let date = value.as(Date.self) {
-                                    Text(formatTime(date))
+                                    Text(formatDateShort(date))
                                         .font(.caption)
                                 }
                             }
+                        }
+                        // Minor ticks every 4 hours with dashed lines, no labels
+                        AxisMarks(values: fourHourDates) { _ in
+                            AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [4, 4]))
                         }
                     }
                     .frame(height: 220)
@@ -258,11 +346,12 @@ struct UsageChartWindow: View {
                         .padding(.top, 4)
                     }
 
-                    // Range selector
-                    if dataPoints.count >= 2 {
+                    // Range selector (always show if we have data, using 7-day window)
+                    if !dataPoints.isEmpty {
                         RangeSelector(
                             dataPoints: dataPoints,
                             otherAccountsData: showOtherAccounts ? otherAccountsData : [],
+                            chartDateRange: chartDateRange,
                             rangeStart: $rangeStart,
                             rangeEnd: $rangeEnd
                         )
@@ -313,9 +402,17 @@ struct UsageChartWindow: View {
         }
         .padding(.horizontal, 24)
         .padding(.top, 56)
-        .padding(.bottom, 40)
-        .frame(width: 620, height: 600)
+        .padding(.bottom, 50)
+        .frame(width: 620, height: 610)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            if !hasInitializedRange {
+                let initial = initialRangeForActiveAccount
+                rangeStart = initial.start
+                rangeEnd = initial.end
+                hasInitializedRange = true
+            }
+        }
         .alert("Clear History?", isPresented: $showClearConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Clear", role: .destructive) {
@@ -568,11 +665,18 @@ struct UsageChartWindow: View {
         formatter.dateFormat = "HH:mm"
         return formatter.string(from: date)
     }
+
+    func formatDateShort(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M/d"
+        return formatter.string(from: date)
+    }
 }
 
 struct RangeSelector: View {
     let dataPoints: [UsageDataPoint]
     let otherAccountsData: [AccountTrace]
+    let chartDateRange: (start: Date, end: Date)  // 7-day window
     @Binding var rangeStart: Double
     @Binding var rangeEnd: Double
     @Environment(\.colorScheme) var colorScheme
@@ -625,6 +729,7 @@ struct RangeSelector: View {
                     }
                 }
                 .chartYScale(domain: 0...100)
+                .chartXScale(domain: chartDateRange.start...chartDateRange.end)
                 .chartXAxis(.hidden)
                 .chartYAxis(.hidden)
 
@@ -786,7 +891,7 @@ class ChartWindowController {
         let window = NSWindow(contentViewController: hostingController)
         window.title = "Usage History - \(account.displayName)"
         window.styleMask = [.titled, .closable, .resizable]
-        window.setContentSize(NSSize(width: 620, height: 600))
+        window.setContentSize(NSSize(width: 620, height: 610))
         window.center()
 
         windows[account.id] = window
