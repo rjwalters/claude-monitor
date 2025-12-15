@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Usage Monitor",
-  "version": "1.4",
+  "version": "1.5",
   "description": "Monitor Claude AI usage across accounts - auto-saves to ~/.claude-monitor",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6fq2+I3Y5Thvl7lFSKsELwclg3bcSfLG8fYhApaiah1XxL1vAPDzIsueO+by0HBspaQKI2JbNFTk17LI2vjdjYvc8r9MSjsEGyinTtMU1+brJ3FMrHGT/1y/nemgNq+4AXRiqS2AxqIZJ33p3kYeExBP4juTWL+V2T2SW6Qi+XuI71DxxnWY/g40TjVkx7nwdr90kGFQ2bXTSkdURDiUR9R4OLg0COYsQudwzSBPr5tY973Uhb/Ug3wZz3Imx3dkeGWoNwMRAUUcUGyqBtm10eFUmVq3hFi7akzVZSOCCT8tMUn/aGrYDyLfmq5SUKZDocORZRqjis9uPJaoVyWDZQIDAQAB",
   "permissions": [

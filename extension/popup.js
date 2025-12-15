@@ -122,6 +122,9 @@ document.getElementById('openUsage').addEventListener('click', () => {
   browserAPI.tabs.create({ url: 'https://claude.ai/settings/usage' });
 });
 
+// Track resources for cleanup
+let refreshTimeoutId = null;
+
 // Refresh button
 document.getElementById('refresh').addEventListener('click', async () => {
   const btn = document.getElementById('refresh');
@@ -137,11 +140,26 @@ document.getElementById('refresh').addEventListener('click', async () => {
   }
 
   // Reload popup data after a short delay
-  setTimeout(async () => {
+  refreshTimeoutId = setTimeout(async () => {
+    refreshTimeoutId = null;
     await loadData();
     btn.textContent = 'Refresh';
     btn.disabled = false;
   }, 2000);
+});
+
+function handleStorageChange(changes, namespace) {
+  if (namespace === 'local') {
+    loadData();
+  }
+}
+
+// Cleanup on popup close
+window.addEventListener('unload', () => {
+  if (refreshTimeoutId) {
+    clearTimeout(refreshTimeoutId);
+  }
+  browserAPI.storage.onChanged.removeListener(handleStorageChange);
 });
 
 // Initial load
@@ -149,8 +167,4 @@ loadData();
 checkNativeHost();
 
 // Listen for storage updates
-browserAPI.storage.onChanged.addListener((changes, namespace) => {
-  if (namespace === 'local') {
-    loadData();
-  }
-});
+browserAPI.storage.onChanged.addListener(handleStorageChange);

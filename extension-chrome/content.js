@@ -258,20 +258,57 @@ function captureUsage() {
   }
 }
 
+// Track timeouts for cleanup
+const pendingTimeouts = new Set();
+
+function scheduleCapture(delay) {
+  const id = setTimeout(() => {
+    pendingTimeouts.delete(id);
+    captureUsage();
+  }, delay);
+  pendingTimeouts.add(id);
+  return id;
+}
+
+// Debounced visibility handler - only one pending at a time
+let visibilityTimeoutId = null;
+function handleVisibilityChange() {
+  if (document.visibilityState === 'visible') {
+    if (visibilityTimeoutId) {
+      clearTimeout(visibilityTimeoutId);
+      pendingTimeouts.delete(visibilityTimeoutId);
+    }
+    visibilityTimeoutId = scheduleCapture(1000);
+  }
+}
+
+// Cleanup function
+function cleanup() {
+  pendingTimeouts.forEach(id => clearTimeout(id));
+  pendingTimeouts.clear();
+  if (visibilityTimeoutId) {
+    clearTimeout(visibilityTimeoutId);
+    visibilityTimeoutId = null;
+  }
+  document.removeEventListener('visibilitychange', handleVisibilityChange);
+  window.removeEventListener('beforeunload', cleanup);
+  window.removeEventListener('pagehide', cleanup);
+}
+
+// Register cleanup handlers
+window.addEventListener('beforeunload', cleanup);
+window.addEventListener('pagehide', cleanup);
+
 // Run on page load and periodically
 if (document.readyState === 'complete') {
-  setTimeout(captureUsage, 500);
+  scheduleCapture(500);
 } else {
-  window.addEventListener('load', () => setTimeout(captureUsage, 500));
+  window.addEventListener('load', () => scheduleCapture(500), { once: true });
 }
 
 // Re-capture after dynamic content loads
-setTimeout(captureUsage, 3000);
-setTimeout(captureUsage, 10000);
+scheduleCapture(3000);
+scheduleCapture(10000);
 
-// Also capture on visibility change (when tab becomes active)
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') {
-    setTimeout(captureUsage, 1000);
-  }
-});
+// Capture on visibility change (debounced)
+document.addEventListener('visibilitychange', handleVisibilityChange);
