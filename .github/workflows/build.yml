@@ -25,6 +25,8 @@ jobs:
   build-release:
     runs-on: macos-14
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
