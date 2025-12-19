@@ -30,9 +30,9 @@ Unzip and move `ClaudeMonitor.app` to your Applications folder.
 **First run:** Right-click → "Open" (required for unsigned apps)
 
 ### 2. Install the Firefox Extension
-Download `claude_monitor-x.x.xpi` from [Releases](https://github.com/rjwalters/claude-monitor/releases)
+Install from [Mozilla Add-ons](https://addons.mozilla.org/addon/claude-monitor/) (recommended)
 
-Drag the `.xpi` file into Firefox to install.
+Or download `claude_monitor-x.x.xpi` from [Releases](https://github.com/rjwalters/claude-monitor/releases) and drag into Firefox.
 
 ### 2b. Chrome Extension (Experimental)
 
@@ -131,10 +131,10 @@ Visit https://claude.ai/settings/usage in Firefox. The extension captures data a
 
 Output: `build/claude-monitor-extension.zip`
 
-To sign for distribution:
+The extension is published on [Mozilla Add-ons](https://addons.mozilla.org/addon/claude-monitor/). To update:
 1. Go to https://addons.mozilla.org/developers/
-2. Submit as "Self-distributed" add-on
-3. Download the signed `.xpi` file
+2. Upload the new version
+3. Updates will be distributed automatically to users
 
 ### Build the macOS App
 
