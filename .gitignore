@@ -9,3 +9,5 @@ build/
 .swiftpm/
 *.xcodeproj/
 .claude/
+*.xpi
+*.zip
