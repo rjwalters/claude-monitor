@@ -178,8 +178,10 @@ class UsageStore: ObservableObject {
                 }
             }
 
-            // Apply 1% change filter to reduce data points while preserving chart shape
-            // Always keep first and last points, and any point showing >= minChangePercent change
+            // Apply change filter to reduce data points while preserving chart shape
+            // Keep a point if EITHER:
+            // - Change from last kept point is >= threshold, OR
+            // - Change to next point is >= threshold (preserves reset points)
             var filteredPoints: [(Date, Double)] = []
             var lastKeptPercent: Double?
 
@@ -193,8 +195,12 @@ class UsageStore: ObservableObject {
                     filteredPoints.append((date, percent))
                     lastKeptPercent = percent
                 } else if let lastPercent = lastKeptPercent {
-                    let change = abs(percent - lastPercent)
-                    if change >= minChangePercent {
+                    let changeFromPrev = abs(percent - lastPercent)
+                    let nextPercent = rawPoints[i + 1].1
+                    let changeToNext = abs(nextPercent - percent)
+
+                    // Keep if either transition is significant
+                    if changeFromPrev >= minChangePercent || changeToNext >= minChangePercent {
                         filteredPoints.append((date, percent))
                         lastKeptPercent = percent
                     }
@@ -264,8 +270,10 @@ class UsageStore: ObservableObject {
                 }
             }
 
-            // Apply 1% change filter based on weeklyAllPercent to reduce data points
-            // Always keep first and last points, and any point showing >= minChangePercent change
+            // Apply change filter based on weeklyAllPercent to reduce data points
+            // Keep a point if EITHER:
+            // - Change from last kept point is >= threshold, OR
+            // - Change to next point is >= threshold (preserves reset points)
             var filteredPoints: [FullUsageDataPoint] = []
             var lastKeptPercent: Double?
 
@@ -278,8 +286,12 @@ class UsageStore: ObservableObject {
                     filteredPoints.append(point)
                     lastKeptPercent = point.weeklyAllPercent
                 } else if let currentPercent = point.weeklyAllPercent, let lastPercent = lastKeptPercent {
-                    let change = abs(currentPercent - lastPercent)
-                    if change >= minChangePercent {
+                    let changeFromPrev = abs(currentPercent - lastPercent)
+                    let nextPercent = rawPoints[i + 1].weeklyAllPercent ?? currentPercent
+                    let changeToNext = abs(nextPercent - currentPercent)
+
+                    // Keep if either transition is significant
+                    if changeFromPrev >= minChangePercent || changeToNext >= minChangePercent {
                         filteredPoints.append(point)
                         lastKeptPercent = currentPercent
                     }
@@ -420,5 +432,75 @@ class UsageStore: ObservableObject {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.date(from: string) ?? ISO8601DateFormatter().date(from: string)
+    }
+}
+
+// MARK: - Update Checker
+
+struct AppVersion {
+    static let current = "1.6.1"
+    static let repoOwner = "rjwalters"
+    static let repoName = "claude-monitor"
+}
+
+struct UpdateInfo {
+    let version: String
+    let releaseURL: String
+}
+
+class UpdateChecker: ObservableObject {
+    @Published var updateAvailable: UpdateInfo?
+    @Published var isChecking = false
+
+    static let shared = UpdateChecker()
+
+    func checkForUpdates() {
+        guard !isChecking else { return }
+        isChecking = true
+
+        let urlString = "https://api.github.com/repos/\(AppVersion.repoOwner)/\(AppVersion.repoName)/releases/latest"
+        guard let url = URL(string: urlString) else {
+            isChecking = false
+            return
+        }
+
+        var request = URLRequest(url: url)
+        request.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                self?.isChecking = false
+
+                guard let data = data, error == nil else { return }
+
+                do {
+                    if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let tagName = json["tag_name"] as? String,
+                       let htmlURL = json["html_url"] as? String {
+                        let latestVersion = tagName.hasPrefix("v") ? String(tagName.dropFirst()) : tagName
+
+                        if self?.isNewerVersion(latestVersion, than: AppVersion.current) == true {
+                            self?.updateAvailable = UpdateInfo(version: latestVersion, releaseURL: htmlURL)
+                        }
+                    }
+                } catch {
+                    print("Failed to parse release info: \(error)")
+                }
+            }
+        }.resume()
+    }
+
+    private func isNewerVersion(_ new: String, than current: String) -> Bool {
+        let newParts = new.split(separator: ".").compactMap { Int($0) }
+        let currentParts = current.split(separator: ".").compactMap { Int($0) }
+
+        for i in 0..<max(newParts.count, currentParts.count) {
+            let newPart = i < newParts.count ? newParts[i] : 0
+            let currentPart = i < currentParts.count ? currentParts[i] : 0
+
+            if newPart > currentPart { return true }
+            if newPart < currentPart { return false }
+        }
+        return false
     }
 }

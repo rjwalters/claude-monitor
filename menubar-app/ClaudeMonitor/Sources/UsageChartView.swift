@@ -17,6 +17,7 @@ struct UsageChartWindow: View {
     let store: UsageStore
     let otherAccountsData: [AccountTrace]  // Data for other accounts
     @Environment(\.colorScheme) var colorScheme
+    @StateObject private var updateChecker = UpdateChecker.shared
     @State private var isEditingName = false
     @State private var editedName = ""
     @State private var isNameHovering = false
@@ -405,6 +406,28 @@ struct UsageChartWindow: View {
         .padding(.bottom, 50)
         .frame(width: 620, height: 610)
         .background(Color(nsColor: .windowBackgroundColor))
+        .overlay(alignment: .bottomLeading) {
+            if let update = updateChecker.updateAvailable {
+                Button(action: {
+                    if let url = URL(string: update.releaseURL) {
+                        NSWorkspace.shared.open(url)
+                    }
+                }) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.down.circle.fill")
+                        Text("Update Available: v\(update.version)")
+                    }
+                    .font(.caption)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.blue)
+                    .foregroundColor(.white)
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .padding(16)
+            }
+        }
         .onAppear {
             if !hasInitializedRange {
                 let initial = initialRangeForActiveAccount
@@ -412,6 +435,7 @@ struct UsageChartWindow: View {
                 rangeEnd = initial.end
                 hasInitializedRange = true
             }
+            updateChecker.checkForUpdates()
         }
         .alert("Clear History?", isPresented: $showClearConfirmation) {
             Button("Cancel", role: .cancel) { }
