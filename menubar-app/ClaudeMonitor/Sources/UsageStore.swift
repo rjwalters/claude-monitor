@@ -147,7 +147,7 @@ class UsageStore: ObservableObject {
         }
     }
 
-    func loadHistory(for accountId: String, limit: Int = 500) -> [UsageDataPoint] {
+    func loadHistory(for accountId: String, daysBack: Int = 7, minChangePercent: Double = 1.0) -> [UsageDataPoint] {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
                 return []
@@ -159,10 +159,15 @@ class UsageStore: ObservableObject {
             let timestamp = SQLite.Expression<String>("timestamp")
             let weeklyAllPercent = SQLite.Expression<Double?>("weekly_all_percent")
 
+            // Calculate the cutoff date for time-based filtering
+            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let cutoffString = formatter.string(from: cutoffDate)
+
             let query = usageTable
-                .filter(accountIdCol == accountId)
-                .order(timestamp.desc)
-                .limit(limit)
+                .filter(accountIdCol == accountId && timestamp >= cutoffString)
+                .order(timestamp.asc)
 
             var rawPoints: [(Date, Double)] = []
 
@@ -173,18 +178,38 @@ class UsageStore: ObservableObject {
                 }
             }
 
-            // Reverse to chronological order
-            rawPoints.reverse()
+            // Apply 1% change filter to reduce data points while preserving chart shape
+            // Always keep first and last points, and any point showing >= minChangePercent change
+            var filteredPoints: [(Date, Double)] = []
+            var lastKeptPercent: Double?
+
+            for i in 0..<rawPoints.count {
+                let (date, percent) = rawPoints[i]
+                let isFirst = i == 0
+                let isLast = i == rawPoints.count - 1
+
+                if isFirst || isLast {
+                    // Always keep first and last points
+                    filteredPoints.append((date, percent))
+                    lastKeptPercent = percent
+                } else if let lastPercent = lastKeptPercent {
+                    let change = abs(percent - lastPercent)
+                    if change >= minChangePercent {
+                        filteredPoints.append((date, percent))
+                        lastKeptPercent = percent
+                    }
+                }
+            }
 
             // Calculate deltas (usage consumed = increase in percentage)
             // Synthetic reset points are now stored in the database, so they'll be
             // loaded naturally and create vertical lines on the chart
             var dataPoints: [UsageDataPoint] = []
-            for i in 0..<rawPoints.count {
-                let (date, percent) = rawPoints[i]
+            for i in 0..<filteredPoints.count {
+                let (date, percent) = filteredPoints[i]
                 var delta: Double = 0
                 if i > 0 {
-                    let prevPercent = rawPoints[i - 1].1
+                    let prevPercent = filteredPoints[i - 1].1
                     let diff = percent - prevPercent
                     // Only count increases as usage (resets show as drops, synthetic points handle visualization)
                     delta = diff > 0 ? diff : 0
@@ -204,7 +229,7 @@ class UsageStore: ObservableObject {
         }
     }
 
-    func loadFullHistory(for accountId: String, limit: Int = 500) -> [FullUsageDataPoint] {
+    func loadFullHistory(for accountId: String, daysBack: Int = 7, minChangePercent: Double = 1.0) -> [FullUsageDataPoint] {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
                 return []
@@ -217,16 +242,21 @@ class UsageStore: ObservableObject {
             let sessionPercent = SQLite.Expression<Double?>("session_percent")
             let weeklyAllPercent = SQLite.Expression<Double?>("weekly_all_percent")
 
-            let query = usageTable
-                .filter(accountIdCol == accountId)
-                .order(timestamp.desc)
-                .limit(limit)
+            // Calculate the cutoff date for time-based filtering
+            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let cutoffString = formatter.string(from: cutoffDate)
 
-            var points: [FullUsageDataPoint] = []
+            let query = usageTable
+                .filter(accountIdCol == accountId && timestamp >= cutoffString)
+                .order(timestamp.asc)
+
+            var rawPoints: [FullUsageDataPoint] = []
 
             for row in try db.prepare(query) {
                 if let date = parseDate(row[timestamp]) {
-                    points.append(FullUsageDataPoint(
+                    rawPoints.append(FullUsageDataPoint(
                         timestamp: date,
                         sessionPercent: row[sessionPercent],
                         weeklyAllPercent: row[weeklyAllPercent]
@@ -234,9 +264,32 @@ class UsageStore: ObservableObject {
                 }
             }
 
-            // Reverse to chronological order
-            points.reverse()
-            return points
+            // Apply 1% change filter based on weeklyAllPercent to reduce data points
+            // Always keep first and last points, and any point showing >= minChangePercent change
+            var filteredPoints: [FullUsageDataPoint] = []
+            var lastKeptPercent: Double?
+
+            for i in 0..<rawPoints.count {
+                let point = rawPoints[i]
+                let isFirst = i == 0
+                let isLast = i == rawPoints.count - 1
+
+                if isFirst || isLast {
+                    filteredPoints.append(point)
+                    lastKeptPercent = point.weeklyAllPercent
+                } else if let currentPercent = point.weeklyAllPercent, let lastPercent = lastKeptPercent {
+                    let change = abs(currentPercent - lastPercent)
+                    if change >= minChangePercent {
+                        filteredPoints.append(point)
+                        lastKeptPercent = currentPercent
+                    }
+                } else {
+                    // Keep points with nil percent values to avoid losing data
+                    filteredPoints.append(point)
+                }
+            }
+
+            return filteredPoints
 
         } catch {
             print("Error loading full history: \(error)")
