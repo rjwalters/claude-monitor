@@ -1,6 +1,6 @@
 {
   "name": "claude-monitor",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "CLI tool to monitor Claude usage across multiple accounts",
   "type": "module",
   "bin": {

@@ -1,11 +1,11 @@
 {
   "manifest_version": 2,
   "name": "Claude Usage Monitor",
-  "version": "1.5",
+  "version": "1.6",
   "description": "Monitor Claude AI usage across accounts - auto-saves to ~/.claude-monitor",
   "browser_specific_settings": {
     "gecko": {
-      "id": "claude-monitor@local",
+      "id": "claude-monitor@rjwalters.github.io",
       "strict_min_version": "140.0",
       "data_collection_permissions": {
         "required": ["none"]
