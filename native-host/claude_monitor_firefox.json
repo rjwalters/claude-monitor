@@ -1,7 +1,7 @@
 {
   "name": "claude_monitor",
   "description": "Claude Usage Monitor Native Host",
-  "path": "/Users/rwalters/GitHub/claude-monitor/native-host/claude_monitor_host.sh",
+  "path": "/Users/rwalters/GitHub/claude-monitor/dist/claude_monitor_host",
   "type": "stdio",
-  "allowed_extensions": ["claude-monitor@local"]
+  "allowed_extensions": ["claude-monitor@rjwalters.github.io", "claude-monitor@local"]
 }

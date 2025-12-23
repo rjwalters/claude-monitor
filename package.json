@@ -1,6 +1,6 @@
 {
   "name": "claude-monitor",
-  "version": "1.6.1",
+  "version": "1.6.2",
   "description": "CLI tool to monitor Claude usage across multiple accounts",
   "type": "module",
   "bin": {
@@ -8,8 +8,15 @@
   },
   "scripts": {
     "build": "tsc",
+    "build:native-host": "pkg native-host/claude_monitor_host.cjs --config package.json",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js"
+  },
+  "pkg": {
+    "scripts": ["native-host/claude_monitor_host.cjs"],
+    "assets": ["node_modules/better-sqlite3/build/Release/better_sqlite3.node"],
+    "targets": ["node20-macos-arm64"],
+    "outputPath": "dist"
   },
   "dependencies": {
     "better-sqlite3": "^12.5.0",
@@ -19,6 +26,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.1",
+    "@yao-pkg/pkg": "^6.11.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   },
