@@ -96,9 +96,10 @@ const insertSyntheticPoint = db.prepare(`
  * Formats: "Thu 10:00 AM" (absolute) or "in 23 hr 57 min" (relative)
  * @param {string} resetStr - The reset time string
  * @param {string} referenceTimestamp - ISO timestamp of the reading that had this reset time
+ * @param {boolean} findPrevious - If true, find the most recent PAST occurrence (for reset detection)
  * @returns {Date|null} - The calculated reset time, or null if parsing failed
  */
-function parseResetTime(resetStr, referenceTimestamp) {
+function parseResetTime(resetStr, referenceTimestamp, findPrevious = false) {
   if (!resetStr) return null;
 
   const refDate = new Date(referenceTimestamp);
@@ -108,7 +109,11 @@ function parseResetTime(resetStr, referenceTimestamp) {
   if (relativeMatch) {
     const hours = parseInt(relativeMatch[1], 10);
     const minutes = relativeMatch[2] ? parseInt(relativeMatch[2], 10) : 0;
-    const resetTime = new Date(refDate.getTime() + (hours * 60 + minutes) * 60 * 1000);
+    let resetTime = new Date(refDate.getTime() + (hours * 60 + minutes) * 60 * 1000);
+    // For relative times, if we need the previous occurrence, subtract a week
+    if (findPrevious) {
+      resetTime = new Date(resetTime.getTime() - 7 * 24 * 60 * 60 * 1000);
+    }
     return resetTime;
   }
 
@@ -140,6 +145,12 @@ function parseResetTime(resetStr, referenceTimestamp) {
     if (daysUntil === 0 && resetTime <= refDate) daysUntil = 7;
 
     resetTime.setDate(resetTime.getDate() + daysUntil);
+
+    // If we need the previous occurrence (for reset detection), subtract a week
+    if (findPrevious) {
+      resetTime.setDate(resetTime.getDate() - 7);
+    }
+
     return resetTime;
   }
 
@@ -292,10 +303,28 @@ async function processMessage(msg) {
       if (prevPercent !== null && prevPercent - weeklyAllPercent > 5) {
         resetDetected = true;
 
-        // Calculate the actual reset time from the previous reading's weekly_reset
-        const resetTime = parseResetTime(prevReading.weekly_reset, prevReading.timestamp);
+        const currentTime = new Date(timestamp);
+        const prevTime = new Date(prevReading.timestamp);
 
-        if (resetTime) {
+        // Calculate the actual reset time from the previous reading's weekly_reset
+        // Pass findPrevious=true since the reset already happened (we're detecting it after the fact)
+        let resetTime = parseResetTime(prevReading.weekly_reset, prevReading.timestamp, true);
+
+        // Validate the reset time is within the window between readings
+        // If not, this is likely an unexpected reset (promotional, plan change, etc.)
+        const isValidScheduledReset = resetTime &&
+          resetTime > prevTime &&
+          resetTime < currentTime;
+
+        if (!isValidScheduledReset) {
+          // Unexpected reset: use midpoint between readings as the reset time
+          // This provides a reasonable visual representation without bad timestamps
+          const midpointMs = (prevTime.getTime() + currentTime.getTime()) / 2;
+          resetTime = new Date(midpointMs);
+        }
+
+        // Final safety check: never insert synthetic points in the future
+        if (resetTime && resetTime <= currentTime) {
           // Insert two synthetic points to create a vertical drop on the chart
           // Point 1: At the reset time, still at the previous usage level
           const resetTimeISO = resetTime.toISOString();

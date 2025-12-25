@@ -78,6 +78,11 @@ class UsageStore: ObservableObject {
 
             var loadedAccounts: [Account] = []
 
+            // Prepare timestamp filter to exclude future timestamps (safety check)
+            let isoFormatter = ISO8601DateFormatter()
+            isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let nowString = isoFormatter.string(from: Date())
+
             // Order by sort_order ascending, then last_updated descending
             let query = accountsTable.order(sortOrder.asc, lastUpdated.desc)
             for row in try db.prepare(query) {
@@ -90,7 +95,7 @@ class UsageStore: ObservableObject {
                 let timestamp = SQLite.Expression<String>("timestamp")
 
                 let latestQuery = usageTable
-                    .filter(accountIdCol == accountId)
+                    .filter(accountIdCol == accountId && timestamp <= nowString)
                     .order(timestamp.desc)
                     .limit(1)
 
