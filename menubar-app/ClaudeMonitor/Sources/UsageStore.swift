@@ -1,5 +1,6 @@
 import Foundation
 import SQLite
+import AppKit
 
 struct Account: Identifiable {
     let id: String
@@ -437,6 +438,76 @@ class UsageStore: ObservableObject {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.date(from: string) ?? ISO8601DateFormatter().date(from: string)
+    }
+
+    /// Get a setting value from the database
+    func getSetting(_ key: String) -> String? {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return nil
+            }
+
+            let db = try Connection(dbPath, readonly: true)
+            let settingsTable = Table("settings")
+            let keyCol = SQLite.Expression<String>("key")
+            let valueCol = SQLite.Expression<String?>("value")
+
+            let query = settingsTable.filter(keyCol == key)
+            if let row = try db.pluck(query) {
+                return row[valueCol]
+            }
+            return nil
+        } catch {
+            print("Error reading setting: \(error)")
+            return nil
+        }
+    }
+
+    /// Get the last browser that sent data (firefox or chrome)
+    var lastBrowser: String {
+        getSetting("last_browser") ?? "firefox"
+    }
+
+    /// Open all accounts - first account in default browser, others in private windows
+    func openAllAccounts() {
+        guard !accounts.isEmpty else { return }
+
+        let browser = lastBrowser
+
+        // Open first account's usage page in default browser
+        if let url = URL(string: "https://claude.ai/settings/usage") {
+            NSWorkspace.shared.open(url)
+        }
+
+        // Open private windows for remaining accounts (to login page)
+        for (index, account) in accounts.enumerated() {
+            guard index > 0 else { continue }
+
+            openPrivateWindow(browser: browser, accountName: account.displayName)
+        }
+    }
+
+    /// Open a private browser window to Claude login page
+    private func openPrivateWindow(browser: String, accountName: String) {
+        let url = "https://claude.ai/login"
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+
+        switch browser {
+        case "chrome":
+            process.arguments = ["-na", "Google Chrome", "--args", "--incognito", url]
+        case "firefox":
+            fallthrough
+        default:
+            process.arguments = ["-a", "Firefox", "--args", "-private-window", url]
+        }
+
+        do {
+            try process.run()
+        } catch {
+            print("Failed to open private window: \(error)")
+        }
     }
 }
 

@@ -47,6 +47,11 @@ db.exec(`
     FOREIGN KEY (account_id) REFERENCES accounts(id)
   );
 
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
+
   CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_history(account_id);
   CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_history(timestamp DESC);
 `);
@@ -89,6 +94,12 @@ const insertSyntheticPoint = db.prepare(`
     account_id, timestamp, primary_percent, session_percent,
     weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data, is_synthetic
   ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 1)
+`);
+
+// Settings table operations
+const upsertSetting = db.prepare(`
+  INSERT INTO settings (key, value) VALUES (?, ?)
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value
 `);
 
 /**
@@ -256,6 +267,11 @@ async function processMessage(msg) {
     const accountId = msg.accountId || 'default';
     const data = msg.data;
     const timestamp = data.timestamp || new Date().toISOString();
+
+    // Store which browser sent the data (for "Open All Accounts" feature)
+    if (msg.browser) {
+      upsertSetting.run('last_browser', msg.browser);
+    }
 
     // Prefer flattened fields from new content.js, fall back to sections parsing
     let sessionPercent = data.sessionPercent ?? data.primaryPercent ?? null;

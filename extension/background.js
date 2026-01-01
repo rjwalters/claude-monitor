@@ -1,5 +1,6 @@
 // Background script for Claude Usage Monitor
 const browserAPI = typeof browser !== 'undefined' ? browser : chrome;
+const BROWSER_TYPE = typeof browser !== 'undefined' ? 'firefox' : 'chrome';
 
 const NATIVE_HOST = 'claude_monitor';
 
@@ -24,6 +25,7 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Send to native host for file storage
     sendToNativeHost({
       type: 'USAGE_UPDATE',
+      browser: BROWSER_TYPE,
       accountId: message.accountId,
       data: message.data
     });

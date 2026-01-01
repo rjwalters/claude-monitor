@@ -102,6 +102,29 @@ struct UsagePopoverView: View {
                     }
                 }
 
+                // Only show "Open All" if there are multiple accounts
+                if store.accounts.count > 1 {
+                    Text("·")
+                        .foregroundColor(.secondary)
+
+                    Button(action: {
+                        store.openAllAccounts()
+                    }) {
+                        Text("Open All")
+                            .underline()
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.accentColor)
+                    .onHover { hovering in
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
+                    .help("Opens usage page for first account, login page in private windows for others")
+                }
+
                 Spacer()
 
                 Button("Quit") {

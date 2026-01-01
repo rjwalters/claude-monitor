@@ -1,6 +1,7 @@
 // Background script for Claude Usage Monitor (Chrome MV3)
 // Use chrome API directly in Chrome
 const browserAPI = chrome;
+const BROWSER_TYPE = 'chrome';
 
 const NATIVE_HOST = 'claude_monitor';
 
@@ -25,6 +26,7 @@ browserAPI.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Send to native host for file storage
     sendToNativeHost({
       type: 'USAGE_UPDATE',
+      browser: BROWSER_TYPE,
       accountId: message.accountId,
       data: message.data
     });
