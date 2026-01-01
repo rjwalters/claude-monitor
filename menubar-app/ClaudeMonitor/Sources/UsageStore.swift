@@ -471,8 +471,23 @@ class UsageStore: ObservableObject {
     /// Open all accounts - first account in default browser, others in private windows
     func openAllAccounts() {
         guard !accounts.isEmpty else { return }
+        guard accounts.count > 1 else {
+            // Only one account, just open usage page
+            if let url = URL(string: "https://claude.ai/settings/usage") {
+                NSWorkspace.shared.open(url)
+            }
+            return
+        }
 
         let browser = lastBrowser
+
+        // Show setup hint for first few uses
+        let hintKey = "openAllAccountsHintCount"
+        let hintCount = UserDefaults.standard.integer(forKey: hintKey)
+        if hintCount < 3 {
+            UserDefaults.standard.set(hintCount + 1, forKey: hintKey)
+            showPrivateWindowHint(browser: browser)
+        }
 
         // Open first account's usage page in default browser
         if let url = URL(string: "https://claude.ai/settings/usage") {
@@ -487,9 +502,27 @@ class UsageStore: ObservableObject {
         }
     }
 
+    /// Show a hint about enabling extension in private windows
+    private func showPrivateWindowHint(browser: String) {
+        let alert = NSAlert()
+        alert.messageText = "Enable Extension in Private Windows"
+        alert.informativeText = """
+            To see which account to log into, enable the extension in private/incognito windows:
+
+            \(browser == "chrome" ? "Chrome" : "Firefox"): Extensions → Claude Usage Monitor → \(browser == "chrome" ? "Allow in Incognito" : "Run in Private Windows")
+
+            This message will show \(3 - UserDefaults.standard.integer(forKey: "openAllAccountsHintCount")) more time(s).
+            """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
     /// Open a private browser window to Claude login page
     private func openPrivateWindow(browser: String, accountName: String) {
-        let url = "https://claude.ai/login"
+        // Pass account name via URL fragment so the extension can show a toast
+        let encodedName = accountName.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed) ?? accountName
+        let url = "https://claude.ai/login#cm_account=\(encodedName)"
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
@@ -500,7 +533,7 @@ class UsageStore: ObservableObject {
         case "firefox":
             fallthrough
         default:
-            process.arguments = ["-a", "Firefox", "--args", "-private-window", url]
+            process.arguments = ["-na", "Firefox", "--args", "-private-window", url]
         }
 
         do {
@@ -514,7 +547,7 @@ class UsageStore: ObservableObject {
 // MARK: - Update Checker
 
 struct AppVersion {
-    static let current = "1.6.1"
+    static let current = "1.7.0"
     static let repoOwner = "rjwalters"
     static let repoName = "claude-monitor"
 }

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Claude Usage Monitor",
-  "version": "1.6.2",
+  "version": "1.7.0",
   "description": "Monitor Claude AI usage across accounts - auto-saves to ~/.claude-monitor",
   "browser_specific_settings": {
     "gecko": {
@@ -31,6 +31,11 @@
     {
       "matches": ["*://claude.ai/settings/usage*"],
       "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://claude.ai/login*"],
+      "js": ["login-helper.js"],
       "run_at": "document_idle"
     }
   ]
