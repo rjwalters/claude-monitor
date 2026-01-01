@@ -116,8 +116,12 @@ function extractUsageData() {
     }
   }
 
-  // Strategy 3: Find reset times by pattern
-  const resetTimes = [...text.matchAll(/Resets?\s+(?:in\s+)?([^\n]+)/gi)];
+  // Strategy 3: Find reset times by pattern (only within the Plan usage limits section)
+  // Stop before "Extra usage" section to avoid picking up monthly reset dates
+  const extraUsageIndex = text.indexOf('Extra usage');
+  const planLimitsText = extraUsageIndex > 0 ? text.slice(0, extraUsageIndex) : text;
+
+  const resetTimes = [...planLimitsText.matchAll(/Resets?\s+(?:in\s+)?([^\n]+)/gi)];
   if (resetTimes.length > 0 && !usage.session.reset) {
     usage.session.reset = resetTimes[0][1].trim();
   }
