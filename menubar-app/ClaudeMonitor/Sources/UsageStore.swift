@@ -42,6 +42,43 @@ struct FullUsageDataPoint: Identifiable {
     let weeklyAllPercent: Double?
 }
 
+struct TokenDataPoint: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let inputTokens: Int64
+    let outputTokens: Int64
+    let cacheCreationTokens: Int64
+    let cacheReadTokens: Int64
+
+    var totalTokens: Int64 {
+        inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens
+    }
+
+    var billableTokens: Int64 {
+        // Cache reads don't count toward quota
+        inputTokens + outputTokens + cacheCreationTokens
+    }
+}
+
+struct DailyTokenSummary: Identifiable {
+    let id = UUID()
+    let day: Date
+    let accountId: String?
+    let inputTokens: Int64
+    let outputTokens: Int64
+    let cacheCreationTokens: Int64
+    let cacheReadTokens: Int64
+    let messageCount: Int64
+
+    var totalTokens: Int64 {
+        inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens
+    }
+
+    var billableTokens: Int64 {
+        inputTokens + outputTokens + cacheCreationTokens
+    }
+}
+
 class UsageStore: ObservableObject {
     @Published var accounts: [Account] = []
     @Published var latestUsage: [String: UsageRecord] = [:]
@@ -312,6 +349,154 @@ class UsageStore: ObservableObject {
         } catch {
             print("Error loading full history: \(error)")
             return []
+        }
+    }
+
+    /// Load hourly token usage for an account from Claude Code data
+    func loadTokenHistory(for accountId: String, daysBack: Int = 7) -> [TokenDataPoint] {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return []
+            }
+
+            let db = try Connection(dbPath, readonly: true)
+
+            // Calculate the cutoff date
+            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let cutoffString = formatter.string(from: cutoffDate)
+
+            // Query hourly aggregated token usage for this account
+            let sql = """
+                SELECT
+                    strftime('%Y-%m-%dT%H:00:00Z', tu.timestamp) as hour,
+                    SUM(tu.input_tokens) as input_tokens,
+                    SUM(tu.output_tokens) as output_tokens,
+                    SUM(tu.cache_creation_tokens) as cache_creation_tokens,
+                    SUM(tu.cache_read_tokens) as cache_read_tokens
+                FROM token_usage tu
+                JOIN token_sessions ts ON tu.session_id = ts.session_id
+                WHERE COALESCE(ts.override_account_id, ts.inferred_account_id) = ?
+                  AND tu.timestamp >= ?
+                GROUP BY hour
+                ORDER BY hour ASC
+            """
+
+            var dataPoints: [TokenDataPoint] = []
+            let statement = try db.prepare(sql)
+
+            for row in statement.bind(accountId, cutoffString) {
+                if let hourStr = row[0] as? String,
+                   let date = parseDate(hourStr) {
+                    let inputTokens = (row[1] as? Int64) ?? 0
+                    let outputTokens = (row[2] as? Int64) ?? 0
+                    let cacheCreationTokens = (row[3] as? Int64) ?? 0
+                    let cacheReadTokens = (row[4] as? Int64) ?? 0
+
+                    dataPoints.append(TokenDataPoint(
+                        timestamp: date,
+                        inputTokens: inputTokens,
+                        outputTokens: outputTokens,
+                        cacheCreationTokens: cacheCreationTokens,
+                        cacheReadTokens: cacheReadTokens
+                    ))
+                }
+            }
+
+            return dataPoints
+
+        } catch {
+            print("Error loading token history: \(error)")
+            return []
+        }
+    }
+
+    /// Load daily token summaries for an account
+    func loadDailyTokenSummary(for accountId: String, daysBack: Int = 7) -> [DailyTokenSummary] {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return []
+            }
+
+            let db = try Connection(dbPath, readonly: true)
+
+            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let cutoffString = formatter.string(from: cutoffDate)
+
+            let sql = """
+                SELECT
+                    date(tu.timestamp) as day,
+                    SUM(tu.input_tokens) as input_tokens,
+                    SUM(tu.output_tokens) as output_tokens,
+                    SUM(tu.cache_creation_tokens) as cache_creation_tokens,
+                    SUM(tu.cache_read_tokens) as cache_read_tokens,
+                    COUNT(*) as message_count
+                FROM token_usage tu
+                JOIN token_sessions ts ON tu.session_id = ts.session_id
+                WHERE COALESCE(ts.override_account_id, ts.inferred_account_id) = ?
+                  AND tu.timestamp >= ?
+                GROUP BY day
+                ORDER BY day DESC
+            """
+
+            var summaries: [DailyTokenSummary] = []
+            let statement = try db.prepare(sql)
+
+            let dayFormatter = DateFormatter()
+            dayFormatter.dateFormat = "yyyy-MM-dd"
+            dayFormatter.timeZone = TimeZone(identifier: "UTC")
+
+            for row in statement.bind(accountId, cutoffString) {
+                if let dayStr = row[0] as? String,
+                   let date = dayFormatter.date(from: dayStr) {
+                    summaries.append(DailyTokenSummary(
+                        day: date,
+                        accountId: accountId,
+                        inputTokens: (row[1] as? Int64) ?? 0,
+                        outputTokens: (row[2] as? Int64) ?? 0,
+                        cacheCreationTokens: (row[3] as? Int64) ?? 0,
+                        cacheReadTokens: (row[4] as? Int64) ?? 0,
+                        messageCount: (row[5] as? Int64) ?? 0
+                    ))
+                }
+            }
+
+            return summaries
+
+        } catch {
+            print("Error loading daily token summary: \(error)")
+            return []
+        }
+    }
+
+    /// Check if token data exists for an account
+    func hasTokenData(for accountId: String) -> Bool {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return false
+            }
+
+            let db = try Connection(dbPath, readonly: true)
+
+            let sql = """
+                SELECT COUNT(*) FROM token_sessions
+                WHERE COALESCE(override_account_id, inferred_account_id) = ?
+            """
+
+            let statement = try db.prepare(sql)
+            for row in statement.bind(accountId) {
+                if let count = row[0] as? Int64 {
+                    return count > 0
+                }
+            }
+            return false
+
+        } catch {
+            print("Error checking token data: \(error)")
+            return false
         }
     }
 

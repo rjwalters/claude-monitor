@@ -1,6 +1,12 @@
 import SwiftUI
 import Charts
 
+/// Chart display mode
+enum ChartMode: String, CaseIterable {
+    case percent = "% of Quota"
+    case tokens = "Tokens"
+}
+
 /// Data for a single account's chart trace
 struct AccountTrace: Identifiable {
     let id: String
@@ -10,12 +16,23 @@ struct AccountTrace: Identifiable {
     let isPrimary: Bool
 }
 
+/// Token trace for a single account
+struct TokenTrace: Identifiable {
+    let id: String
+    let name: String
+    let dataPoints: [TokenDataPoint]
+    let color: Color
+    let isPrimary: Bool
+}
+
 struct UsageChartWindow: View {
     let account: Account
     let dataPoints: [UsageDataPoint]
     let fullDataPoints: [FullUsageDataPoint]
+    let tokenDataPoints: [TokenDataPoint]
     let store: UsageStore
     let otherAccountsData: [AccountTrace]  // Data for other accounts
+    let otherTokenData: [TokenTrace]  // Token data for other accounts
     @Environment(\.colorScheme) var colorScheme
     @StateObject private var updateChecker = UpdateChecker.shared
     @State private var isEditingName = false
@@ -26,6 +43,7 @@ struct UsageChartWindow: View {
     @State private var rangeEnd: Double = 1.0    // 0-1 percentage of 7-day range
     @State private var hasInitializedRange = false
     @State private var showOtherAccounts = false
+    @State private var chartMode: ChartMode = .percent
 
     /// The 7-day window: ends at the latest data point (or now), starts 7 days before
     var chartDateRange: (start: Date, end: Date) {
@@ -82,6 +100,53 @@ struct UsageChartWindow: View {
                 isPrimary: trace.isPrimary
             )
         }
+    }
+
+    /// Filtered token data points based on current range selection
+    var filteredTokenDataPoints: [TokenDataPoint] {
+        guard tokenDataPoints.count >= 2 else { return tokenDataPoints }
+        let startDate = dateForRangePosition(rangeStart)
+        let endDate = dateForRangePosition(rangeEnd)
+        return tokenDataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
+    }
+
+    /// Filtered other accounts token data based on current range selection
+    var filteredOtherTokenData: [TokenTrace] {
+        guard !otherTokenData.isEmpty else { return [] }
+        let startDate = dateForRangePosition(rangeStart)
+        let endDate = dateForRangePosition(rangeEnd)
+        return otherTokenData.map { trace in
+            TokenTrace(
+                id: trace.id,
+                name: trace.name,
+                dataPoints: trace.dataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate },
+                color: trace.color,
+                isPrimary: trace.isPrimary
+            )
+        }
+    }
+
+    /// Maximum token value in the filtered range (for Y-axis scaling)
+    var maxTokenValue: Int64 {
+        var maxVal: Int64 = 0
+        for point in filteredTokenDataPoints {
+            maxVal = max(maxVal, point.billableTokens)
+        }
+        if showOtherAccounts {
+            for trace in filteredOtherTokenData {
+                for point in trace.dataPoints {
+                    maxVal = max(maxVal, point.billableTokens)
+                }
+            }
+        }
+        // Round up to a nice number
+        let magnitude = max(1, Int64(pow(10, floor(log10(Double(max(1, maxVal)))))))
+        return ((maxVal / magnitude) + 1) * magnitude
+    }
+
+    /// Check if we have token data to display
+    var hasTokenData: Bool {
+        !tokenDataPoints.isEmpty
     }
 
     /// Convert range position (0-1) to actual date within 7-day window
@@ -230,12 +295,24 @@ struct UsageChartWindow: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                // Weekly Usage chart with points
+                // Usage chart with mode toggle
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("Weekly Usage")
+                        Text(chartMode == .percent ? "Weekly Usage" : "Token Usage")
                             .font(.headline)
                         Spacer()
+
+                        // Chart mode toggle (only show if we have token data)
+                        if hasTokenData {
+                            Picker("", selection: $chartMode) {
+                                ForEach(ChartMode.allCases, id: \.self) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 160)
+                        }
+
                         if !otherAccountsData.isEmpty {
                             Button(action: { showOtherAccounts.toggle() }) {
                                 HStack(spacing: 4) {
@@ -250,6 +327,7 @@ struct UsageChartWindow: View {
                         }
                     }
 
+                    if chartMode == .percent {
                     Chart {
                         // Other accounts (rendered first so primary is on top)
                         if showOtherAccounts {
@@ -321,6 +399,63 @@ struct UsageChartWindow: View {
                         }
                     }
                     .frame(height: 220)
+                    } else {
+                        // Token chart
+                        Chart {
+                            // Other accounts tokens (rendered first so primary is on top)
+                            if showOtherAccounts {
+                                ForEach(filteredOtherTokenData) { trace in
+                                    ForEach(trace.dataPoints) { point in
+                                        BarMark(
+                                            x: .value("Time", point.timestamp),
+                                            y: .value("Tokens", point.billableTokens),
+                                            width: .fixed(8)
+                                        )
+                                        .foregroundStyle(trace.color)
+                                        .opacity(0.6)
+                                    }
+                                }
+                            }
+
+                            // Primary account tokens (blue bars - matches percent chart)
+                            ForEach(filteredTokenDataPoints) { point in
+                                BarMark(
+                                    x: .value("Time", point.timestamp),
+                                    y: .value("Tokens", point.billableTokens),
+                                    width: .fixed(10)
+                                )
+                                .foregroundStyle(Color.blue)
+                            }
+                        }
+                        .chartYScale(domain: 0...Double(maxTokenValue))
+                        .chartXScale(domain: dateForRangePosition(rangeStart)...dateForRangePosition(rangeEnd))
+                        .chartYAxis {
+                            AxisMarks(position: .leading) { value in
+                                AxisGridLine()
+                                AxisValueLabel {
+                                    if let tokens = value.as(Double.self) {
+                                        Text(formatTokenCount(Int64(tokens)))
+                                            .font(.caption)
+                                    }
+                                }
+                            }
+                        }
+                        .chartXAxis {
+                            AxisMarks(values: midnightDates) { value in
+                                AxisGridLine(stroke: StrokeStyle(lineWidth: 1))
+                                AxisValueLabel {
+                                    if let date = value.as(Date.self) {
+                                        Text(formatDateShort(date))
+                                            .font(.caption)
+                                    }
+                                }
+                            }
+                            AxisMarks(values: fourHourDates) { _ in
+                                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [4, 4]))
+                            }
+                        }
+                        .frame(height: 220)
+                    }
 
                     // Legend for other accounts
                     if showOtherAccounts && !otherAccountsData.isEmpty {
@@ -695,6 +830,18 @@ struct UsageChartWindow: View {
         formatter.dateFormat = "M/d"
         return formatter.string(from: date)
     }
+
+    func formatTokenCount(_ tokens: Int64) -> String {
+        if tokens >= 1_000_000_000 {
+            return String(format: "%.1fB", Double(tokens) / 1_000_000_000)
+        } else if tokens >= 1_000_000 {
+            return String(format: "%.1fM", Double(tokens) / 1_000_000)
+        } else if tokens >= 1_000 {
+            return String(format: "%.0fK", Double(tokens) / 1_000)
+        } else {
+            return "\(tokens)"
+        }
+    }
 }
 
 struct RangeSelector: View {
@@ -884,18 +1031,30 @@ class ChartWindowController {
 
         let dataPoints = store.loadHistory(for: account.id)
         let fullDataPoints = store.loadFullHistory(for: account.id)
+        let tokenDataPoints = store.loadTokenHistory(for: account.id)
 
         // Load data for other accounts
         var otherAccountsData: [AccountTrace] = []
+        var otherTokenData: [TokenTrace] = []
         for (index, otherAccount) in store.accounts.enumerated() {
             if otherAccount.id != account.id {
                 let otherData = store.loadHistory(for: otherAccount.id)
+                let otherTokens = store.loadTokenHistory(for: otherAccount.id)
+                let colorIndex = index % otherAccountColors.count
                 if !otherData.isEmpty {
-                    let colorIndex = index % otherAccountColors.count
                     otherAccountsData.append(AccountTrace(
                         id: otherAccount.id,
                         name: otherAccount.displayName,
                         dataPoints: otherData,
+                        color: otherAccountColors[colorIndex],
+                        isPrimary: false
+                    ))
+                }
+                if !otherTokens.isEmpty {
+                    otherTokenData.append(TokenTrace(
+                        id: otherAccount.id,
+                        name: otherAccount.displayName,
+                        dataPoints: otherTokens,
                         color: otherAccountColors[colorIndex],
                         isPrimary: false
                     ))
@@ -907,8 +1066,10 @@ class ChartWindowController {
             account: account,
             dataPoints: dataPoints,
             fullDataPoints: fullDataPoints,
+            tokenDataPoints: tokenDataPoints,
             store: store,
-            otherAccountsData: otherAccountsData
+            otherAccountsData: otherAccountsData,
+            otherTokenData: otherTokenData
         )
         let hostingController = NSHostingController(rootView: chartView)
 

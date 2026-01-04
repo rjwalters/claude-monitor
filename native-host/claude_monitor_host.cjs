@@ -54,6 +54,54 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_history(account_id);
   CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_history(timestamp DESC);
+
+  -- Token tracking from Claude Code local JSONL files
+  CREATE TABLE IF NOT EXISTS token_sessions (
+    session_id TEXT PRIMARY KEY,
+    project_path TEXT,
+    first_message_ts TEXT NOT NULL,
+    last_message_ts TEXT,
+    inferred_account_id TEXT,
+    override_account_id TEXT,
+    total_input_tokens INTEGER DEFAULT 0,
+    total_output_tokens INTEGER DEFAULT 0,
+    total_cache_creation_tokens INTEGER DEFAULT 0,
+    total_cache_read_tokens INTEGER DEFAULT 0,
+    message_count INTEGER DEFAULT 0,
+    last_import_ts TEXT,
+    FOREIGN KEY (inferred_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (override_account_id) REFERENCES accounts(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS token_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    model TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_creation_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    message_uuid TEXT UNIQUE,
+    FOREIGN KEY (session_id) REFERENCES token_sessions(session_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
+  CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp DESC);
+  CREATE INDEX IF NOT EXISTS idx_token_sessions_account ON token_sessions(inferred_account_id);
+
+  -- Calibration data: correlates tokens with quota percentages at reset points
+  CREATE TABLE IF NOT EXISTS quota_calibration (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL,
+    reset_timestamp TEXT NOT NULL,
+    tokens_in_period INTEGER,
+    percent_at_reset REAL,
+    tokens_per_percent REAL,
+    FOREIGN KEY (account_id) REFERENCES accounts(id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_calibration_account ON quota_calibration(account_id);
 `);
 
 // Migration: Add sort_order column if it doesn't exist
@@ -196,6 +244,289 @@ const getAccountHistory = db.prepare(`
   ORDER BY timestamp DESC
   LIMIT ?
 `);
+
+// Token tracking prepared statements
+const upsertTokenSession = db.prepare(`
+  INSERT INTO token_sessions (
+    session_id, project_path, first_message_ts, last_message_ts,
+    inferred_account_id, total_input_tokens, total_output_tokens,
+    total_cache_creation_tokens, total_cache_read_tokens, message_count, last_import_ts
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  ON CONFLICT(session_id) DO UPDATE SET
+    last_message_ts = excluded.last_message_ts,
+    total_input_tokens = excluded.total_input_tokens,
+    total_output_tokens = excluded.total_output_tokens,
+    total_cache_creation_tokens = excluded.total_cache_creation_tokens,
+    total_cache_read_tokens = excluded.total_cache_read_tokens,
+    message_count = excluded.message_count,
+    last_import_ts = excluded.last_import_ts
+`);
+
+const insertTokenUsage = db.prepare(`
+  INSERT OR IGNORE INTO token_usage (
+    session_id, timestamp, model, input_tokens, output_tokens,
+    cache_creation_tokens, cache_read_tokens, message_uuid
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const inferAccountForTimestamp = db.prepare(`
+  SELECT account_id FROM usage_history
+  WHERE timestamp <= ?
+  ORDER BY timestamp DESC
+  LIMIT 1
+`);
+
+const getTokenSessionsSummary = db.prepare(`
+  SELECT
+    ts.session_id,
+    ts.project_path,
+    ts.first_message_ts,
+    ts.last_message_ts,
+    COALESCE(ts.override_account_id, ts.inferred_account_id) as account_id,
+    ts.total_input_tokens,
+    ts.total_output_tokens,
+    ts.total_cache_creation_tokens,
+    ts.total_cache_read_tokens,
+    ts.message_count
+  FROM token_sessions ts
+  ORDER BY ts.first_message_ts DESC
+`);
+
+const getTokenSummaryByAccount = db.prepare(`
+  SELECT
+    COALESCE(ts.override_account_id, ts.inferred_account_id) as account_id,
+    SUM(ts.total_input_tokens) as total_input,
+    SUM(ts.total_output_tokens) as total_output,
+    SUM(ts.total_cache_creation_tokens) as total_cache_creation,
+    SUM(ts.total_cache_read_tokens) as total_cache_read,
+    SUM(ts.message_count) as total_messages,
+    COUNT(*) as session_count
+  FROM token_sessions ts
+  WHERE ts.first_message_ts >= ?
+  GROUP BY account_id
+`);
+
+const getDailyTokensByAccount = db.prepare(`
+  SELECT
+    date(tu.timestamp) as day,
+    COALESCE(ts.override_account_id, ts.inferred_account_id) as account_id,
+    SUM(tu.input_tokens) as input_tokens,
+    SUM(tu.output_tokens) as output_tokens,
+    SUM(tu.cache_creation_tokens) as cache_creation_tokens,
+    SUM(tu.cache_read_tokens) as cache_read_tokens,
+    COUNT(*) as message_count
+  FROM token_usage tu
+  JOIN token_sessions ts ON tu.session_id = ts.session_id
+  WHERE tu.timestamp >= ?
+  GROUP BY day, account_id
+  ORDER BY day DESC
+`);
+
+// Calibration: get last reset timestamp for an account
+const getLastCalibrationReset = db.prepare(`
+  SELECT reset_timestamp FROM quota_calibration
+  WHERE account_id = ?
+  ORDER BY reset_timestamp DESC
+  LIMIT 1
+`);
+
+// Calibration: sum tokens in a time window for an account
+const getTokensInWindow = db.prepare(`
+  SELECT
+    SUM(tu.input_tokens + tu.output_tokens + tu.cache_creation_tokens) as billable_tokens
+  FROM token_usage tu
+  JOIN token_sessions ts ON tu.session_id = ts.session_id
+  WHERE COALESCE(ts.override_account_id, ts.inferred_account_id) = ?
+    AND tu.timestamp > ?
+    AND tu.timestamp <= ?
+`);
+
+// Calibration: insert a calibration data point
+const insertCalibration = db.prepare(`
+  INSERT INTO quota_calibration (
+    account_id, reset_timestamp, tokens_in_period, percent_at_reset, tokens_per_percent
+  ) VALUES (?, ?, ?, ?, ?)
+`);
+
+// Calibration: get all calibration points for an account
+const getCalibrationData = db.prepare(`
+  SELECT * FROM quota_calibration
+  WHERE account_id = ?
+  ORDER BY reset_timestamp DESC
+`);
+
+/**
+ * Scan Claude Code JSONL files and import token usage data
+ */
+function syncTokenUsage() {
+  const claudeDir = path.join(os.homedir(), '.claude', 'projects');
+
+  if (!fs.existsSync(claudeDir)) {
+    return { success: false, error: 'Claude Code directory not found', sessionsProcessed: 0 };
+  }
+
+  let sessionsProcessed = 0;
+  let messagesImported = 0;
+  const errors = [];
+
+  // Find all project directories
+  const projectDirs = fs.readdirSync(claudeDir, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => path.join(claudeDir, d.name));
+
+  const importTransaction = db.transaction(() => {
+    for (const projectDir of projectDirs) {
+      const projectPath = projectDir.replace(os.homedir(), '~');
+
+      // Find all JSONL files (excluding agent-* files which are subprocesses)
+      let jsonlFiles;
+      try {
+        jsonlFiles = fs.readdirSync(projectDir)
+          .filter(f => f.endsWith('.jsonl') && !f.startsWith('agent-'))
+          .map(f => path.join(projectDir, f));
+      } catch (e) {
+        continue;
+      }
+
+      for (const jsonlPath of jsonlFiles) {
+        try {
+          const sessionId = path.basename(jsonlPath, '.jsonl');
+          const result = processJsonlFile(jsonlPath, sessionId, projectPath);
+          if (result.messagesImported > 0) {
+            sessionsProcessed++;
+            messagesImported += result.messagesImported;
+          }
+        } catch (e) {
+          errors.push(`${jsonlPath}: ${e.message}`);
+        }
+      }
+    }
+  });
+
+  try {
+    importTransaction();
+  } catch (e) {
+    return { success: false, error: e.message, sessionsProcessed: 0 };
+  }
+
+  return {
+    success: true,
+    sessionsProcessed,
+    messagesImported,
+    errors: errors.length > 0 ? errors : undefined
+  };
+}
+
+/**
+ * Process a single JSONL file and extract token usage
+ */
+function processJsonlFile(jsonlPath, sessionId, projectPath) {
+  const content = fs.readFileSync(jsonlPath, 'utf8');
+  const lines = content.split('\n').filter(l => l.trim());
+
+  let firstMessageTs = null;
+  let lastMessageTs = null;
+  let totalInput = 0;
+  let totalOutput = 0;
+  let totalCacheCreation = 0;
+  let totalCacheRead = 0;
+  let messageCount = 0;
+  let messagesImported = 0;
+  const messagesToInsert = [];
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+
+      // Only process assistant messages with usage data
+      if (entry.type !== 'assistant' || !entry.message?.usage) {
+        continue;
+      }
+
+      const timestamp = entry.timestamp;
+      const usage = entry.message.usage;
+      const model = entry.message.model || 'unknown';
+      const messageUuid = entry.uuid;
+
+      if (!timestamp || !messageUuid) continue;
+
+      // Track first/last timestamps
+      if (!firstMessageTs || timestamp < firstMessageTs) {
+        firstMessageTs = timestamp;
+      }
+      if (!lastMessageTs || timestamp > lastMessageTs) {
+        lastMessageTs = timestamp;
+      }
+
+      // Extract token counts
+      const inputTokens = usage.input_tokens || 0;
+      const outputTokens = usage.output_tokens || 0;
+      const cacheCreationTokens = usage.cache_creation_input_tokens || 0;
+      const cacheReadTokens = usage.cache_read_input_tokens || 0;
+
+      // Accumulate totals
+      totalInput += inputTokens;
+      totalOutput += outputTokens;
+      totalCacheCreation += cacheCreationTokens;
+      totalCacheRead += cacheReadTokens;
+      messageCount++;
+
+      // Collect for later insertion (after session is created)
+      messagesToInsert.push({
+        timestamp,
+        model,
+        inputTokens,
+        outputTokens,
+        cacheCreationTokens,
+        cacheReadTokens,
+        messageUuid
+      });
+    } catch (e) {
+      // Skip malformed lines
+      continue;
+    }
+  }
+
+  if (firstMessageTs) {
+    // Infer account from the timestamp of the first message
+    const accountResult = inferAccountForTimestamp.get(firstMessageTs);
+    const inferredAccountId = accountResult?.account_id || null;
+
+    // Upsert session summary FIRST (so foreign key constraint is satisfied)
+    upsertTokenSession.run(
+      sessionId,
+      projectPath,
+      firstMessageTs,
+      lastMessageTs,
+      inferredAccountId,
+      totalInput,
+      totalOutput,
+      totalCacheCreation,
+      totalCacheRead,
+      messageCount,
+      new Date().toISOString()
+    );
+
+    // Now insert individual messages (session record exists now)
+    for (const msg of messagesToInsert) {
+      const result = insertTokenUsage.run(
+        sessionId,
+        msg.timestamp,
+        msg.model,
+        msg.inputTokens,
+        msg.outputTokens,
+        msg.cacheCreationTokens,
+        msg.cacheReadTokens,
+        msg.messageUuid
+      );
+      if (result.changes > 0) {
+        messagesImported++;
+      }
+    }
+  }
+
+  return { messagesImported };
+}
 
 // Read message from stdin (native messaging protocol)
 function getMessage() {
@@ -364,6 +695,36 @@ async function processMessage(msg) {
             0,
             0
           );
+
+          // Calibration: calculate tokens consumed in this billing period
+          try {
+            // Find the start of this billing period (previous reset or earliest data)
+            const lastCalibration = getLastCalibrationReset.get(accountId);
+            const periodStart = lastCalibration?.reset_timestamp || '1970-01-01T00:00:00Z';
+
+            // Sum tokens in the period that just ended
+            const tokenResult = getTokensInWindow.get(accountId, periodStart, resetTimeISO);
+            const tokensInPeriod = tokenResult?.billable_tokens || 0;
+
+            // Only record calibration if we have meaningful data
+            if (tokensInPeriod > 0 && prevPercent > 5) {
+              const tokensPerPercent = tokensInPeriod / prevPercent;
+              insertCalibration.run(
+                accountId,
+                resetTimeISO,
+                tokensInPeriod,
+                prevPercent,
+                tokensPerPercent
+              );
+              // Log for debugging
+              const tokensM = (tokensInPeriod / 1_000_000).toFixed(1);
+              const tppK = (tokensPerPercent / 1_000).toFixed(0);
+              process.stderr.write(`[Calibration] ${accountId}: ${prevPercent}% = ${tokensM}M tokens (${tppK}K/%)\\n`);
+            }
+          } catch (calibrationError) {
+            // Don't fail the main operation if calibration fails
+            process.stderr.write(`[Calibration Error] ${calibrationError.message}\\n`);
+          }
         }
       }
     }
@@ -382,11 +743,18 @@ async function processMessage(msg) {
       0  // is_synthetic = false
     );
 
+    // Sync token usage from Claude Code JSONL files
+    const tokenSync = syncTokenUsage();
+
     sendMessage({
       success: true,
       accountId,
       percent: data.primaryPercent,
       resetDetected,
+      tokenSync: {
+        sessionsProcessed: tokenSync.sessionsProcessed,
+        messagesImported: tokenSync.messagesImported
+      },
       dbPath: DB_FILE
     });
 
@@ -445,6 +813,31 @@ async function processMessage(msg) {
     updateAll();
 
     sendMessage({ success: true, accountId });
+
+  } else if (msg.type === 'SYNC_TOKENS') {
+    // Scan Claude Code JSONL files and import token usage
+    const result = syncTokenUsage();
+    sendMessage(result);
+
+  } else if (msg.type === 'GET_TOKEN_SUMMARY') {
+    // Get token usage summary, optionally filtered by time range
+    const daysBack = msg.daysBack || 7;
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - daysBack);
+    const cutoffStr = cutoffDate.toISOString();
+
+    const byAccount = getTokenSummaryByAccount.all(cutoffStr);
+    const daily = getDailyTokensByAccount.all(cutoffStr);
+    const sessions = getTokenSessionsSummary.all();
+
+    sendMessage({
+      success: true,
+      summary: {
+        byAccount,
+        daily,
+        recentSessions: sessions.slice(0, 20)
+      }
+    });
 
   } else {
     sendMessage({ success: false, error: 'Unknown message type' });
