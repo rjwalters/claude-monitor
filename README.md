@@ -295,6 +295,18 @@ claude-monitor/
 └── package.json
 ```
 
+## Related Projects
+
+- **[ccusage](https://github.com/ryoppippi/ccusage)** - CLI tool that analyzes Claude Code token usage from local JSONL files. Shows daily/monthly reports, session breakdowns, and cost estimates. Run with `npx ccusage@latest`.
+
+- **[VibePulse](https://github.com/wesm/vibepulse)** - macOS menu bar app for tracking Claude Code + Codex token spend. Built on ccusage, displays real-time consumption with 30-day analytics.
+
+**How they differ from Claude Monitor:**
+- ccusage/VibePulse read **local Claude Code logs** → show token counts and API-equivalent costs
+- Claude Monitor reads **claude.ai web UI** → shows quota percentages and reset times
+
+Claude Monitor now integrates local token data alongside web-scraped quota info, giving you both views in one app.
+
 ## License
 
 MIT
