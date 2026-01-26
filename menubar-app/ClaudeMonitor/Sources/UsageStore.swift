@@ -514,8 +514,20 @@ class UsageStore: ObservableObject {
             let account = accountsTable.filter(id == accountId)
             try db.run(account.update(accountName <- newName))
 
-            // Reload to reflect the change
-            loadFromDatabase()
+            // Immediately update local state for instant UI feedback
+            if let index = accounts.firstIndex(where: { $0.id == accountId }) {
+                let oldAccount = accounts[index]
+                let updatedAccount = Account(
+                    id: oldAccount.id,
+                    accountName: newName,
+                    email: oldAccount.email,
+                    plan: oldAccount.plan,
+                    lastUpdated: oldAccount.lastUpdated,
+                    latestPercent: oldAccount.latestPercent
+                )
+                accounts[index] = updatedAccount
+                onAccountsChanged?()
+            }
 
         } catch {
             DispatchQueue.main.async {
@@ -732,7 +744,7 @@ class UsageStore: ObservableObject {
 // MARK: - Update Checker
 
 struct AppVersion {
-    static let current = "1.7.0"
+    static let current = "1.7.1"
     static let repoOwner = "rjwalters"
     static let repoName = "claude-monitor"
 }

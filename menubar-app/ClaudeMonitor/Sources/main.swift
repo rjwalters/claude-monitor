@@ -22,7 +22,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         // Create status bar item with fixed width for consistent layout
-        statusItem = NSStatusBar.system.statusItem(withLength: 36)
+        // Width accommodates parentheses for weekly limit display: (XX%)
+        statusItem = NSStatusBar.system.statusItem(withLength: 45)
 
         if let button = statusItem?.button {
             button.action = #selector(togglePopover)
@@ -61,6 +62,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem?.button else { return }
 
         var percent: Int = 0
+        var isWeeklyLimit = false
 
         // Find the highest percentage across all accounts (most constrained)
         if let primaryAccount = usageStore.accounts.first,
@@ -69,26 +71,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let sessionPercent = usage.sessionPercent ?? 0
             let weeklyAllPercent = usage.weeklyAllPercent ?? 0
             percent = Int(max(sessionPercent, weeklyAllPercent))
+            isWeeklyLimit = weeklyAllPercent >= sessionPercent
         } else if let primaryAccount = usageStore.accounts.first {
             percent = Int(primaryAccount.latestPercent ?? 0)
+            isWeeklyLimit = true  // Default to weekly if we only have primary percent
         }
 
+
         // Create Stats-style image with "LLM" label and percentage
-        button.image = createStatsStyleImage(percent: percent)
+        // Weekly limit shown in parentheses: (XX%), session limit without: XX%
+        button.image = createStatsStyleImage(percent: percent, isWeeklyLimit: isWeeklyLimit)
         button.title = ""
     }
 
-    func createStatsStyleImage(percent: Int) -> NSImage {
+    func createStatsStyleImage(percent: Int, isWeeklyLimit: Bool) -> NSImage {
         // Match Stats Mini widget exactly
         // Label: 7pt light at y=12, Value: 12pt regular at y=1
         let labelFont = NSFont.systemFont(ofSize: 7, weight: .light)
         let valueFont = NSFont.systemFont(ofSize: 12, weight: .regular)
 
         let labelText = "LLM"
-        let percentText = percent > 0 ? "\(percent)%" : "--"
+        // Weekly limit shown in parentheses: (XX%), session limit without: XX%
+        let percentText: String
+        if percent > 0 {
+            percentText = isWeeklyLimit ? "(\(percent)%)" : "\(percent)%"
+        } else {
+            percentText = "--"
+        }
 
-        // Width: 31 like Stats Mini with label
-        let width: CGFloat = 31
+        // Width accommodates parentheses for weekly limit display: (XX%)
+        let width: CGFloat = 40
         let height: CGFloat = 22
 
         let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
@@ -108,23 +120,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let style = NSMutableParagraphStyle()
             style.alignment = .left
 
-            // Draw label at y=14 (top, shifted up 2px)
             let labelAttrs: [NSAttributedString.Key: Any] = [
                 .font: labelFont,
                 .foregroundColor: labelColor,
                 .paragraphStyle: style
             ]
-            let labelRect = CGRect(x: 2, y: 14, width: width - 4, height: 7)
-            let labelStr = NSAttributedString(string: labelText, attributes: labelAttrs)
-            labelStr.draw(with: labelRect)
-
-            // Draw value at y=3 (bottom, shifted up 2px)
             let valueAttrs: [NSAttributedString.Key: Any] = [
                 .font: valueFont,
                 .foregroundColor: valueColor,
                 .paragraphStyle: style
             ]
-            let valueRect = CGRect(x: 2, y: 3, width: width - 4, height: 13)
+
+            // Measure text widths to center the block
+            let labelSize = (labelText as NSString).size(withAttributes: labelAttrs)
+            let valueSize = (percentText as NSString).size(withAttributes: valueAttrs)
+            let blockWidth = max(labelSize.width, valueSize.width)
+            let xOffset = (width - blockWidth) / 2
+
+            // Draw label at y=14 (top, shifted up 2px)
+            let labelRect = CGRect(x: xOffset, y: 14, width: blockWidth, height: 7)
+            let labelStr = NSAttributedString(string: labelText, attributes: labelAttrs)
+            labelStr.draw(with: labelRect)
+
+            // Draw value at y=3 (bottom, shifted up 2px)
+            let valueRect = CGRect(x: xOffset, y: 3, width: blockWidth, height: 13)
             let valueStr = NSAttributedString(string: percentText, attributes: valueAttrs)
             valueStr.draw(with: valueRect)
 

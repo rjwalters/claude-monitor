@@ -37,6 +37,7 @@ struct UsageChartWindow: View {
     @StateObject private var updateChecker = UpdateChecker.shared
     @State private var isEditingName = false
     @State private var editedName = ""
+    @State private var displayName: String = ""
     @State private var isNameHovering = false
     @State private var showClearConfirmation = false
     @State private var rangeStart: Double = 0.0  // 0-1 percentage of 7-day range
@@ -229,7 +230,7 @@ struct UsageChartWindow: View {
                         HStack(spacing: 6) {
                             if isNameHovering {
                                 Button(action: {
-                                    editedName = account.accountName ?? account.displayName
+                                    editedName = displayName
                                     isEditingName = true
                                 }) {
                                     Image(systemName: "pencil")
@@ -238,7 +239,7 @@ struct UsageChartWindow: View {
                                 }
                                 .buttonStyle(.plain)
                             }
-                            Text(account.displayName)
+                            Text(displayName)
                                 .font(.title2)
                                 .fontWeight(.semibold)
                         }
@@ -463,7 +464,7 @@ struct UsageChartWindow: View {
                             // Primary account
                             HStack(spacing: 4) {
                                 Circle().fill(Color.blue).frame(width: 8, height: 8)
-                                Text(account.displayName)
+                                Text(displayName)
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
@@ -564,6 +565,10 @@ struct UsageChartWindow: View {
             }
         }
         .onAppear {
+            // Initialize display name from account
+            if displayName.isEmpty {
+                displayName = account.displayName
+            }
             if !hasInitializedRange {
                 let initial = initialRangeForActiveAccount
                 rangeStart = initial.start
@@ -637,6 +642,11 @@ struct UsageChartWindow: View {
         let trimmed = editedName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
             store.updateAccountName(accountId: account.id, newName: trimmed)
+            displayName = trimmed
+            // Update window title
+            if let window = ChartWindowController.windows[account.id] {
+                window.title = "Usage History - \(trimmed)"
+            }
         }
         isEditingName = false
     }
