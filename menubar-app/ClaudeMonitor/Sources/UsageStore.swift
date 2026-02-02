@@ -574,7 +574,15 @@ class UsageStore: ObservableObject {
                 try db.run(account.update(sortOrder <- index))
             }
 
-            // Reload to reflect the change
+            // Immediately update local state for instant UI feedback
+            // This prevents a flash of SetupGuideView while loadFromDatabase runs async
+            if let localIndex = accounts.firstIndex(where: { $0.id == accountId }) {
+                let movedAccount = accounts.remove(at: localIndex)
+                accounts.insert(movedAccount, at: 0)
+                onAccountsChanged?()
+            }
+
+            // Reload to get any other database changes
             loadFromDatabase()
 
         } catch {
