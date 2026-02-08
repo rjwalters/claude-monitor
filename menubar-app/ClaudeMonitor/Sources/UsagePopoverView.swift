@@ -71,12 +71,15 @@ struct UsagePopoverView: View {
             } else if store.accounts.isEmpty {
                 SetupGuideView(installer: installer, error: nil)
             } else {
-                VStack(spacing: 12) {
-                    ForEach(Array(store.accounts.enumerated()), id: \.element.id) { index, account in
-                        ClickableAccountCard(account: account, usage: store.latestUsage[account.id], store: store, isFirst: index == 0)
+                ScrollView {
+                    VStack(spacing: 12) {
+                        ForEach(Array(store.accounts.enumerated()), id: \.element.id) { index, account in
+                            ClickableAccountCard(account: account, usage: store.latestUsage[account.id], store: store, isFirst: index == 0)
+                        }
                     }
+                    .padding()
                 }
-                .padding()
+                .frame(maxHeight: 480)
             }
 
             Divider()
