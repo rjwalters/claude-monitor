@@ -75,23 +75,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             })
         )
 
-        // Start polling for updates
-        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.refreshData()
+        // Start round-robin polling — one account per tick, 60s apart
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.refreshNext()
         }
 
-        // Initial load
-        refreshData()
+        // Initial load — poll all accounts once
+        refreshAll()
     }
 
-    func refreshData() {
-        flog.info("refreshData: starting poll cycle", category: "App")
+    /// Poll all accounts (startup and manual refresh)
+    func refreshAll() {
+        flog.info("refreshAll: polling all accounts", category: "App")
         Task {
             await oauthPoller.pollAll()
             await MainActor.run {
                 usageStore.loadFromDatabase()
                 updateStatusButton()
-                flog.info("refreshData: loaded \(usageStore.accounts.count) account(s)", category: "App")
+                flog.info("refreshAll: loaded \(usageStore.accounts.count) account(s)", category: "App")
+            }
+        }
+    }
+
+    /// Poll one account (round-robin, called by timer)
+    func refreshNext() {
+        Task {
+            await oauthPoller.pollNext()
+            await MainActor.run {
+                usageStore.loadFromDatabase()
+                updateStatusButton()
             }
         }
     }
@@ -247,7 +259,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if popover.isShown {
                 popover.performClose(nil)
             } else if let button = statusItem?.button {
-                refreshData()
+                refreshAll()
                 popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             }
         }

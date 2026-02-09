@@ -306,12 +306,11 @@ class OAuthPoller: ObservableObject {
             let now = ISO8601DateFormatter().string(from: Date())
             let label = orgName ?? email ?? accountId
 
-            // Upsert account
+            // Upsert account — never overwrite account_name (user may have renamed)
             try db.run("""
                 INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order)
                 VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0))
                 ON CONFLICT(id) DO UPDATE SET
-                    account_name = COALESCE(excluded.account_name, accounts.account_name),
                     email = COALESCE(excluded.email, accounts.email),
                     plan = COALESCE(excluded.plan, accounts.plan),
                     last_updated = excluded.last_updated
@@ -505,8 +504,33 @@ class OAuthPoller: ObservableObject {
         }
     }
 
-    // MARK: - Polling (M1.1 retry, M2.3 concurrent)
+    // MARK: - Polling (round-robin, one account per tick)
 
+    /// Index of the next credential to poll (round-robin)
+    private var nextPollIndex = 0
+
+    /// Poll the next credential in round-robin order.
+    /// Called once per timer tick (60s) so API calls are spaced out.
+    func pollNext() async {
+        let credentials = loadActiveCredentials()
+        guard !credentials.isEmpty else {
+            flog.info("pollNext: no active credentials", category: fcat)
+            return
+        }
+
+        // Wrap index if credentials changed
+        if nextPollIndex >= credentials.count {
+            nextPollIndex = 0
+        }
+
+        let credential = credentials[nextPollIndex]
+        flog.info("pollNext: \(credential.label) (\(nextPollIndex + 1)/\(credentials.count))", category: fcat)
+        nextPollIndex = (nextPollIndex + 1) % credentials.count
+
+        await pollWithRetry(credential)
+    }
+
+    /// Poll all credentials at once (used for initial load and manual refresh).
     func pollAll() async {
         let credentials = loadActiveCredentials()
         guard !credentials.isEmpty else {
@@ -515,24 +539,9 @@ class OAuthPoller: ObservableObject {
         }
         flog.info("pollAll: polling \(credentials.count) credential(s)", category: fcat)
 
-        // Keychain is only read at startup and via the wizard's "Scan Keychain" button.
-        // All polling uses DB-stored tokens to avoid repeated macOS keychain prompts.
-
-        // Concurrent polling with stagger (M2.3)
-        flog.info("pollAll: entering TaskGroup with \(credentials.count) credential(s)", category: fcat)
-        await withTaskGroup(of: Void.self) { group in
-            for (index, credential) in credentials.enumerated() {
-                flog.info("pollAll: adding task for \(credential.label) (id=\(credential.id ?? -1))", category: fcat)
-                group.addTask {
-                    // Stagger by 5 seconds per credential to avoid rate limits
-                    if index > 0 {
-                        try? await Task.sleep(nanoseconds: UInt64(index) * 5_000_000_000)
-                    }
-                    await self.pollWithRetry(credential)
-                }
-            }
+        for credential in credentials {
+            await pollWithRetry(credential)
         }
-        flog.info("pollAll: TaskGroup completed", category: fcat)
     }
 
     /// Poll with exponential backoff (M1.1)
@@ -768,12 +777,11 @@ class OAuthPoller: ObservableObject {
             let db = try Connection(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
 
-            // Upsert account using org UUID as the account ID
+            // Upsert account using org UUID — never overwrite account_name (user may have renamed)
             try db.run("""
                 INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order)
                 VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0))
                 ON CONFLICT(id) DO UPDATE SET
-                    account_name = COALESCE(excluded.account_name, accounts.account_name),
                     email = COALESCE(excluded.email, accounts.email),
                     plan = COALESCE(excluded.plan, accounts.plan),
                     last_updated = excluded.last_updated
