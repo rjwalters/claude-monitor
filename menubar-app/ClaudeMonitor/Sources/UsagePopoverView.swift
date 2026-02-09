@@ -1,11 +1,37 @@
 import SwiftUI
 
+/// Format a reset time string for display.
+/// Handles both ISO 8601 timestamps (from API) and relative strings (from extension).
+func formatResetTime(_ str: String) -> String {
+    // Try ISO 8601 parse
+    let isoFormatter = ISO8601DateFormatter()
+    isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let date = isoFormatter.date(from: str) ?? ISO8601DateFormatter().date(from: str)
+
+    if let date = date {
+        let interval = date.timeIntervalSinceNow
+        if interval <= 0 { return "Reset" }
+        let hours = Int(interval) / 3600
+        let minutes = (Int(interval) % 3600) / 60
+        if hours > 0 {
+            return "Resets in \(hours) hr \(minutes) min"
+        }
+        return "Resets in \(minutes) min"
+    }
+
+    // Already a relative string (e.g. "in 23 hr 57 min") — return as-is
+    return str
+}
+
 struct UsagePopoverView: View {
     @ObservedObject var store: UsageStore
-    @StateObject private var installer = ExtensionInstaller()
+    @ObservedObject var oauthPoller: OAuthPoller
     @Environment(\.colorScheme) var colorScheme
     @State private var showGitHubLink = false
     @State private var titleHoverTimer: Timer?
+    @State private var showMigrationBanner = false
+    @State private var showRemoveConfirmation = false
+    @State private var accountToRemove: Account?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -66,15 +92,72 @@ struct UsagePopoverView: View {
 
             Divider()
 
+            // Migration notice (M5.3)
+            if showMigrationBanner {
+                HStack {
+                    Image(systemName: "info.circle")
+                        .foregroundColor(.blue)
+                    Text("The browser extension is no longer needed. OAuth is now the default.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button(action: dismissMigrationBanner) {
+                        Image(systemName: "xmark")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(Color.blue.opacity(0.1))
+
+                Divider()
+            }
+
             if let error = store.error {
-                SetupGuideView(installer: installer, error: error)
+                SetupGuideView(oauthPoller: oauthPoller, store: store, error: error)
             } else if store.accounts.isEmpty {
-                SetupGuideView(installer: installer, error: nil)
+                SetupGuideView(oauthPoller: oauthPoller, store: store, error: nil)
             } else {
+                // Account picker when multiple accounts (M3.1)
+                if store.accounts.count > 1 {
+                    HStack {
+                        Text("Menubar account:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Picker("", selection: Binding(
+                            get: { store.primaryAccountId ?? store.accounts.first?.id ?? "" },
+                            set: { newId in
+                                store.primaryAccountId = newId
+                                store.onAccountsChanged?()
+                            }
+                        )) {
+                            ForEach(store.accounts) { account in
+                                Text(account.displayName).tag(account.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: 180)
+                    }
+                    .padding(.horizontal)
+                    .padding(.top, 6)
+                }
+
                 ScrollView {
                     VStack(spacing: 12) {
                         ForEach(Array(store.accounts.enumerated()), id: \.element.id) { index, account in
-                            ClickableAccountCard(account: account, usage: store.latestUsage[account.id], store: store, isFirst: index == 0)
+                            ClickableAccountCard(
+                                account: account,
+                                usage: store.latestUsage[account.id],
+                                store: store,
+                                oauthPoller: oauthPoller,
+                                isFirst: index == 0,
+                                onRemove: {
+                                    accountToRemove = account
+                                    showRemoveConfirmation = true
+                                }
+                            )
                         }
                     }
                     .padding()
@@ -125,10 +208,19 @@ struct UsagePopoverView: View {
                             NSCursor.pop()
                         }
                     }
-                    .help("Opens usage page for first account, login page in private windows for others")
                 }
 
                 Spacer()
+
+                // Add account button (M2.2)
+                if !store.accounts.isEmpty {
+                    Button(action: addAccount) {
+                        Image(systemName: "plus")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Import credentials from Keychain")
+                }
 
                 Button("Quit") {
                     NSApp.terminate(nil)
@@ -142,6 +234,22 @@ struct UsagePopoverView: View {
         .frame(width: 320)
         .fixedSize(horizontal: false, vertical: true)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            // Check migration banner (M5.3)
+            if store.hasNativeHostManifests && store.getSetting("migration_banner_dismissed") == nil {
+                showMigrationBanner = true
+            }
+        }
+        .alert("Remove Account?", isPresented: $showRemoveConfirmation) {
+            Button("Cancel", role: .cancel) { }
+            Button("Remove", role: .destructive) {
+                if let account = accountToRemove {
+                    removeAccount(account)
+                }
+            }
+        } message: {
+            Text("This will deactivate the credential and remove usage data for \(accountToRemove?.displayName ?? "this account").")
+        }
     }
 
     func timeAgo(_ date: Date) -> String {
@@ -150,12 +258,75 @@ struct UsagePopoverView: View {
         if seconds < 3600 { return "\(seconds / 60)m ago" }
         return "\(seconds / 3600)h ago"
     }
+
+    // M2.2: Re-scan keychain and import new credentials
+    private func addAccount() {
+        let results = oauthPoller.importAllFromKeychain()
+        var imported = 0
+        for result in results {
+            if case .success(let credential) = result {
+                store.ensureDatabase()
+                oauthPoller.saveCredential(credential)
+                imported += 1
+            }
+        }
+        if imported > 0 {
+            store.loadFromDatabase()
+        }
+    }
+
+    private func dismissMigrationBanner() {
+        showMigrationBanner = false
+        store.setSetting("migration_banner_dismissed", value: "1")
+    }
+
+    // M4.3: Remove account
+    private func removeAccount(_ account: Account) {
+        // Deactivate credential
+        let credentials = oauthPoller.loadActiveCredentials()
+        for cred in credentials where cred.accountId == account.id {
+            oauthPoller.deactivateCredential(cred)
+        }
+        // Clear account data
+        store.clearAccountData(accountId: account.id)
+    }
+}
+
+// MARK: - Token Status Dot (M1.3)
+
+struct TokenStatusDot: View {
+    let accountId: String?
+    @ObservedObject var oauthPoller: OAuthPoller
+
+    var statusForAccount: CredentialStatus? {
+        guard let accountId = accountId else { return nil }
+        return oauthPoller.credentialStatuses.first(where: { $0.accountId == accountId })
+    }
+
+    var dotColor: Color {
+        guard let status = statusForAccount else { return .gray }
+        switch status.status {
+        case .valid: return .green
+        case .refreshing: return .yellow
+        case .expired, .revoked, .error: return .red
+        case .missing: return .gray
+        }
+    }
+
+    var body: some View {
+        Circle()
+            .fill(dotColor)
+            .frame(width: 8, height: 8)
+            .help(statusForAccount?.lastError ?? statusForAccount?.status.rawValue ?? "unknown")
+    }
 }
 
 struct AccountCard: View {
     let account: Account
     let usage: UsageRecord?
+    var oauthPoller: OAuthPoller? = nil
     var onEditTapped: (() -> Void)? = nil
+    var onRemove: (() -> Void)? = nil
     @Environment(\.colorScheme) var colorScheme
     @State private var isNameHovering = false
 
@@ -171,6 +342,11 @@ struct AccountCard: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
+                        // Token status dot (M1.3)
+                        if let poller = oauthPoller {
+                            TokenStatusDot(accountId: account.id, oauthPoller: poller)
+                        }
+
                         if isNameHovering, let onEdit = onEditTapped {
                             Button(action: onEdit) {
                                 Image(systemName: "pencil")
@@ -230,12 +406,53 @@ struct AccountCard: View {
                     )
                 }
 
-                // Last updated
+                // Re-auth prompt (M4.2)
+                if let poller = oauthPoller,
+                   let status = poller.credentialStatuses.first(where: { $0.accountId == account.id }),
+                   status.status == .expired || status.status == .revoked {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle")
+                            .foregroundColor(.orange)
+                            .font(.caption)
+                        Text("Token \(status.status.rawValue)")
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                        Spacer()
+                        Button("Re-authenticate") {
+                            if let url = URL(string: "https://claude.ai/login") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        .font(.caption)
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                    .padding(.top, 4)
+                }
+
+                // Last updated + last poll time (M1.3)
                 HStack {
                     Spacer()
                     Text("Updated \(formatDate(usage.timestamp))")
                         .font(.caption2)
                         .foregroundColor(.secondary)
+                }
+            }
+
+            // Remove account button (M4.3) — shown on hover
+            if isNameHovering, let onRemove = onRemove {
+                HStack {
+                    Spacer()
+                    Button(action: onRemove) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 9))
+                            Text("Remove")
+                                .font(.system(size: 10))
+                        }
+                        .foregroundColor(.red)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
         }
@@ -300,7 +517,7 @@ struct UsageRow: View {
             .frame(height: 6)
 
             if let reset = resetTime {
-                Text(reset)
+                Text(formatResetTime(reset))
                     .font(.caption2)
                     .foregroundColor(.secondary)
             }
@@ -318,7 +535,9 @@ struct ClickableAccountCard: View {
     let account: Account
     let usage: UsageRecord?
     let store: UsageStore
+    var oauthPoller: OAuthPoller? = nil
     var isFirst: Bool = false
+    var onRemove: (() -> Void)? = nil
     @State private var isHovering = false
     @State private var isEditing = false
     @State private var editedName = ""
@@ -342,15 +561,17 @@ struct ClickableAccountCard: View {
                     AccountCard(
                         account: account,
                         usage: usage,
+                        oauthPoller: oauthPoller,
                         onEditTapped: {
                             editedName = account.accountName ?? account.displayName
                             isEditing = true
-                        }
+                        },
+                        onRemove: onRemove
                     )
                 }
                 .buttonStyle(CardButtonStyle(isHovering: isHovering))
 
-                // Move to top button (only shown on hover for non-first cards)
+                // Move to top / pin button (only shown on hover for non-first cards)
                 if !isFirst && isHovering {
                     Button(action: {
                         store.moveAccountToTop(accountId: account.id)
@@ -533,10 +754,14 @@ struct CardButtonStyle: ButtonStyle {
     }
 }
 
+// MARK: - Setup Guide (M5.1: extension buttons removed)
+
 struct SetupGuideView: View {
-    @ObservedObject var installer: ExtensionInstaller
+    @ObservedObject var oauthPoller: OAuthPoller
+    let store: UsageStore
     let error: String?
     @Environment(\.colorScheme) var colorScheme
+    @State private var importError: String?
 
     var cardBackground: Color {
         colorScheme == .dark
@@ -557,7 +782,7 @@ struct SetupGuideView: View {
                 Text("No Usage Data")
                     .font(.headline)
 
-                Text("Visit the Claude usage page in Firefox to start collecting data")
+                Text("Import your Claude Code credentials to get started")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -569,18 +794,35 @@ struct SetupGuideView: View {
                         .multilineTextAlignment(.center)
                         .padding(.top, 4)
                 }
+
+                if let importError = importError {
+                    Text(importError)
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 4)
+                }
             }
 
-            // Action buttons
+            // Action buttons (M5.1: extension buttons removed)
             VStack(spacing: 12) {
-                if !installer.nativeHostInstalled {
-                    Button(action: { _ = installer.installNativeHost() }) {
-                        Label("Install Native Bridge", systemImage: "puzzlepiece.extension")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.regular)
+                Button(action: importFromClaudeCode) {
+                    Label("Import from Claude Code", systemImage: "key")
+                        .frame(maxWidth: .infinity)
                 }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+
+                Button(action: {
+                    if let url = URL(string: "https://claude.ai/login") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }) {
+                    Label("Add Account (Login)", systemImage: "person.badge.plus")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
 
                 Button(action: {
                     if let url = URL(string: "https://claude.ai/settings/usage") {
@@ -592,13 +834,6 @@ struct SetupGuideView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.regular)
-
-                Button(action: { installer.openExtensionDownload() }) {
-                    Label("Get Firefox Extension", systemImage: "arrow.down.circle")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.regular)
             }
             .padding(.horizontal)
 
@@ -606,9 +841,29 @@ struct SetupGuideView: View {
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            installer.checkInstallationStatus()
+    }
+
+    private func importFromClaudeCode() {
+        importError = nil
+        let results = oauthPoller.importAllFromKeychain()
+        var importedCount = 0
+        var lastErrorMsg: String?
+
+        for result in results {
+            switch result {
+            case .success(let credential):
+                store.ensureDatabase()
+                oauthPoller.saveCredential(credential)
+                importedCount += 1
+            case .failure(let error):
+                lastErrorMsg = error.localizedDescription
+            }
+        }
+
+        if importedCount > 0 {
+            store.loadFromDatabase()
+        } else {
+            importError = lastErrorMsg ?? "Could not read Claude Code credentials from Keychain. Is Claude Code installed and signed in?"
         }
     }
 }
-

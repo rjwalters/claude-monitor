@@ -31,6 +31,7 @@ struct UsageChartWindow: View {
     let fullDataPoints: [FullUsageDataPoint]
     let tokenDataPoints: [TokenDataPoint]
     let store: UsageStore
+    let oauthPoller: OAuthPoller?
     let otherAccountsData: [AccountTrace]  // Data for other accounts
     let otherTokenData: [TokenTrace]  // Token data for other accounts
     @Environment(\.colorScheme) var colorScheme
@@ -247,10 +248,24 @@ struct UsageChartWindow: View {
                             isNameHovering = hovering
                         }
                     }
-                    if let plan = account.plan {
-                        Text(plan)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
+                    HStack(spacing: 6) {
+                        if let plan = account.plan {
+                            Text(plan)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                        // Token status in chart header (M4.4)
+                        if let poller = oauthPoller,
+                           let status = poller.credentialStatuses.first(where: { $0.accountId == account.id }) {
+                            Circle()
+                                .fill(tokenStatusColor(status.status))
+                                .frame(width: 8, height: 8)
+                            if let lastPoll = status.lastPoll {
+                                Text("Polled \(pollTimeAgo(lastPoll))")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
                     }
                 }
                 Spacer()
@@ -823,6 +838,22 @@ struct UsageChartWindow: View {
         }
     }
 
+    func tokenStatusColor(_ status: TokenStatus) -> Color {
+        switch status {
+        case .valid: return .green
+        case .refreshing: return .yellow
+        case .expired, .revoked, .error: return .red
+        case .missing: return .gray
+        }
+    }
+
+    func pollTimeAgo(_ date: Date) -> String {
+        let seconds = Int(-date.timeIntervalSinceNow)
+        if seconds < 60 { return "just now" }
+        if seconds < 3600 { return "\(seconds / 60)m ago" }
+        return "\(seconds / 3600)h ago"
+    }
+
     func colorForPercent(_ percent: Double) -> Color {
         if percent > 95 { return Color(nsColor: .systemRed) }
         if percent >= 90 { return Color(nsColor: .systemOrange) }
@@ -1032,7 +1063,7 @@ class ChartWindowController {
         .orange, .green, .purple, .pink, .cyan, .yellow, .mint, .indigo
     ]
 
-    static func showChart(for account: Account, store: UsageStore) {
+    static func showChart(for account: Account, store: UsageStore, oauthPoller: OAuthPoller? = nil) {
         // Close existing window for this account if open
         if let existing = windows[account.id] {
             existing.close()
@@ -1078,6 +1109,7 @@ class ChartWindowController {
             fullDataPoints: fullDataPoints,
             tokenDataPoints: tokenDataPoints,
             store: store,
+            oauthPoller: oauthPoller,
             otherAccountsData: otherAccountsData,
             otherTokenData: otherTokenData
         )

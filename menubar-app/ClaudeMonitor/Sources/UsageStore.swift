@@ -95,10 +95,94 @@ class UsageStore: ObservableObject {
         dbPath = homeDir.appendingPathComponent(".claude-monitor/usage.db").path
     }
 
+    // MARK: - Primary Account (M3.3)
+
+    /// The account ID shown in the menubar badge
+    var primaryAccountId: String? {
+        get { getSetting("primary_account_id") }
+        set { setSetting("primary_account_id", value: newValue) }
+    }
+
+    /// Creates the database and schema if they don't exist.
+    /// Called on launch so the app works standalone without the native host.
+    func ensureDatabase() {
+        let fm = FileManager.default
+        let dir = (dbPath as NSString).deletingLastPathComponent
+        if !fm.fileExists(atPath: dir) {
+            try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        }
+        guard !fm.fileExists(atPath: dbPath) else {
+            // DB exists — just enable WAL
+            if let db = try? Connection(dbPath) {
+                try? db.execute("PRAGMA journal_mode=WAL")
+            }
+            return
+        }
+        do {
+            let db = try Connection(dbPath)
+            try db.execute("PRAGMA journal_mode=WAL")
+            try db.execute("""
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id TEXT PRIMARY KEY,
+                    account_name TEXT,
+                    email TEXT,
+                    plan TEXT,
+                    last_updated TEXT,
+                    sort_order INTEGER DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS usage_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    primary_percent REAL,
+                    session_percent REAL,
+                    weekly_all_percent REAL,
+                    weekly_sonnet_percent REAL,
+                    session_reset TEXT,
+                    weekly_reset TEXT,
+                    raw_data TEXT,
+                    is_synthetic INTEGER DEFAULT 0,
+                    FOREIGN KEY (account_id) REFERENCES accounts(id)
+                );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_history(account_id);
+                CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_history(timestamp DESC);
+                CREATE TABLE IF NOT EXISTS oauth_credentials (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT,
+                    label TEXT NOT NULL,
+                    source TEXT DEFAULT 'keychain',
+                    keychain_service TEXT,
+                    keychain_account TEXT,
+                    access_token TEXT,
+                    refresh_token TEXT,
+                    expires_at INTEGER,
+                    scopes TEXT,
+                    subscription_type TEXT,
+                    rate_limit_tier TEXT,
+                    last_poll_at TEXT,
+                    last_error TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (account_id) REFERENCES accounts(id)
+                );
+            """)
+        } catch {
+            print("Failed to create database: \(error)")
+        }
+    }
+
     func loadFromDatabase() {
         do {
+            if !FileManager.default.fileExists(atPath: dbPath) {
+                ensureDatabase()
+            }
             guard FileManager.default.fileExists(atPath: dbPath) else {
-                error = "Database not found. Install the Firefox extension first."
+                error = "Could not create database."
                 accounts = []
                 return
             }
@@ -222,9 +306,6 @@ class UsageStore: ObservableObject {
             }
 
             // Apply change filter to reduce data points while preserving chart shape
-            // Keep a point if EITHER:
-            // - Change from last kept point is >= threshold, OR
-            // - Change to next point is >= threshold (preserves reset points)
             var filteredPoints: [(Date, Double)] = []
             var lastKeptPercent: Double?
 
@@ -234,7 +315,6 @@ class UsageStore: ObservableObject {
                 let isLast = i == rawPoints.count - 1
 
                 if isFirst || isLast {
-                    // Always keep first and last points
                     filteredPoints.append((date, percent))
                     lastKeptPercent = percent
                 } else if let lastPercent = lastKeptPercent {
@@ -242,7 +322,6 @@ class UsageStore: ObservableObject {
                     let nextPercent = rawPoints[i + 1].1
                     let changeToNext = abs(nextPercent - percent)
 
-                    // Keep if either transition is significant
                     if changeFromPrev >= minChangePercent || changeToNext >= minChangePercent {
                         filteredPoints.append((date, percent))
                         lastKeptPercent = percent
@@ -250,9 +329,6 @@ class UsageStore: ObservableObject {
                 }
             }
 
-            // Calculate deltas (usage consumed = increase in percentage)
-            // Synthetic reset points are now stored in the database, so they'll be
-            // loaded naturally and create vertical lines on the chart
             var dataPoints: [UsageDataPoint] = []
             for i in 0..<filteredPoints.count {
                 let (date, percent) = filteredPoints[i]
@@ -260,7 +336,6 @@ class UsageStore: ObservableObject {
                 if i > 0 {
                     let prevPercent = filteredPoints[i - 1].1
                     let diff = percent - prevPercent
-                    // Only count increases as usage (resets show as drops, synthetic points handle visualization)
                     delta = diff > 0 ? diff : 0
                 }
                 dataPoints.append(UsageDataPoint(
@@ -291,7 +366,6 @@ class UsageStore: ObservableObject {
             let sessionPercent = SQLite.Expression<Double?>("session_percent")
             let weeklyAllPercent = SQLite.Expression<Double?>("weekly_all_percent")
 
-            // Calculate the cutoff date for time-based filtering
             let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -313,10 +387,6 @@ class UsageStore: ObservableObject {
                 }
             }
 
-            // Apply change filter based on weeklyAllPercent to reduce data points
-            // Keep a point if EITHER:
-            // - Change from last kept point is >= threshold, OR
-            // - Change to next point is >= threshold (preserves reset points)
             var filteredPoints: [FullUsageDataPoint] = []
             var lastKeptPercent: Double?
 
@@ -333,13 +403,11 @@ class UsageStore: ObservableObject {
                     let nextPercent = rawPoints[i + 1].weeklyAllPercent ?? currentPercent
                     let changeToNext = abs(nextPercent - currentPercent)
 
-                    // Keep if either transition is significant
                     if changeFromPrev >= minChangePercent || changeToNext >= minChangePercent {
                         filteredPoints.append(point)
                         lastKeptPercent = currentPercent
                     }
                 } else {
-                    // Keep points with nil percent values to avoid losing data
                     filteredPoints.append(point)
                 }
             }
@@ -361,13 +429,11 @@ class UsageStore: ObservableObject {
 
             let db = try Connection(dbPath, readonly: true)
 
-            // Calculate the cutoff date
             let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let cutoffString = formatter.string(from: cutoffDate)
 
-            // Query hourly aggregated token usage for this account
             let sql = """
                 SELECT
                     strftime('%Y-%m-%dT%H:00:00Z', tu.timestamp) as hour,
@@ -574,8 +640,10 @@ class UsageStore: ObservableObject {
                 try db.run(account.update(sortOrder <- index))
             }
 
+            // Also set as primary account (M3.5)
+            primaryAccountId = accountId
+
             // Immediately update local state for instant UI feedback
-            // This prevents a flash of SetupGuideView while loadFromDatabase runs async
             if let localIndex = accounts.firstIndex(where: { $0.id == accountId }) {
                 let movedAccount = accounts.remove(at: localIndex)
                 accounts.insert(movedAccount, at: 0)
@@ -668,91 +736,50 @@ class UsageStore: ObservableObject {
         }
     }
 
-    /// Get the last browser that sent data (firefox or chrome)
-    var lastBrowser: String {
-        getSetting("last_browser") ?? "firefox"
+    /// Set a setting value in the database (M3.3)
+    func setSetting(_ key: String, value: String?) {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else { return }
+            let db = try Connection(dbPath)
+            if let value = value {
+                try db.run("""
+                    INSERT INTO settings (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """, key, value)
+            } else {
+                try db.run("DELETE FROM settings WHERE key = ?", key)
+            }
+        } catch {
+            print("Error writing setting: \(error)")
+        }
     }
 
-    /// Open all accounts - first account in default browser, others in private windows
+    /// Open all accounts — just open claude.ai/settings/usage for each (M5.2 simplified)
     func openAllAccounts() {
-        guard !accounts.isEmpty else { return }
-        guard accounts.count > 1 else {
-            // Only one account, just open usage page
+        for account in accounts {
+            let _ = account  // each account gets the same URL
             if let url = URL(string: "https://claude.ai/settings/usage") {
                 NSWorkspace.shared.open(url)
             }
-            return
-        }
-
-        let browser = lastBrowser
-
-        // Show setup hint for first few uses
-        let hintKey = "openAllAccountsHintCount"
-        let hintCount = UserDefaults.standard.integer(forKey: hintKey)
-        if hintCount < 3 {
-            UserDefaults.standard.set(hintCount + 1, forKey: hintKey)
-            showPrivateWindowHint(browser: browser)
-        }
-
-        // Open first account's usage page in default browser
-        if let url = URL(string: "https://claude.ai/settings/usage") {
-            NSWorkspace.shared.open(url)
-        }
-
-        // Open private windows for remaining accounts (to login page)
-        for (index, account) in accounts.enumerated() {
-            guard index > 0 else { continue }
-
-            openPrivateWindow(browser: browser, accountName: account.displayName)
         }
     }
 
-    /// Show a hint about enabling extension in private windows
-    private func showPrivateWindowHint(browser: String) {
-        let alert = NSAlert()
-        alert.messageText = "Enable Extension in Private Windows"
-        alert.informativeText = """
-            To see which account to log into, enable the extension in private/incognito windows:
-
-            \(browser == "chrome" ? "Chrome" : "Firefox"): Extensions → Claude Usage Monitor → \(browser == "chrome" ? "Allow in Incognito" : "Run in Private Windows")
-
-            This message will show \(3 - UserDefaults.standard.integer(forKey: "openAllAccountsHintCount")) more time(s).
-            """
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
-    }
-
-    /// Open a private browser window to Claude login page
-    private func openPrivateWindow(browser: String, accountName: String) {
-        // Pass account name via URL fragment so the extension can show a toast
-        let encodedName = accountName.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed) ?? accountName
-        let url = "https://claude.ai/login#cm_account=\(encodedName)"
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-
-        switch browser {
-        case "chrome":
-            process.arguments = ["-na", "Google Chrome", "--args", "--incognito", url]
-        case "firefox":
-            fallthrough
-        default:
-            process.arguments = ["-na", "Firefox", "--args", "-private-window", url]
-        }
-
-        do {
-            try process.run()
-        } catch {
-            print("Failed to open private window: \(error)")
-        }
+    /// Check if native host manifests exist (for migration notice M5.3)
+    var hasNativeHostManifests: Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let firefoxPath = home
+            .appendingPathComponent("Library/Application Support/Mozilla/NativeMessagingHosts/claude_monitor.json")
+        let chromePath = home
+            .appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts/claude_monitor.json")
+        return FileManager.default.fileExists(atPath: firefoxPath.path)
+            || FileManager.default.fileExists(atPath: chromePath.path)
     }
 }
 
 // MARK: - Update Checker
 
 struct AppVersion {
-    static let current = "1.7.1"
+    static let current = "2.0.0"
     static let repoOwner = "rjwalters"
     static let repoName = "claude-monitor"
 }

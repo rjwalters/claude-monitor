@@ -1,6 +1,6 @@
 # Claude Monitor
 
-Monitor your Claude AI usage with a macOS menu bar widget. Uses a browser extension to collect usage data from claude.ai and displays it in your menu bar.
+Monitor your Claude AI usage with a macOS menu bar widget. Reads OAuth credentials from the Claude Code keychain to poll usage data directly from the Anthropic API.
 
 ![Menu bar popover showing usage for multiple accounts](widget_popup.png)
 ![Usage history chart with consumption trends](plot_window.png)
@@ -9,65 +9,69 @@ Monitor your Claude AI usage with a macOS menu bar widget. Uses a browser extens
 
 Anthropic doesn't provide API access to usage data for consumer subscriptions (Pro/Max). The only way to see your usage is at https://claude.ai/settings/usage, which is protected by Cloudflare bot detection.
 
-This tool uses a browser extension to capture your usage data from your authenticated session, stores it in a local SQLite database, and displays it in a convenient menu bar widget.
+This tool uses Claude Code's OAuth credentials (stored in the macOS Keychain) to fetch your usage data directly from the Anthropic API and display it in a convenient menu bar widget.
 
 ## Features
 
 - Real-time usage percentage in your macOS menu bar (Stats app style)
 - Color-coded status: normal (<90%), orange (90-95%), red (>95%)
 - Detailed breakdown: session limits, weekly limits (all models & Sonnet)
-- Usage history charts
-- Multi-account support via Firefox containers
-- Auto-refreshes every 30 seconds
+- Usage history charts with token usage overlay
+- Multi-account support via OAuth keychain credentials
+- Account switching (right-click menu bar icon or popover picker)
+- Token health monitoring with re-auth prompts
+- Auto-refreshes every 30 seconds with exponential backoff on errors
 
 ## Quick Install (End Users)
 
-### 1. Download the macOS App
+### 1. Prerequisites
+
+- macOS 13+ (Ventura or later)
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and signed in
+
+### 2. Download the macOS App
+
 Download `ClaudeMonitor.zip` from [Releases](https://github.com/rjwalters/claude-monitor/releases)
 
 Unzip and move `ClaudeMonitor.app` to your Applications folder.
 
-**First run:** Right-click → "Open" (required for unsigned apps)
-
-### 2. Install the Firefox Extension
-Install from [Mozilla Add-ons](https://addons.mozilla.org/addon/claude-monitor/) (recommended)
-
-Or download `claude_monitor-x.x.xpi` from [Releases](https://github.com/rjwalters/claude-monitor/releases) and drag into Firefox.
-
-### 2b. Chrome Extension (Experimental)
-
-A Chrome extension is available in the `extension-chrome/` folder but is **experimental and untested**. The developer uses Firefox, so Chrome support is provided on a best-effort basis.
-
-To try it:
-1. Open `chrome://extensions`
-2. Enable "Developer mode"
-3. Click "Load unpacked" and select the `extension-chrome/` folder
-4. Run `native-host/install.sh` to set up native messaging for both browsers
-
-**If you encounter issues with the Chrome extension, please [open an issue](https://github.com/rjwalters/claude-monitor/issues)** - we're happy to fix problems as they're reported.
+**First run:** Right-click > "Open" (required for unsigned apps)
 
 ### 3. Setup
+
 1. Click the menu bar widget
-2. Click "Install Native Bridge" (one-time setup)
-3. Visit https://claude.ai/settings/usage in Firefox
-4. Your usage data will appear in the menu bar!
+2. Click "Import from Claude Code"
+3. Your usage data will appear in the menu bar!
+
+### Multiple Accounts
+
+Claude Monitor supports multiple Claude Code accounts:
+
+1. Sign into each account with Claude Code (each gets a separate keychain entry)
+2. Click the "+" button in the footer to re-scan the keychain
+3. Right-click the menu bar icon to quickly switch which account shows in the badge
+4. Use the account picker in the popover to change the primary displayed account
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  Firefox Extension (runs on claude.ai/settings/usage)                   │
-│  Extracts: session %, weekly limits, reset times, account info          │
+│  macOS Keychain (Claude Code OAuth credentials)                         │
 └──────────────────────────┬──────────────────────────────────────────────┘
-                           │ Native Messaging
+                           │ Reads tokens
                            ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  Native Host (Node.js) → SQLite database (~/.claude-monitor/usage.db)  │
+│  OAuthPoller → Anthropic API → SQLite (~/.claude-monitor/usage.db)      │
+│  - Concurrent polling per account with exponential backoff              │
+│  - Auto-detects new keychain entries every 5 minutes                    │
+│  - Token health monitoring (valid/expired/revoked)                      │
 └──────────────────────────┬──────────────────────────────────────────────┘
                            │ Reads DB
                            ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  macOS Menu Bar App (SwiftUI) - shows usage % with click for details   │
+│  macOS Menu Bar App (SwiftUI) - shows usage % with click for details    │
+│  - Left-click: popover with account cards                               │
+│  - Right-click: quick account switcher                                  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -76,9 +80,8 @@ To try it:
 ### Requirements
 
 - macOS 13+ (Ventura or later)
-- Firefox browser
-- Node.js 18+
 - Xcode Command Line Tools
+- Claude Code installed and signed in
 
 ### 1. Clone the repository
 
@@ -87,29 +90,7 @@ git clone https://github.com/rjwalters/claude-monitor.git
 cd claude-monitor
 ```
 
-### 2. Install dependencies
-
-```bash
-npm install
-```
-
-### 3. Install the Native Messaging Host
-
-```bash
-cd native-host
-chmod +x install.sh
-./install.sh
-cd ..
-```
-
-### 4. Load the Firefox Extension (Development)
-
-1. Open Firefox: `about:debugging`
-2. Click "This Firefox" in the sidebar
-3. Click "Load Temporary Add-on..."
-4. Select `extension/manifest.json`
-
-### 5. Build and Run the Menu Bar App
+### 2. Build and Run the Menu Bar App
 
 ```bash
 cd menubar-app/ClaudeMonitor
@@ -117,26 +98,11 @@ swift build
 .build/debug/ClaudeMonitor &
 ```
 
-### 6. Collect Data
+### 3. Import Credentials
 
-Visit https://claude.ai/settings/usage in Firefox. The extension captures data automatically.
+Click the menu bar widget, then click "Import from Claude Code" to read your Claude Code OAuth credentials from the macOS Keychain.
 
 ## Building for Release
-
-### Build the Extension
-
-```bash
-./scripts/build-extension.sh
-```
-
-Output: `build/claude-monitor-extension.zip`
-
-The extension is published on [Mozilla Add-ons](https://addons.mozilla.org/addon/claude-monitor/). To update:
-1. Go to https://addons.mozilla.org/developers/
-2. Upload the new version
-3. Updates will be distributed automatically to users
-
-### Build the macOS App
 
 ```bash
 ./scripts/build-macos-app.sh
@@ -145,8 +111,6 @@ The extension is published on [Mozilla Add-ons](https://addons.mozilla.org/addon
 Output: `build/ClaudeMonitor.zip`
 
 ## Auto-Start on Login (Optional)
-
-To have the menu bar app start automatically:
 
 ```bash
 # Create LaunchAgent
@@ -184,49 +148,17 @@ launchctl unload ~/Library/LaunchAgents/com.claude-monitor.plist
 rm ~/Library/LaunchAgents/com.claude-monitor.plist
 ```
 
-## Multiple Accounts
-
-For multiple Claude accounts, use [Firefox Multi-Account Containers](https://addons.mozilla.org/en-US/firefox/addon/multi-account-containers/):
-
-1. Install the Multi-Account Containers extension
-2. Create a container for each Claude account
-3. Open claude.ai/settings/usage in each container
-4. Each account will be tracked separately in the menu bar app
-
 ## Troubleshooting
 
-### Menu bar shows "C: --"
+### Menu bar shows "LLM --"
 
-No data has been collected yet. Visit https://claude.ai/settings/usage with the extension loaded.
+No data has been collected yet. Click the widget and import your Claude Code credentials.
 
-### Native host not connecting
+### Import fails
 
-1. Re-run the install script (creates manifests for Firefox & Chrome):
-   ```bash
-   cd native-host && ./install.sh
-   ```
-
-2. **Restart your browser** (required after installing native host)
-
-3. Check the manifest exists:
-   ```bash
-   # Firefox
-   cat ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/claude_monitor.json
-   # Chrome
-   cat ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/claude_monitor.json
-   ```
-
-4. Test manually:
-   ```bash
-   cd claude-monitor
-   node -e 'const m=JSON.stringify({type:"GET_DATA"});const b=Buffer.alloc(4);b.writeUInt32LE(Buffer.byteLength(m),0);process.stdout.write(b);process.stdout.write(m);' | ./native-host/claude_monitor_host.sh
-   ```
-
-### Extension not capturing data
-
-1. Check the browser console (Cmd+Option+J) for errors
-2. Make sure you're on exactly `https://claude.ai/settings/usage`
-3. Try refreshing the page
+1. Make sure Claude Code is installed and you've signed in (`claude` in terminal)
+2. Check that the keychain entry exists: Keychain Access > search "Claude Code"
+3. The app needs permission to read the keychain — click "Always Allow" when prompted
 
 ### Database location
 
@@ -251,14 +183,8 @@ pkill ClaudeMonitor
 launchctl unload ~/Library/LaunchAgents/com.claude-monitor.plist 2>/dev/null
 rm ~/Library/LaunchAgents/com.claude-monitor.plist 2>/dev/null
 
-# Remove native hosts
-rm ~/Library/Application\ Support/Mozilla/NativeMessagingHosts/claude_monitor.json
-rm ~/Library/Application\ Support/Google/Chrome/NativeMessagingHosts/claude_monitor.json 2>/dev/null
-
 # Remove data
 rm -rf ~/.claude-monitor
-
-# Remove the extension from Firefox (about:debugging > This Firefox > Remove)
 
 # Delete the repo
 rm -rf /path/to/claude-monitor
@@ -268,30 +194,20 @@ rm -rf /path/to/claude-monitor
 
 ```
 claude-monitor/
-├── extension/                    # Firefox extension (MV2)
-│   ├── manifest.json            # Extension manifest
-│   ├── content.js               # Scrapes usage data from claude.ai
-│   ├── background.js            # Sends data to native host
-│   ├── popup.html/js            # Extension popup UI
-│   └── README.md
-├── extension-chrome/             # Chrome extension (MV3, experimental)
-│   ├── manifest.json            # MV3 manifest with stable extension key
-│   ├── content.js               # Same as Firefox
-│   ├── background.js            # Service worker (uses chrome.action)
-│   └── popup.html/js            # Same as Firefox
-├── native-host/                  # Native messaging host
-│   ├── claude_monitor_host.cjs  # Node.js script (SQLite)
-│   ├── claude_monitor_host.sh   # Shell wrapper (ensures node in PATH)
-│   └── install.sh               # Installation script (Firefox & Chrome)
 ├── menubar-app/ClaudeMonitor/   # macOS menu bar app
 │   ├── Package.swift            # Swift package definition
 │   └── Sources/
-│       ├── main.swift           # App entry point
-│       ├── UsageStore.swift     # SQLite data access
-│       └── UsagePopoverView.swift # SwiftUI UI
+│       ├── main.swift           # App entry point, menubar, right-click menu
+│       ├── UsageStore.swift     # SQLite data access, settings
+│       ├── UsagePopoverView.swift # SwiftUI popover UI
+│       ├── UsageChartView.swift # Chart window
+│       ├── OAuthPoller.swift    # OAuth polling, keychain, retry logic
+│       └── AnthropicAPI.swift   # API client, response types
 ├── src/                          # CLI tool (optional)
 │   ├── cli.ts
 │   └── reader.ts
+├── scripts/
+│   └── build-macos-app.sh       # Build script for distribution
 └── package.json
 ```
 
@@ -303,9 +219,9 @@ claude-monitor/
 
 **How they differ from Claude Monitor:**
 - ccusage/VibePulse read **local Claude Code logs** → show token counts and API-equivalent costs
-- Claude Monitor reads **claude.ai web UI** → shows quota percentages and reset times
+- Claude Monitor reads **the Anthropic API via OAuth** → shows quota percentages and reset times
 
-Claude Monitor now integrates local token data alongside web-scraped quota info, giving you both views in one app.
+Claude Monitor now integrates local token data alongside OAuth-sourced quota info, giving you both views in one app.
 
 ## License
 

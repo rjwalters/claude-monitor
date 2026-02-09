@@ -25,9 +25,6 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 # Copy executable
 cp ".build/release/ClaudeMonitor" "$APP_BUNDLE/Contents/MacOS/"
 
-# Copy native host files for bundling
-cp "$PROJECT_ROOT/native-host/claude_monitor_host.cjs" "$APP_BUNDLE/Contents/Resources/"
-
 # Create Info.plist
 cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -43,9 +40,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
     <key>CFBundleDisplayName</key>
     <string>Claude Monitor</string>
     <key>CFBundleVersion</key>
-    <string>1.0.0</string>
+    <string>2.0.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>2.0.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
