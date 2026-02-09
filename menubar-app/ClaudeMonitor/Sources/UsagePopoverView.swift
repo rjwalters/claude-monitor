@@ -26,12 +26,14 @@ func formatResetTime(_ str: String) -> String {
 struct UsagePopoverView: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var oauthPoller: OAuthPoller
+    var onLoginToAll: (() -> Void)?
     @Environment(\.colorScheme) var colorScheme
     @State private var showGitHubLink = false
     @State private var titleHoverTimer: Timer?
     @State private var showMigrationBanner = false
     @State private var showRemoveConfirmation = false
     @State private var accountToRemove: Account?
+
 
     var body: some View {
         VStack(spacing: 0) {
@@ -120,30 +122,6 @@ struct UsagePopoverView: View {
             } else if store.accounts.isEmpty {
                 SetupGuideView(oauthPoller: oauthPoller, store: store, error: nil)
             } else {
-                // Account picker when multiple accounts (M3.1)
-                if store.accounts.count > 1 {
-                    HStack {
-                        Text("Menubar account:")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Picker("", selection: Binding(
-                            get: { store.primaryAccountId ?? store.accounts.first?.id ?? "" },
-                            set: { newId in
-                                store.primaryAccountId = newId
-                                store.onAccountsChanged?()
-                            }
-                        )) {
-                            ForEach(store.accounts) { account in
-                                Text(account.displayName).tag(account.id)
-                            }
-                        }
-                        .pickerStyle(.menu)
-                        .frame(maxWidth: 180)
-                    }
-                    .padding(.horizontal)
-                    .padding(.top, 6)
-                }
-
                 ScrollView {
                     VStack(spacing: 12) {
                         ForEach(Array(store.accounts.enumerated()), id: \.element.id) { index, account in
@@ -188,25 +166,20 @@ struct UsagePopoverView: View {
                     }
                 }
 
-                // Only show "Open All" if there are multiple accounts
-                if store.accounts.count > 1 {
-                    Text("·")
-                        .foregroundColor(.secondary)
+                Text("·")
+                    .foregroundColor(.secondary)
 
-                    Button(action: {
-                        store.openAllAccounts()
-                    }) {
-                        Text("Open All")
-                            .underline()
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundColor(.accentColor)
-                    .onHover { hovering in
-                        if hovering {
-                            NSCursor.pointingHand.push()
-                        } else {
-                            NSCursor.pop()
-                        }
+                Button(action: openLoginWizard) {
+                    Text("Login to All")
+                        .underline()
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.accentColor)
+                .onHover { hovering in
+                    if hovering {
+                        NSCursor.pointingHand.push()
+                    } else {
+                        NSCursor.pop()
                     }
                 }
 
@@ -257,6 +230,10 @@ struct UsagePopoverView: View {
         if seconds < 60 { return "just now" }
         if seconds < 3600 { return "\(seconds / 60)m ago" }
         return "\(seconds / 3600)h ago"
+    }
+
+    private func openLoginWizard() {
+        onLoginToAll?()
     }
 
     // M2.2: Re-scan keychain and import new credentials
@@ -864,6 +841,123 @@ struct SetupGuideView: View {
             store.loadFromDatabase()
         } else {
             importError = lastErrorMsg ?? "Could not read Claude Code credentials from Keychain. Is Claude Code installed and signed in?"
+        }
+    }
+}
+
+// MARK: - Login Wizard
+
+struct LoginWizardView: View {
+    @ObservedObject var store: UsageStore
+    @ObservedObject var oauthPoller: OAuthPoller
+    var onDone: () -> Void
+
+    @State private var statusMessage: String?
+    @State private var isScanning = false
+
+    /// Accounts that have an active credential
+    private var linkedIds: Set<String> {
+        Set(oauthPoller.loadActiveCredentials().compactMap { $0.accountId })
+    }
+
+    private var allLinked: Bool {
+        !store.accounts.isEmpty && linkedIds.count == store.accounts.count
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Login to All Accounts")
+                .font(.headline)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("1. In Claude Code, type /login")
+                Text("2. Sign in as the next account")
+                Text("3. Click Scan Keychain below")
+                Text("4. Repeat for each account")
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+
+            Divider()
+
+            // Account list with checkmarks
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(store.accounts) { account in
+                    HStack(spacing: 8) {
+                        Image(systemName: linkedIds.contains(account.id) ? "checkmark.circle.fill" : "circle")
+                            .foregroundColor(linkedIds.contains(account.id) ? .green : .secondary)
+                            .font(.caption)
+                        Text(account.displayName)
+                            .font(.caption)
+                            .lineLimit(1)
+                        Spacer()
+                        if linkedIds.contains(account.id),
+                           let usage = store.latestUsage[account.id] {
+                            let pct = Int(max(usage.sessionPercent ?? 0, usage.weeklyAllPercent ?? 0))
+                            Text("\(pct)%")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+
+            if let msg = statusMessage {
+                Text(msg)
+                    .font(.caption)
+                    .foregroundColor(msg.contains("No token") ? .orange : .green)
+            }
+
+            Divider()
+
+            HStack {
+                Button(action: scanKeychain) {
+                    Label(isScanning ? "Scanning..." : "Scan Keychain", systemImage: "key")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(isScanning)
+
+                Spacer()
+
+                Button("Close") {
+                    onDone()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding()
+        .frame(width: 280)
+    }
+
+    // MARK: - Helpers
+
+    private func scanKeychain() {
+        isScanning = true
+        statusMessage = nil
+
+        store.ensureDatabase()
+
+        Task {
+            // Import token and identify account via profile API
+            if let email = await oauthPoller.scanKeychainWithProfile() {
+                await MainActor.run {
+                    // Reload accounts — may include a newly discovered account
+                    store.loadFromDatabase()
+                    isScanning = false
+                    if allLinked {
+                        statusMessage = "All accounts linked!"
+                    } else {
+                        statusMessage = "Linked \(email)."
+                    }
+                }
+            } else {
+                await MainActor.run {
+                    isScanning = false
+                    statusMessage = "No token found. Use /login in Claude Code first."
+                }
+            }
         }
     }
 }

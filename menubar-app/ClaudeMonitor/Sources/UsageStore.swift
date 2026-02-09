@@ -111,13 +111,6 @@ class UsageStore: ObservableObject {
         if !fm.fileExists(atPath: dir) {
             try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
         }
-        guard !fm.fileExists(atPath: dbPath) else {
-            // DB exists — just enable WAL
-            if let db = try? Connection(dbPath) {
-                try? db.execute("PRAGMA journal_mode=WAL")
-            }
-            return
-        }
         do {
             let db = try Connection(dbPath)
             try db.execute("PRAGMA journal_mode=WAL")
@@ -751,16 +744,6 @@ class UsageStore: ObservableObject {
             }
         } catch {
             print("Error writing setting: \(error)")
-        }
-    }
-
-    /// Open all accounts — just open claude.ai/settings/usage for each (M5.2 simplified)
-    func openAllAccounts() {
-        for account in accounts {
-            let _ = account  // each account gets the same URL
-            if let url = URL(string: "https://claude.ai/settings/usage") {
-                NSWorkspace.shared.open(url)
-            }
         }
     }
 

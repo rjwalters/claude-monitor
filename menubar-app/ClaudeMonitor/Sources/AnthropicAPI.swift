@@ -2,6 +2,8 @@ import Foundation
 import os
 
 private let logger = Logger(subsystem: "com.claude-monitor.app", category: "AnthropicAPI")
+private let flog = FileLogger.shared
+private let fcat = "API"
 
 // MARK: - API Response Types
 
@@ -54,6 +56,41 @@ struct TokenRefreshResponse: Codable {
         case tokenType = "token_type"
         case expiresIn = "expires_in"
         case refreshToken = "refresh_token"
+    }
+}
+
+struct ProfileResponse: Codable {
+    let account: ProfileAccount
+    let organization: ProfileOrganization
+
+    struct ProfileAccount: Codable {
+        let uuid: String
+        let fullName: String?
+        let displayName: String?
+        let email: String
+
+        enum CodingKeys: String, CodingKey {
+            case uuid
+            case fullName = "full_name"
+            case displayName = "display_name"
+            case email
+        }
+    }
+
+    struct ProfileOrganization: Codable {
+        let uuid: String
+        let name: String?
+        let organizationType: String?
+        let rateLimitTier: String?
+        let subscriptionStatus: String?
+
+        enum CodingKeys: String, CodingKey {
+            case uuid
+            case name
+            case organizationType = "organization_type"
+            case rateLimitTier = "rate_limit_tier"
+            case subscriptionStatus = "subscription_status"
+        }
     }
 }
 
@@ -110,6 +147,7 @@ class AnthropicAPIClient {
             (data, response) = try await session.data(for: request)
         } catch {
             logger.error("Network error fetching usage: \(error.localizedDescription)")
+            flog.error("Network error fetching usage: \(error.localizedDescription)", category: fcat)
             throw AnthropicAPIError.networkError(error)
         }
 
@@ -119,15 +157,55 @@ class AnthropicAPIClient {
 
         if httpResponse.statusCode == 401 {
             logger.warning("Unauthorized response from usage API")
+            flog.warning("Unauthorized (401) from usage API", category: fcat)
             throw AnthropicAPIError.unauthorized
         }
 
         guard (200..<300).contains(httpResponse.statusCode) else {
             logger.warning("HTTP \(httpResponse.statusCode) from usage API")
+            flog.warning("HTTP \(httpResponse.statusCode) from usage API", category: fcat)
             throw AnthropicAPIError.httpError(httpResponse.statusCode)
         }
 
-        return try JSONDecoder().decode(UsageResponse.self, from: data)
+        let usage = try JSONDecoder().decode(UsageResponse.self, from: data)
+        let pct5h = usage.fiveHour.map { "\(Int($0.utilization))%" } ?? "n/a"
+        let pct7d = usage.sevenDay.map { "\(Int($0.utilization))%" } ?? "n/a"
+        flog.info("Usage fetched — session: \(pct5h), weekly: \(pct7d)", category: fcat)
+        return usage
+    }
+
+    func fetchProfile(accessToken: String) async throws -> ProfileResponse {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/profile")!)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        request.setValue("claude-code/2.0.32", forHTTPHeaderField: "User-Agent")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            flog.error("Network error fetching profile: \(error.localizedDescription)", category: fcat)
+            throw AnthropicAPIError.networkError(error)
+        }
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw AnthropicAPIError.invalidResponse
+        }
+
+        if httpResponse.statusCode == 401 {
+            throw AnthropicAPIError.unauthorized
+        }
+
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            flog.warning("HTTP \(httpResponse.statusCode) from profile API", category: fcat)
+            throw AnthropicAPIError.httpError(httpResponse.statusCode)
+        }
+
+        let profile = try JSONDecoder().decode(ProfileResponse.self, from: data)
+        flog.info("Profile fetched — email: \(profile.account.email), org: \(profile.organization.name ?? "none") (\(profile.organization.uuid))", category: fcat)
+        return profile
     }
 
     func refreshToken(refreshToken: String) async throws -> TokenRefreshResponse {
@@ -144,6 +222,7 @@ class AnthropicAPIClient {
             (data, response) = try await session.data(for: request)
         } catch {
             logger.error("Network error refreshing token: \(error.localizedDescription)")
+            flog.error("Network error refreshing token: \(error.localizedDescription)", category: fcat)
             throw AnthropicAPIError.networkError(error)
         }
 
@@ -153,6 +232,7 @@ class AnthropicAPIClient {
 
         guard (200..<300).contains(httpResponse.statusCode) else {
             logger.warning("Token refresh failed with HTTP \(httpResponse.statusCode)")
+            flog.warning("Token refresh failed with HTTP \(httpResponse.statusCode)", category: fcat)
             throw AnthropicAPIError.tokenRefreshFailed
         }
 
