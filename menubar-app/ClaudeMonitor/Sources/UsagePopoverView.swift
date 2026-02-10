@@ -449,23 +449,23 @@ struct AccountCard: View {
                             isReauthenticating = true
                             Task {
                                 if let scanStore = store {
-                                    // Try keychain re-scan first
-                                    if let _ = await poller.scanKeychainWithProfile() {
-                                        await MainActor.run {
-                                            scanStore.loadFromDatabase()
-                                            isReauthenticating = false
-                                        }
-                                    } else {
-                                        // Keychain scan failed — fall back to browser
-                                        await MainActor.run {
-                                            isReauthenticating = false
+                                    let _ = await poller.scanKeychainWithProfile()
+                                    await MainActor.run {
+                                        scanStore.loadFromDatabase()
+                                        isReauthenticating = false
+                                        // Check if THIS account's credential is still revoked
+                                        let stillBad = poller.credentialStatuses
+                                            .first(where: { $0.accountId == account.id })
+                                            .map { $0.status == .revoked || $0.status == .expired || $0.status == .missing }
+                                            ?? true
+                                        if stillBad {
+                                            // Keychain didn't help this account — open browser
                                             if let url = URL(string: "https://claude.ai/login") {
                                                 NSWorkspace.shared.open(url)
                                             }
                                         }
                                     }
                                 } else {
-                                    // No store — fall back to browser
                                     await MainActor.run {
                                         isReauthenticating = false
                                         if let url = URL(string: "https://claude.ai/login") {
