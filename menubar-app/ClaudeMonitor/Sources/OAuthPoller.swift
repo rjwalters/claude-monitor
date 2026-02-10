@@ -591,28 +591,48 @@ class OAuthPoller: ObservableObject {
                 updateCredentialLastPoll(credential, error: nil)
                 updateCredentialStatus(credential, status: .valid, error: nil)
                 return
-            } else if tokenHealth == .expired && credential.source == "keychain" {
+            } else if (tokenHealth == .expired || tokenHealth == .missing) && credential.source == "keychain" {
                 // Re-read from keychain — Claude Code may have refreshed the token
-                flog.info("Re-reading keychain for expired credential \(credential.label)", category: fcat)
+                flog.info("Re-reading keychain for \(tokenHealth.rawValue) credential \(credential.label)", category: fcat)
                 if let freshToken = readTokenFromKeychain(service: credential.keychainService, account: credential.keychainAccount) {
                     let freshExpiry = readExpiresAtFromKeychain(service: credential.keychainService, account: credential.keychainAccount)
                     let now = Int64(Date().timeIntervalSince1970 * 1000)
                     // Accept if expiry is in the future or nil (no expiry info)
                     if freshExpiry == nil || freshExpiry! > now {
-                        flog.info("Re-read keychain: got fresh token for \(credential.label) (expires: \(freshExpiry.map { String($0) } ?? "nil"))", category: fcat)
-                        updateStoredToken(credential, accessToken: freshToken, expiresAt: freshExpiry)
-                        updateCredentialStatus(credential, status: .refreshing, error: "Re-reading from keychain")
-                        // Fetch usage with the fresh token
-                        let usage = try await apiClient.fetchUsage(accessToken: freshToken)
-
-                        if let profile = try? await apiClient.fetchProfile(accessToken: freshToken) {
-                            updateAccountFromProfile(credential: credential, profile: profile)
+                        // Verify token belongs to this credential's account before using it
+                        // (keychain may contain a token for a different account)
+                        if let expectedAccountId = credential.accountId {
+                            if let profile = try? await apiClient.fetchProfile(accessToken: freshToken) {
+                                let tokenAccountId = profile.organization.uuid
+                                if tokenAccountId != expectedAccountId {
+                                    flog.info("Re-read keychain: token belongs to \(tokenAccountId), not \(expectedAccountId) — skipping", category: fcat)
+                                    // Don't use this token — it's for a different account
+                                } else {
+                                    flog.info("Re-read keychain: verified token for \(credential.label) (expires: \(freshExpiry.map { String($0) } ?? "nil"))", category: fcat)
+                                    updateStoredToken(credential, accessToken: freshToken, expiresAt: freshExpiry)
+                                    let usage = try await apiClient.fetchUsage(accessToken: freshToken)
+                                    writeUsageToDB(credential: credential, usage: usage)
+                                    updateCredentialLastPoll(credential, error: nil)
+                                    updateCredentialStatus(credential, status: .valid, error: nil)
+                                    return
+                                }
+                            } else {
+                                flog.warning("Re-read keychain: profile fetch failed, cannot verify account", category: fcat)
+                            }
+                        } else {
+                            // No account_id yet — use token and let profile association happen
+                            flog.info("Re-read keychain: got fresh token for \(credential.label) (no account_id, expires: \(freshExpiry.map { String($0) } ?? "nil"))", category: fcat)
+                            updateStoredToken(credential, accessToken: freshToken, expiresAt: freshExpiry)
+                            updateCredentialStatus(credential, status: .refreshing, error: "Re-reading from keychain")
+                            let usage = try await apiClient.fetchUsage(accessToken: freshToken)
+                            if let profile = try? await apiClient.fetchProfile(accessToken: freshToken) {
+                                updateAccountFromProfile(credential: credential, profile: profile)
+                            }
+                            writeUsageToDB(credential: credential, usage: usage)
+                            updateCredentialLastPoll(credential, error: nil)
+                            updateCredentialStatus(credential, status: .valid, error: nil)
+                            return
                         }
-
-                        writeUsageToDB(credential: credential, usage: usage)
-                        updateCredentialLastPoll(credential, error: nil)
-                        updateCredentialStatus(credential, status: .valid, error: nil)
-                        return
                     } else {
                         flog.info("Re-read keychain: token still expired for \(credential.label)", category: fcat)
                     }
@@ -818,20 +838,27 @@ class OAuthPoller: ObservableObject {
             // Update credential to point to correct account
             let currentAccountId = credential.accountId
             if currentAccountId != orgId {
-                try db.run(
-                    "UPDATE oauth_credentials SET account_id = ?, updated_at = ? WHERE id = ?",
-                    orgId, now, credId
-                )
-                flog.info("Linked credential \(credential.label) to account \(email) (\(orgId))", category: fcat)
+                // Only re-link if the current account_id is auto-generated (oauth_N) or nil.
+                // Once a credential is linked to a real org UUID, don't override it — the
+                // token may belong to a different account (shared keychain entry).
+                if let oldId = currentAccountId, !oldId.hasPrefix("oauth_") {
+                    flog.warning("Profile says \(orgId) but credential already linked to \(oldId) — not re-linking", category: fcat)
+                } else {
+                    try db.run(
+                        "UPDATE oauth_credentials SET account_id = ?, updated_at = ? WHERE id = ?",
+                        orgId, now, credId
+                    )
+                    flog.info("Linked credential \(credential.label) to account \(email) (\(orgId))", category: fcat)
 
-                // Clean up orphaned account if it was auto-generated (oauth_N)
-                if let oldId = currentAccountId, oldId.hasPrefix("oauth_") {
-                    let refCount = try db.scalar(
-                        "SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ?", oldId
-                    ) as? Int64 ?? 0
-                    if refCount == 0 {
-                        try db.run("DELETE FROM accounts WHERE id = ?", oldId)
-                        flog.info("Cleaned up orphaned account \(oldId)", category: fcat)
+                    // Clean up orphaned account if it was auto-generated (oauth_N)
+                    if let oldId = currentAccountId, oldId.hasPrefix("oauth_") {
+                        let refCount = try db.scalar(
+                            "SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ?", oldId
+                        ) as? Int64 ?? 0
+                        if refCount == 0 {
+                            try db.run("DELETE FROM accounts WHERE id = ?", oldId)
+                            flog.info("Cleaned up orphaned account \(oldId)", category: fcat)
+                        }
                     }
                 }
             }
