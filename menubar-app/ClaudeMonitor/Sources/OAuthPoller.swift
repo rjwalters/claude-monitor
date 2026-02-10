@@ -591,6 +591,34 @@ class OAuthPoller: ObservableObject {
                 updateCredentialLastPoll(credential, error: nil)
                 updateCredentialStatus(credential, status: .valid, error: nil)
                 return
+            } else if tokenHealth == .expired && credential.source == "keychain" {
+                // Re-read from keychain — Claude Code may have refreshed the token
+                flog.info("Re-reading keychain for expired credential \(credential.label)", category: fcat)
+                if let freshToken = readTokenFromKeychain(service: credential.keychainService, account: credential.keychainAccount) {
+                    let freshExpiry = readExpiresAtFromKeychain(service: credential.keychainService, account: credential.keychainAccount)
+                    let now = Int64(Date().timeIntervalSince1970 * 1000)
+                    // Accept if expiry is in the future or nil (no expiry info)
+                    if freshExpiry == nil || freshExpiry! > now {
+                        flog.info("Re-read keychain: got fresh token for \(credential.label) (expires: \(freshExpiry.map { String($0) } ?? "nil"))", category: fcat)
+                        updateStoredToken(credential, accessToken: freshToken, expiresAt: freshExpiry)
+                        updateCredentialStatus(credential, status: .refreshing, error: "Re-reading from keychain")
+                        // Fetch usage with the fresh token
+                        let usage = try await apiClient.fetchUsage(accessToken: freshToken)
+
+                        if let profile = try? await apiClient.fetchProfile(accessToken: freshToken) {
+                            updateAccountFromProfile(credential: credential, profile: profile)
+                        }
+
+                        writeUsageToDB(credential: credential, usage: usage)
+                        updateCredentialLastPoll(credential, error: nil)
+                        updateCredentialStatus(credential, status: .valid, error: nil)
+                        return
+                    } else {
+                        flog.info("Re-read keychain: token still expired for \(credential.label)", category: fcat)
+                    }
+                } else {
+                    flog.info("Re-read keychain: no token found for \(credential.label)", category: fcat)
+                }
             }
             throw AnthropicAPIError.unauthorized
         }
@@ -906,6 +934,23 @@ class OAuthPoller: ObservableObject {
             self.lastError = error
         }
         updateCredentialLastPoll(credential, error: error)
+    }
+
+    /// Update stored access_token and expires_at from raw values (used for keychain re-reads)
+    private func updateStoredToken(_ credential: OAuthCredential, accessToken: String, expiresAt: Int64?) {
+        guard let credId = credential.id,
+              FileManager.default.fileExists(atPath: dbPath) else { return }
+        do {
+            let db = try Connection(dbPath)
+            let now = ISO8601DateFormatter().string(from: Date())
+            try db.run(
+                "UPDATE oauth_credentials SET access_token = ?, expires_at = ?, updated_at = ? WHERE id = ?",
+                accessToken, expiresAt, now, credId
+            )
+            flog.info("Updated stored token for credential \(credId) from keychain", category: fcat)
+        } catch {
+            flog.error("Failed to update stored token: \(error.localizedDescription)", category: fcat)
+        }
     }
 
     private func updateCredentialTokens(_ credential: OAuthCredential, response: TokenRefreshResponse) {

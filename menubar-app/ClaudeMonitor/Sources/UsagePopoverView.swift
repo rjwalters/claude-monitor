@@ -349,10 +349,12 @@ struct AccountCard: View {
     let account: Account
     let usage: UsageRecord?
     var oauthPoller: OAuthPoller? = nil
+    var store: UsageStore? = nil
     var onEditTapped: (() -> Void)? = nil
     var onRemove: (() -> Void)? = nil
     @Environment(\.colorScheme) var colorScheme
     @State private var isNameHovering = false
+    @State private var isReauthenticating = false
 
     var cardBackground: Color {
         colorScheme == .dark
@@ -442,14 +444,41 @@ struct AccountCard: View {
                             .font(.caption)
                             .foregroundColor(.orange)
                         Spacer()
-                        Button("Re-authenticate") {
-                            if let url = URL(string: "https://claude.ai/login") {
-                                NSWorkspace.shared.open(url)
+                        Button(isReauthenticating ? "Scanning..." : "Re-authenticate") {
+                            guard !isReauthenticating else { return }
+                            isReauthenticating = true
+                            Task {
+                                if let scanStore = store {
+                                    // Try keychain re-scan first
+                                    if let _ = await poller.scanKeychainWithProfile() {
+                                        await MainActor.run {
+                                            scanStore.loadFromDatabase()
+                                            isReauthenticating = false
+                                        }
+                                    } else {
+                                        // Keychain scan failed — fall back to browser
+                                        await MainActor.run {
+                                            isReauthenticating = false
+                                            if let url = URL(string: "https://claude.ai/login") {
+                                                NSWorkspace.shared.open(url)
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // No store — fall back to browser
+                                    await MainActor.run {
+                                        isReauthenticating = false
+                                        if let url = URL(string: "https://claude.ai/login") {
+                                            NSWorkspace.shared.open(url)
+                                        }
+                                    }
+                                }
                             }
                         }
                         .font(.caption)
                         .buttonStyle(.bordered)
                         .controlSize(.mini)
+                        .disabled(isReauthenticating)
                     }
                     .padding(.top, 4)
                 }
@@ -587,6 +616,7 @@ struct ClickableAccountCard: View {
                         account: account,
                         usage: usage,
                         oauthPoller: oauthPoller,
+                        store: store,
                         onEditTapped: {
                             editedName = account.accountName ?? account.displayName
                             isEditing = true
