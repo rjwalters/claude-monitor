@@ -435,50 +435,41 @@ struct AccountCard: View {
                 // Re-auth prompt (M4.2)
                 if let poller = oauthPoller,
                    let status = poller.credentialStatuses.first(where: { $0.accountId == account.id }),
-                   status.status == .expired || status.status == .revoked {
-                    HStack {
-                        Image(systemName: "exclamationmark.triangle")
-                            .foregroundColor(.orange)
-                            .font(.caption)
-                        Text("Token \(status.status.rawValue)")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                        Spacer()
-                        Button(isReauthenticating ? "Scanning..." : "Re-authenticate") {
-                            guard !isReauthenticating else { return }
-                            isReauthenticating = true
-                            Task {
-                                if let scanStore = store {
-                                    let _ = await poller.scanKeychainWithProfile()
-                                    await MainActor.run {
-                                        scanStore.loadFromDatabase()
-                                        isReauthenticating = false
-                                        // Check if THIS account's credential is still revoked
-                                        let stillBad = poller.credentialStatuses
-                                            .first(where: { $0.accountId == account.id })
-                                            .map { $0.status == .revoked || $0.status == .expired || $0.status == .missing }
-                                            ?? true
-                                        if stillBad {
-                                            // Keychain didn't help this account — open browser
-                                            if let url = URL(string: "https://claude.ai/login") {
-                                                NSWorkspace.shared.open(url)
-                                            }
+                   status.status == .expired || status.status == .revoked || status.status == .missing {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundColor(.orange)
+                                .font(.caption)
+                            Text("Token \(status.status.rawValue)")
+                                .font(.caption)
+                                .foregroundColor(.orange)
+                            Spacer()
+                            Button(isReauthenticating ? "Scanning..." : "Scan Keychain") {
+                                guard !isReauthenticating else { return }
+                                isReauthenticating = true
+                                Task {
+                                    if let scanStore = store {
+                                        let _ = await poller.scanKeychainWithProfile()
+                                        await MainActor.run {
+                                            scanStore.loadFromDatabase()
+                                            isReauthenticating = false
                                         }
-                                    }
-                                } else {
-                                    await MainActor.run {
-                                        isReauthenticating = false
-                                        if let url = URL(string: "https://claude.ai/login") {
-                                            NSWorkspace.shared.open(url)
+                                    } else {
+                                        await MainActor.run {
+                                            isReauthenticating = false
                                         }
                                     }
                                 }
                             }
+                            .font(.caption)
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                            .disabled(isReauthenticating)
                         }
-                        .font(.caption)
-                        .buttonStyle(.bordered)
-                        .controlSize(.mini)
-                        .disabled(isReauthenticating)
+                        Text("Run /login in Claude Code, then Scan Keychain")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
                     }
                     .padding(.top, 4)
                 }
