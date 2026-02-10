@@ -1,5 +1,38 @@
 import SwiftUI
 
+// MARK: - Popover Height Manager
+
+extension CGFloat {
+    func clamped(to range: ClosedRange<CGFloat>) -> CGFloat {
+        return Swift.min(Swift.max(self, range.lowerBound), range.upperBound)
+    }
+}
+
+class PopoverHeightManager: ObservableObject {
+    static let minHeight: CGFloat = 200
+    static let maxHeight: CGFloat = 800
+    static let defaultHeight: CGFloat = 400
+
+    @Published var currentHeight: CGFloat
+    weak var popover: NSPopover?
+
+    private let store: UsageStore
+
+    init(store: UsageStore) {
+        self.store = store
+        if let saved = store.getSetting("popover_height"),
+           let value = Double(saved) {
+            self.currentHeight = CGFloat(value).clamped(to: Self.minHeight...Self.maxHeight)
+        } else {
+            self.currentHeight = Self.defaultHeight
+        }
+    }
+
+    func persist() {
+        store.setSetting("popover_height", value: String(Int(currentHeight)))
+    }
+}
+
 @main
 struct ClaudeMonitorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
@@ -18,6 +51,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var usageStore = UsageStore()
     var oauthPoller = OAuthPoller()
     var loginWizardWindow: NSWindow?
+    var heightManager: PopoverHeightManager!
 
     private let flog = FileLogger.shared
 
@@ -65,15 +99,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.updateStatusButton()
         }
 
+        // Create height manager (reads persisted height from DB)
+        heightManager = PopoverHeightManager(store: usageStore)
+
         // Create popover
         popover = NSPopover()
-        popover?.contentSize = NSSize(width: 320, height: 400)
+        popover?.contentSize = NSSize(width: 320, height: heightManager.currentHeight)
         popover?.behavior = .transient
         popover?.contentViewController = NSHostingController(
-            rootView: UsagePopoverView(store: usageStore, oauthPoller: oauthPoller, onLoginToAll: { [weak self] in
+            rootView: UsagePopoverView(store: usageStore, oauthPoller: oauthPoller, heightManager: heightManager, onLoginToAll: { [weak self] in
                 self?.openLoginWizard()
             })
         )
+        heightManager.popover = popover
 
         // Start round-robin polling — one account per tick, 60s apart
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
@@ -259,6 +297,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if popover.isShown {
                 popover.performClose(nil)
             } else if let button = statusItem?.button {
+                popover.contentSize = NSSize(width: 320, height: heightManager.currentHeight)
                 refreshAll()
                 popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             }

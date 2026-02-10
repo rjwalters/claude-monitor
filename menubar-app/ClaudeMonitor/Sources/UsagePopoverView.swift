@@ -26,6 +26,7 @@ func formatResetTime(_ str: String) -> String {
 struct UsagePopoverView: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var oauthPoller: OAuthPoller
+    @ObservedObject var heightManager: PopoverHeightManager
     var onLoginToAll: (() -> Void)?
     @Environment(\.colorScheme) var colorScheme
     @State private var showGitHubLink = false
@@ -33,6 +34,11 @@ struct UsagePopoverView: View {
     @State private var showMigrationBanner = false
     @State private var showRemoveConfirmation = false
     @State private var accountToRemove: Account?
+
+    /// Chrome height: header (~50) + dividers (~2) + footer (~42) + resize handle (~14)
+    private var scrollViewMaxHeight: CGFloat {
+        heightManager.currentHeight - 108
+    }
 
 
     var body: some View {
@@ -141,7 +147,7 @@ struct UsagePopoverView: View {
                     }
                     .padding()
                 }
-                .frame(maxHeight: 480)
+                .frame(maxHeight: scrollViewMaxHeight)
             }
 
             Divider()
@@ -204,9 +210,10 @@ struct UsagePopoverView: View {
             }
             .padding(.horizontal)
             .padding(.vertical, 10)
+
+            PopoverResizeHandle(heightManager: heightManager)
         }
-        .frame(width: 320)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(width: 320, height: heightManager.currentHeight)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             // Check migration banner (M5.3)
@@ -267,6 +274,45 @@ struct UsagePopoverView: View {
         }
         // Clear account data
         store.clearAccountData(accountId: account.id)
+    }
+}
+
+// MARK: - Popover Resize Handle
+
+struct PopoverResizeHandle: View {
+    @ObservedObject var heightManager: PopoverHeightManager
+    @State private var dragStartHeight: CGFloat = 0
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 2)
+            .fill(Color.secondary.opacity(0.4))
+            .frame(width: 36, height: 4)
+            .padding(.vertical, 5)
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture()
+                    .onChanged { value in
+                        if dragStartHeight == 0 {
+                            dragStartHeight = heightManager.currentHeight
+                        }
+                        let newHeight = (dragStartHeight + value.translation.height)
+                            .clamped(to: PopoverHeightManager.minHeight...PopoverHeightManager.maxHeight)
+                        heightManager.currentHeight = newHeight
+                        heightManager.popover?.contentSize = NSSize(width: 320, height: newHeight)
+                    }
+                    .onEnded { _ in
+                        dragStartHeight = 0
+                        heightManager.persist()
+                    }
+            )
+            .onHover { hovering in
+                if hovering {
+                    NSCursor.resizeUpDown.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
     }
 }
 
