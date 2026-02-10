@@ -504,6 +504,43 @@ class OAuthPoller: ObservableObject {
         }
     }
 
+    // MARK: - Keychain Sync (runs once per poll cycle)
+
+    /// Read the keychain once, identify the account, and update the matching credential.
+    /// Claude Code stores one token at a time in a single keychain entry (`rwalters`).
+    /// When the user does `/login` for a different account, this picks it up.
+    private func syncKeychainTokens() async {
+        // Read token from the single shared keychain entry
+        guard let freshToken = readTokenFromKeychain(service: "Claude Code-credentials", account: nil) else {
+            return
+        }
+        let freshExpiry = readExpiresAtFromKeychain(service: "Claude Code-credentials", account: nil)
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+
+        // Skip if token is expired
+        if let exp = freshExpiry, exp <= now {
+            return
+        }
+
+        // Identify which account this token belongs to
+        guard let profile = try? await apiClient.fetchProfile(accessToken: freshToken) else {
+            flog.warning("syncKeychainTokens: profile fetch failed", category: fcat)
+            return
+        }
+
+        let tokenAccountId = profile.organization.uuid
+        let credentials = loadActiveCredentials()
+
+        // Find the credential(s) matching this account and update if their token is stale
+        for cred in credentials where cred.source == "keychain" && cred.accountId == tokenAccountId {
+            let health = checkTokenHealth(cred)
+            if health == .missing || health == .expired || cred.accessToken != freshToken {
+                flog.info("syncKeychainTokens: updating token for \(cred.label) (\(tokenAccountId))", category: fcat)
+                updateStoredToken(cred, accessToken: freshToken, expiresAt: freshExpiry)
+            }
+        }
+    }
+
     // MARK: - Polling (round-robin, one account per tick)
 
     /// Index of the next credential to poll (round-robin)
@@ -512,6 +549,8 @@ class OAuthPoller: ObservableObject {
     /// Poll the next credential in round-robin order.
     /// Called once per timer tick (60s) so API calls are spaced out.
     func pollNext() async {
+        await syncKeychainTokens()
+
         let credentials = loadActiveCredentials()
         guard !credentials.isEmpty else {
             flog.info("pollNext: no active credentials", category: fcat)
@@ -532,6 +571,8 @@ class OAuthPoller: ObservableObject {
 
     /// Poll all credentials at once (used for initial load and manual refresh).
     func pollAll() async {
+        await syncKeychainTokens()
+
         let credentials = loadActiveCredentials()
         guard !credentials.isEmpty else {
             flog.info("pollAll: no active credentials", category: fcat)
@@ -591,54 +632,6 @@ class OAuthPoller: ObservableObject {
                 updateCredentialLastPoll(credential, error: nil)
                 updateCredentialStatus(credential, status: .valid, error: nil)
                 return
-            } else if (tokenHealth == .expired || tokenHealth == .missing) && credential.source == "keychain" {
-                // Re-read from keychain — Claude Code may have refreshed the token
-                flog.info("Re-reading keychain for \(tokenHealth.rawValue) credential \(credential.label)", category: fcat)
-                if let freshToken = readTokenFromKeychain(service: credential.keychainService, account: credential.keychainAccount) {
-                    let freshExpiry = readExpiresAtFromKeychain(service: credential.keychainService, account: credential.keychainAccount)
-                    let now = Int64(Date().timeIntervalSince1970 * 1000)
-                    // Accept if expiry is in the future or nil (no expiry info)
-                    if freshExpiry == nil || freshExpiry! > now {
-                        // Verify token belongs to this credential's account before using it
-                        // (keychain may contain a token for a different account)
-                        if let expectedAccountId = credential.accountId {
-                            if let profile = try? await apiClient.fetchProfile(accessToken: freshToken) {
-                                let tokenAccountId = profile.organization.uuid
-                                if tokenAccountId != expectedAccountId {
-                                    flog.info("Re-read keychain: token belongs to \(tokenAccountId), not \(expectedAccountId) — skipping", category: fcat)
-                                    // Don't use this token — it's for a different account
-                                } else {
-                                    flog.info("Re-read keychain: verified token for \(credential.label) (expires: \(freshExpiry.map { String($0) } ?? "nil"))", category: fcat)
-                                    updateStoredToken(credential, accessToken: freshToken, expiresAt: freshExpiry)
-                                    let usage = try await apiClient.fetchUsage(accessToken: freshToken)
-                                    writeUsageToDB(credential: credential, usage: usage)
-                                    updateCredentialLastPoll(credential, error: nil)
-                                    updateCredentialStatus(credential, status: .valid, error: nil)
-                                    return
-                                }
-                            } else {
-                                flog.warning("Re-read keychain: profile fetch failed, cannot verify account", category: fcat)
-                            }
-                        } else {
-                            // No account_id yet — use token and let profile association happen
-                            flog.info("Re-read keychain: got fresh token for \(credential.label) (no account_id, expires: \(freshExpiry.map { String($0) } ?? "nil"))", category: fcat)
-                            updateStoredToken(credential, accessToken: freshToken, expiresAt: freshExpiry)
-                            updateCredentialStatus(credential, status: .refreshing, error: "Re-reading from keychain")
-                            let usage = try await apiClient.fetchUsage(accessToken: freshToken)
-                            if let profile = try? await apiClient.fetchProfile(accessToken: freshToken) {
-                                updateAccountFromProfile(credential: credential, profile: profile)
-                            }
-                            writeUsageToDB(credential: credential, usage: usage)
-                            updateCredentialLastPoll(credential, error: nil)
-                            updateCredentialStatus(credential, status: .valid, error: nil)
-                            return
-                        }
-                    } else {
-                        flog.info("Re-read keychain: token still expired for \(credential.label)", category: fcat)
-                    }
-                } else {
-                    flog.info("Re-read keychain: no token found for \(credential.label)", category: fcat)
-                }
             }
             throw AnthropicAPIError.unauthorized
         }
