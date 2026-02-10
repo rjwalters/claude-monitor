@@ -653,6 +653,66 @@ class UsageStore: ObservableObject {
         }
     }
 
+    func moveAccountToBottom(accountId: String) {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return
+            }
+
+            let db = try Connection(dbPath)
+            let accountsTable = Table("accounts")
+            let id = SQLite.Expression<String>("id")
+            let sortOrder = SQLite.Expression<Int?>("sort_order")
+
+            // Get current accounts in order
+            let query = accountsTable.order(sortOrder.asc)
+            var accountIds: [String] = []
+            for row in try db.prepare(query) {
+                accountIds.append(row[id])
+            }
+
+            // Find and move target to end
+            guard let targetIndex = accountIds.firstIndex(of: accountId) else {
+                return
+            }
+
+            // Already at bottom, no need to reorder
+            if targetIndex == accountIds.count - 1 {
+                return
+            }
+
+            // Reorder: move target to end
+            let targetId = accountIds.remove(at: targetIndex)
+            accountIds.append(targetId)
+
+            // Update all sort orders
+            for (index, accId) in accountIds.enumerated() {
+                let account = accountsTable.filter(id == accId)
+                try db.run(account.update(sortOrder <- index))
+            }
+
+            // Set new top account as primary
+            if let newTopId = accountIds.first {
+                primaryAccountId = newTopId
+            }
+
+            // Immediately update local state for instant UI feedback
+            if let localIndex = accounts.firstIndex(where: { $0.id == accountId }) {
+                let movedAccount = accounts.remove(at: localIndex)
+                accounts.append(movedAccount)
+                onAccountsChanged?()
+            }
+
+            // Reload to get any other database changes
+            loadFromDatabase()
+
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to reorder account: \(error.localizedDescription)"
+            }
+        }
+    }
+
     func clearAccountData(accountId: String) {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {

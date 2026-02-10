@@ -131,6 +131,7 @@ struct UsagePopoverView: View {
                                 store: store,
                                 oauthPoller: oauthPoller,
                                 isFirst: index == 0,
+                                isLast: index == store.accounts.count - 1,
                                 onRemove: {
                                     accountToRemove = account
                                     showRemoveConfirmation = true
@@ -514,6 +515,7 @@ struct ClickableAccountCard: View {
     let store: UsageStore
     var oauthPoller: OAuthPoller? = nil
     var isFirst: Bool = false
+    var isLast: Bool = false
     var onRemove: (() -> Void)? = nil
     @State private var isHovering = false
     @State private var isEditing = false
@@ -557,6 +559,34 @@ struct ClickableAccountCard: View {
                             Image(systemName: "arrow.up.to.line")
                                 .font(.system(size: 9))
                             Text("Pin to top")
+                                .font(.system(size: 10))
+                        }
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.9))
+                        .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(8)
+                    .onHover { hovering in
+                        if hovering {
+                            NSCursor.pointingHand.push()
+                        } else {
+                            NSCursor.pop()
+                        }
+                    }
+                }
+
+                // Send to bottom button (only shown on hover for the first card when not also last)
+                if isFirst && !isLast && isHovering {
+                    Button(action: {
+                        store.moveAccountToBottom(accountId: account.id)
+                    }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "arrow.down.to.line")
+                                .font(.system(size: 9))
+                            Text("Send to bottom")
                                 .font(.system(size: 10))
                         }
                         .foregroundColor(.secondary)
