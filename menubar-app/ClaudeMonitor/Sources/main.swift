@@ -51,6 +51,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var usageStore = UsageStore()
     var oauthPoller = OAuthPoller()
     var loginWizardWindow: NSWindow?
+    var summaryWindow: NSWindow?
     var heightManager: PopoverHeightManager!
 
     private let flog = FileLogger.shared
@@ -109,6 +110,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover?.contentViewController = NSHostingController(
             rootView: UsagePopoverView(store: usageStore, oauthPoller: oauthPoller, heightManager: heightManager, onLoginToAll: { [weak self] in
                 self?.openLoginWizard()
+            }, onSummary: { [weak self] in
+                self?.openSummaryWindow()
             })
         )
         heightManager.popover = popover
@@ -347,6 +350,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.loginWizardWindow = window
 
             self.flog.info("Login wizard window opened", category: "App")
+        }
+    }
+
+    // MARK: - Summary Window
+
+    func openSummaryWindow() {
+        flog.info("openSummaryWindow called", category: "App")
+
+        popover?.performClose(nil)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            guard let self = self else { return }
+
+            if let window = self.summaryWindow, window.isVisible {
+                window.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+                return
+            }
+
+            let summaryView = SummaryTableView(store: self.usageStore, oauthPoller: self.oauthPoller, onDone: { [weak self] in
+                self?.summaryWindow?.close()
+                self?.summaryWindow = nil
+            })
+
+            let hostingController = NSHostingController(rootView: summaryView)
+            if #available(macOS 13.0, *) {
+                hostingController.sizingOptions = []
+            }
+            let window = NSWindow(contentViewController: hostingController)
+            window.title = "Account Summary"
+            window.styleMask = [.titled, .closable]
+            window.setContentSize(NSSize(width: 480, height: 400))
+            window.center()
+            window.isReleasedWhenClosed = false
+            window.level = .floating
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            self.summaryWindow = window
+
+            self.flog.info("Summary window opened", category: "App")
         }
     }
 }

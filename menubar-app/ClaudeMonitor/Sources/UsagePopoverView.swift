@@ -1,9 +1,26 @@
 import SwiftUI
 
+/// Format a time interval using a single unit with decreasing precision:
+/// "34 min" (up to 90 min), "1.5 hrs" (half-hour granularity), "3 days" (rounded up).
+func formatInterval(_ seconds: TimeInterval) -> String {
+    if seconds <= 0 { return "now" }
+    let minutes = seconds / 60
+    if minutes < 90 { return "\(Int(minutes)) min" }
+    let hours = seconds / 3600
+    if hours < 24 {
+        let rounded = (hours * 2).rounded() / 2  // nearest 0.5
+        if rounded == rounded.rounded() {
+            return "\(Int(rounded)) hrs"
+        }
+        return String(format: "%.1f hrs", rounded)
+    }
+    let days = Int(ceil(seconds / 86400))
+    return "\(days) \(days == 1 ? "day" : "days")"
+}
+
 /// Format a reset time string for display.
 /// Handles both ISO 8601 timestamps (from API) and relative strings.
 func formatResetTime(_ str: String) -> String {
-    // Try ISO 8601 parse
     let isoFormatter = ISO8601DateFormatter()
     isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let date = isoFormatter.date(from: str) ?? ISO8601DateFormatter().date(from: str)
@@ -11,15 +28,10 @@ func formatResetTime(_ str: String) -> String {
     if let date = date {
         let interval = date.timeIntervalSinceNow
         if interval <= 0 { return "Reset" }
-        let hours = Int(interval) / 3600
-        let minutes = (Int(interval) % 3600) / 60
-        if hours > 0 {
-            return "Resets in \(hours) hr \(minutes) min"
-        }
-        return "Resets in \(minutes) min"
+        return "Resets in \(formatInterval(interval))"
     }
 
-    // Already a relative string (e.g. "in 23 hr 57 min") — return as-is
+    // Already a relative string — return as-is
     return str
 }
 
@@ -172,10 +184,9 @@ struct UsagePopoverView: View {
     }
 
     func timeAgo(_ date: Date) -> String {
-        let seconds = Int(-date.timeIntervalSinceNow)
+        let seconds = -date.timeIntervalSinceNow
         if seconds < 60 { return "just now" }
-        if seconds < 3600 { return "\(seconds / 60)m ago" }
-        return "\(seconds / 3600)h ago"
+        return "\(formatInterval(seconds)) ago"
     }
 
     private func openLoginWizard() {
