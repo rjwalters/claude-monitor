@@ -515,10 +515,26 @@ class OAuthPoller: ObservableObject {
             return
         }
         let freshExpiry = readExpiresAtFromKeychain(service: "Claude Code-credentials", account: nil)
+        let freshRefreshToken = readRefreshTokenFromKeychain(service: "Claude Code-credentials", account: nil)
         let now = Int64(Date().timeIntervalSince1970 * 1000)
 
-        // Skip if token is expired
+        // If token is expired, attempt refresh using stored refresh token
         if let exp = freshExpiry, exp <= now {
+            flog.info("syncKeychainTokens: keychain token is expired, attempting refresh", category: fcat)
+            let credentials = loadActiveCredentials()
+            for cred in credentials where cred.source == "keychain" {
+                // Use fresh refresh token from keychain, fall back to stored one
+                let rt = freshRefreshToken ?? cred.refreshToken
+                guard let refreshToken = rt else { continue }
+                do {
+                    let refreshResponse = try await apiClient.refreshToken(refreshToken: refreshToken)
+                    flog.info("syncKeychainTokens: refreshed expired token for \(cred.label)", category: fcat)
+                    updateCredentialTokens(cred, response: refreshResponse)
+                    updateCredentialStatus(cred, status: .valid, error: nil)
+                } catch {
+                    flog.warning("syncKeychainTokens: refresh failed for \(cred.label): \(error.localizedDescription)", category: fcat)
+                }
+            }
             return
         }
 
@@ -536,7 +552,7 @@ class OAuthPoller: ObservableObject {
             let health = checkTokenHealth(cred)
             if health == .missing || health == .expired || cred.accessToken != freshToken {
                 flog.info("syncKeychainTokens: updating token for \(cred.label) (\(tokenAccountId))", category: fcat)
-                updateStoredToken(cred, accessToken: freshToken, expiresAt: freshExpiry)
+                updateStoredToken(cred, accessToken: freshToken, expiresAt: freshExpiry, refreshToken: freshRefreshToken)
             }
         }
     }
@@ -619,10 +635,10 @@ class OAuthPoller: ObservableObject {
         flog.info("Token health for \(credential.label): \(tokenHealth.rawValue)", category: fcat)
         if tokenHealth == .expired || tokenHealth == .missing {
             updateCredentialStatus(credential, status: tokenHealth, error: "Token \(tokenHealth.rawValue)")
-            if tokenHealth == .expired && credential.source == "manual", let refreshToken = credential.refreshToken {
-                // Try automatic refresh for manual credentials
-                logger.info("Attempting automatic token refresh for \(credential.label)")
-                flog.info("Attempting automatic token refresh for \(credential.label)", category: fcat)
+            if tokenHealth == .expired, let refreshToken = credential.refreshToken {
+                // Try automatic refresh for expired tokens
+                logger.info("Auto-refreshing expired token for \(credential.label)")
+                flog.info("Auto-refreshing expired token for \(credential.label)", category: fcat)
                 updateCredentialStatus(credential, status: .refreshing, error: nil)
                 let refreshResponse = try await apiClient.refreshToken(refreshToken: refreshToken)
                 updateCredentialTokens(credential, response: refreshResponse)
@@ -634,6 +650,29 @@ class OAuthPoller: ObservableObject {
                 return
             }
             throw AnthropicAPIError.unauthorized
+        }
+
+        // Proactive refresh: refresh tokens nearing expiry (within 5 minutes)
+        if tokenHealth == .valid, let expiresAt = credential.expiresAt, let refreshToken = credential.refreshToken {
+            let now = Int64(Date().timeIntervalSince1970 * 1000)
+            let fiveMinutes: Int64 = 5 * 60 * 1000
+            if expiresAt - now < fiveMinutes {
+                logger.info("Proactively refreshing nearly-expired token for \(credential.label)")
+                flog.info("Proactively refreshing nearly-expired token for \(credential.label) (expires in \((expiresAt - now) / 1000)s)", category: fcat)
+                updateCredentialStatus(credential, status: .refreshing, error: nil)
+                do {
+                    let refreshResponse = try await apiClient.refreshToken(refreshToken: refreshToken)
+                    updateCredentialTokens(credential, response: refreshResponse)
+                    let usage = try await apiClient.fetchUsage(accessToken: refreshResponse.accessToken)
+                    writeUsageToDB(credential: credential, usage: usage)
+                    updateCredentialLastPoll(credential, error: nil)
+                    updateCredentialStatus(credential, status: .valid, error: nil)
+                    return
+                } catch {
+                    flog.warning("Proactive refresh failed for \(credential.label): \(error.localizedDescription) — continuing with current token", category: fcat)
+                    // Fall through to use the still-valid (but soon-to-expire) token
+                }
+            }
         }
 
         guard let token = resolveAccessToken(credential) else {
@@ -658,7 +697,7 @@ class OAuthPoller: ObservableObject {
             }
         } catch AnthropicAPIError.unauthorized {
             // Try refresh if we have a refresh token (manual source)
-            if credential.source == "manual", let refreshToken = credential.refreshToken {
+            if let refreshToken = credential.refreshToken {
                 do {
                     updateCredentialStatus(credential, status: .refreshing, error: nil)
                     let refreshResponse = try await apiClient.refreshToken(refreshToken: refreshToken)
@@ -778,6 +817,33 @@ class OAuthPoller: ObservableObject {
 
         let json = (topJson["claudeAiOauth"] as? [String: Any]) ?? topJson
         return json["expiresAt"] as? Int64 ?? json["expires_at"] as? Int64
+    }
+
+    private func readRefreshTokenFromKeychain(service: String?, account: String?) -> String? {
+        guard let service = service else { return nil }
+
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        if let account = account {
+            query[kSecAttrAccount as String] = account
+        }
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let topJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        let json = (topJson["claudeAiOauth"] as? [String: Any]) ?? topJson
+        return json["refreshToken"] as? String ?? json["refresh_token"] as? String
     }
 
     // MARK: - Credential Status Tracking (M1.2)
@@ -956,16 +1022,16 @@ class OAuthPoller: ObservableObject {
         updateCredentialLastPoll(credential, error: error)
     }
 
-    /// Update stored access_token and expires_at from raw values (used for keychain re-reads)
-    private func updateStoredToken(_ credential: OAuthCredential, accessToken: String, expiresAt: Int64?) {
+    /// Update stored access_token, expires_at, and optionally refresh_token from raw values (used for keychain re-reads)
+    private func updateStoredToken(_ credential: OAuthCredential, accessToken: String, expiresAt: Int64?, refreshToken: String? = nil) {
         guard let credId = credential.id,
               FileManager.default.fileExists(atPath: dbPath) else { return }
         do {
             let db = try Connection(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
             try db.run(
-                "UPDATE oauth_credentials SET access_token = ?, expires_at = ?, updated_at = ? WHERE id = ?",
-                accessToken, expiresAt, now, credId
+                "UPDATE oauth_credentials SET access_token = ?, expires_at = ?, refresh_token = COALESCE(?, refresh_token), updated_at = ? WHERE id = ?",
+                accessToken, expiresAt, refreshToken, now, credId
             )
             flog.info("Updated stored token for credential \(credId) from keychain", category: fcat)
         } catch {
