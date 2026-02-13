@@ -7,9 +7,9 @@ Monitor your Claude AI usage with a macOS menu bar widget. Reads OAuth credentia
 
 ## Why?
 
-Anthropic doesn't provide API access to usage data for consumer subscriptions (Pro/Max). The only way to see your usage is at https://claude.ai/settings/usage, which is protected by Cloudflare bot detection.
+Anthropic doesn't expose a documented, public API for checking consumer subscription usage (Pro/Max). The web dashboard at https://claude.ai/settings/usage shows your limits, but there's no programmatic equivalent.
 
-This tool uses Claude Code's OAuth credentials (stored in the macOS Keychain) to fetch your usage data directly from the Anthropic API and display it in a convenient menu bar widget.
+This tool uses Claude Code's OAuth credentials (stored in the macOS Keychain) to poll the same internal API endpoints and display your usage data in a convenient menu bar widget.
 
 ## Features
 
