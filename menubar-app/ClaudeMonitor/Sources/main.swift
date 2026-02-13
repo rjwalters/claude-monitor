@@ -61,7 +61,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        flog.info("ClaudeMonitor launched (v2.0.0)", category: "App")
+        flog.info("ClaudeMonitor launched (v1.8.0)", category: "App")
 
         // Ensure database exists (standalone mode without native host)
         usageStore.ensureDatabase()
