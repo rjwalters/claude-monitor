@@ -807,16 +807,6 @@ class UsageStore: ObservableObject {
         }
     }
 
-    /// Check if native host manifests exist (for migration notice M5.3)
-    var hasNativeHostManifests: Bool {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let firefoxPath = home
-            .appendingPathComponent("Library/Application Support/Mozilla/NativeMessagingHosts/claude_monitor.json")
-        let chromePath = home
-            .appendingPathComponent("Library/Application Support/Google/Chrome/NativeMessagingHosts/claude_monitor.json")
-        return FileManager.default.fileExists(atPath: firefoxPath.path)
-            || FileManager.default.fileExists(atPath: chromePath.path)
-    }
 }
 
 // MARK: - Update Checker

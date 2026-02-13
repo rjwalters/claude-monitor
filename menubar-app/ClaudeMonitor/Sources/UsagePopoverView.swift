@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Format a reset time string for display.
-/// Handles both ISO 8601 timestamps (from API) and relative strings (from extension).
+/// Handles both ISO 8601 timestamps (from API) and relative strings.
 func formatResetTime(_ str: String) -> String {
     // Try ISO 8601 parse
     let isoFormatter = ISO8601DateFormatter()
@@ -28,10 +28,10 @@ struct UsagePopoverView: View {
     @ObservedObject var oauthPoller: OAuthPoller
     @ObservedObject var heightManager: PopoverHeightManager
     var onLoginToAll: (() -> Void)?
+    var onSummary: (() -> Void)?
     @Environment(\.colorScheme) var colorScheme
     @State private var showGitHubLink = false
     @State private var titleHoverTimer: Timer?
-    @State private var showMigrationBanner = false
     @State private var showRemoveConfirmation = false
     @State private var accountToRemove: Account?
 
@@ -100,28 +100,6 @@ struct UsagePopoverView: View {
 
             Divider()
 
-            // Migration notice (M5.3)
-            if showMigrationBanner {
-                HStack {
-                    Image(systemName: "info.circle")
-                        .foregroundColor(.blue)
-                    Text("The browser extension is no longer needed. OAuth is now the default.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Button(action: dismissMigrationBanner) {
-                        Image(systemName: "xmark")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal)
-                .padding(.vertical, 6)
-                .background(Color.blue.opacity(0.1))
-
-                Divider()
-            }
 
             if let error = store.error {
                 SetupGuideView(oauthPoller: oauthPoller, store: store, error: error)
@@ -154,53 +132,19 @@ struct UsagePopoverView: View {
 
             // Footer
             HStack {
-                // Open Usage Page as a hyperlink
-                Button(action: {
-                    if let url = URL(string: "https://claude.ai/settings/usage") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }) {
-                    Text("Open Usage Page")
-                        .underline()
+                Button(action: { onSummary?() }) {
+                    Label("Summary", systemImage: "tablecells")
                 }
-                .buttonStyle(.plain)
-                .foregroundColor(.accentColor)
-                .onHover { hovering in
-                    if hovering {
-                        NSCursor.pointingHand.push()
-                    } else {
-                        NSCursor.pop()
-                    }
-                }
-
-                Text("·")
-                    .foregroundColor(.secondary)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
 
                 Button(action: openLoginWizard) {
-                    Text("Login to All")
-                        .underline()
+                    Label("Keychain", systemImage: "key")
                 }
-                .buttonStyle(.plain)
-                .foregroundColor(.accentColor)
-                .onHover { hovering in
-                    if hovering {
-                        NSCursor.pointingHand.push()
-                    } else {
-                        NSCursor.pop()
-                    }
-                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
 
                 Spacer()
-
-                // Add account button (M2.2)
-                if !store.accounts.isEmpty {
-                    Button(action: addAccount) {
-                        Image(systemName: "plus")
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Import credentials from Keychain")
-                }
 
                 Button("Quit") {
                     NSApp.terminate(nil)
@@ -215,12 +159,6 @@ struct UsagePopoverView: View {
         }
         .frame(width: 320, height: heightManager.currentHeight)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear {
-            // Check migration banner (M5.3)
-            if store.hasNativeHostManifests && store.getSetting("migration_banner_dismissed") == nil {
-                showMigrationBanner = true
-            }
-        }
         .alert("Remove Account?", isPresented: $showRemoveConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Remove", role: .destructive) {
@@ -242,27 +180,6 @@ struct UsagePopoverView: View {
 
     private func openLoginWizard() {
         onLoginToAll?()
-    }
-
-    // M2.2: Re-scan keychain and import new credentials
-    private func addAccount() {
-        let results = oauthPoller.importAllFromKeychain()
-        var imported = 0
-        for result in results {
-            if case .success(let credential) = result {
-                store.ensureDatabase()
-                oauthPoller.saveCredential(credential)
-                imported += 1
-            }
-        }
-        if imported > 0 {
-            store.loadFromDatabase()
-        }
-    }
-
-    private func dismissMigrationBanner() {
-        showMigrationBanner = false
-        store.setSetting("migration_banner_dismissed", value: "1")
     }
 
     // M4.3: Remove account
@@ -828,7 +745,7 @@ struct CardButtonStyle: ButtonStyle {
     }
 }
 
-// MARK: - Setup Guide (M5.1: extension buttons removed)
+// MARK: - Setup Guide
 
 struct SetupGuideView: View {
     @ObservedObject var oauthPoller: OAuthPoller
@@ -878,7 +795,7 @@ struct SetupGuideView: View {
                 }
             }
 
-            // Action buttons (M5.1: extension buttons removed)
+            // Action buttons
             VStack(spacing: 12) {
                 Button(action: importFromClaudeCode) {
                     Label("Import from Claude Code", systemImage: "key")
@@ -1056,5 +973,171 @@ struct LoginWizardView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Summary Table
+
+struct SummaryTableView: View {
+    @ObservedObject var store: UsageStore
+    @ObservedObject var oauthPoller: OAuthPoller
+    var onDone: () -> Void
+
+    /// Accounts sorted by availability: most usable first.
+    /// Effective usage = max(session%, weekly%) — lower is more available.
+    /// Ties broken by earliest reset time (sooner reset = more useful soon).
+    private var sortedAccounts: [(account: Account, usage: UsageRecord?)] {
+        store.accounts.map { account in
+            (account: account, usage: store.latestUsage[account.id])
+        }.sorted { a, b in
+            let aEffective = max(a.usage?.sessionPercent ?? 0, a.usage?.weeklyAllPercent ?? 0)
+            let bEffective = max(b.usage?.sessionPercent ?? 0, b.usage?.weeklyAllPercent ?? 0)
+            if aEffective != bEffective { return aEffective < bEffective }
+            let aReset = resetSeconds(a.usage)
+            let bReset = resetSeconds(b.usage)
+            return aReset < bReset
+        }
+    }
+
+    /// Seconds until reset (session first, then weekly). Returns large value if unknown.
+    private func resetSeconds(_ usage: UsageRecord?) -> TimeInterval {
+        guard let usage = usage else { return .greatestFiniteMagnitude }
+        for str in [usage.sessionReset, usage.weeklyReset].compactMap({ $0 }) {
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = iso.date(from: str) ?? ISO8601DateFormatter().date(from: str) {
+                return date.timeIntervalSinceNow
+            }
+        }
+        return .greatestFiniteMagnitude
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header row
+            HStack(spacing: 0) {
+                Text("Account")
+                    .frame(width: 120, alignment: .leading)
+                Text("Session")
+                    .frame(width: 70, alignment: .trailing)
+                Text("Weekly")
+                    .frame(width: 70, alignment: .trailing)
+                Text("Reset")
+                    .frame(width: 100, alignment: .trailing)
+                Text("Token")
+                    .frame(width: 60, alignment: .center)
+            }
+            .font(.caption.bold())
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            Divider()
+
+            // Rows
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(sortedAccounts, id: \.account.id) { item in
+                        SummaryRow(
+                            account: item.account,
+                            usage: item.usage,
+                            oauthPoller: oauthPoller
+                        )
+                    }
+                }
+            }
+
+            Divider()
+
+            // Footer
+            HStack {
+                Spacer()
+                Button("Close") { onDone() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+            .padding(10)
+        }
+        .frame(width: 460)
+    }
+}
+
+struct SummaryRow: View {
+    let account: Account
+    let usage: UsageRecord?
+    let oauthPoller: OAuthPoller
+    @Environment(\.colorScheme) var colorScheme
+
+    private var tokenStatus: TokenStatus {
+        guard let status = oauthPoller.credentialStatuses.first(where: { $0.accountId == account.id }) else {
+            return .missing
+        }
+        return status.status
+    }
+
+    private var tokenDotColor: Color {
+        switch tokenStatus {
+        case .valid: return .green
+        case .refreshing: return .yellow
+        case .expired, .revoked, .error: return .red
+        case .missing: return .gray
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(account.displayName)
+                .lineLimit(1)
+                .frame(width: 120, alignment: .leading)
+
+            percentText(usage?.sessionPercent)
+                .frame(width: 70, alignment: .trailing)
+
+            percentText(usage?.weeklyAllPercent)
+                .frame(width: 70, alignment: .trailing)
+
+            Text(resetLabel)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .frame(width: 100, alignment: .trailing)
+
+            Circle()
+                .fill(tokenDotColor)
+                .frame(width: 8, height: 8)
+                .help(tokenStatus.rawValue)
+                .frame(width: 60)
+        }
+        .font(.caption)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(colorScheme == .dark ? Color.white.opacity(0.02) : Color.clear)
+    }
+
+    private var resetLabel: String {
+        if let reset = usage?.sessionReset {
+            return formatResetTime(reset)
+        }
+        if let reset = usage?.weeklyReset {
+            return formatResetTime(reset)
+        }
+        return "—"
+    }
+
+    @ViewBuilder
+    private func percentText(_ value: Double?) -> some View {
+        if let pct = value {
+            Text("\(Int(pct))%")
+                .foregroundColor(colorForPercent(pct))
+        } else {
+            Text("—")
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func colorForPercent(_ percent: Double) -> Color {
+        if percent > 95 { return Color(nsColor: .systemRed) }
+        if percent >= 90 { return Color(nsColor: .systemOrange) }
+        return .primary
     }
 }

@@ -17,10 +17,12 @@ This tool uses Claude Code's OAuth credentials (stored in the macOS Keychain) to
 - Color-coded status: normal (<90%), orange (90-95%), red (>95%)
 - Detailed breakdown: session limits, weekly limits (all models & Sonnet)
 - Usage history charts with token usage overlay
+- Summary table view across all accounts
 - Multi-account support via OAuth keychain credentials
-- Account switching (right-click menu bar icon or popover picker)
-- Token health monitoring with re-auth prompts
-- Auto-refreshes every 30 seconds with exponential backoff on errors
+- Account reordering (drag to reorder, right-click menu bar icon to switch)
+- Token health monitoring with automatic refresh (including proactive refresh before expiry)
+- Automatic keychain sync — picks up new tokens from Claude Code `/login`
+- Round-robin polling every 60 seconds with exponential backoff on errors
 
 ## Quick Install (End Users)
 
@@ -40,17 +42,17 @@ Unzip and move `ClaudeMonitor.app` to your Applications folder.
 ### 3. Setup
 
 1. Click the menu bar widget
-2. Click "Import from Claude Code"
+2. Click the **Keychain** button in the footer to scan for Claude Code credentials
 3. Your usage data will appear in the menu bar!
 
 ### Multiple Accounts
 
 Claude Monitor supports multiple Claude Code accounts:
 
-1. Sign into each account with Claude Code (each gets a separate keychain entry)
-2. Click the "+" button in the footer to re-scan the keychain
+1. Sign into each account with Claude Code (`/login` in the CLI)
+2. Click the **Keychain** button in the footer to re-scan
 3. Right-click the menu bar icon to quickly switch which account shows in the badge
-4. Use the account picker in the popover to change the primary displayed account
+4. Drag account cards in the popover to reorder them
 
 ## Architecture
 
@@ -58,19 +60,19 @@ Claude Monitor supports multiple Claude Code accounts:
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  macOS Keychain (Claude Code OAuth credentials)                         │
 └──────────────────────────┬──────────────────────────────────────────────┘
-                           │ Reads tokens
+                           │ Reads tokens + refresh tokens
                            ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  OAuthPoller → Anthropic API → SQLite (~/.claude-monitor/usage.db)      │
-│  - Concurrent polling per account with exponential backoff              │
-│  - Auto-detects new keychain entries every 5 minutes                    │
-│  - Token health monitoring (valid/expired/revoked)                      │
+│  - Round-robin polling (one account per tick, 60s interval)             │
+│  - Automatic token refresh (expired + proactive near-expiry)            │
+│  - Keychain sync picks up rotated tokens from Claude Code               │
 └──────────────────────────┬──────────────────────────────────────────────┘
                            │ Reads DB
                            ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  macOS Menu Bar App (SwiftUI) - shows usage % with click for details    │
-│  - Left-click: popover with account cards                               │
+│  - Left-click: popover with account cards and summary table             │
 │  - Right-click: quick account switcher                                  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -80,7 +82,7 @@ Claude Monitor supports multiple Claude Code accounts:
 ### Requirements
 
 - macOS 13+ (Ventura or later)
-- Xcode Command Line Tools
+- Xcode Command Line Tools (`xcode-select --install`)
 - Claude Code installed and signed in
 
 ### 1. Clone the repository
@@ -100,7 +102,7 @@ swift build
 
 ### 3. Import Credentials
 
-Click the menu bar widget, then click "Import from Claude Code" to read your Claude Code OAuth credentials from the macOS Keychain.
+Click the menu bar widget, then click the **Keychain** button to read your Claude Code OAuth credentials from the macOS Keychain.
 
 ## Building for Release
 
@@ -125,7 +127,7 @@ cat > ~/Library/LaunchAgents/com.claude-monitor.plist << 'EOF'
     <string>com.claude-monitor</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/YOUR_USERNAME/GitHub/claude-monitor/menubar-app/ClaudeMonitor/.build/debug/ClaudeMonitor</string>
+        <string>/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -134,9 +136,6 @@ cat > ~/Library/LaunchAgents/com.claude-monitor.plist << 'EOF'
 </dict>
 </plist>
 EOF
-
-# Update the path with your actual username
-sed -i '' "s/YOUR_USERNAME/$(whoami)/g" ~/Library/LaunchAgents/com.claude-monitor.plist
 
 # Load it
 launchctl load ~/Library/LaunchAgents/com.claude-monitor.plist
@@ -152,13 +151,20 @@ rm ~/Library/LaunchAgents/com.claude-monitor.plist
 
 ### Menu bar shows "LLM --"
 
-No data has been collected yet. Click the widget and import your Claude Code credentials.
+No data has been collected yet. Click the widget and scan the keychain for your Claude Code credentials.
 
-### Import fails
+### Keychain scan fails
 
 1. Make sure Claude Code is installed and you've signed in (`claude` in terminal)
 2. Check that the keychain entry exists: Keychain Access > search "Claude Code"
 3. The app needs permission to read the keychain — click "Always Allow" when prompted
+
+### Logs
+
+Debug logs are written to:
+```
+~/.claude-monitor/debug.log
+```
 
 ### Database location
 
@@ -186,8 +192,8 @@ rm ~/Library/LaunchAgents/com.claude-monitor.plist 2>/dev/null
 # Remove data
 rm -rf ~/.claude-monitor
 
-# Delete the repo
-rm -rf /path/to/claude-monitor
+# Remove the app
+rm -rf /Applications/ClaudeMonitor.app
 ```
 
 ## Project Structure
@@ -201,14 +207,11 @@ claude-monitor/
 │       ├── UsageStore.swift     # SQLite data access, settings
 │       ├── UsagePopoverView.swift # SwiftUI popover UI
 │       ├── UsageChartView.swift # Chart window
-│       ├── OAuthPoller.swift    # OAuth polling, keychain, retry logic
-│       └── AnthropicAPI.swift   # API client, response types
-├── src/                          # CLI tool (optional)
-│   ├── cli.ts
-│   └── reader.ts
-├── scripts/
-│   └── build-macos-app.sh       # Build script for distribution
-└── package.json
+│       ├── OAuthPoller.swift    # OAuth polling, keychain sync, token refresh
+│       ├── AnthropicAPI.swift   # API client, response types
+│       └── FileLogger.swift     # Debug logging
+└── scripts/
+    └── build-macos-app.sh       # Build script for distribution
 ```
 
 ## Related Projects
@@ -220,8 +223,6 @@ claude-monitor/
 **How they differ from Claude Monitor:**
 - ccusage/VibePulse read **local Claude Code logs** → show token counts and API-equivalent costs
 - Claude Monitor reads **the Anthropic API via OAuth** → shows quota percentages and reset times
-
-Claude Monitor now integrates local token data alongside OAuth-sourced quota info, giving you both views in one app.
 
 ## License
 
