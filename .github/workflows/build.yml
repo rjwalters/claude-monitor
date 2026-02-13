@@ -16,6 +16,3 @@ jobs:
         run: |
           cd menubar-app/ClaudeMonitor
           swift build
-
-      - name: Build Extension Package
-        run: ./scripts/build-extension.sh
