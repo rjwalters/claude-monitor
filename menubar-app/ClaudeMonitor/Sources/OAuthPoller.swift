@@ -356,6 +356,72 @@ class OAuthPoller: ObservableObject {
         }
     }
 
+    // MARK: - Deduplication
+
+    /// Deduplicate credentials at startup: if an account_id has multiple active credentials,
+    /// keep the most recently updated one, merge refresh_token from older ones, deactivate duplicates.
+    func deduplicateCredentials() {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return }
+        do {
+            let db = try Connection(dbPath)
+            let now = ISO8601DateFormatter().string(from: Date())
+
+            // Find account_ids with multiple active credentials
+            let dupeStmt = try db.prepare(
+                "SELECT account_id, COUNT(*) as cnt FROM oauth_credentials WHERE is_active = 1 AND account_id IS NOT NULL GROUP BY account_id HAVING cnt > 1"
+            )
+
+            for row in dupeStmt {
+                guard let accountId = row[0] as? String else { continue }
+                let count = row[1] as? Int64 ?? 0
+
+                // Get all active credentials for this account, newest first
+                let credStmt = try db.prepare(
+                    "SELECT id, refresh_token FROM oauth_credentials WHERE account_id = ? AND is_active = 1 ORDER BY updated_at DESC",
+                    accountId
+                )
+
+                var creds: [(id: Int64, refreshToken: String?)] = []
+                for credRow in credStmt {
+                    if let id = credRow[0] as? Int64 {
+                        creds.append((id: id, refreshToken: credRow[1] as? String))
+                    }
+                }
+
+                guard creds.count > 1 else { continue }
+
+                let keeper = creds[0]
+                let duplicates = Array(creds.dropFirst())
+
+                // If keeper lacks a refresh token, grab one from a duplicate
+                if keeper.refreshToken == nil {
+                    for dup in duplicates {
+                        if let rt = dup.refreshToken {
+                            try db.run(
+                                "UPDATE oauth_credentials SET refresh_token = ?, updated_at = ? WHERE id = ?",
+                                rt, now, keeper.id
+                            )
+                            flog.info("Merged refresh_token from credential \(dup.id) into keeper \(keeper.id) for account \(accountId)", category: fcat)
+                            break
+                        }
+                    }
+                }
+
+                // Deactivate duplicates
+                for dup in duplicates {
+                    try db.run(
+                        "UPDATE oauth_credentials SET is_active = 0, updated_at = ? WHERE id = ?",
+                        now, dup.id
+                    )
+                }
+
+                flog.info("Deduplicated credentials for account \(accountId): kept \(keeper.id), deactivated \(duplicates.count) duplicate(s) (had \(count) total)", category: fcat)
+            }
+        } catch {
+            flog.error("Failed to deduplicate credentials: \(error.localizedDescription)", category: fcat)
+        }
+    }
+
     // MARK: - Database Operations
 
     func saveCredential(_ credential: OAuthCredential) {
@@ -394,11 +460,18 @@ class OAuthPoller: ObservableObject {
                     last_updated = excluded.last_updated
             """, accountId, credential.label, plan, now)
 
-            // Check if credential already exists for this keychain entry
-            let existingCred = try db.scalar(
-                "SELECT id FROM oauth_credentials WHERE keychain_service = ? AND keychain_account = ?",
-                credential.keychainService ?? "", credential.keychainAccount ?? ""
+            // Check if credential already exists — first by account_id, then by keychain entry
+            var existingCred = try db.scalar(
+                "SELECT id FROM oauth_credentials WHERE account_id = ? AND is_active = 1 LIMIT 1",
+                accountId
             ) as? Int64
+
+            if existingCred == nil {
+                existingCred = try db.scalar(
+                    "SELECT id FROM oauth_credentials WHERE keychain_service = ? AND keychain_account = ?",
+                    credential.keychainService ?? "", credential.keychainAccount ?? ""
+                ) as? Int64
+            }
 
             if let credId = existingCred {
                 // Update existing credential — always refresh stored tokens
@@ -504,27 +577,74 @@ class OAuthPoller: ObservableObject {
         }
     }
 
+    // MARK: - Keychain Token Bundle
+
+    struct KeychainTokenBundle {
+        let accessToken: String
+        let refreshToken: String?
+        let expiresAt: Int64?
+    }
+
+    /// Read all token fields from the keychain in a single query.
+    private func readFullTokenFromKeychain(service: String?, account: String?) -> KeychainTokenBundle? {
+        guard let service = service else { return nil }
+
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        if let account = account {
+            query[kSecAttrAccount as String] = account
+        }
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess,
+              let data = result as? Data,
+              let topJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        let json = (topJson["claudeAiOauth"] as? [String: Any]) ?? topJson
+        guard let accessToken = json["accessToken"] as? String ?? json["access_token"] as? String else {
+            return nil
+        }
+
+        return KeychainTokenBundle(
+            accessToken: accessToken,
+            refreshToken: json["refreshToken"] as? String ?? json["refresh_token"] as? String,
+            expiresAt: json["expiresAt"] as? Int64 ?? json["expires_at"] as? Int64
+        )
+    }
+
     // MARK: - Keychain Sync (runs once per poll cycle)
 
     /// Read the keychain once, identify the account, and update the matching credential.
-    /// Claude Code stores one token at a time in a single keychain entry (`rwalters`).
+    /// Claude Code stores one token at a time in a single keychain entry.
     /// When the user does `/login` for a different account, this picks it up.
     private func syncKeychainTokens() async {
-        // Read token from the single shared keychain entry
-        guard let freshToken = readTokenFromKeychain(service: "Claude Code-credentials", account: nil) else {
+        guard let bundle = readFullTokenFromKeychain(service: "Claude Code-credentials", account: nil) else {
             return
         }
-        let freshExpiry = readExpiresAtFromKeychain(service: "Claude Code-credentials", account: nil)
-        let freshRefreshToken = readRefreshTokenFromKeychain(service: "Claude Code-credentials", account: nil)
+
         let now = Int64(Date().timeIntervalSince1970 * 1000)
 
-        // If token is expired, attempt refresh using stored refresh token
-        if let exp = freshExpiry, exp <= now {
-            flog.info("syncKeychainTokens: keychain token is expired, attempting refresh", category: fcat)
+        // If token is expired, store the refresh token for all keychain credentials
+        // so they can use it for refresh, then attempt refresh
+        if let exp = bundle.expiresAt, exp <= now {
+            flog.info("syncKeychainTokens: keychain token is expired, storing refresh token and attempting refresh", category: fcat)
             let credentials = loadActiveCredentials()
             for cred in credentials where cred.source == "keychain" {
+                // Store the keychain's refresh token so it's available even if keychain changes
+                if let rt = bundle.refreshToken {
+                    updateStoredRefreshToken(cred, refreshToken: rt)
+                }
                 // Use fresh refresh token from keychain, fall back to stored one
-                let rt = freshRefreshToken ?? cred.refreshToken
+                let rt = bundle.refreshToken ?? cred.refreshToken
                 guard let refreshToken = rt else { continue }
                 do {
                     let refreshResponse = try await apiClient.refreshToken(refreshToken: refreshToken)
@@ -538,21 +658,43 @@ class OAuthPoller: ObservableObject {
             return
         }
 
-        // Identify which account this token belongs to
-        guard let profile = try? await apiClient.fetchProfile(accessToken: freshToken) else {
+        // Token is valid — identify which account it belongs to
+        guard let profile = try? await apiClient.fetchProfile(accessToken: bundle.accessToken) else {
             flog.warning("syncKeychainTokens: profile fetch failed", category: fcat)
             return
         }
 
         let tokenAccountId = profile.organization.uuid
+        let email = profile.account.email
+        let orgName = profile.organization.name
+        let plan = profile.organization.organizationType ?? "Pro"
         let credentials = loadActiveCredentials()
 
-        // Find the credential(s) matching this account and update if their token is stale
-        for cred in credentials where cred.source == "keychain" && cred.accountId == tokenAccountId {
-            let health = checkTokenHealth(cred)
-            if health == .missing || health == .expired || cred.accessToken != freshToken {
-                flog.info("syncKeychainTokens: updating token for \(cred.label) (\(tokenAccountId))", category: fcat)
-                updateStoredToken(cred, accessToken: freshToken, expiresAt: freshExpiry, refreshToken: freshRefreshToken)
+        // Check if any credential matches this account
+        let matchingCreds = credentials.filter { $0.source == "keychain" && $0.accountId == tokenAccountId }
+
+        if matchingCreds.isEmpty {
+            // Brand-new account detected — auto-create credential
+            flog.info("syncKeychainTokens: new account detected \(email) (\(tokenAccountId)), auto-creating credential", category: fcat)
+            saveCredentialForAccount(
+                accountId: tokenAccountId,
+                email: email,
+                orgName: orgName,
+                plan: plan,
+                accessToken: bundle.accessToken,
+                refreshToken: bundle.refreshToken,
+                expiresAt: bundle.expiresAt,
+                keychainService: "Claude Code-credentials",
+                keychainAccount: nil
+            )
+        } else {
+            // Update matching credential(s) with fresh token data
+            for cred in matchingCreds {
+                let health = checkTokenHealth(cred)
+                if health == .missing || health == .expired || cred.accessToken != bundle.accessToken {
+                    flog.info("syncKeychainTokens: updating token for \(cred.label) (\(tokenAccountId))", category: fcat)
+                    updateStoredToken(cred, accessToken: bundle.accessToken, expiresAt: bundle.expiresAt, refreshToken: bundle.refreshToken)
+                }
             }
         }
     }
@@ -652,11 +794,11 @@ class OAuthPoller: ObservableObject {
             throw AnthropicAPIError.unauthorized
         }
 
-        // Proactive refresh: refresh tokens nearing expiry (within 5 minutes)
+        // Proactive refresh: refresh tokens nearing expiry (within 15 minutes)
         if tokenHealth == .valid, let expiresAt = credential.expiresAt, let refreshToken = credential.refreshToken {
             let now = Int64(Date().timeIntervalSince1970 * 1000)
-            let fiveMinutes: Int64 = 5 * 60 * 1000
-            if expiresAt - now < fiveMinutes {
+            let fifteenMinutes: Int64 = 15 * 60 * 1000
+            if expiresAt - now < fifteenMinutes {
                 logger.info("Proactively refreshing nearly-expired token for \(credential.label)")
                 flog.info("Proactively refreshing nearly-expired token for \(credential.label) (expires in \((expiresAt - now) / 1000)s)", category: fcat)
                 updateCredentialStatus(credential, status: .refreshing, error: nil)
@@ -756,94 +898,13 @@ class OAuthPoller: ObservableObject {
 
         // Fall back to keychain if no stored token
         if credential.source == "keychain" {
-            if let keychainToken = readTokenFromKeychain(service: credential.keychainService, account: credential.keychainAccount) {
-                return keychainToken
+            if let bundle = readFullTokenFromKeychain(service: credential.keychainService, account: credential.keychainAccount) {
+                return bundle.accessToken
             }
             flog.info("No stored or keychain token for \(credential.label)", category: fcat)
         }
 
         return nil
-    }
-
-    private func readTokenFromKeychain(service: String?, account: String?) -> String? {
-        guard let service = service else { return nil }
-
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        if let account = account {
-            query[kSecAttrAccount as String] = account
-        }
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let topJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-
-        let json = (topJson["claudeAiOauth"] as? [String: Any]) ?? topJson
-        return json["accessToken"] as? String ?? json["access_token"] as? String
-    }
-
-    private func readExpiresAtFromKeychain(service: String?, account: String?) -> Int64? {
-        guard let service = service else { return nil }
-
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        if let account = account {
-            query[kSecAttrAccount as String] = account
-        }
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let topJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-
-        let json = (topJson["claudeAiOauth"] as? [String: Any]) ?? topJson
-        return json["expiresAt"] as? Int64 ?? json["expires_at"] as? Int64
-    }
-
-    private func readRefreshTokenFromKeychain(service: String?, account: String?) -> String? {
-        guard let service = service else { return nil }
-
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-
-        if let account = account {
-            query[kSecAttrAccount as String] = account
-        }
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess,
-              let data = result as? Data,
-              let topJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-
-        let json = (topJson["claudeAiOauth"] as? [String: Any]) ?? topJson
-        return json["refreshToken"] as? String ?? json["refresh_token"] as? String
     }
 
     // MARK: - Credential Status Tracking (M1.2)
@@ -1036,6 +1097,23 @@ class OAuthPoller: ObservableObject {
             flog.info("Updated stored token for credential \(credId) from keychain", category: fcat)
         } catch {
             flog.error("Failed to update stored token: \(error.localizedDescription)", category: fcat)
+        }
+    }
+
+    /// Update only the refresh_token column without touching access_token or expires_at.
+    private func updateStoredRefreshToken(_ credential: OAuthCredential, refreshToken: String) {
+        guard let credId = credential.id,
+              FileManager.default.fileExists(atPath: dbPath) else { return }
+        do {
+            let db = try Connection(dbPath)
+            let now = ISO8601DateFormatter().string(from: Date())
+            try db.run(
+                "UPDATE oauth_credentials SET refresh_token = ?, updated_at = ? WHERE id = ?",
+                refreshToken, now, credId
+            )
+            flog.info("Updated stored refresh_token for credential \(credId)", category: fcat)
+        } catch {
+            flog.error("Failed to update stored refresh_token: \(error.localizedDescription)", category: fcat)
         }
     }
 

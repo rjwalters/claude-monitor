@@ -66,6 +66,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Ensure database exists (standalone mode without native host)
         usageStore.ensureDatabase()
 
+        // Deduplicate credentials at startup (fixes multiple credentials per account)
+        oauthPoller.deduplicateCredentials()
+
         // One-time keychain import at startup (only if no credentials in DB yet).
         // This is the only automatic keychain read; further imports happen via the
         // "Scan Keychain" button in the Login Wizard so the user controls the prompts.
@@ -381,7 +384,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let window = NSWindow(contentViewController: hostingController)
             window.title = "Account Summary"
             window.styleMask = [.titled, .closable]
-            window.setContentSize(NSSize(width: 480, height: 400))
+            window.setContentSize(NSSize(width: 510, height: 400))
             window.center()
             window.isReleasedWhenClosed = false
             window.level = .floating

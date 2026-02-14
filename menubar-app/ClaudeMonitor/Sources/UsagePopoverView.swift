@@ -405,9 +405,24 @@ struct AccountCard: View {
                 // Last updated + last poll time (M1.3)
                 HStack {
                     Spacer()
-                    Text("Updated \(formatDate(usage.timestamp))")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
+                    let age = -usage.timestamp.timeIntervalSinceNow
+                    if age > 30 * 60 {
+                        HStack(spacing: 3) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.caption2)
+                            Text("Updated \(formatDate(usage.timestamp))")
+                                .font(.caption2)
+                        }
+                        .foregroundColor(.orange)
+                    } else if age > 10 * 60 {
+                        Text("Updated \(formatDate(usage.timestamp))")
+                            .font(.caption2)
+                            .foregroundColor(.yellow)
+                    } else {
+                        Text("Updated \(formatDate(usage.timestamp))")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
 
@@ -1035,6 +1050,8 @@ struct SummaryTableView: View {
                     .frame(width: 70, alignment: .trailing)
                 Text("Reset")
                     .frame(width: 100, alignment: .trailing)
+                Text("Fresh")
+                    .frame(width: 50, alignment: .center)
                 Text("Token")
                     .frame(width: 60, alignment: .center)
             }
@@ -1069,7 +1086,7 @@ struct SummaryTableView: View {
             }
             .padding(10)
         }
-        .frame(width: 460)
+        .frame(width: 510)
     }
 }
 
@@ -1095,6 +1112,27 @@ struct SummaryRow: View {
         }
     }
 
+    /// Data age in seconds (nil if no usage data)
+    private var dataAge: TimeInterval? {
+        guard let usage = usage else { return nil }
+        return -usage.timestamp.timeIntervalSinceNow
+    }
+
+    /// Freshness dot color: green (<10 min), yellow (<30 min), red (>30 min)
+    private var freshnessDotColor: Color {
+        guard let age = dataAge else { return .gray }
+        if age < 10 * 60 { return .green }
+        if age < 30 * 60 { return .yellow }
+        return .red
+    }
+
+    private var freshnessLabel: String {
+        guard let age = dataAge else { return "No data" }
+        if age < 10 * 60 { return "Fresh (<10 min)" }
+        if age < 30 * 60 { return "Stale (\(Int(age / 60)) min)" }
+        return "Very stale (\(Int(age / 60)) min)"
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             Text(account.displayName)
@@ -1112,6 +1150,12 @@ struct SummaryRow: View {
                 .foregroundColor(.secondary)
                 .lineLimit(1)
                 .frame(width: 100, alignment: .trailing)
+
+            Circle()
+                .fill(freshnessDotColor)
+                .frame(width: 8, height: 8)
+                .help(freshnessLabel)
+                .frame(width: 50)
 
             Circle()
                 .fill(tokenDotColor)
