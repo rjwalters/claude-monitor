@@ -375,9 +375,10 @@ class OAuthPoller: ObservableObject {
                 guard let accountId = row[0] as? String else { continue }
                 let count = row[1] as? Int64 ?? 0
 
-                // Get all active credentials for this account, newest first
+                // Get all active credentials for this account, best token first
+                // Prefer the credential with the latest-expiring token (not just most recently updated)
                 let credStmt = try db.prepare(
-                    "SELECT id, refresh_token FROM oauth_credentials WHERE account_id = ? AND is_active = 1 ORDER BY updated_at DESC",
+                    "SELECT id, refresh_token FROM oauth_credentials WHERE account_id = ? AND is_active = 1 ORDER BY COALESCE(expires_at, 0) DESC, updated_at DESC",
                     accountId
                 )
 
