@@ -627,7 +627,32 @@ class OAuthPoller: ObservableObject {
     /// Read the keychain once, identify the account, and update the matching credential.
     /// Claude Code stores one token at a time in a single keychain entry.
     /// When the user does `/login` for a different account, this picks it up.
+    ///
+    /// To reduce macOS Keychain authorization prompts, we skip the keychain read
+    /// when all keychain-sourced credentials already have valid, non-expired tokens
+    /// stored in the database. The keychain is only consulted when a token is
+    /// expired/missing or when no keychain credentials exist yet.
     private func syncKeychainTokens() async {
+        let credentials = loadActiveCredentials()
+        let keychainCreds = credentials.filter { $0.source == "keychain" }
+
+        // If we have keychain credentials and ALL of them have valid, non-expired
+        // tokens stored in the DB, skip the keychain read entirely to avoid
+        // triggering macOS authorization prompts.
+        if !keychainCreds.isEmpty {
+            let allValid = keychainCreds.allSatisfy { cred in
+                guard cred.accessToken != nil else { return false }
+                guard let expiresAt = cred.expiresAt else { return true }  // no expiry = assume valid
+                let now = Int64(Date().timeIntervalSince1970 * 1000)
+                let fiveMinutes: Int64 = 5 * 60 * 1000
+                return expiresAt - now > fiveMinutes  // valid for at least 5 more minutes
+            }
+            if allValid {
+                flog.info("syncKeychainTokens: all keychain credentials have valid tokens, skipping keychain read", category: fcat)
+                return
+            }
+        }
+
         guard let bundle = readFullTokenFromKeychain(service: "Claude Code-credentials", account: nil) else {
             return
         }
@@ -638,8 +663,7 @@ class OAuthPoller: ObservableObject {
         // so they can use it for refresh, then attempt refresh
         if let exp = bundle.expiresAt, exp <= now {
             flog.info("syncKeychainTokens: keychain token is expired, storing refresh token and attempting refresh", category: fcat)
-            let credentials = loadActiveCredentials()
-            for cred in credentials where cred.source == "keychain" {
+            for cred in keychainCreds {
                 // Store the keychain's refresh token so it's available even if keychain changes
                 if let rt = bundle.refreshToken {
                     updateStoredRefreshToken(cred, refreshToken: rt)
@@ -669,10 +693,9 @@ class OAuthPoller: ObservableObject {
         let email = profile.account.email
         let orgName = profile.organization.name
         let plan = profile.organization.organizationType ?? "Pro"
-        let credentials = loadActiveCredentials()
 
         // Check if any credential matches this account
-        let matchingCreds = credentials.filter { $0.source == "keychain" && $0.accountId == tokenAccountId }
+        let matchingCreds = keychainCreds.filter { $0.accountId == tokenAccountId }
 
         if matchingCreds.isEmpty {
             // Brand-new account detected — auto-create credential
@@ -897,14 +920,9 @@ class OAuthPoller: ObservableObject {
             return storedToken
         }
 
-        // Fall back to keychain if no stored token
-        if credential.source == "keychain" {
-            if let bundle = readFullTokenFromKeychain(service: credential.keychainService, account: credential.keychainAccount) {
-                return bundle.accessToken
-            }
-            flog.info("No stored or keychain token for \(credential.label)", category: fcat)
-        }
-
+        // No stored token available — syncKeychainTokens() will pick up
+        // fresh tokens from the keychain on the next poll cycle if needed.
+        flog.info("No stored token for \(credential.label)", category: fcat)
         return nil
     }
 
