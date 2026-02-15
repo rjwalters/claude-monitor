@@ -624,8 +624,8 @@ class OAuthPoller: ObservableObject {
 
     // MARK: - Keychain Sync (runs once per poll cycle)
 
-    /// Read the keychain once, identify the account, and update the matching credential.
-    /// Claude Code stores one token at a time in a single keychain entry.
+    /// Read ALL keychain entries, identify each account, and update the matching credential.
+    /// Claude Code stores one keychain entry per account under the same service name.
     /// When the user does `/login` for a different account, this picks it up.
     ///
     /// To reduce macOS Keychain authorization prompts, we skip the keychain read
@@ -653,71 +653,95 @@ class OAuthPoller: ObservableObject {
             }
         }
 
-        guard let bundle = readFullTokenFromKeychain(service: "Claude Code-credentials", account: nil) else {
-            return
-        }
-
+        // Read ALL keychain entries (one per Claude Code account)
+        let keychainResults = importAllFromKeychain()
         let now = Int64(Date().timeIntervalSince1970 * 1000)
 
-        // If token is expired, store the refresh token for all keychain credentials
-        // so they can use it for refresh, then attempt refresh
-        if let exp = bundle.expiresAt, exp <= now {
-            flog.info("syncKeychainTokens: keychain token is expired, storing refresh token and attempting refresh", category: fcat)
-            for cred in keychainCreds {
-                // Store the keychain's refresh token so it's available even if keychain changes
-                if let rt = bundle.refreshToken {
-                    updateStoredRefreshToken(cred, refreshToken: rt)
-                }
-                // Use fresh refresh token from keychain, fall back to stored one
-                let rt = bundle.refreshToken ?? cred.refreshToken
-                guard let refreshToken = rt else { continue }
-                do {
-                    let refreshResponse = try await apiClient.refreshToken(refreshToken: refreshToken)
-                    flog.info("syncKeychainTokens: refreshed expired token for \(cred.label)", category: fcat)
-                    updateCredentialTokens(cred, response: refreshResponse)
-                    updateCredentialStatus(cred, status: .valid, error: nil)
-                } catch {
-                    flog.warning("syncKeychainTokens: refresh failed for \(cred.label): \(error.localizedDescription)", category: fcat)
-                }
+        for result in keychainResults {
+            guard case .success(let rawCred) = result,
+                  let accessToken = rawCred.accessToken else {
+                continue
             }
-            return
-        }
 
-        // Token is valid — identify which account it belongs to
-        guard let profile = try? await apiClient.fetchProfile(accessToken: bundle.accessToken) else {
-            flog.warning("syncKeychainTokens: profile fetch failed", category: fcat)
-            return
-        }
+            let isExpired = rawCred.expiresAt.map { $0 <= now } ?? false
 
-        let tokenAccountId = profile.organization.uuid
-        let email = profile.account.email
-        let orgName = profile.organization.name
-        let plan = profile.organization.organizationType ?? "Pro"
+            if isExpired {
+                // Token expired — try to refresh using THIS entry's own refresh token
+                guard let rt = rawCred.refreshToken else {
+                    flog.warning("syncKeychainTokens: expired keychain entry has no refresh token (account: \(rawCred.keychainAccount ?? "unknown"))", category: fcat)
+                    continue
+                }
 
-        // Check if any credential matches this account
-        let matchingCreds = keychainCreds.filter { $0.accountId == tokenAccountId }
+                do {
+                    let refreshResponse = try await apiClient.refreshToken(refreshToken: rt)
 
-        if matchingCreds.isEmpty {
-            // Brand-new account detected — auto-create credential
-            flog.info("syncKeychainTokens: new account detected \(email) (\(tokenAccountId)), auto-creating credential", category: fcat)
-            saveCredentialForAccount(
-                accountId: tokenAccountId,
-                email: email,
-                orgName: orgName,
-                plan: plan,
-                accessToken: bundle.accessToken,
-                refreshToken: bundle.refreshToken,
-                expiresAt: bundle.expiresAt,
-                keychainService: "Claude Code-credentials",
-                keychainAccount: nil
-            )
-        } else {
-            // Update matching credential(s) with fresh token data
-            for cred in matchingCreds {
-                let health = checkTokenHealth(cred)
-                if health == .missing || health == .expired || cred.accessToken != bundle.accessToken {
-                    flog.info("syncKeychainTokens: updating token for \(cred.label) (\(tokenAccountId))", category: fcat)
-                    updateStoredToken(cred, accessToken: bundle.accessToken, expiresAt: bundle.expiresAt, refreshToken: bundle.refreshToken)
+                    // Identify account with new token
+                    guard let profile = try? await apiClient.fetchProfile(accessToken: refreshResponse.accessToken) else {
+                        flog.warning("syncKeychainTokens: profile fetch failed after refresh (account: \(rawCred.keychainAccount ?? "unknown"))", category: fcat)
+                        continue
+                    }
+
+                    let orgId = profile.organization.uuid
+                    let email = profile.account.email
+                    let orgName = profile.organization.name
+                    let plan = profile.organization.organizationType ?? "Pro"
+
+                    let matchingCreds = keychainCreds.filter { $0.accountId == orgId }
+
+                    if matchingCreds.isEmpty {
+                        flog.info("syncKeychainTokens: new account from refreshed token \(email) (\(orgId))", category: fcat)
+                        let newExpiresAt = refreshResponse.expiresIn.map { Int64(Date().timeIntervalSince1970 * 1000) + Int64($0) * 1000 }
+                        saveCredentialForAccount(
+                            accountId: orgId, email: email, orgName: orgName, plan: plan,
+                            accessToken: refreshResponse.accessToken,
+                            refreshToken: refreshResponse.refreshToken ?? rt,
+                            expiresAt: newExpiresAt,
+                            keychainService: "Claude Code-credentials",
+                            keychainAccount: rawCred.keychainAccount
+                        )
+                    } else {
+                        for cred in matchingCreds {
+                            flog.info("syncKeychainTokens: refreshed token for \(cred.label) (\(orgId))", category: fcat)
+                            updateCredentialTokens(cred, response: refreshResponse)
+                            updateCredentialStatus(cred, status: .valid, error: nil)
+                        }
+                    }
+                } catch {
+                    flog.warning("syncKeychainTokens: refresh failed for keychain entry \(rawCred.keychainAccount ?? "unknown"): \(error.localizedDescription)", category: fcat)
+                }
+            } else {
+                // Token is valid — identify which account it belongs to
+                guard let profile = try? await apiClient.fetchProfile(accessToken: accessToken) else {
+                    flog.warning("syncKeychainTokens: profile fetch failed (account: \(rawCred.keychainAccount ?? "unknown"))", category: fcat)
+                    continue
+                }
+
+                let tokenAccountId = profile.organization.uuid
+                let email = profile.account.email
+                let orgName = profile.organization.name
+                let plan = profile.organization.organizationType ?? "Pro"
+
+                let matchingCreds = keychainCreds.filter { $0.accountId == tokenAccountId }
+
+                if matchingCreds.isEmpty {
+                    flog.info("syncKeychainTokens: new account detected \(email) (\(tokenAccountId)), auto-creating credential", category: fcat)
+                    saveCredentialForAccount(
+                        accountId: tokenAccountId, email: email, orgName: orgName, plan: plan,
+                        accessToken: accessToken,
+                        refreshToken: rawCred.refreshToken,
+                        expiresAt: rawCred.expiresAt,
+                        keychainService: "Claude Code-credentials",
+                        keychainAccount: rawCred.keychainAccount
+                    )
+                } else {
+                    for cred in matchingCreds {
+                        let health = checkTokenHealth(cred)
+                        if health == .missing || health == .expired || cred.accessToken != accessToken {
+                            flog.info("syncKeychainTokens: updating token for \(cred.label) (\(tokenAccountId))", category: fcat)
+                            updateStoredToken(cred, accessToken: accessToken, expiresAt: rawCred.expiresAt, refreshToken: rawCred.refreshToken)
+                            updateCredentialStatus(cred, status: .valid, error: nil)
+                        }
+                    }
                 }
             }
         }

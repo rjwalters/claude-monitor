@@ -231,8 +231,9 @@ class AnthropicAPIClient {
         }
 
         guard (200..<300).contains(httpResponse.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? "<non-utf8>"
             logger.warning("Token refresh failed with HTTP \(httpResponse.statusCode)")
-            flog.warning("Token refresh failed with HTTP \(httpResponse.statusCode)", category: fcat)
+            flog.warning("Token refresh failed with HTTP \(httpResponse.statusCode): \(body)", category: fcat)
             throw AnthropicAPIError.tokenRefreshFailed
         }
 
