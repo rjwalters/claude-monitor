@@ -5,6 +5,9 @@ private let logger = Logger(subsystem: "com.claude-monitor.app", category: "Anth
 private let flog = FileLogger.shared
 private let fcat = "API"
 
+// Auto-updated by build script from installed claude-code version
+private let claudeCodeUserAgent = "claude-code/2.0.37"
+
 // MARK: - API Response Types
 
 struct UsageResponse: Codable {
@@ -139,7 +142,7 @@ class AnthropicAPIClient {
         request.httpMethod = "GET"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        request.setValue("claude-code/2.0.32", forHTTPHeaderField: "User-Agent")
+        request.setValue(claudeCodeUserAgent, forHTTPHeaderField: "User-Agent")
 
         let data: Data
         let response: URLResponse
@@ -179,7 +182,7 @@ class AnthropicAPIClient {
         request.httpMethod = "GET"
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        request.setValue("claude-code/2.0.32", forHTTPHeaderField: "User-Agent")
+        request.setValue(claudeCodeUserAgent, forHTTPHeaderField: "User-Agent")
 
         let data: Data
         let response: URLResponse

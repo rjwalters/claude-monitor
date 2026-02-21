@@ -13,6 +13,16 @@ echo "Building macOS app..."
 
 cd "$APP_DIR"
 
+# Auto-detect installed claude-code version for User-Agent header
+CLAUDE_CODE_VERSION=$(npm list -g @anthropic-ai/claude-code --depth=0 2>/dev/null | grep claude-code | sed 's/.*@//')
+if [ -n "$CLAUDE_CODE_VERSION" ]; then
+    echo "Detected claude-code version: $CLAUDE_CODE_VERSION"
+    sed -i '' "s|claude-code/[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*|claude-code/${CLAUDE_CODE_VERSION}|g" \
+        Sources/AnthropicAPI.swift
+else
+    echo "Warning: could not detect claude-code version, using existing value"
+fi
+
 # Build release version
 swift build -c release
 
@@ -40,9 +50,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
     <key>CFBundleDisplayName</key>
     <string>Claude Monitor</string>
     <key>CFBundleVersion</key>
-    <string>1.10.0</string>
+    <string>1.11.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.10.0</string>
+    <string>1.11.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
