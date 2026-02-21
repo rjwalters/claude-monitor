@@ -384,7 +384,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let window = NSWindow(contentViewController: hostingController)
             window.title = "Account Summary"
             window.styleMask = [.titled, .closable]
-            window.setContentSize(NSSize(width: 510, height: 400))
+            window.setContentSize(NSSize(width: 640, height: 400))
             window.center()
             window.isReleasedWhenClosed = false
             window.level = .floating

@@ -1043,17 +1043,19 @@ struct SummaryTableView: View {
             // Header row
             HStack(spacing: 0) {
                 Text("Account")
-                    .frame(width: 120, alignment: .leading)
-                Text("Session")
-                    .frame(width: 70, alignment: .trailing)
-                Text("Weekly")
-                    .frame(width: 70, alignment: .trailing)
-                Text("Reset")
-                    .frame(width: 100, alignment: .trailing)
+                    .frame(width: 140, alignment: .leading)
+                Text("Session %")
+                    .frame(width: 65, alignment: .trailing)
+                Text("Session Reset")
+                    .frame(width: 90, alignment: .trailing)
+                Text("Weekly %")
+                    .frame(width: 65, alignment: .trailing)
+                Text("Weekly Reset")
+                    .frame(width: 90, alignment: .trailing)
                 Text("Fresh")
                     .frame(width: 50, alignment: .center)
                 Text("Token")
-                    .frame(width: 60, alignment: .center)
+                    .frame(width: 50, alignment: .center)
             }
             .font(.caption.bold())
             .foregroundColor(.secondary)
@@ -1086,7 +1088,7 @@ struct SummaryTableView: View {
             }
             .padding(10)
         }
-        .frame(width: 510)
+        .frame(width: 616)
     }
 }
 
@@ -1137,19 +1139,25 @@ struct SummaryRow: View {
         HStack(spacing: 0) {
             Text(account.displayName)
                 .lineLimit(1)
-                .frame(width: 120, alignment: .leading)
+                .frame(width: 140, alignment: .leading)
 
             percentText(usage?.sessionPercent)
-                .frame(width: 70, alignment: .trailing)
+                .frame(width: 65, alignment: .trailing)
 
-            percentText(usage?.weeklyAllPercent)
-                .frame(width: 70, alignment: .trailing)
-
-            Text(resetLabel)
+            Text(resetTimeLabel(usage?.sessionReset))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .lineLimit(1)
-                .frame(width: 100, alignment: .trailing)
+                .frame(width: 90, alignment: .trailing)
+
+            percentText(usage?.weeklyAllPercent)
+                .frame(width: 65, alignment: .trailing)
+
+            Text(resetTimeLabel(usage?.weeklyReset))
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .frame(width: 90, alignment: .trailing)
 
             Circle()
                 .fill(freshnessDotColor)
@@ -1161,7 +1169,7 @@ struct SummaryRow: View {
                 .fill(tokenDotColor)
                 .frame(width: 8, height: 8)
                 .help(tokenStatus.rawValue)
-                .frame(width: 60)
+                .frame(width: 50)
         }
         .font(.caption)
         .padding(.horizontal, 12)
@@ -1169,14 +1177,17 @@ struct SummaryRow: View {
         .background(colorScheme == .dark ? Color.white.opacity(0.02) : Color.clear)
     }
 
-    private var resetLabel: String {
-        if let reset = usage?.sessionReset {
-            return formatResetTime(reset)
+    private func resetTimeLabel(_ str: String?) -> String {
+        guard let str = str else { return "—" }
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = isoFormatter.date(from: str) ?? ISO8601DateFormatter().date(from: str)
+        if let date = date {
+            let interval = date.timeIntervalSinceNow
+            if interval <= 0 { return "now" }
+            return formatInterval(interval)
         }
-        if let reset = usage?.weeklyReset {
-            return formatResetTime(reset)
-        }
-        return "—"
+        return str
     }
 
     @ViewBuilder
