@@ -39,7 +39,7 @@ struct UsagePopoverView: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var oauthPoller: OAuthPoller
     @ObservedObject var heightManager: PopoverHeightManager
-    var onLoginToAll: (() -> Void)?
+    var onAddAccount: (() -> Void)?
     var onSummary: (() -> Void)?
     @Environment(\.colorScheme) var colorScheme
     @State private var showGitHubLink = false
@@ -114,20 +114,18 @@ struct UsagePopoverView: View {
 
 
             if let error = store.error {
-                SetupGuideView(oauthPoller: oauthPoller, store: store, error: error)
+                SetupGuideView(oauthPoller: oauthPoller, store: store, error: error, onAddAccount: onAddAccount)
             } else if store.accounts.isEmpty {
-                SetupGuideView(oauthPoller: oauthPoller, store: store, error: nil)
+                SetupGuideView(oauthPoller: oauthPoller, store: store, error: nil, onAddAccount: onAddAccount)
             } else {
                 ScrollView {
                     VStack(spacing: 12) {
-                        ForEach(Array(store.accounts.enumerated()), id: \.element.id) { index, account in
+                        ForEach(store.sortedAccountsForPopover) { account in
                             ClickableAccountCard(
                                 account: account,
                                 usage: store.latestUsage[account.id],
                                 store: store,
                                 oauthPoller: oauthPoller,
-                                isFirst: index == 0,
-                                isLast: index == store.accounts.count - 1,
                                 onRemove: {
                                     accountToRemove = account
                                     showRemoveConfirmation = true
@@ -150,8 +148,8 @@ struct UsagePopoverView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
 
-                Button(action: openLoginWizard) {
-                    Label("Keychain", systemImage: "key")
+                Button(action: { onAddAccount?() }) {
+                    Label("Add Account", systemImage: "plus")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
@@ -189,11 +187,6 @@ struct UsagePopoverView: View {
         return "\(formatInterval(seconds)) ago"
     }
 
-    private func openLoginWizard() {
-        onLoginToAll?()
-    }
-
-    // M4.3: Remove account
     private func removeAccount(_ account: Account) {
         // Deactivate credential
         let credentials = oauthPoller.loadActiveCredentials()
@@ -244,7 +237,7 @@ struct PopoverResizeHandle: View {
     }
 }
 
-// MARK: - Token Status Dot (M1.3)
+// MARK: - Token Status Dot
 
 struct TokenStatusDot: View {
     let accountId: String?
@@ -282,7 +275,6 @@ struct AccountCard: View {
     var onRemove: (() -> Void)? = nil
     @Environment(\.colorScheme) var colorScheme
     @State private var isNameHovering = false
-    @State private var isReauthenticating = false
 
     var cardBackground: Color {
         colorScheme == .dark
@@ -296,7 +288,7 @@ struct AccountCard: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        // Token status dot (M1.3)
+                        // Token status dot
                         if let poller = oauthPoller {
                             TokenStatusDot(accountId: account.id, oauthPoller: poller)
                         }
@@ -360,7 +352,7 @@ struct AccountCard: View {
                     )
                 }
 
-                // Re-auth prompt (M4.2)
+                // Token status warning
                 if let poller = oauthPoller,
                    let status = poller.credentialStatuses.first(where: { $0.accountId == account.id }),
                    status.status == .expired || status.status == .revoked || status.status == .missing {
@@ -372,37 +364,15 @@ struct AccountCard: View {
                             Text("Token \(status.status.rawValue)")
                                 .font(.caption)
                                 .foregroundColor(.orange)
-                            Spacer()
-                            Button(isReauthenticating ? "Scanning..." : "Scan Keychain") {
-                                guard !isReauthenticating else { return }
-                                isReauthenticating = true
-                                Task {
-                                    if let scanStore = store {
-                                        let _ = await poller.scanKeychainWithProfile()
-                                        await MainActor.run {
-                                            scanStore.loadFromDatabase()
-                                            isReauthenticating = false
-                                        }
-                                    } else {
-                                        await MainActor.run {
-                                            isReauthenticating = false
-                                        }
-                                    }
-                                }
-                            }
-                            .font(.caption)
-                            .buttonStyle(.bordered)
-                            .controlSize(.mini)
-                            .disabled(isReauthenticating)
                         }
-                        Text("Run /login in Claude Code, then Scan Keychain")
+                        Text("Re-add with a fresh token from 'claude setup-token'")
                             .font(.caption2)
                             .foregroundColor(.secondary)
                     }
                     .padding(.top, 4)
                 }
 
-                // Last updated + last poll time (M1.3)
+                // Last updated
                 HStack {
                     Spacer()
                     let age = -usage.timestamp.timeIntervalSinceNow
@@ -426,7 +396,7 @@ struct AccountCard: View {
                 }
             }
 
-            // Remove account button (M4.3) — shown on hover
+            // Remove account button — shown on hover
             if isNameHovering, let onRemove = onRemove {
                 HStack {
                     Spacer()
@@ -523,8 +493,6 @@ struct ClickableAccountCard: View {
     let usage: UsageRecord?
     let store: UsageStore
     var oauthPoller: OAuthPoller? = nil
-    var isFirst: Bool = false
-    var isLast: Bool = false
     var onRemove: (() -> Void)? = nil
     @State private var isHovering = false
     @State private var isEditing = false
@@ -542,80 +510,22 @@ struct ClickableAccountCard: View {
                 }
             )
         } else {
-            ZStack(alignment: .bottomLeading) {
-                Button(action: {
-                    ChartWindowController.showChart(for: account, store: store)
-                }) {
-                    AccountCard(
-                        account: account,
-                        usage: usage,
-                        oauthPoller: oauthPoller,
-                        store: store,
-                        onEditTapped: {
-                            editedName = account.accountName ?? account.displayName
-                            isEditing = true
-                        },
-                        onRemove: onRemove
-                    )
-                }
-                .buttonStyle(CardButtonStyle(isHovering: isHovering))
-
-                // Move to top / pin button (only shown on hover for non-first cards)
-                if !isFirst && isHovering {
-                    Button(action: {
-                        store.moveAccountToTop(accountId: account.id)
-                    }) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "arrow.up.to.line")
-                                .font(.system(size: 9))
-                            Text("Pin to top")
-                                .font(.system(size: 10))
-                        }
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.9))
-                        .cornerRadius(4)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(8)
-                    .onHover { hovering in
-                        if hovering {
-                            NSCursor.pointingHand.push()
-                        } else {
-                            NSCursor.pop()
-                        }
-                    }
-                }
-
-                // Send to bottom button (only shown on hover for the first card when not also last)
-                if isFirst && !isLast && isHovering {
-                    Button(action: {
-                        store.moveAccountToBottom(accountId: account.id)
-                    }) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "arrow.down.to.line")
-                                .font(.system(size: 9))
-                            Text("Send to bottom")
-                                .font(.system(size: 10))
-                        }
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(Color(nsColor: .controlBackgroundColor).opacity(0.9))
-                        .cornerRadius(4)
-                    }
-                    .buttonStyle(.plain)
-                    .padding(8)
-                    .onHover { hovering in
-                        if hovering {
-                            NSCursor.pointingHand.push()
-                        } else {
-                            NSCursor.pop()
-                        }
-                    }
-                }
+            Button(action: {
+                ChartWindowController.showChart(for: account, store: store)
+            }) {
+                AccountCard(
+                    account: account,
+                    usage: usage,
+                    oauthPoller: oauthPoller,
+                    store: store,
+                    onEditTapped: {
+                        editedName = account.accountName ?? account.displayName
+                        isEditing = true
+                    },
+                    onRemove: onRemove
+                )
             }
+            .buttonStyle(CardButtonStyle(isHovering: isHovering))
             .onHover { hovering in
                 isHovering = hovering
                 if hovering {
@@ -691,7 +601,6 @@ struct EditableAccountCard: View {
             }
 
             if let usage = usage {
-                // Session usage
                 if let sessionPercent = usage.sessionPercent {
                     UsageRow(
                         label: "Session",
@@ -700,7 +609,6 @@ struct EditableAccountCard: View {
                     )
                 }
 
-                // Weekly - All models
                 if let weeklyAll = usage.weeklyAllPercent {
                     UsageRow(
                         label: "Weekly (All)",
@@ -709,7 +617,6 @@ struct EditableAccountCard: View {
                     )
                 }
 
-                // Weekly - Sonnet
                 if let weeklySonnet = usage.weeklySONnetPercent {
                     UsageRow(
                         label: "Weekly (Sonnet)",
@@ -718,7 +625,6 @@ struct EditableAccountCard: View {
                     )
                 }
 
-                // Last updated
                 HStack {
                     Spacer()
                     Text("Updated \(formatDate(usage.timestamp))")
@@ -777,20 +683,13 @@ struct SetupGuideView: View {
     @ObservedObject var oauthPoller: OAuthPoller
     let store: UsageStore
     let error: String?
+    var onAddAccount: (() -> Void)?
     @Environment(\.colorScheme) var colorScheme
-    @State private var importError: String?
-
-    var cardBackground: Color {
-        colorScheme == .dark
-            ? Color.white.opacity(0.05)
-            : Color.black.opacity(0.03)
-    }
 
     var body: some View {
         VStack(spacing: 16) {
             Spacer()
 
-            // Icon and title
             VStack(spacing: 8) {
                 Image(systemName: "chart.bar.fill")
                     .font(.system(size: 40))
@@ -799,7 +698,7 @@ struct SetupGuideView: View {
                 Text("No Usage Data")
                     .font(.headline)
 
-                Text("Import your Claude Code credentials to get started")
+                Text("Add accounts using tokens from 'claude setup-token'")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
@@ -811,34 +710,14 @@ struct SetupGuideView: View {
                         .multilineTextAlignment(.center)
                         .padding(.top, 4)
                 }
-
-                if let importError = importError {
-                    Text(importError)
-                        .font(.caption)
-                        .foregroundColor(.orange)
-                        .multilineTextAlignment(.center)
-                        .padding(.top, 4)
-                }
             }
 
-            // Action buttons
             VStack(spacing: 12) {
-                Button(action: importFromClaudeCode) {
-                    Label("Import from Claude Code", systemImage: "key")
+                Button(action: { onAddAccount?() }) {
+                    Label("Add Account", systemImage: "plus")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .controlSize(.regular)
-
-                Button(action: {
-                    if let url = URL(string: "https://claude.ai/login") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }) {
-                    Label("Add Account (Login)", systemImage: "person.badge.plus")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
                 .controlSize(.regular)
 
                 Button(action: {
@@ -859,84 +738,98 @@ struct SetupGuideView: View {
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-
-    private func importFromClaudeCode() {
-        importError = nil
-        let results = oauthPoller.importAllFromKeychain()
-        var importedCount = 0
-        var lastErrorMsg: String?
-
-        for result in results {
-            switch result {
-            case .success(let credential):
-                store.ensureDatabase()
-                oauthPoller.saveCredential(credential)
-                importedCount += 1
-            case .failure(let error):
-                lastErrorMsg = error.localizedDescription
-            }
-        }
-
-        if importedCount > 0 {
-            store.loadFromDatabase()
-        } else {
-            importError = lastErrorMsg ?? "Could not read Claude Code credentials from Keychain. Is Claude Code installed and signed in?"
-        }
-    }
 }
 
-// MARK: - Login Wizard
+// MARK: - Add Account View
 
-struct LoginWizardView: View {
+struct AddAccountView: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var oauthPoller: OAuthPoller
     var onDone: () -> Void
 
+    @State private var tokenText = ""
     @State private var statusMessage: String?
-    @State private var isScanning = false
-
-    /// Accounts that have an active credential
-    private var linkedIds: Set<String> {
-        Set(oauthPoller.loadActiveCredentials().compactMap { $0.accountId })
-    }
-
-    private var allLinked: Bool {
-        !store.accounts.isEmpty && linkedIds.count == store.accounts.count
-    }
+    @State private var isAdding = false
+    @State private var envImportResults: [EnvImportResult] = []
+    @State private var envPathText = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Login to All Accounts")
+            Text("Add Account")
                 .font(.headline)
 
+            // Instructions
             VStack(alignment: .leading, spacing: 2) {
-                Text("1. In Claude Code, type /login")
-                Text("2. Sign in as the next account")
-                Text("3. Click Scan Keychain below")
-                Text("4. Repeat for each account")
+                Text("1. Run: claude setup-token")
+                    .font(.caption)
+                Text("2. Paste the token below")
+                    .font(.caption)
             }
-            .font(.caption)
             .foregroundColor(.secondary)
 
             Divider()
 
-            // Account list with checkmarks
+            // Token entry
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(store.accounts) { account in
-                    HStack(spacing: 8) {
-                        Image(systemName: linkedIds.contains(account.id) ? "checkmark.circle.fill" : "circle")
-                            .foregroundColor(linkedIds.contains(account.id) ? .green : .secondary)
-                            .font(.caption)
-                        Text(account.displayName)
-                            .font(.caption)
-                            .lineLimit(1)
-                        Spacer()
-                        if linkedIds.contains(account.id),
-                           let usage = store.latestUsage[account.id] {
-                            let pct = Int(max(usage.sessionPercent ?? 0, usage.weeklyAllPercent ?? 0))
-                            Text("\(pct)%")
+                Text("Token")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextField("sk-ant-oat01-...", text: $tokenText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.caption, design: .monospaced))
+                    .onSubmit { addToken() }
+            }
+
+            Button(action: addToken) {
+                Label(isAdding ? "Adding..." : "Add Account", systemImage: "plus.circle")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+            .disabled(isAdding || tokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+            Divider()
+
+            // Bulk import from .env
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Bulk Import")
+                    .font(.caption.bold())
+                    .foregroundColor(.secondary)
+                Text("Import ACCOUNT_EMAIL_N / ACCOUNT_KEY_N pairs from a .env file")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 4) {
+                    TextField("~/.env or /path/to/.env", text: $envPathText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.caption, design: .monospaced))
+                        .onSubmit { importEnvFile() }
+                    Button(action: importEnvFile) {
+                        Text(isAdding ? "..." : "Import")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isAdding || envPathText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+
+            // Import results
+            if !envImportResults.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(envImportResults, id: \.email) { result in
+                        HStack(spacing: 6) {
+                            Image(systemName: result.success ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                .foregroundColor(result.success ? .green : .red)
                                 .font(.caption)
-                                .foregroundColor(.secondary)
+                            Text(result.email)
+                                .font(.caption)
+                                .lineLimit(1)
+                            if let error = result.error {
+                                Text(error)
+                                    .font(.caption2)
+                                    .foregroundColor(.red)
+                                    .lineLimit(1)
+                            }
                         }
                     }
                 }
@@ -945,57 +838,78 @@ struct LoginWizardView: View {
             if let msg = statusMessage {
                 Text(msg)
                     .font(.caption)
-                    .foregroundColor(msg.contains("No token") ? .orange : .green)
+                    .foregroundColor(msg.contains("Error") || msg.contains("Invalid") || msg.contains("No ") ? .orange : .green)
             }
+
+            Spacer()
 
             Divider()
 
             HStack {
-                Button(action: scanKeychain) {
-                    Label(isScanning ? "Scanning..." : "Scan Keychain", systemImage: "key")
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(isScanning)
-
                 Spacer()
-
-                Button("Close") {
-                    onDone()
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
+                Button("Close") { onDone() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
             }
         }
         .padding()
-        .frame(width: 280)
+        .frame(width: 320)
     }
 
-    // MARK: - Helpers
+    private func addToken() {
+        let token = tokenText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
 
-    private func scanKeychain() {
-        isScanning = true
+        isAdding = true
         statusMessage = nil
 
         store.ensureDatabase()
 
         Task {
-            // Import token and identify account via profile API
-            if let email = await oauthPoller.scanKeychainWithProfile() {
-                await MainActor.run {
-                    // Reload accounts — may include a newly discovered account
+            let (email, error) = await oauthPoller.addAccountWithToken(token)
+            await MainActor.run {
+                isAdding = false
+                if let email = email {
+                    statusMessage = "Added \(email)"
+                    tokenText = ""
                     store.loadFromDatabase()
-                    isScanning = false
-                    if allLinked {
-                        statusMessage = "All accounts linked!"
-                    } else {
-                        statusMessage = "Linked \(email)."
-                    }
+                } else {
+                    statusMessage = error ?? "Failed to add account"
                 }
-            } else {
-                await MainActor.run {
-                    isScanning = false
-                    statusMessage = "No token found. Use /login in Claude Code first."
+            }
+        }
+    }
+
+    private func importEnvFile() {
+        let raw = envPathText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return }
+
+        // Expand ~ to home directory
+        let expanded = (raw as NSString).expandingTildeInPath
+        let url = URL(fileURLWithPath: expanded)
+
+        guard FileManager.default.fileExists(atPath: expanded) else {
+            statusMessage = "File not found: \(expanded)"
+            return
+        }
+
+        isAdding = true
+        statusMessage = nil
+        envImportResults = []
+
+        store.ensureDatabase()
+
+        Task {
+            let results = await oauthPoller.importFromEnvFile(url: url)
+            await MainActor.run {
+                isAdding = false
+                envImportResults = results
+                let successCount = results.filter { $0.success }.count
+                if successCount > 0 {
+                    statusMessage = "Imported \(successCount) of \(results.count) account(s)"
+                    store.loadFromDatabase()
+                } else {
+                    statusMessage = "No accounts imported"
                 }
             }
         }
@@ -1010,8 +924,6 @@ struct SummaryTableView: View {
     var onDone: () -> Void
 
     /// Accounts sorted by availability: most usable first.
-    /// Effective usage = max(session%, weekly%) — lower is more available.
-    /// Ties broken by earliest reset time (sooner reset = more useful soon).
     private var sortedAccounts: [(account: Account, usage: UsageRecord?)] {
         store.accounts.map { account in
             (account: account, usage: store.latestUsage[account.id])
@@ -1019,23 +931,8 @@ struct SummaryTableView: View {
             let aEffective = max(a.usage?.sessionPercent ?? 0, a.usage?.weeklyAllPercent ?? 0)
             let bEffective = max(b.usage?.sessionPercent ?? 0, b.usage?.weeklyAllPercent ?? 0)
             if aEffective != bEffective { return aEffective < bEffective }
-            let aReset = resetSeconds(a.usage)
-            let bReset = resetSeconds(b.usage)
-            return aReset < bReset
+            return UsageStore.resetSeconds(a.usage) < UsageStore.resetSeconds(b.usage)
         }
-    }
-
-    /// Seconds until reset (session first, then weekly). Returns large value if unknown.
-    private func resetSeconds(_ usage: UsageRecord?) -> TimeInterval {
-        guard let usage = usage else { return .greatestFiniteMagnitude }
-        for str in [usage.sessionReset, usage.weeklyReset].compactMap({ $0 }) {
-            let iso = ISO8601DateFormatter()
-            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = iso.date(from: str) ?? ISO8601DateFormatter().date(from: str) {
-                return date.timeIntervalSinceNow
-            }
-        }
-        return .greatestFiniteMagnitude
     }
 
     var body: some View {

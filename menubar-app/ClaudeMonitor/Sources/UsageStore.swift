@@ -95,14 +95,6 @@ class UsageStore: ObservableObject {
         dbPath = homeDir.appendingPathComponent(".claude-monitor/usage.db").path
     }
 
-    // MARK: - Primary Account (M3.3)
-
-    /// The account ID shown in the menubar badge
-    var primaryAccountId: String? {
-        get { getSetting("primary_account_id") }
-        set { setSetting("primary_account_id", value: newValue) }
-    }
-
     /// Creates the database and schema if they don't exist.
     /// Called on launch so the app works standalone without the native host.
     func ensureDatabase() {
@@ -169,6 +161,33 @@ class UsageStore: ObservableObject {
         }
     }
 
+    /// Seconds until reset (session first, then weekly). Returns large value if unknown.
+    static func resetSeconds(_ usage: UsageRecord?) -> TimeInterval {
+        guard let usage = usage else { return .greatestFiniteMagnitude }
+        for str in [usage.sessionReset, usage.weeklyReset].compactMap({ $0 }) {
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = iso.date(from: str) ?? ISO8601DateFormatter().date(from: str) {
+                return date.timeIntervalSinceNow
+            }
+        }
+        return .greatestFiniteMagnitude
+    }
+
+    /// Accounts sorted for popover display: most available (lowest usage) first.
+    var sortedAccountsForPopover: [Account] {
+        let pairs = accounts.map { account in
+            (account: account, usage: latestUsage[account.id])
+        }
+        let sorted = pairs.sorted { a, b in
+            let aEffective = max(a.usage?.sessionPercent ?? 0, a.usage?.weeklyAllPercent ?? 0)
+            let bEffective = max(b.usage?.sessionPercent ?? 0, b.usage?.weeklyAllPercent ?? 0)
+            if aEffective != bEffective { return aEffective < bEffective }
+            return UsageStore.resetSeconds(a.usage) < UsageStore.resetSeconds(b.usage)
+        }
+        return sorted.map { $0.account }
+    }
+
     func loadFromDatabase() {
         do {
             if !FileManager.default.fileExists(atPath: dbPath) {
@@ -180,90 +199,73 @@ class UsageStore: ObservableObject {
                 return
             }
 
-            let db = try Connection(dbPath, readonly: true)
-
-            // Load accounts
-            let accountsTable = Table("accounts")
-            let id = SQLite.Expression<String>("id")
-            let accountName = SQLite.Expression<String?>("account_name")
-            let email = SQLite.Expression<String?>("email")
-            let plan = SQLite.Expression<String?>("plan")
-            let lastUpdated = SQLite.Expression<String?>("last_updated")
-            let sortOrder = SQLite.Expression<Int?>("sort_order")
+            let db = try Connection(dbPath)
 
             var loadedAccounts: [Account] = []
 
-            // Prepare timestamp filter to exclude future timestamps (safety check)
             let isoFormatter = ISO8601DateFormatter()
             isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let nowString = isoFormatter.string(from: Date())
 
-            // Order by sort_order ascending, then last_updated descending
-            let query = accountsTable.order(sortOrder.asc, lastUpdated.desc)
-            for row in try db.prepare(query) {
-                let accountId = row[id]
+            // Load accounts using raw SQL
+            let accountStmt = try db.prepare(
+                "SELECT id, account_name, email, plan, last_updated FROM accounts ORDER BY last_updated DESC"
+            )
+
+            for row in accountStmt {
+                guard let accountId = row[0] as? String else { continue }
+                let acctName = row[1] as? String
+                let acctEmail = row[2] as? String
+                let acctPlan = row[3] as? String
+                let acctLastUpdated = row[4] as? String
 
                 // Get latest percent from usage_history
-                let usageTable = Table("usage_history")
-                let primaryPercent = SQLite.Expression<Double?>("primary_percent")
-                let accountIdCol = SQLite.Expression<String>("account_id")
-                let timestamp = SQLite.Expression<String>("timestamp")
-
-                let latestQuery = usageTable
-                    .filter(accountIdCol == accountId && timestamp <= nowString)
-                    .order(timestamp.desc)
-                    .limit(1)
-
                 var percent: Double? = nil
-                if let usageRow = try db.pluck(latestQuery) {
-                    percent = usageRow[primaryPercent]
+                let usageStmt = try db.prepare(
+                    "SELECT primary_percent FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1"
+                )
+                for usageRow in usageStmt.bind(accountId, nowString) {
+                    percent = usageRow[0] as? Double
                 }
 
                 let account = Account(
                     id: accountId,
-                    accountName: row[accountName],
-                    email: row[email],
-                    plan: row[plan],
-                    lastUpdated: parseDate(row[lastUpdated]),
+                    accountName: acctName,
+                    email: acctEmail,
+                    plan: acctPlan,
+                    lastUpdated: parseDate(acctLastUpdated),
                     latestPercent: percent
                 )
                 loadedAccounts.append(account)
 
                 // Load latest usage for this account
-                if let usageRow = try db.pluck(latestQuery) {
-                    let sessionPercent = SQLite.Expression<Double?>("session_percent")
-                    let weeklyAllPercent = SQLite.Expression<Double?>("weekly_all_percent")
-                    let weeklySONnetPercent = SQLite.Expression<Double?>("weekly_sonnet_percent")
-                    let sessionReset = SQLite.Expression<String?>("session_reset")
-                    let weeklyReset = SQLite.Expression<String?>("weekly_reset")
-                    let rowId = SQLite.Expression<Int64>("id")
-
+                let latestStmt = try db.prepare(
+                    "SELECT id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1"
+                )
+                for usageRow in latestStmt.bind(accountId, nowString) {
                     let record = UsageRecord(
-                        id: usageRow[rowId],
+                        id: (usageRow[0] as? Int64) ?? 0,
                         accountId: accountId,
-                        timestamp: parseDate(usageRow[timestamp]) ?? Date(),
-                        primaryPercent: usageRow[primaryPercent],
-                        sessionPercent: usageRow[sessionPercent],
-                        weeklyAllPercent: usageRow[weeklyAllPercent],
-                        weeklySONnetPercent: usageRow[weeklySONnetPercent],
-                        sessionReset: usageRow[sessionReset],
-                        weeklyReset: usageRow[weeklyReset]
+                        timestamp: parseDate(usageRow[1] as? String) ?? Date(),
+                        primaryPercent: usageRow[2] as? Double,
+                        sessionPercent: usageRow[3] as? Double,
+                        weeklyAllPercent: usageRow[4] as? Double,
+                        weeklySONnetPercent: usageRow[5] as? Double,
+                        sessionReset: usageRow[6] as? String,
+                        weeklyReset: usageRow[7] as? String
                     )
                     latestUsage[accountId] = record
                 }
             }
 
-            DispatchQueue.main.async {
-                self.accounts = loadedAccounts
-                self.lastRefresh = Date()
-                self.error = nil
-                self.onAccountsChanged?()
-            }
+            self.accounts = loadedAccounts
+            self.lastRefresh = Date()
+            self.error = nil
+            self.onAccountsChanged?()
 
         } catch {
-            DispatchQueue.main.async {
-                self.error = "Database error: \(error.localizedDescription)"
-            }
+            FileLogger.shared.error("loadFromDatabase: \(error)", category: "DB")
+            self.error = "Database error: \(error.localizedDescription)"
         }
     }
 
@@ -591,124 +593,6 @@ class UsageStore: ObservableObject {
         } catch {
             DispatchQueue.main.async {
                 self.error = "Failed to update account name: \(error.localizedDescription)"
-            }
-        }
-    }
-
-    func moveAccountToTop(accountId: String) {
-        do {
-            guard FileManager.default.fileExists(atPath: dbPath) else {
-                return
-            }
-
-            let db = try Connection(dbPath)
-            let accountsTable = Table("accounts")
-            let id = SQLite.Expression<String>("id")
-            let sortOrder = SQLite.Expression<Int?>("sort_order")
-
-            // Get current accounts in order
-            let query = accountsTable.order(sortOrder.asc)
-            var accountIds: [String] = []
-            for row in try db.prepare(query) {
-                accountIds.append(row[id])
-            }
-
-            // Find and move target to front
-            guard let targetIndex = accountIds.firstIndex(of: accountId) else {
-                return
-            }
-
-            // Already at top, no need to reorder
-            if targetIndex == 0 {
-                return
-            }
-
-            // Reorder: move target to front
-            let targetId = accountIds.remove(at: targetIndex)
-            accountIds.insert(targetId, at: 0)
-
-            // Update all sort orders
-            for (index, accId) in accountIds.enumerated() {
-                let account = accountsTable.filter(id == accId)
-                try db.run(account.update(sortOrder <- index))
-            }
-
-            // Also set as primary account (M3.5)
-            primaryAccountId = accountId
-
-            // Immediately update local state for instant UI feedback
-            if let localIndex = accounts.firstIndex(where: { $0.id == accountId }) {
-                let movedAccount = accounts.remove(at: localIndex)
-                accounts.insert(movedAccount, at: 0)
-                onAccountsChanged?()
-            }
-
-            // Reload to get any other database changes
-            loadFromDatabase()
-
-        } catch {
-            DispatchQueue.main.async {
-                self.error = "Failed to reorder account: \(error.localizedDescription)"
-            }
-        }
-    }
-
-    func moveAccountToBottom(accountId: String) {
-        do {
-            guard FileManager.default.fileExists(atPath: dbPath) else {
-                return
-            }
-
-            let db = try Connection(dbPath)
-            let accountsTable = Table("accounts")
-            let id = SQLite.Expression<String>("id")
-            let sortOrder = SQLite.Expression<Int?>("sort_order")
-
-            // Get current accounts in order
-            let query = accountsTable.order(sortOrder.asc)
-            var accountIds: [String] = []
-            for row in try db.prepare(query) {
-                accountIds.append(row[id])
-            }
-
-            // Find and move target to end
-            guard let targetIndex = accountIds.firstIndex(of: accountId) else {
-                return
-            }
-
-            // Already at bottom, no need to reorder
-            if targetIndex == accountIds.count - 1 {
-                return
-            }
-
-            // Reorder: move target to end
-            let targetId = accountIds.remove(at: targetIndex)
-            accountIds.append(targetId)
-
-            // Update all sort orders
-            for (index, accId) in accountIds.enumerated() {
-                let account = accountsTable.filter(id == accId)
-                try db.run(account.update(sortOrder <- index))
-            }
-
-            // Set new top account as primary
-            if let newTopId = accountIds.first {
-                primaryAccountId = newTopId
-            }
-
-            // Immediately update local state for instant UI feedback
-            if let localIndex = accounts.firstIndex(where: { $0.id == accountId }) {
-                let movedAccount = accounts.remove(at: localIndex)
-                accounts.append(movedAccount)
-                onAccountsChanged?()
-            }
-
-            // Reload to get any other database changes
-            loadFromDatabase()
-
-        } catch {
-            DispatchQueue.main.async {
-                self.error = "Failed to reorder account: \(error.localizedDescription)"
             }
         }
     }

@@ -66,24 +66,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Ensure database exists (standalone mode without native host)
         usageStore.ensureDatabase()
 
-        // Deduplicate credentials at startup (fixes multiple credentials per account)
-        oauthPoller.deduplicateCredentials()
-
-        // One-time keychain import at startup (only if no credentials in DB yet).
-        // This is the only automatic keychain read; further imports happen via the
-        // "Scan Keychain" button in the Login Wizard so the user controls the prompts.
-        if !oauthPoller.hasCredentials {
-            flog.info("No OAuth credentials found — auto-importing from keychain", category: "App")
-            Task {
-                if let email = await oauthPoller.scanKeychainWithProfile() {
-                    flog.info("Startup import: linked \(email)", category: "App")
-                }
-                await MainActor.run {
-                    usageStore.loadFromDatabase()
-                }
-            }
-        }
-
         // Hide dock icon
         NSApp.setActivationPolicy(.accessory)
 
@@ -111,8 +93,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         popover?.contentSize = NSSize(width: 320, height: heightManager.currentHeight)
         popover?.behavior = .transient
         popover?.contentViewController = NSHostingController(
-            rootView: UsagePopoverView(store: usageStore, oauthPoller: oauthPoller, heightManager: heightManager, onLoginToAll: { [weak self] in
-                self?.openLoginWizard()
+            rootView: UsagePopoverView(store: usageStore, oauthPoller: oauthPoller, heightManager: heightManager, onAddAccount: { [weak self] in
+                self?.openAddAccountWindow()
             }, onSummary: { [weak self] in
                 self?.openSummaryWindow()
             })
@@ -160,8 +142,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var percent: Int = 0
         var isWeeklyLimit = false
 
-        // Top card in popover = menubar account
-        let targetAccount = usageStore.accounts.first
+        // Top card in popover = menubar account (active account or most available)
+        let targetAccount = usageStore.sortedAccountsForPopover.first
 
         if let account = targetAccount,
            let usage = usageStore.latestUsage[account.id] {
@@ -262,9 +244,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func showContextMenu() {
         let menu = NSMenu()
 
-        // Account list with checkmark on top card (menubar account)
-        let topId = usageStore.accounts.first?.id
-        for account in usageStore.accounts {
+        // Account list sorted by availability
+        for account in usageStore.sortedAccountsForPopover {
             let item = NSMenuItem(
                 title: account.displayName,
                 action: #selector(selectAccount(_:)),
@@ -272,7 +253,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
             item.target = self
             item.representedObject = account.id
-            item.state = account.id == topId ? .on : .off
             if let usage = usageStore.latestUsage[account.id] {
                 let pct = Int(max(usage.sessionPercent ?? 0, usage.weeklyAllPercent ?? 0))
                 item.title = "\(account.displayName) (\(pct)%)"
@@ -293,9 +273,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func selectAccount(_ sender: NSMenuItem) {
-        guard let accountId = sender.representedObject as? String else { return }
-        // Pin to top: reorder so selected account becomes top card (and menubar account)
-        usageStore.moveAccountToTop(accountId: accountId)
+        guard let accountId = sender.representedObject as? String,
+              let account = usageStore.accounts.first(where: { $0.id == accountId }) else { return }
+        ChartWindowController.showChart(for: account, store: usageStore)
     }
 
     func togglePopover() {
@@ -310,19 +290,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Login Wizard Window
+    // MARK: - Add Account Window
 
-    func openLoginWizard() {
-        flog.info("openLoginWizard called", category: "App")
+    func openAddAccountWindow() {
+        flog.info("openAddAccountWindow called", category: "App")
 
-        // Close the popover first, then open wizard after a delay
+        // Close the popover first, then open window after a delay
         // to avoid AppKit layout crash during popover dismissal
         popover?.performClose(nil)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self = self else { return }
-
-            self.flog.info("openLoginWizard executing", category: "App")
 
             if let window = self.loginWizardWindow, window.isVisible {
                 window.makeKeyAndOrderFront(nil)
@@ -330,21 +308,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
 
-            let wizardView = LoginWizardView(store: self.usageStore, oauthPoller: self.oauthPoller, onDone: { [weak self] in
+            let addAccountView = AddAccountView(store: self.usageStore, oauthPoller: self.oauthPoller, onDone: { [weak self] in
                 self?.loginWizardWindow?.close()
                 self?.loginWizardWindow = nil
             })
 
-            let hostingController = NSHostingController(rootView: wizardView)
-            // Prevent NSHostingController from auto-resizing the window
-            // (avoids recursive layout crash in NSHostingView.updateAnimatedWindowSize)
+            let hostingController = NSHostingController(rootView: addAccountView)
             if #available(macOS 13.0, *) {
                 hostingController.sizingOptions = []
             }
             let window = NSWindow(contentViewController: hostingController)
-            window.title = "Login to All Accounts"
+            window.title = "Add Account"
             window.styleMask = [.titled, .closable]
-            window.setContentSize(NSSize(width: 320, height: 480))
+            window.setContentSize(NSSize(width: 360, height: 420))
             window.center()
             window.isReleasedWhenClosed = false
             window.level = .floating
@@ -352,7 +328,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             self.loginWizardWindow = window
 
-            self.flog.info("Login wizard window opened", category: "App")
+            self.flog.info("Add Account window opened", category: "App")
         }
     }
 
