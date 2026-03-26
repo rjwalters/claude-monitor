@@ -272,28 +272,16 @@ class OAuthPoller: ObservableObject {
         }
     }
 
-    // MARK: - Polling (round-robin, one account per tick)
+    // MARK: - Polling (each account once per interval, staggered)
 
-    private var nextPollIndex = 0
+    /// How often each account should be polled (seconds)
+    private let pollInterval: TimeInterval = 600  // 10 minutes
 
-    func pollNext() async {
-        let credentials = loadActiveCredentials()
-        guard !credentials.isEmpty else {
-            flog.info("pollNext: no active credentials", category: fcat)
-            return
-        }
+    /// Last poll time per credential ID
+    private var lastPollTimes: [Int64: Date] = [:]
 
-        if nextPollIndex >= credentials.count {
-            nextPollIndex = 0
-        }
-
-        let credential = credentials[nextPollIndex]
-        flog.info("pollNext: \(credential.label) (\(nextPollIndex + 1)/\(credentials.count))", category: fcat)
-        nextPollIndex = (nextPollIndex + 1) % credentials.count
-
-        await pollWithRetry(credential)
-    }
-
+    /// Poll all accounts (startup and manual refresh). Staggers next-poll times
+    /// by spacing sequential calls so they naturally spread out.
     func pollAll() async {
         let credentials = loadActiveCredentials()
         guard !credentials.isEmpty else {
@@ -304,7 +292,31 @@ class OAuthPoller: ObservableObject {
 
         for credential in credentials {
             await pollWithRetry(credential)
+            if let credId = credential.id {
+                lastPollTimes[credId] = Date()
+            }
         }
+    }
+
+    /// Poll any accounts whose poll interval has elapsed. Returns count of accounts polled.
+    func pollDue() async -> Int {
+        let credentials = loadActiveCredentials()
+        guard !credentials.isEmpty else { return 0 }
+
+        let now = Date()
+        var polled = 0
+
+        for credential in credentials {
+            guard let credId = credential.id else { continue }
+            let lastPoll = lastPollTimes[credId]
+            if lastPoll == nil || now.timeIntervalSince(lastPoll!) >= pollInterval {
+                await pollWithRetry(credential)
+                lastPollTimes[credId] = Date()
+                polled += 1
+            }
+        }
+
+        return polled
     }
 
     private func pollWithRetry(_ credential: OAuthCredential, maxRetries: Int = 2) async {

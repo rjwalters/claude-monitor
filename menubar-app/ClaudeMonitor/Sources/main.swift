@@ -101,12 +101,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         heightManager.popover = popover
 
-        // Start round-robin polling — one account per tick, 60s apart
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.refreshNext()
+        // Tick every 30s; each account is polled once per 10 min (staggered)
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.refreshDue()
         }
 
-        // Initial load — poll all accounts once
+        // Initial load — poll all accounts once (staggers their next-poll times)
         refreshAll()
     }
 
@@ -123,13 +123,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Poll one account (round-robin, called by timer)
-    func refreshNext() {
+    /// Poll any accounts that are due (called by 30s timer)
+    func refreshDue() {
         Task {
-            await oauthPoller.pollNext()
-            await MainActor.run {
-                usageStore.loadFromDatabase()
-                updateStatusButton()
+            let polled = await oauthPoller.pollDue()
+            if polled > 0 {
+                await MainActor.run {
+                    usageStore.loadFromDatabase()
+                    updateStatusButton()
+                }
             }
         }
     }
