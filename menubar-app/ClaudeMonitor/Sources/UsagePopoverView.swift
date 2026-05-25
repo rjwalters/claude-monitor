@@ -35,23 +35,159 @@ func formatResetTime(_ str: String) -> String {
     return str
 }
 
+// MARK: - Column layout
+
+/// Centralized column widths so header + rows stay in lockstep.
+enum SummaryColumns {
+    static let radio: CGFloat = 30
+    static let account: CGFloat = 150
+    static let headroom: CGFloat = 80
+    static let percent: CGFloat = 60
+    static let reset: CGFloat = 80
+    static let dot: CGFloat = 40
+    static let chart: CGFloat = 46
+    static let horizontalPadding: CGFloat = 12
+}
+
+// MARK: - Sorting
+
+enum SummarySort: String {
+    case account, headroom, sessionPercent, sessionReset, weeklyPercent, weeklyReset, fresh, token
+
+    /// First-click direction for this column — "best first" intuition.
+    var defaultDirection: SortDirection {
+        switch self {
+        case .headroom: return .desc   // higher score = better, show first
+        default: return .asc           // lower % / sooner reset / fresher / better-status first
+        }
+    }
+}
+
+enum SortDirection {
+    case asc, desc
+    func toggled() -> SortDirection { self == .asc ? .desc : .asc }
+}
+
+/// "Which account should I use" score 0–100.
+/// 100 = no usage / max headroom; 0 = capped on either session or weekly.
+/// Returns nil if there's no usage data yet (sorts to bottom).
+func headroomScore(_ usage: UsageRecord?) -> Double? {
+    guard let usage = usage else { return nil }
+    let session = usage.sessionPercent ?? 0
+    let weekly = usage.weeklyAllPercent ?? 0
+    let used = max(session, weekly)
+    return max(0, min(100, 100 - used))
+}
+
+/// Seconds until reset for an ISO-8601 string; nil if unparseable/absent.
+func resetSecondsForString(_ str: String?) -> Double? {
+    guard let str = str else { return nil }
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = iso.date(from: str) ?? ISO8601DateFormatter().date(from: str) {
+        return date.timeIntervalSinceNow
+    }
+    return nil
+}
+
+/// Lower rank = "better" status (valid first, missing last).
+func tokenStatusRank(_ status: TokenStatus) -> Int {
+    switch status {
+    case .valid: return 0
+    case .refreshing: return 1
+    case .expired: return 2
+    case .revoked: return 3
+    case .error: return 4
+    case .missing: return 5
+    }
+}
+
 struct UsagePopoverView: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var oauthPoller: OAuthPoller
     @ObservedObject var heightManager: PopoverHeightManager
     var onAddAccount: (() -> Void)?
-    var onSummary: (() -> Void)?
     @Environment(\.colorScheme) var colorScheme
     @State private var showGitHubLink = false
     @State private var titleHoverTimer: Timer?
     @State private var showRemoveConfirmation = false
     @State private var accountToRemove: Account?
+    @State private var sortBy: SummarySort = .headroom
+    @State private var sortDir: SortDirection = .desc
 
-    /// Chrome height: header (~50) + dividers (~2) + footer (~42) + resize handle (~14)
+    /// Chrome height: header (~50) + column header (~28) + dividers (~3) + footer (~42) + resize handle (~14)
     private var scrollViewMaxHeight: CGFloat {
-        heightManager.currentHeight - 108
+        heightManager.currentHeight - 137
     }
 
+    /// Accounts paired with latest usage, sorted by the user-selected column.
+    /// Recomputed every render so the table sorts live as usage updates.
+    private var sortedRows: [(account: Account, usage: UsageRecord?)] {
+        let pairs = store.accounts.map { ($0, store.latestUsage[$0.id]) }
+        return pairs.sorted { compareRows($0, $1) }
+    }
+
+    /// Lookup table for token status by account ID — built once per render
+    /// so sorting by Token doesn't scan the array N×log(N) times.
+    private var tokenStatusByAccount: [String: TokenStatus] {
+        var map: [String: TokenStatus] = [:]
+        for cs in oauthPoller.credentialStatuses {
+            if let id = cs.accountId { map[id] = cs.status }
+        }
+        return map
+    }
+
+    /// Sort comparator for two rows under the current column/direction.
+    /// Rows without data sort to the bottom regardless of direction.
+    private func compareRows(_ a: (Account, UsageRecord?), _ b: (Account, UsageRecord?)) -> Bool {
+        // Account name is a string compare, not numeric
+        if case .account = sortBy {
+            let cmp = a.0.displayName.localizedCaseInsensitiveCompare(b.0.displayName)
+            if cmp == .orderedSame { return a.0.id < b.0.id }
+            return sortDir == .asc
+                ? (cmp == .orderedAscending)
+                : (cmp == .orderedDescending)
+        }
+
+        let (av, bv) = sortValues(a, b, for: sortBy)
+        switch (av, bv) {
+        case (nil, nil): return a.0.id < b.0.id
+        case (nil, _):   return false          // nil rows go last
+        case (_, nil):   return true
+        case let (.some(x), .some(y)):
+            if x == y { return a.0.id < b.0.id }
+            return sortDir == .asc ? (x < y) : (x > y)
+        }
+    }
+
+    /// Numeric value to compare for each column. `nil` = no data → sorts last.
+    private func sortValues(
+        _ a: (Account, UsageRecord?), _ b: (Account, UsageRecord?),
+        for column: SummarySort
+    ) -> (Double?, Double?) {
+        switch column {
+        case .headroom:
+            return (headroomScore(a.1), headroomScore(b.1))
+        case .sessionPercent:
+            return (a.1?.sessionPercent, b.1?.sessionPercent)
+        case .weeklyPercent:
+            return (a.1?.weeklyAllPercent, b.1?.weeklyAllPercent)
+        case .sessionReset:
+            return (resetSecondsForString(a.1?.sessionReset), resetSecondsForString(b.1?.sessionReset))
+        case .weeklyReset:
+            return (resetSecondsForString(a.1?.weeklyReset), resetSecondsForString(b.1?.weeklyReset))
+        case .fresh:
+            // Data age in seconds (lower = fresher). nil usage → nil → sorts last.
+            return (a.1.map { -$0.timestamp.timeIntervalSinceNow },
+                    b.1.map { -$0.timestamp.timeIntervalSinceNow })
+        case .token:
+            let lookup = tokenStatusByAccount
+            return (Double(tokenStatusRank(lookup[a.0.id] ?? .missing)),
+                    Double(tokenStatusRank(lookup[b.0.id] ?? .missing)))
+        case .account:
+            return (nil, nil)  // handled above
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -106,34 +242,34 @@ struct UsagePopoverView: View {
                         .foregroundColor(.secondary)
                 }
                 .buttonStyle(.plain)
-                .onHover { hovering in }
             }
             .padding()
 
             Divider()
-
 
             if let error = store.error {
                 SetupGuideView(oauthPoller: oauthPoller, store: store, error: error, onAddAccount: onAddAccount)
             } else if store.accounts.isEmpty {
                 SetupGuideView(oauthPoller: oauthPoller, store: store, error: nil, onAddAccount: onAddAccount)
             } else {
+                SummaryHeaderRow(sortBy: $sortBy, sortDir: $sortDir)
+                Divider()
+
                 ScrollView {
-                    VStack(spacing: 12) {
-                        ForEach(store.sortedAccountsForPopover) { account in
-                            ClickableAccountCard(
-                                account: account,
-                                usage: store.latestUsage[account.id],
+                    VStack(spacing: 0) {
+                        ForEach(sortedRows, id: \.account.id) { item in
+                            SummaryRow(
+                                account: item.account,
+                                usage: item.usage,
                                 store: store,
                                 oauthPoller: oauthPoller,
                                 onRemove: {
-                                    accountToRemove = account
+                                    accountToRemove = item.account
                                     showRemoveConfirmation = true
                                 }
                             )
                         }
                     }
-                    .padding()
                 }
                 .frame(maxHeight: scrollViewMaxHeight)
             }
@@ -142,12 +278,6 @@ struct UsagePopoverView: View {
 
             // Footer
             HStack {
-                Button(action: { onSummary?() }) {
-                    Label("Summary", systemImage: "tablecells")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-
                 Button(action: { onAddAccount?() }) {
                     Label("Add Account", systemImage: "plus")
                 }
@@ -167,7 +297,7 @@ struct UsagePopoverView: View {
 
             PopoverResizeHandle(heightManager: heightManager)
         }
-        .frame(width: 320, height: heightManager.currentHeight)
+        .frame(width: PopoverHeightManager.popoverWidth, height: heightManager.currentHeight)
         .background(Color(nsColor: .windowBackgroundColor))
         .alert("Remove Account?", isPresented: $showRemoveConfirmation) {
             Button("Cancel", role: .cancel) { }
@@ -188,12 +318,10 @@ struct UsagePopoverView: View {
     }
 
     private func removeAccount(_ account: Account) {
-        // Deactivate credential
         let credentials = oauthPoller.loadActiveCredentials()
         for cred in credentials where cred.accountId == account.id {
             oauthPoller.deactivateCredential(cred)
         }
-        // Clear account data
         store.clearAccountData(accountId: account.id)
     }
 }
@@ -220,7 +348,10 @@ struct PopoverResizeHandle: View {
                         let newHeight = (dragStartHeight + value.translation.height)
                             .clamped(to: PopoverHeightManager.minHeight...PopoverHeightManager.maxHeight)
                         heightManager.currentHeight = newHeight
-                        heightManager.popover?.contentSize = NSSize(width: 320, height: newHeight)
+                        heightManager.popover?.contentSize = NSSize(
+                            width: PopoverHeightManager.popoverWidth,
+                            height: newHeight
+                        )
                     }
                     .onEnded { _ in
                         dragStartHeight = 0
@@ -237,20 +368,114 @@ struct PopoverResizeHandle: View {
     }
 }
 
-// MARK: - Token Status Dot
+// MARK: - Summary Table — Header
 
-struct TokenStatusDot: View {
-    let accountId: String?
-    @ObservedObject var oauthPoller: OAuthPoller
+struct SummaryHeaderRow: View {
+    @Binding var sortBy: SummarySort
+    @Binding var sortDir: SortDirection
 
-    var statusForAccount: CredentialStatus? {
-        guard let accountId = accountId else { return nil }
-        return oauthPoller.credentialStatuses.first(where: { $0.accountId == accountId })
+    var body: some View {
+        HStack(spacing: 0) {
+            Text("Bar")
+                .frame(width: SummaryColumns.radio, alignment: .center)
+                .help("Account shown in the menu bar")
+            SortableHeader(title: "Account", column: .account,
+                           width: SummaryColumns.account, alignment: .leading,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            SortableHeader(title: "Headroom", column: .headroom,
+                           width: SummaryColumns.headroom, alignment: .trailing,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            SortableHeader(title: "Session %", column: .sessionPercent,
+                           width: SummaryColumns.percent, alignment: .trailing,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            SortableHeader(title: "Sess Reset", column: .sessionReset,
+                           width: SummaryColumns.reset, alignment: .trailing,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            SortableHeader(title: "Weekly %", column: .weeklyPercent,
+                           width: SummaryColumns.percent, alignment: .trailing,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            SortableHeader(title: "Wk Reset", column: .weeklyReset,
+                           width: SummaryColumns.reset, alignment: .trailing,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            SortableHeader(title: "Fresh", column: .fresh,
+                           width: SummaryColumns.dot, alignment: .center,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            SortableHeader(title: "Token", column: .token,
+                           width: SummaryColumns.dot, alignment: .center,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            Text("History")
+                .frame(width: SummaryColumns.chart, alignment: .center)
+        }
+        .font(.caption.bold())
+        .foregroundColor(.secondary)
+        .padding(.horizontal, SummaryColumns.horizontalPadding)
+        .padding(.vertical, 8)
+    }
+}
+
+/// A clickable column header. Tapping switches sort to this column (using
+/// the column's default direction); tapping the active column flips direction.
+struct SortableHeader: View {
+    let title: String
+    let column: SummarySort
+    let width: CGFloat
+    let alignment: Alignment
+    @Binding var sortBy: SummarySort
+    @Binding var sortDir: SortDirection
+
+    private var isActive: Bool { sortBy == column }
+
+    var body: some View {
+        Button(action: handleTap) {
+            HStack(spacing: 2) {
+                Text(title)
+                if isActive {
+                    Image(systemName: sortDir == .asc ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .bold))
+                }
+            }
+            .foregroundColor(isActive ? .primary : .secondary)
+        }
+        .buttonStyle(.plain)
+        .frame(width: width, alignment: alignment)
+        .help("Sort by \(title)")
+        .onHover { hovering in
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
     }
 
-    var dotColor: Color {
-        guard let status = statusForAccount else { return .gray }
-        switch status.status {
+    private func handleTap() {
+        if sortBy == column {
+            sortDir = sortDir.toggled()
+        } else {
+            sortBy = column
+            sortDir = column.defaultDirection
+        }
+    }
+}
+
+// MARK: - Summary Table — Row
+
+struct SummaryRow: View {
+    let account: Account
+    let usage: UsageRecord?
+    let store: UsageStore
+    let oauthPoller: OAuthPoller
+    var onRemove: (() -> Void)? = nil
+    @Environment(\.colorScheme) var colorScheme
+    @State private var isEditingName = false
+    @State private var editedName = ""
+    @FocusState private var isFocused: Bool
+
+    private var tokenStatus: TokenStatus {
+        guard let status = oauthPoller.credentialStatuses.first(where: { $0.accountId == account.id }) else {
+            return .missing
+        }
+        return status.status
+    }
+
+    private var tokenDotColor: Color {
+        switch tokenStatus {
         case .valid: return .green
         case .refreshing: return .yellow
         case .expired, .revoked, .error: return .red
@@ -258,276 +483,135 @@ struct TokenStatusDot: View {
         }
     }
 
-    var body: some View {
-        Circle()
-            .fill(dotColor)
-            .frame(width: 8, height: 8)
-            .help(statusForAccount?.lastError ?? statusForAccount?.status.rawValue ?? "unknown")
-    }
-}
-
-struct AccountCard: View {
-    let account: Account
-    let usage: UsageRecord?
-    var oauthPoller: OAuthPoller? = nil
-    var store: UsageStore? = nil
-    var onEditTapped: (() -> Void)? = nil
-    var onRemove: (() -> Void)? = nil
-    @Environment(\.colorScheme) var colorScheme
-    @State private var isNameHovering = false
-
-    var cardBackground: Color {
-        colorScheme == .dark
-            ? Color.white.opacity(0.05)
-            : Color.black.opacity(0.03)
+    /// Data age in seconds (nil if no usage data)
+    private var dataAge: TimeInterval? {
+        guard let usage = usage else { return nil }
+        return -usage.timestamp.timeIntervalSinceNow
     }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Account header
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
-                        // Token status dot
-                        if let poller = oauthPoller {
-                            TokenStatusDot(accountId: account.id, oauthPoller: poller)
-                        }
-
-                        if isNameHovering, let onEdit = onEditTapped {
-                            Button(action: onEdit) {
-                                Image(systemName: "pencil")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        Text(account.displayName)
-                            .font(.headline)
-                            .foregroundColor(.primary)
-                            .lineLimit(1)
-                    }
-                    .onHover { hovering in
-                        isNameHovering = hovering
-                    }
-                    if let plan = account.plan {
-                        Text(plan)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                Spacer()
-                if let percent = account.latestPercent {
-                    Text("\(Int(percent))%")
-                        .font(.title2)
-                        .fontWeight(.bold)
-                        .foregroundColor(colorForPercent(percent))
-                }
-            }
-
-            if let usage = usage {
-                // Session usage
-                if let sessionPercent = usage.sessionPercent {
-                    UsageRow(
-                        label: "Session",
-                        percent: sessionPercent,
-                        resetTime: usage.sessionReset
-                    )
-                }
-
-                // Weekly - All models
-                if let weeklyAll = usage.weeklyAllPercent {
-                    UsageRow(
-                        label: "Weekly (All)",
-                        percent: weeklyAll,
-                        resetTime: usage.weeklyReset
-                    )
-                }
-
-                // Weekly - Sonnet
-                if let weeklySonnet = usage.weeklySONnetPercent {
-                    UsageRow(
-                        label: "Weekly (Sonnet)",
-                        percent: weeklySonnet,
-                        resetTime: nil
-                    )
-                }
-
-                // Token status warning
-                if let poller = oauthPoller,
-                   let status = poller.credentialStatuses.first(where: { $0.accountId == account.id }),
-                   status.status == .expired || status.status == .revoked || status.status == .missing {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Image(systemName: "exclamationmark.triangle")
-                                .foregroundColor(.orange)
-                                .font(.caption)
-                            Text("Token \(status.status.rawValue)")
-                                .font(.caption)
-                                .foregroundColor(.orange)
-                        }
-                        Text("Re-add with a fresh token from 'claude setup-token'")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.top, 4)
-                }
-
-                // Last updated
-                HStack {
-                    Spacer()
-                    let age = -usage.timestamp.timeIntervalSinceNow
-                    if age > 30 * 60 {
-                        HStack(spacing: 3) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.caption2)
-                            Text("Updated \(formatDate(usage.timestamp))")
-                                .font(.caption2)
-                        }
-                        .foregroundColor(.orange)
-                    } else if age > 10 * 60 {
-                        Text("Updated \(formatDate(usage.timestamp))")
-                            .font(.caption2)
-                            .foregroundColor(.yellow)
-                    } else {
-                        Text("Updated \(formatDate(usage.timestamp))")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-            }
-
-            // Remove account button — shown on hover
-            if isNameHovering, let onRemove = onRemove {
-                HStack {
-                    Spacer()
-                    Button(action: onRemove) {
-                        HStack(spacing: 3) {
-                            Image(systemName: "trash")
-                                .font(.system(size: 9))
-                            Text("Remove")
-                                .font(.system(size: 10))
-                        }
-                        .foregroundColor(.red)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .padding()
-        .background(cardBackground)
-        .cornerRadius(8)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
-        )
+    /// Freshness dot color: green (<10 min), yellow (<30 min), red (>30 min)
+    private var freshnessDotColor: Color {
+        guard let age = dataAge else { return .gray }
+        if age < 10 * 60 { return .green }
+        if age < 30 * 60 { return .yellow }
+        return .red
     }
 
-    func colorForPercent(_ percent: Double) -> Color {
-        if percent > 95 { return Color(nsColor: .systemRed) }
-        if percent >= 90 { return Color(nsColor: .systemOrange) }
-        return .primary
+    private var freshnessLabel: String {
+        guard let age = dataAge else { return "No data" }
+        if age < 10 * 60 { return "Fresh (<10 min)" }
+        if age < 30 * 60 { return "Stale (\(Int(age / 60)) min)" }
+        return "Very stale (\(Int(age / 60)) min)"
     }
 
-    func formatDate(_ date: Date) -> String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
+    /// True when this row is the one whose usage is shown in the menubar.
+    private var isMenubarSelected: Bool {
+        store.effectivePrimaryAccountId == account.id
     }
-}
 
-struct UsageRow: View {
-    let label: String
-    let percent: Double
-    let resetTime: String?
-    @Environment(\.colorScheme) var colorScheme
-
-    var trackColor: Color {
-        colorScheme == .dark
-            ? Color.white.opacity(0.1)
-            : Color.black.opacity(0.1)
+    /// True when the user has explicitly pinned this row (vs. just being the
+    /// auto-sorted first account). Determines whether re-clicking clears.
+    private var isExplicitlyPinned: Bool {
+        store.primaryAccountId == account.id
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(label)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                Text("\(Int(percent))%")
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .foregroundColor(.primary)
+        HStack(spacing: 0) {
+            // Menu-bar source radio
+            Button(action: togglePrimary) {
+                Image(systemName: isMenubarSelected
+                      ? "largecircle.fill.circle"
+                      : "circle")
+                    .foregroundColor(isMenubarSelected ? .accentColor : .secondary)
+                    .opacity(isMenubarSelected && !isExplicitlyPinned ? 0.55 : 1.0)
             }
-
-            GeometryReader { geometry in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(trackColor)
-                        .frame(height: 6)
-
-                    RoundedRectangle(cornerRadius: 3)
-                        .fill(colorForPercent(percent))
-                        .frame(width: geometry.size.width * CGFloat(min(percent, 100) / 100), height: 6)
-                }
-            }
-            .frame(height: 6)
-
-            if let reset = resetTime {
-                Text(formatResetTime(reset))
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-        }
-    }
-
-    func colorForPercent(_ percent: Double) -> Color {
-        if percent > 95 { return Color(nsColor: .systemRed) }
-        if percent >= 90 { return Color(nsColor: .systemOrange) }
-        return .primary
-    }
-}
-
-struct ClickableAccountCard: View {
-    let account: Account
-    let usage: UsageRecord?
-    let store: UsageStore
-    var oauthPoller: OAuthPoller? = nil
-    var onRemove: (() -> Void)? = nil
-    @State private var isHovering = false
-    @State private var isEditing = false
-    @State private var editedName = ""
-
-    var body: some View {
-        if isEditing {
-            EditableAccountCard(
-                account: account,
-                usage: usage,
-                editedName: $editedName,
-                isEditing: $isEditing,
-                onSave: { newName in
-                    store.updateAccountName(accountId: account.id, newName: newName)
-                }
-            )
-        } else {
-            Button(action: {
-                ChartWindowController.showChart(for: account, store: store)
-            }) {
-                AccountCard(
-                    account: account,
-                    usage: usage,
-                    oauthPoller: oauthPoller,
-                    store: store,
-                    onEditTapped: {
-                        editedName = account.accountName ?? account.displayName
-                        isEditing = true
-                    },
-                    onRemove: onRemove
-                )
-            }
-            .buttonStyle(CardButtonStyle(isHovering: isHovering))
+            .buttonStyle(.plain)
+            .frame(width: SummaryColumns.radio, alignment: .center)
+            .help(isExplicitlyPinned
+                  ? "Pinned to menu bar — click to clear"
+                  : (isMenubarSelected
+                     ? "Auto-selected (most available) — click to pin"
+                     : "Click to show this account in the menu bar"))
             .onHover { hovering in
-                isHovering = hovering
+                if hovering {
+                    NSCursor.pointingHand.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+
+            // Account name — inline-editable
+            Group {
+                if isEditingName {
+                    HStack(spacing: 4) {
+                        TextField("Name", text: $editedName)
+                            .textFieldStyle(.plain)
+                            .focused($isFocused)
+                            .onSubmit { saveRename() }
+                            .onExitCommand { isEditingName = false }
+                        Button(action: saveRename) {
+                            Image(systemName: "checkmark")
+                                .font(.caption2)
+                                .foregroundColor(.green)
+                        }
+                        .buttonStyle(.plain)
+                        Button(action: { isEditingName = false }) {
+                            Image(systemName: "xmark")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else {
+                    Text(account.displayName)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .frame(width: SummaryColumns.account, alignment: .leading)
+
+            headroomCell
+                .frame(width: SummaryColumns.headroom, alignment: .trailing)
+
+            percentText(usage?.sessionPercent)
+                .frame(width: SummaryColumns.percent, alignment: .trailing)
+
+            Text(resetLabel(usage?.sessionReset))
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .frame(width: SummaryColumns.reset, alignment: .trailing)
+
+            percentText(usage?.weeklyAllPercent)
+                .frame(width: SummaryColumns.percent, alignment: .trailing)
+
+            Text(resetLabel(usage?.weeklyReset))
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .frame(width: SummaryColumns.reset, alignment: .trailing)
+
+            Circle()
+                .fill(freshnessDotColor)
+                .frame(width: 8, height: 8)
+                .help(freshnessLabel)
+                .frame(width: SummaryColumns.dot)
+
+            Circle()
+                .fill(tokenDotColor)
+                .frame(width: 8, height: 8)
+                .help(tokenStatus.rawValue)
+                .frame(width: SummaryColumns.dot)
+
+            // History column — opens the detailed chart window
+            Button(action: openChart) {
+                Image(systemName: "chart.line.uptrend.xyaxis")
+                    .foregroundColor(.accentColor)
+            }
+            .buttonStyle(.plain)
+            .frame(width: SummaryColumns.chart)
+            .help("Open usage history")
+            .onHover { hovering in
                 if hovering {
                     NSCursor.pointingHand.push()
                 } else {
@@ -535,145 +619,98 @@ struct ClickableAccountCard: View {
                 }
             }
         }
-    }
-}
-
-struct EditableAccountCard: View {
-    let account: Account
-    let usage: UsageRecord?
-    @Binding var editedName: String
-    @Binding var isEditing: Bool
-    let onSave: (String) -> Void
-    @Environment(\.colorScheme) var colorScheme
-    @FocusState private var isFocused: Bool
-
-    var cardBackground: Color {
-        colorScheme == .dark
-            ? Color.white.opacity(0.05)
-            : Color.black.opacity(0.03)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            // Editable account header
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 8) {
-                        TextField("Account name", text: $editedName)
-                            .textFieldStyle(.plain)
-                            .font(.headline)
-                            .focused($isFocused)
-                            .onSubmit {
-                                saveAndClose()
-                            }
-                            .onExitCommand {
-                                isEditing = false
-                            }
-
-                        Button(action: saveAndClose) {
-                            Image(systemName: "checkmark")
-                                .font(.caption)
-                                .foregroundColor(.green)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: { isEditing = false }) {
-                            Image(systemName: "xmark")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    if let plan = account.plan {
-                        Text(plan)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                Spacer()
-                if let percent = account.latestPercent {
-                    Text("\(Int(percent))%")
-                        .font(.title2)
-                        .fontWeight(.bold)
-                        .foregroundColor(colorForPercent(percent))
-                }
+        .font(.caption)
+        .padding(.horizontal, SummaryColumns.horizontalPadding)
+        .padding(.vertical, 6)
+        .background(colorScheme == .dark ? Color.white.opacity(0.02) : Color.clear)
+        .contextMenu {
+            Button(action: openChart) {
+                Label("Open History", systemImage: "chart.line.uptrend.xyaxis")
             }
-
-            if let usage = usage {
-                if let sessionPercent = usage.sessionPercent {
-                    UsageRow(
-                        label: "Session",
-                        percent: sessionPercent,
-                        resetTime: usage.sessionReset
-                    )
-                }
-
-                if let weeklyAll = usage.weeklyAllPercent {
-                    UsageRow(
-                        label: "Weekly (All)",
-                        percent: weeklyAll,
-                        resetTime: usage.weeklyReset
-                    )
-                }
-
-                if let weeklySonnet = usage.weeklySONnetPercent {
-                    UsageRow(
-                        label: "Weekly (Sonnet)",
-                        percent: weeklySonnet,
-                        resetTime: nil
-                    )
-                }
-
-                HStack {
-                    Spacer()
-                    Text("Updated \(formatDate(usage.timestamp))")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
+            Button(action: startRename) {
+                Label("Rename", systemImage: "pencil")
+            }
+            Divider()
+            Button(role: .destructive, action: { onRemove?() }) {
+                Label("Remove", systemImage: "trash")
             }
         }
-        .padding()
-        .background(cardBackground)
-        .cornerRadius(8)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.accentColor.opacity(0.5), lineWidth: 2)
-        )
-        .onAppear {
+    }
+
+    private func openChart() {
+        ChartWindowController.showChart(for: account, store: store, oauthPoller: oauthPoller)
+    }
+
+    private func togglePrimary() {
+        // Clicking the currently-pinned row clears the pin (back to auto).
+        // Clicking any other row pins it.
+        store.setPrimaryAccount(isExplicitlyPinned ? nil : account.id)
+    }
+
+    private func startRename() {
+        editedName = account.accountName ?? account.displayName
+        isEditingName = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             isFocused = true
         }
     }
 
-    func saveAndClose() {
+    private func saveRename() {
         let trimmed = editedName.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
-            onSave(trimmed)
+            store.updateAccountName(accountId: account.id, newName: trimmed)
         }
-        isEditing = false
+        isEditingName = false
     }
 
-    func colorForPercent(_ percent: Double) -> Color {
+    private func resetLabel(_ str: String?) -> String {
+        guard let str = str else { return "—" }
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = isoFormatter.date(from: str) ?? ISO8601DateFormatter().date(from: str)
+        if let date = date {
+            let interval = date.timeIntervalSinceNow
+            if interval <= 0 { return "now" }
+            return formatInterval(interval)
+        }
+        return str
+    }
+
+    @ViewBuilder
+    private var headroomCell: some View {
+        if let score = headroomScore(usage) {
+            Text("\(Int(score.rounded()))")
+                .fontWeight(.semibold)
+                .foregroundColor(colorForHeadroom(score))
+                .help("Higher = more available capacity (100 = none used, 0 = capped)")
+        } else {
+            Text("—")
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func colorForHeadroom(_ score: Double) -> Color {
+        if score >= 70 { return Color(nsColor: .systemGreen) }
+        if score >= 30 { return .primary }
+        if score >= 5  { return Color(nsColor: .systemOrange) }
+        return Color(nsColor: .systemRed)
+    }
+
+    @ViewBuilder
+    private func percentText(_ value: Double?) -> some View {
+        if let pct = value {
+            Text("\(Int(pct))%")
+                .foregroundColor(colorForPercent(pct))
+        } else {
+            Text("—")
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func colorForPercent(_ percent: Double) -> Color {
         if percent > 95 { return Color(nsColor: .systemRed) }
         if percent >= 90 { return Color(nsColor: .systemOrange) }
         return .primary
-    }
-
-    func formatDate(_ date: Date) -> String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
-    }
-}
-
-struct CardButtonStyle: ButtonStyle {
-    let isHovering: Bool
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed ? 0.98 : (isHovering ? 1.01 : 1.0))
-            .animation(.easeInOut(duration: 0.1), value: configuration.isPressed)
-            .animation(.easeInOut(duration: 0.15), value: isHovering)
     }
 }
 
@@ -746,6 +783,8 @@ struct AddAccountView: View {
     @ObservedObject var store: UsageStore
     @ObservedObject var oauthPoller: OAuthPoller
     var onDone: () -> Void
+    /// Called after a successful add/import so the host can refresh polled state.
+    var onImported: (() -> Void)? = nil
 
     @State private var tokenText = ""
     @State private var statusMessage: String?
@@ -873,6 +912,7 @@ struct AddAccountView: View {
                     statusMessage = "Added \(email)"
                     tokenText = ""
                     store.loadFromDatabase()
+                    onImported?()
                 } else {
                     statusMessage = error ?? "Failed to add account"
                 }
@@ -908,199 +948,11 @@ struct AddAccountView: View {
                 if successCount > 0 {
                     statusMessage = "Imported \(successCount) of \(results.count) account(s)"
                     store.loadFromDatabase()
+                    onImported?()
                 } else {
                     statusMessage = "No accounts imported"
                 }
             }
         }
-    }
-}
-
-// MARK: - Summary Table
-
-struct SummaryTableView: View {
-    @ObservedObject var store: UsageStore
-    @ObservedObject var oauthPoller: OAuthPoller
-    var onDone: () -> Void
-
-    /// Accounts sorted by availability: most usable first.
-    private var sortedAccounts: [(account: Account, usage: UsageRecord?)] {
-        store.accounts.map { account in
-            (account: account, usage: store.latestUsage[account.id])
-        }.sorted { a, b in
-            let aEffective = max(a.usage?.sessionPercent ?? 0, a.usage?.weeklyAllPercent ?? 0)
-            let bEffective = max(b.usage?.sessionPercent ?? 0, b.usage?.weeklyAllPercent ?? 0)
-            if aEffective != bEffective { return aEffective < bEffective }
-            return UsageStore.resetSeconds(a.usage) < UsageStore.resetSeconds(b.usage)
-        }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Header row
-            HStack(spacing: 0) {
-                Text("Account")
-                    .frame(width: 140, alignment: .leading)
-                Text("Session %")
-                    .frame(width: 65, alignment: .trailing)
-                Text("Session Reset")
-                    .frame(width: 90, alignment: .trailing)
-                Text("Weekly %")
-                    .frame(width: 65, alignment: .trailing)
-                Text("Weekly Reset")
-                    .frame(width: 90, alignment: .trailing)
-                Text("Fresh")
-                    .frame(width: 50, alignment: .center)
-                Text("Token")
-                    .frame(width: 50, alignment: .center)
-            }
-            .font(.caption.bold())
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-
-            Divider()
-
-            // Rows
-            ScrollView {
-                VStack(spacing: 0) {
-                    ForEach(sortedAccounts, id: \.account.id) { item in
-                        SummaryRow(
-                            account: item.account,
-                            usage: item.usage,
-                            oauthPoller: oauthPoller
-                        )
-                    }
-                }
-            }
-
-            Divider()
-
-            // Footer
-            HStack {
-                Spacer()
-                Button("Close") { onDone() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            }
-            .padding(10)
-        }
-        .frame(width: 616)
-    }
-}
-
-struct SummaryRow: View {
-    let account: Account
-    let usage: UsageRecord?
-    let oauthPoller: OAuthPoller
-    @Environment(\.colorScheme) var colorScheme
-
-    private var tokenStatus: TokenStatus {
-        guard let status = oauthPoller.credentialStatuses.first(where: { $0.accountId == account.id }) else {
-            return .missing
-        }
-        return status.status
-    }
-
-    private var tokenDotColor: Color {
-        switch tokenStatus {
-        case .valid: return .green
-        case .refreshing: return .yellow
-        case .expired, .revoked, .error: return .red
-        case .missing: return .gray
-        }
-    }
-
-    /// Data age in seconds (nil if no usage data)
-    private var dataAge: TimeInterval? {
-        guard let usage = usage else { return nil }
-        return -usage.timestamp.timeIntervalSinceNow
-    }
-
-    /// Freshness dot color: green (<10 min), yellow (<30 min), red (>30 min)
-    private var freshnessDotColor: Color {
-        guard let age = dataAge else { return .gray }
-        if age < 10 * 60 { return .green }
-        if age < 30 * 60 { return .yellow }
-        return .red
-    }
-
-    private var freshnessLabel: String {
-        guard let age = dataAge else { return "No data" }
-        if age < 10 * 60 { return "Fresh (<10 min)" }
-        if age < 30 * 60 { return "Stale (\(Int(age / 60)) min)" }
-        return "Very stale (\(Int(age / 60)) min)"
-    }
-
-    var body: some View {
-        HStack(spacing: 0) {
-            Text(account.displayName)
-                .lineLimit(1)
-                .frame(width: 140, alignment: .leading)
-
-            percentText(usage?.sessionPercent)
-                .frame(width: 65, alignment: .trailing)
-
-            Text(resetTimeLabel(usage?.sessionReset))
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-                .frame(width: 90, alignment: .trailing)
-
-            percentText(usage?.weeklyAllPercent)
-                .frame(width: 65, alignment: .trailing)
-
-            Text(resetTimeLabel(usage?.weeklyReset))
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-                .frame(width: 90, alignment: .trailing)
-
-            Circle()
-                .fill(freshnessDotColor)
-                .frame(width: 8, height: 8)
-                .help(freshnessLabel)
-                .frame(width: 50)
-
-            Circle()
-                .fill(tokenDotColor)
-                .frame(width: 8, height: 8)
-                .help(tokenStatus.rawValue)
-                .frame(width: 50)
-        }
-        .font(.caption)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-        .background(colorScheme == .dark ? Color.white.opacity(0.02) : Color.clear)
-    }
-
-    private func resetTimeLabel(_ str: String?) -> String {
-        guard let str = str else { return "—" }
-        let isoFormatter = ISO8601DateFormatter()
-        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let date = isoFormatter.date(from: str) ?? ISO8601DateFormatter().date(from: str)
-        if let date = date {
-            let interval = date.timeIntervalSinceNow
-            if interval <= 0 { return "now" }
-            return formatInterval(interval)
-        }
-        return str
-    }
-
-    @ViewBuilder
-    private func percentText(_ value: Double?) -> some View {
-        if let pct = value {
-            Text("\(Int(pct))%")
-                .foregroundColor(colorForPercent(pct))
-        } else {
-            Text("—")
-                .foregroundColor(.secondary)
-        }
-    }
-
-    private func colorForPercent(_ percent: Double) -> Color {
-        if percent > 95 { return Color(nsColor: .systemRed) }
-        if percent >= 90 { return Color(nsColor: .systemOrange) }
-        return .primary
     }
 }

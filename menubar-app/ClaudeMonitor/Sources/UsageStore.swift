@@ -84,9 +84,13 @@ class UsageStore: ObservableObject {
     @Published var latestUsage: [String: UsageRecord] = [:]
     @Published var lastRefresh: Date?
     @Published var error: String?
+    /// Account chosen by the user to drive the menubar icon. `nil` = auto (most-available).
+    @Published var primaryAccountId: String?
 
-    /// Called when accounts change (e.g., reordering) so the menubar can update
+    /// Called when accounts change (e.g., reordering, primary selection) so the menubar can update
     var onAccountsChanged: (() -> Void)?
+
+    private static let primaryAccountSettingKey = "primary_account_id"
 
     private let dbPath: String
 
@@ -172,6 +176,23 @@ class UsageStore: ObservableObject {
             }
         }
         return .greatestFiniteMagnitude
+    }
+
+    /// Account ID currently driving the menubar icon. Falls back to the
+    /// most-available account when the user hasn't pinned one (or pinned a
+    /// removed account).
+    var effectivePrimaryAccountId: String? {
+        if let pinned = primaryAccountId, accounts.contains(where: { $0.id == pinned }) {
+            return pinned
+        }
+        return sortedAccountsForPopover.first?.id
+    }
+
+    /// User picked a row as the menubar source (or `nil` to revert to auto).
+    func setPrimaryAccount(_ id: String?) {
+        primaryAccountId = id
+        setSetting(Self.primaryAccountSettingKey, value: id)
+        onAccountsChanged?()
     }
 
     /// Accounts sorted for popover display: most available (lowest usage) first.
@@ -261,6 +282,13 @@ class UsageStore: ObservableObject {
             self.accounts = loadedAccounts
             self.lastRefresh = Date()
             self.error = nil
+
+            // Refresh primary account selection from settings (handles external DB edits)
+            let savedPrimary = getSetting(Self.primaryAccountSettingKey)
+            if self.primaryAccountId != savedPrimary {
+                self.primaryAccountId = savedPrimary
+            }
+
             self.onAccountsChanged?()
 
         } catch {
@@ -696,7 +724,7 @@ class UsageStore: ObservableObject {
 // MARK: - Update Checker
 
 struct AppVersion {
-    static let current = "1.11.0"
+    static let current = "1.12.0"
     static let repoOwner = "rjwalters"
     static let repoName = "claude-monitor"
 }

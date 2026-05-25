@@ -9,6 +9,7 @@ extension CGFloat {
 }
 
 class PopoverHeightManager: ObservableObject {
+    static let popoverWidth: CGFloat = 690
     static let minHeight: CGFloat = 200
     static let maxHeight: CGFloat = 800
     static let defaultHeight: CGFloat = 400
@@ -51,7 +52,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var usageStore = UsageStore()
     var oauthPoller = OAuthPoller()
     var loginWizardWindow: NSWindow?
-    var summaryWindow: NSWindow?
     var heightManager: PopoverHeightManager!
 
     private let flog = FileLogger.shared
@@ -90,13 +90,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create popover
         popover = NSPopover()
-        popover?.contentSize = NSSize(width: 320, height: heightManager.currentHeight)
-        popover?.behavior = .transient
+        popover?.contentSize = NSSize(width: PopoverHeightManager.popoverWidth, height: heightManager.currentHeight)
+        // .semitransient keeps the popover open while user interacts with other
+        // windows in this app (e.g. multiple chart windows launched from rows).
+        popover?.behavior = .semitransient
         popover?.contentViewController = NSHostingController(
             rootView: UsagePopoverView(store: usageStore, oauthPoller: oauthPoller, heightManager: heightManager, onAddAccount: { [weak self] in
                 self?.openAddAccountWindow()
-            }, onSummary: { [weak self] in
-                self?.openSummaryWindow()
             })
         )
         heightManager.popover = popover
@@ -144,8 +144,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var percent: Int = 0
         var isWeeklyLimit = false
 
-        // Top card in popover = menubar account (active account or most available)
-        let targetAccount = usageStore.sortedAccountsForPopover.first
+        // Menubar follows the user's pinned account, or falls back to most-available.
+        let targetAccount = usageStore.accounts.first(where: { $0.id == usageStore.effectivePrimaryAccountId })
 
         if let account = targetAccount,
            let usage = usageStore.latestUsage[account.id] {
@@ -285,7 +285,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if popover.isShown {
                 popover.performClose(nil)
             } else if let button = statusItem?.button {
-                popover.contentSize = NSSize(width: 320, height: heightManager.currentHeight)
+                popover.contentSize = NSSize(width: PopoverHeightManager.popoverWidth, height: heightManager.currentHeight)
                 refreshAll()
                 popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             }
@@ -313,6 +313,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let addAccountView = AddAccountView(store: self.usageStore, oauthPoller: self.oauthPoller, onDone: { [weak self] in
                 self?.loginWizardWindow?.close()
                 self?.loginWizardWindow = nil
+            }, onImported: { [weak self] in
+                // Poll the freshly-added credentials so credentialStatuses populates
+                // (the import only pings — it doesn't update poller status), and the
+                // popover sees an up-to-date snapshot when it next opens.
+                self?.refreshAll()
             })
 
             let hostingController = NSHostingController(rootView: addAccountView)
@@ -334,43 +339,4 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Summary Window
-
-    func openSummaryWindow() {
-        flog.info("openSummaryWindow called", category: "App")
-
-        popover?.performClose(nil)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            guard let self = self else { return }
-
-            if let window = self.summaryWindow, window.isVisible {
-                window.makeKeyAndOrderFront(nil)
-                NSApp.activate(ignoringOtherApps: true)
-                return
-            }
-
-            let summaryView = SummaryTableView(store: self.usageStore, oauthPoller: self.oauthPoller, onDone: { [weak self] in
-                self?.summaryWindow?.close()
-                self?.summaryWindow = nil
-            })
-
-            let hostingController = NSHostingController(rootView: summaryView)
-            if #available(macOS 13.0, *) {
-                hostingController.sizingOptions = []
-            }
-            let window = NSWindow(contentViewController: hostingController)
-            window.title = "Account Summary"
-            window.styleMask = [.titled, .closable]
-            window.setContentSize(NSSize(width: 640, height: 400))
-            window.center()
-            window.isReleasedWhenClosed = false
-            window.level = .floating
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            self.summaryWindow = window
-
-            self.flog.info("Summary window opened", category: "App")
-        }
-    }
 }
