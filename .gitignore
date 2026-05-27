@@ -8,6 +8,7 @@ build/
 .build/
 .swiftpm/
 *.xcodeproj/
-.claude/
+.claude/*
+!.claude/commands/
 *.xpi
 *.zip

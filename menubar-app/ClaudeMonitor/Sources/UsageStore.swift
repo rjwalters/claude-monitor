@@ -589,7 +589,9 @@ class UsageStore: ObservableObject {
         }
     }
 
-    func updateAccountName(accountId: String, newName: String) {
+    /// Set a custom alias for an account. Pass `nil` to clear the alias and
+    /// fall back to the email/id default.
+    func updateAccountName(accountId: String, newName: String?) {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
                 return
@@ -724,7 +726,7 @@ class UsageStore: ObservableObject {
 // MARK: - Update Checker
 
 struct AppVersion {
-    static let current = "1.12.0"
+    static let current = "1.13.0"
     static let repoOwner = "rjwalters"
     static let repoName = "claude-monitor"
 }

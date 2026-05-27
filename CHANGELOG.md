@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] - 2026-05-27
+
+### Summary
+
+Inline-edit account aliases directly from the summary table. Double-click an
+account name to rename it, with a one-click restore-default button to clear
+the alias and fall back to the email.
+
+### Added
+
+- **Double-click an account name to rename it.** The summary table's Account
+  column is now an editable field on double-click — useful for aliasing
+  accounts to something shorter or more meaningful than the email.
+- **Restore-default button in rename mode.** A small counterclockwise-arrow
+  button appears next to the save/cancel controls when a custom alias is set;
+  click it to clear the alias and fall back to the email-based default name.
+
+### Changed
+
+- `UsageStore.updateAccountName` now accepts `String?` so callers can clear an
+  alias by passing `nil`.
+
 ## [1.12.0] - 2026-05-25
 
 ### Summary

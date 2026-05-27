@@ -540,7 +540,7 @@ struct SummaryRow: View {
                 }
             }
 
-            // Account name — inline-editable
+            // Account name — inline-editable (double-click to rename)
             Group {
                 if isEditingName {
                     HStack(spacing: 4) {
@@ -549,6 +549,15 @@ struct SummaryRow: View {
                             .focused($isFocused)
                             .onSubmit { saveRename() }
                             .onExitCommand { isEditingName = false }
+                        if account.accountName != nil {
+                            Button(action: restoreDefaultName) {
+                                Image(systemName: "arrow.counterclockwise")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Restore default name")
+                        }
                         Button(action: saveRename) {
                             Image(systemName: "checkmark")
                                 .font(.caption2)
@@ -566,6 +575,10 @@ struct SummaryRow: View {
                     Text(account.displayName)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { startRename() }
+                        .help("Double-click to rename")
                 }
             }
             .frame(width: SummaryColumns.account, alignment: .leading)
@@ -660,6 +673,11 @@ struct SummaryRow: View {
         if !trimmed.isEmpty {
             store.updateAccountName(accountId: account.id, newName: trimmed)
         }
+        isEditingName = false
+    }
+
+    private func restoreDefaultName() {
+        store.updateAccountName(accountId: account.id, newName: nil)
         isEditingName = false
     }
 
