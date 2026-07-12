@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-07-11
+
+### Summary
+
+Zero-dependency build. The SQLite.swift package is replaced by a minimal
+in-tree wrapper over the system SQLite that ships with macOS, eliminating the
+app's only upstream dependency and producing real SQLite error messages in
+the log.
+
+### Changed
+
+- **SQLite.swift dependency removed.** A new `SQLiteDB.swift` wraps the system
+  `libsqlite3` C API, mirroring the subset the app used (raw SQL with `?`
+  placeholders, index-subscriptable rows, busy timeout). The handful of typed
+  `Table`/`Expression` query sites are rewritten as plain SQL.
+- **Real SQLite error messages.** Database failures now log `sqlite3_errmsg()`
+  text (e.g. `attempt to write a readonly database`) instead of opaque codes
+  like `SQLite.Result error 0`.
+
+### Removed
+
+- `SQLite.swift` package dependency and `Package.resolved` — the package now
+  builds with no external dependencies.
+
 ## [1.13.1] - 2026-07-11
 
 ### Summary
