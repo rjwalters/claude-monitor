@@ -1,5 +1,4 @@
 import Foundation
-import SQLite
 import AppKit
 
 /// Opens a SQLite connection with a busy timeout so concurrent access from
@@ -312,10 +311,6 @@ class UsageStore: ObservableObject {
             }
 
             let db = try openDatabase(dbPath, readonly: true)
-            let usageTable = Table("usage_history")
-            let accountIdCol = SQLite.Expression<String>("account_id")
-            let timestamp = SQLite.Expression<String>("timestamp")
-            let weeklyAllPercent = SQLite.Expression<Double?>("weekly_all_percent")
 
             // Calculate the cutoff date for time-based filtering
             let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
@@ -323,15 +318,15 @@ class UsageStore: ObservableObject {
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let cutoffString = formatter.string(from: cutoffDate)
 
-            let query = usageTable
-                .filter(accountIdCol == accountId && timestamp >= cutoffString)
-                .order(timestamp.asc)
+            let stmt = try db.prepare(
+                "SELECT timestamp, weekly_all_percent FROM usage_history WHERE account_id = ? AND timestamp >= ? ORDER BY timestamp ASC"
+            )
 
             var rawPoints: [(Date, Double)] = []
 
-            for row in try db.prepare(query) {
-                if let percent = row[weeklyAllPercent],
-                   let date = parseDate(row[timestamp]) {
+            for row in stmt.bind(accountId, cutoffString) {
+                if let percent = row[1] as? Double,
+                   let date = parseDate(row[0] as? String) {
                     rawPoints.append((date, percent))
                 }
             }
@@ -391,29 +386,24 @@ class UsageStore: ObservableObject {
             }
 
             let db = try openDatabase(dbPath, readonly: true)
-            let usageTable = Table("usage_history")
-            let accountIdCol = SQLite.Expression<String>("account_id")
-            let timestamp = SQLite.Expression<String>("timestamp")
-            let sessionPercent = SQLite.Expression<Double?>("session_percent")
-            let weeklyAllPercent = SQLite.Expression<Double?>("weekly_all_percent")
 
             let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
             let formatter = ISO8601DateFormatter()
             formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let cutoffString = formatter.string(from: cutoffDate)
 
-            let query = usageTable
-                .filter(accountIdCol == accountId && timestamp >= cutoffString)
-                .order(timestamp.asc)
+            let stmt = try db.prepare(
+                "SELECT timestamp, session_percent, weekly_all_percent FROM usage_history WHERE account_id = ? AND timestamp >= ? ORDER BY timestamp ASC"
+            )
 
             var rawPoints: [FullUsageDataPoint] = []
 
-            for row in try db.prepare(query) {
-                if let date = parseDate(row[timestamp]) {
+            for row in stmt.bind(accountId, cutoffString) {
+                if let date = parseDate(row[0] as? String) {
                     rawPoints.append(FullUsageDataPoint(
                         timestamp: date,
-                        sessionPercent: row[sessionPercent],
-                        weeklyAllPercent: row[weeklyAllPercent]
+                        sessionPercent: row[1] as? Double,
+                        weeklyAllPercent: row[2] as? Double
                     ))
                 }
             }
@@ -606,12 +596,7 @@ class UsageStore: ObservableObject {
             }
 
             let db = try openDatabase(dbPath)
-            let accountsTable = Table("accounts")
-            let id = SQLite.Expression<String>("id")
-            let accountName = SQLite.Expression<String?>("account_name")
-
-            let account = accountsTable.filter(id == accountId)
-            try db.run(account.update(accountName <- newName))
+            try db.run("UPDATE accounts SET account_name = ? WHERE id = ?", newName, accountId)
 
             // Immediately update local state for instant UI feedback
             if let index = accounts.firstIndex(where: { $0.id == accountId }) {
@@ -643,15 +628,9 @@ class UsageStore: ObservableObject {
 
             let db = try openDatabase(dbPath)
 
-            // Delete usage history for this account
-            let usageTable = Table("usage_history")
-            let accountIdCol = SQLite.Expression<String>("account_id")
-            try db.run(usageTable.filter(accountIdCol == accountId).delete())
-
-            // Delete the account
-            let accountsTable = Table("accounts")
-            let id = SQLite.Expression<String>("id")
-            try db.run(accountsTable.filter(id == accountId).delete())
+            // Delete usage history for this account, then the account itself
+            try db.run("DELETE FROM usage_history WHERE account_id = ?", accountId)
+            try db.run("DELETE FROM accounts WHERE id = ?", accountId)
 
             // Reload to reflect the change
             loadFromDatabase()
@@ -696,15 +675,7 @@ class UsageStore: ObservableObject {
             }
 
             let db = try openDatabase(dbPath, readonly: true)
-            let settingsTable = Table("settings")
-            let keyCol = SQLite.Expression<String>("key")
-            let valueCol = SQLite.Expression<String?>("value")
-
-            let query = settingsTable.filter(keyCol == key)
-            if let row = try db.pluck(query) {
-                return row[valueCol]
-            }
-            return nil
+            return try db.scalar("SELECT value FROM settings WHERE key = ?", key) as? String
         } catch {
             print("Error reading setting: \(error)")
             return nil

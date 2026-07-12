@@ -1,5 +1,4 @@
 import Foundation
-import SQLite
 import os
 
 private let logger = Logger(subsystem: "com.claude-monitor.app", category: "OAuthPoller")

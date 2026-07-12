@@ -6,15 +6,9 @@ let package = Package(
     platforms: [
         .macOS(.v14)
     ],
-    dependencies: [
-        .package(url: "https://github.com/stephencelis/SQLite.swift.git", from: "0.15.0")
-    ],
     targets: [
         .executableTarget(
             name: "ClaudeMonitor",
-            dependencies: [
-                .product(name: "SQLite", package: "SQLite.swift")
-            ],
             path: "Sources",
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"])
