@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.1] - 2026-07-11
+
+### Summary
+
+Reliability release. Hardens SQLite access against lock contention that could
+stall the app at launch before the menu-bar icon appeared, and adds startup
+phase logging so any future launch stall is diagnosable from `debug.log`.
+
+### Changed
+
+- **SQLite connections now use a 5-second busy timeout.** All database opens go
+  through a shared `openDatabase()` helper, so concurrent access from other
+  processes waits briefly for locks instead of failing immediately with
+  `SQLite.Result error 0`.
+- **Startup phases are logged.** `applicationDidFinishLaunching` logs database,
+  status-item, and popover milestones, so a launch that stalls before the
+  menu-bar icon appears shows exactly where it stopped.
+
+### Fixed
+
+- `ensureDatabase` failures are now written to `~/.claude-monitor/debug.log`
+  via `FileLogger` instead of being lost on stdout.
+
 ## [1.13.0] - 2026-05-27
 
 ### Summary
