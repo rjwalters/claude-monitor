@@ -2,6 +2,14 @@ import Foundation
 import SQLite
 import AppKit
 
+/// Opens a SQLite connection with a busy timeout so concurrent access from
+/// other processes waits briefly for locks instead of failing immediately.
+func openDatabase(_ path: String, readonly: Bool = false) throws -> Connection {
+    let db = try Connection(path, readonly: readonly)
+    db.busyTimeout = 5
+    return db
+}
+
 struct Account: Identifiable {
     let id: String
     let accountName: String?
@@ -108,7 +116,7 @@ class UsageStore: ObservableObject {
             try? fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
         }
         do {
-            let db = try Connection(dbPath)
+            let db = try openDatabase(dbPath)
             try db.execute("PRAGMA journal_mode=WAL")
             try db.execute("""
                 CREATE TABLE IF NOT EXISTS accounts (
@@ -161,7 +169,7 @@ class UsageStore: ObservableObject {
                 );
             """)
         } catch {
-            print("Failed to create database: \(error)")
+            FileLogger.shared.error("Failed to create database: \(error)", category: "DB")
         }
     }
 
@@ -220,7 +228,7 @@ class UsageStore: ObservableObject {
                 return
             }
 
-            let db = try Connection(dbPath)
+            let db = try openDatabase(dbPath)
 
             var loadedAccounts: [Account] = []
 
@@ -303,7 +311,7 @@ class UsageStore: ObservableObject {
                 return []
             }
 
-            let db = try Connection(dbPath, readonly: true)
+            let db = try openDatabase(dbPath, readonly: true)
             let usageTable = Table("usage_history")
             let accountIdCol = SQLite.Expression<String>("account_id")
             let timestamp = SQLite.Expression<String>("timestamp")
@@ -382,7 +390,7 @@ class UsageStore: ObservableObject {
                 return []
             }
 
-            let db = try Connection(dbPath, readonly: true)
+            let db = try openDatabase(dbPath, readonly: true)
             let usageTable = Table("usage_history")
             let accountIdCol = SQLite.Expression<String>("account_id")
             let timestamp = SQLite.Expression<String>("timestamp")
@@ -450,7 +458,7 @@ class UsageStore: ObservableObject {
                 return []
             }
 
-            let db = try Connection(dbPath, readonly: true)
+            let db = try openDatabase(dbPath, readonly: true)
 
             let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
             let formatter = ISO8601DateFormatter()
@@ -508,7 +516,7 @@ class UsageStore: ObservableObject {
                 return []
             }
 
-            let db = try Connection(dbPath, readonly: true)
+            let db = try openDatabase(dbPath, readonly: true)
 
             let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
             let formatter = ISO8601DateFormatter()
@@ -568,7 +576,7 @@ class UsageStore: ObservableObject {
                 return false
             }
 
-            let db = try Connection(dbPath, readonly: true)
+            let db = try openDatabase(dbPath, readonly: true)
 
             let sql = """
                 SELECT COUNT(*) FROM token_sessions
@@ -597,7 +605,7 @@ class UsageStore: ObservableObject {
                 return
             }
 
-            let db = try Connection(dbPath)
+            let db = try openDatabase(dbPath)
             let accountsTable = Table("accounts")
             let id = SQLite.Expression<String>("id")
             let accountName = SQLite.Expression<String?>("account_name")
@@ -633,7 +641,7 @@ class UsageStore: ObservableObject {
                 return
             }
 
-            let db = try Connection(dbPath)
+            let db = try openDatabase(dbPath)
 
             // Delete usage history for this account
             let usageTable = Table("usage_history")
@@ -687,7 +695,7 @@ class UsageStore: ObservableObject {
                 return nil
             }
 
-            let db = try Connection(dbPath, readonly: true)
+            let db = try openDatabase(dbPath, readonly: true)
             let settingsTable = Table("settings")
             let keyCol = SQLite.Expression<String>("key")
             let valueCol = SQLite.Expression<String?>("value")
@@ -707,7 +715,7 @@ class UsageStore: ObservableObject {
     func setSetting(_ key: String, value: String?) {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else { return }
-            let db = try Connection(dbPath)
+            let db = try openDatabase(dbPath)
             if let value = value {
                 try db.run("""
                     INSERT INTO settings (key, value) VALUES (?, ?)

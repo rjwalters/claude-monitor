@@ -65,6 +65,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Ensure database exists (standalone mode without native host)
         usageStore.ensureDatabase()
+        flog.info("Database ready", category: "App")
 
         // Hide dock icon
         NSApp.setActivationPolicy(.accessory)
@@ -79,6 +80,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
             updateStatusButton()
         }
+        flog.info("Status item created", category: "App")
 
         // Update menubar when accounts change (e.g., reordering)
         usageStore.onAccountsChanged = { [weak self] in
@@ -100,6 +102,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             })
         )
         heightManager.popover = popover
+        flog.info("Popover ready, starting poll timer", category: "App")
 
         // Tick every 30s; each account is polled once per 10 min (staggered)
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in

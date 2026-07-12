@@ -170,7 +170,7 @@ class OAuthPoller: ObservableObject {
     ) {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
         do {
-            let db = try Connection(dbPath)
+            let db = try openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
             let label = orgName ?? email ?? accountId
 
@@ -217,7 +217,7 @@ class OAuthPoller: ObservableObject {
     func loadActiveCredentials() -> [OAuthCredential] {
         guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
         do {
-            let db = try Connection(dbPath, readonly: true)
+            let db = try openDatabase(dbPath, readonly: true)
             var credentials: [OAuthCredential] = []
 
             let stmt = try db.prepare("""
@@ -260,7 +260,7 @@ class OAuthPoller: ObservableObject {
         guard let credId = credential.id,
               FileManager.default.fileExists(atPath: dbPath) else { return }
         do {
-            let db = try Connection(dbPath)
+            let db = try openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
             try db.run(
                 "UPDATE oauth_credentials SET is_active = 0, updated_at = ? WHERE id = ?",
@@ -370,7 +370,7 @@ class OAuthPoller: ObservableObject {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
 
         do {
-            let db = try Connection(dbPath)
+            let db = try openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
 
             let sessionPercent = ping.sessionPercent
@@ -453,7 +453,7 @@ class OAuthPoller: ObservableObject {
         guard let credId = credential.id,
               FileManager.default.fileExists(atPath: dbPath) else { return }
         do {
-            let db = try Connection(dbPath)
+            let db = try openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
             try db.run(
                 "UPDATE oauth_credentials SET last_poll_at = ?, last_error = ?, updated_at = ? WHERE id = ?",
