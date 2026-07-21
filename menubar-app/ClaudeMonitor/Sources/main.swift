@@ -9,7 +9,7 @@ extension CGFloat {
 }
 
 class PopoverHeightManager: ObservableObject {
-    static let popoverWidth: CGFloat = 690
+    static let popoverWidth: CGFloat = 818
     static let minHeight: CGFloat = 200
     static let maxHeight: CGFloat = 800
     static let defaultHeight: CGFloat = 400
@@ -109,8 +109,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refreshDue()
         }
 
-        // Initial load — poll all accounts once (staggers their next-poll times)
-        refreshAll()
+        // Initial load — sync accounts from the master + local list files, then
+        // poll all accounts once (staggers their next-poll times).
+        syncThenRefreshAll()
+    }
+
+    /// Import accounts from ~/.claude-monitor/accounts.env (+ accounts.local.env)
+    /// additively, then poll everything. Runs once at launch.
+    func syncThenRefreshAll() {
+        Task {
+            let results = await oauthPoller.syncFromAccountFiles()
+            if !results.isEmpty {
+                let ok = results.filter { $0.success }.count
+                flog.info("syncThenRefreshAll: imported \(ok)/\(results.count) account(s) from list files", category: "App")
+            }
+            await oauthPoller.pollAll()
+            await MainActor.run {
+                usageStore.loadFromDatabase()
+                updateStatusButton()
+                flog.info("syncThenRefreshAll: loaded \(usageStore.accounts.count) account(s)", category: "App")
+            }
+        }
     }
 
     /// Poll all accounts (startup and manual refresh)
@@ -130,7 +149,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func refreshDue() {
         Task {
             let polled = await oauthPoller.pollDue()
-            if polled > 0 {
+            // Fable-tier probe runs on its own (slower) cadence and writes the
+            // premium/overage headers the UI reads.
+            let fableProbed = await oauthPoller.probeFableDue()
+            if polled > 0 || fableProbed > 0 {
                 await MainActor.run {
                     usageStore.loadFromDatabase()
                     updateStatusButton()
