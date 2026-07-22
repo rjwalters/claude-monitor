@@ -121,6 +121,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             await MainActor.run {
                 usageStore.loadFromDatabase()
                 updateStatusButton()
+                // Emit ~/.claude-monitor/ranking.json for external load balancers (#2)
+                RankingExporter.export()
                 flog.info("refreshAll: loaded \(usageStore.accounts.count) account(s)", category: "App")
             }
         }
@@ -134,6 +136,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run {
                     usageStore.loadFromDatabase()
                     updateStatusButton()
+                    // Emit ~/.claude-monitor/ranking.json for external load balancers (#2)
+                    RankingExporter.export()
                 }
             }
         }
