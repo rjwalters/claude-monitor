@@ -8,29 +8,42 @@ extension CGFloat {
     }
 }
 
+/// Sizes the popover to hug its content: the window height tracks the number
+/// of account rows so there is no empty space below the table. Height is
+/// clamped to [minHeight, maxHeight]; when rows would exceed maxHeight the row
+/// list scrolls. There is no manual resize — the fit is automatic.
 class PopoverHeightManager: ObservableObject {
     static let popoverWidth: CGFloat = 818
     static let minHeight: CGFloat = 200
     static let maxHeight: CGFloat = 800
-    static let defaultHeight: CGFloat = 400
 
-    @Published var currentHeight: CGFloat
+    /// Fixed chrome around the scrolling row list: header (~50) + column
+    /// header (~28) + dividers (~3) + footer (~42).
+    static let chromeHeight: CGFloat = 123
+    /// Height of a single account row: caption text (~16) + 6pt vertical
+    /// padding × 2. Keep in sync with `SummaryRow`'s `.padding(.vertical, 6)`.
+    static let rowHeight: CGFloat = 28
+    /// Height for the setup/empty/error state (no table rows to size against).
+    static let setupHeight: CGFloat = 360
+
+    @Published var currentHeight: CGFloat = PopoverHeightManager.minHeight
     weak var popover: NSPopover?
 
-    private let store: UsageStore
-
-    init(store: UsageStore) {
-        self.store = store
-        if let saved = store.getSetting("popover_height"),
-           let value = Double(saved) {
-            self.currentHeight = CGFloat(value).clamped(to: Self.minHeight...Self.maxHeight)
-        } else {
-            self.currentHeight = Self.defaultHeight
-        }
+    /// Content-fitted popover height for `rowCount` account rows, clamped to
+    /// [minHeight, maxHeight]. With no rows (setup/empty/error state) a fixed
+    /// setup height is used so the guide isn't cramped.
+    func fittedHeight(rowCount: Int) -> CGFloat {
+        guard rowCount > 0 else { return Self.setupHeight }
+        let content = Self.chromeHeight + CGFloat(rowCount) * Self.rowHeight
+        return content.clamped(to: Self.minHeight...Self.maxHeight)
     }
 
-    func persist() {
-        store.setSetting("popover_height", value: String(Int(currentHeight)))
+    /// Recompute `currentHeight` from the row count and resize the live popover
+    /// so the window hugs its content.
+    func update(rowCount: Int) {
+        let h = fittedHeight(rowCount: rowCount)
+        if h != currentHeight { currentHeight = h }
+        popover?.contentSize = NSSize(width: Self.popoverWidth, height: h)
     }
 }
 
@@ -87,12 +100,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.updateStatusButton()
         }
 
-        // Create height manager (reads persisted height from DB)
-        heightManager = PopoverHeightManager(store: usageStore)
+        // Create height manager (auto-fits the popover to its content)
+        heightManager = PopoverHeightManager()
 
         // Create popover
         popover = NSPopover()
-        popover?.contentSize = NSSize(width: PopoverHeightManager.popoverWidth, height: heightManager.currentHeight)
+        popover?.contentSize = NSSize(width: PopoverHeightManager.popoverWidth, height: heightManager.fittedHeight(rowCount: usageStore.accounts.count))
         // .semitransient keeps the popover open while user interacts with other
         // windows in this app (e.g. multiple chart windows launched from rows).
         popover?.behavior = .semitransient
@@ -140,6 +153,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             await MainActor.run {
                 usageStore.loadFromDatabase()
                 updateStatusButton()
+                // Emit ~/.claude-monitor/ranking.json for external load balancers (#2)
+                RankingExporter.export()
                 flog.info("refreshAll: loaded \(usageStore.accounts.count) account(s)", category: "App")
             }
         }
@@ -156,6 +171,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run {
                     usageStore.loadFromDatabase()
                     updateStatusButton()
+                    // Emit ~/.claude-monitor/ranking.json for external load balancers (#2)
+                    RankingExporter.export()
                 }
             }
         }
@@ -310,7 +327,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if popover.isShown {
                 popover.performClose(nil)
             } else if let button = statusItem?.button {
-                popover.contentSize = NSSize(width: PopoverHeightManager.popoverWidth, height: heightManager.currentHeight)
+                heightManager.update(rowCount: usageStore.accounts.count)
                 refreshAll()
                 popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             }

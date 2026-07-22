@@ -12,3 +12,38 @@ build/
 !.claude/commands/
 *.xpi
 *.zip
+.loom/locks/
+.loom/sweep-checkpoint/
+# >>> loom-managed (do not edit) >>>
+# Loom runtime state (don't commit these)
+.loom-in-use
+.loom-checkpoint
+.loom/.daemon.pid
+.loom/.daemon.log
+.loom/daemon.sock
+.loom/daemon-loop.pid
+.loom/daemon-metrics.json
+.loom/loom-source-path
+.loom/spawn-loop-state.json
+.loom/issue-failures.json
+.loom/interventions/
+.loom/worktrees/
+.loom/state.json
+.loom/mcp-command.json
+.loom/activity.db
+.loom/claims/
+.loom/signals/
+.loom/status/
+.loom/retry-state/
+.loom/diagnostics/
+.loom/guide-docs-state.json
+.loom/metrics_state.json
+.loom/manifest.json
+.loom/stuck-config.json
+.loom/metrics/
+.loom/usage-cache.json
+.loom/claude-config/
+.loom/*.log
+.loom/*.sock
+.loom/logs/
+# <<< loom-managed <<<

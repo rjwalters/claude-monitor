@@ -294,10 +294,12 @@ claude-monitor/
 │   └── Sources/
 │       ├── main.swift              # AppDelegate, menubar icon, popover wiring
 │       ├── UsageStore.swift        # SQLite store, settings, primary-account pin
+│       ├── SQLiteDB.swift          # Minimal system-libsqlite3 wrapper (zero deps)
 │       ├── UsagePopoverView.swift  # Summary table, sortable headers, add-account dialog
 │       ├── UsageChartView.swift    # Per-account chart window
 │       ├── OAuthPoller.swift       # API pings, token add/import
 │       ├── AnthropicAPI.swift      # API client
+│       ├── RankingExporter.swift   # Emits ~/.claude-monitor/ranking.json for load balancers
 │       └── FileLogger.swift        # Debug logging
 └── scripts/
     └── build-macos-app.sh          # Release build script
