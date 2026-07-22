@@ -115,9 +115,15 @@ struct UsagePopoverView: View {
     @State private var sortBy: SummarySort = .headroom
     @State private var sortDir: SortDirection = .desc
 
-    /// Chrome height: header (~50) + column header (~28) + dividers (~3) + footer (~42) + resize handle (~14)
+    /// Space available for the scrolling row list = popover height minus fixed chrome.
     private var scrollViewMaxHeight: CGFloat {
-        heightManager.currentHeight - 137
+        heightManager.currentHeight - PopoverHeightManager.chromeHeight
+    }
+
+    /// Row count used to size the popover. The setup/empty/error states show a
+    /// guide instead of the table, so they size against zero rows.
+    private var effectiveRowCount: Int {
+        (store.error != nil || store.accounts.isEmpty) ? 0 : store.accounts.count
     }
 
     /// Accounts paired with latest usage, sorted by the user-selected column.
@@ -294,11 +300,13 @@ struct UsagePopoverView: View {
             }
             .padding(.horizontal)
             .padding(.vertical, 10)
-
-            PopoverResizeHandle(heightManager: heightManager)
         }
         .frame(width: PopoverHeightManager.popoverWidth, height: heightManager.currentHeight)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear { heightManager.update(rowCount: effectiveRowCount) }
+        .onChange(of: effectiveRowCount) { _, newCount in
+            heightManager.update(rowCount: newCount)
+        }
         .alert("Remove Account?", isPresented: $showRemoveConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Remove", role: .destructive) {
@@ -323,48 +331,6 @@ struct UsagePopoverView: View {
             oauthPoller.deactivateCredential(cred)
         }
         store.clearAccountData(accountId: account.id)
-    }
-}
-
-// MARK: - Popover Resize Handle
-
-struct PopoverResizeHandle: View {
-    @ObservedObject var heightManager: PopoverHeightManager
-    @State private var dragStartHeight: CGFloat = 0
-
-    var body: some View {
-        RoundedRectangle(cornerRadius: 2)
-            .fill(Color.secondary.opacity(0.4))
-            .frame(width: 36, height: 4)
-            .padding(.vertical, 5)
-            .frame(maxWidth: .infinity)
-            .contentShape(Rectangle())
-            .gesture(
-                DragGesture()
-                    .onChanged { value in
-                        if dragStartHeight == 0 {
-                            dragStartHeight = heightManager.currentHeight
-                        }
-                        let newHeight = (dragStartHeight + value.translation.height)
-                            .clamped(to: PopoverHeightManager.minHeight...PopoverHeightManager.maxHeight)
-                        heightManager.currentHeight = newHeight
-                        heightManager.popover?.contentSize = NSSize(
-                            width: PopoverHeightManager.popoverWidth,
-                            height: newHeight
-                        )
-                    }
-                    .onEnded { _ in
-                        dragStartHeight = 0
-                        heightManager.persist()
-                    }
-            )
-            .onHover { hovering in
-                if hovering {
-                    NSCursor.resizeUpDown.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
     }
 }
 
