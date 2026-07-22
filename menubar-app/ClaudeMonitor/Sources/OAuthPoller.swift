@@ -120,26 +120,7 @@ class OAuthPoller: ObservableObject {
 
     /// Parse an env string for ACCOUNT_EMAIL_N / ACCOUNT_KEY_N pairs and import each.
     func importFromEnvString(_ content: String) async -> [EnvImportResult] {
-        // Parse all KEY=VALUE pairs
-        var env: [String: String] = [:]
-        for line in content.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
-            guard let eqIndex = trimmed.firstIndex(of: "=") else { continue }
-            let key = String(trimmed[trimmed.startIndex..<eqIndex]).trimmingCharacters(in: .whitespaces)
-            let value = String(trimmed[trimmed.index(after: eqIndex)...]).trimmingCharacters(in: .whitespaces)
-            env[key] = value
-        }
-
-        // Find numbered account pairs: ACCOUNT_EMAIL_N + ACCOUNT_KEY_N
-        var accounts: [(index: Int, email: String, token: String)] = []
-        for i in 1...99 {
-            guard let email = env["ACCOUNT_EMAIL_\(i)"],
-                  let token = env["ACCOUNT_KEY_\(i)"] else {
-                continue  // Skip gaps — files may have non-consecutive numbering
-            }
-            accounts.append((index: i, email: email, token: token))
-        }
+        let accounts = parseAccountPairs(content)
 
         if accounts.isEmpty {
             flog.warning("importFromEnvFile: no ACCOUNT_EMAIL_N/ACCOUNT_KEY_N pairs found", category: fcat)
@@ -150,7 +131,7 @@ class OAuthPoller: ObservableObject {
 
         var results: [EnvImportResult] = []
         for account in accounts {
-            let (orgId, error) = await addAccountWithToken(account.token, email: account.email)
+            let (_, error) = await addAccountWithToken(account.token, email: account.email)
             results.append(EnvImportResult(
                 email: account.email,
                 success: error == nil,
@@ -158,6 +139,86 @@ class OAuthPoller: ObservableObject {
             ))
         }
 
+        return results
+    }
+
+    /// Parse env content into ordered (email, token) pairs from ACCOUNT_EMAIL_N /
+    /// ACCOUNT_KEY_N. Gaps in numbering are skipped; order follows the index N.
+    private func parseAccountPairs(_ content: String) -> [(email: String, token: String)] {
+        var env: [String: String] = [:]
+        for line in content.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            guard let eqIndex = trimmed.firstIndex(of: "=") else { continue }
+            let key = String(trimmed[trimmed.startIndex..<eqIndex]).trimmingCharacters(in: .whitespaces)
+            let value = String(trimmed[trimmed.index(after: eqIndex)...]).trimmingCharacters(in: .whitespaces)
+            env[key] = value
+        }
+
+        var pairs: [(email: String, token: String)] = []
+        for i in 1...99 {
+            guard let email = env["ACCOUNT_EMAIL_\(i)"],
+                  let token = env["ACCOUNT_KEY_\(i)"] else {
+                continue  // Skip gaps — files may have non-consecutive numbering
+            }
+            pairs.append((email: email, token: token))
+        }
+        return pairs
+    }
+
+    // MARK: - Account List Files (master + local override)
+
+    /// Master account list — the shared source of truth.
+    private var masterAccountsPath: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude-monitor/accounts.env").path
+    }
+
+    /// Local override/additions — never shared; wins over master by email.
+    private var localAccountsPath: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude-monitor/accounts.local.env").path
+    }
+
+    /// Load the master account list plus the local override/additions file, merge
+    /// them (local overrides master for a matching email and appends new emails),
+    /// and additively import each. Accounts already in the DB but absent from the
+    /// merged list are left untouched — this never removes accounts.
+    @discardableResult
+    func syncFromAccountFiles() async -> [EnvImportResult] {
+        let fm = FileManager.default
+        var merged: [(email: String, token: String)] = []
+        var indexByEmail: [String: Int] = [:]
+
+        func apply(_ path: String, label: String) {
+            guard fm.fileExists(atPath: path),
+                  let content = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+            let pairs = parseAccountPairs(content)
+            flog.info("syncFromAccountFiles: \(label) lists \(pairs.count) account(s)", category: fcat)
+            for pair in pairs {
+                if let existing = indexByEmail[pair.email] {
+                    merged[existing] = pair            // local overrides master token
+                } else {
+                    indexByEmail[pair.email] = merged.count
+                    merged.append(pair)                // addition, order preserved
+                }
+            }
+        }
+
+        apply(masterAccountsPath, label: "master")
+        apply(localAccountsPath, label: "local")
+
+        guard !merged.isEmpty else {
+            flog.info("syncFromAccountFiles: no account list files found", category: fcat)
+            return []
+        }
+
+        flog.info("syncFromAccountFiles: importing \(merged.count) merged account(s)", category: fcat)
+        var results: [EnvImportResult] = []
+        for pair in merged {
+            let (_, error) = await addAccountWithToken(pair.token, email: pair.email)
+            results.append(EnvImportResult(email: pair.email, success: error == nil, error: error))
+        }
         return results
     }
 
@@ -279,6 +340,13 @@ class OAuthPoller: ObservableObject {
     /// Last poll time per credential ID
     private var lastPollTimes: [Int64: Date] = [:]
 
+    /// How often to probe the Fable tier per account (seconds). Independent of the
+    /// Haiku poll — a few times an hour is enough to track Fable availability/usage
+    /// without spending meaningful Fable quota.
+    private let fableProbeInterval: TimeInterval = 1200  // 20 minutes → ~3×/hour
+    private let fableProbeModel = "claude-fable-5"
+    private var lastFableProbeTimes: [String: Date] = [:]
+
     /// Poll all accounts (startup and manual refresh). Staggers next-poll times
     /// by spacing sequential calls so they naturally spread out.
     func pollAll() async {
@@ -316,6 +384,34 @@ class OAuthPoller: ObservableObject {
         }
 
         return polled
+    }
+
+    /// Probe the Fable tier for any account whose Fable-probe interval has elapsed,
+    /// archiving whatever the API returns (a headerless 429 today; real Fable
+    /// rate-limit data once extra-usage credits are enabled). Returns count probed.
+    func probeFableDue() async -> Int {
+        let credentials = loadActiveCredentials()
+        guard !credentials.isEmpty else { return 0 }
+
+        let now = Date()
+        var probed = 0
+
+        for credential in credentials {
+            guard let accountId = credential.accountId,
+                  let token = credential.accessToken else { continue }
+            let last = lastFableProbeTimes[accountId]
+            guard last == nil || now.timeIntervalSince(last!) >= fableProbeInterval else { continue }
+
+            let (status, headers) = await apiClient.rawProbe(accessToken: token, model: fableProbeModel)
+            if status > 0 {
+                archiveSnapshot(accountId: accountId, probeModel: "fable", httpStatus: status, headers: headers)
+                flog.info("Fable probe \(status) — org: \(accountId.prefix(8))... (\(headers.count) header(s))", category: fcat)
+            }
+            lastFableProbeTimes[accountId] = Date()
+            probed += 1
+        }
+
+        return probed
     }
 
     private func pollWithRetry(_ credential: OAuthCredential, maxRetries: Int = 2) async {
@@ -405,10 +501,9 @@ class OAuthPoller: ObservableObject {
                 break
             }
 
-            // Build raw_data JSON from ping headers
-            let rawData = """
-            {"ping_status":\(ping.httpStatus),"session_status":"\(ping.sessionStatus ?? "")","weekly_status":"\(ping.weeklyStatus ?? "")","overall_status":"\(ping.overallStatus ?? "")"}
-            """
+            // Store the full captured header set (not a hand-picked subset) so the
+            // archive keeps up with new fields the API adds.
+            let rawData = headersJSON(ping.rawHeaders)
 
             try db.run("""
                 INSERT INTO usage_history (
@@ -422,6 +517,37 @@ class OAuthPoller: ObservableObject {
 
         } catch {
             flog.error("Failed to write ping to DB: \(error.localizedDescription)", category: fcat)
+        }
+
+        // Archive the raw capture regardless of the curated write above.
+        archiveSnapshot(accountId: accountId, probeModel: "haiku",
+                        httpStatus: ping.httpStatus, headers: ping.rawHeaders)
+    }
+
+    // MARK: - Raw Snapshot Archive
+
+    /// Serialize a header dictionary to a stable (sorted-key) JSON string.
+    private func headersJSON(_ headers: [String: String]) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(headers),
+              let str = String(data: data, encoding: .utf8) else { return "{}" }
+        return str
+    }
+
+    /// Append one raw probe result to `probe_snapshots`. This is the "store
+    /// everything" archive — every field, understood or not, per poll per model.
+    func archiveSnapshot(accountId: String, probeModel: String, httpStatus: Int, headers: [String: String]) {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return }
+        do {
+            let db = try openDatabase(dbPath)
+            let now = ISO8601DateFormatter().string(from: Date())
+            try db.run("""
+                INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                VALUES (?, ?, ?, ?, ?)
+            """, accountId, now, probeModel, httpStatus, headersJSON(headers))
+        } catch {
+            flog.error("Failed to archive \(probeModel) snapshot: \(error.localizedDescription)", category: fcat)
         }
     }
 

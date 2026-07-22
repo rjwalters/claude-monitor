@@ -93,6 +93,22 @@ Point the importer at the file path; each pair is validated via a ping and
 added on success. Pinning, sorting, and per-account charts work the same way
 regardless of how the accounts were added.
 
+#### Master account list (auto-loaded at launch)
+
+Instead of importing by hand, keep a master list that the app loads every time
+it starts:
+
+- `~/.claude-monitor/accounts.env` — the master list (shared source of truth)
+- `~/.claude-monitor/accounts.local.env` — local overrides and additions (keep
+  this machine-specific; don't share it)
+
+Both use the same `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` format. At launch the app
+merges them (the local file **overrides** the master token for a matching email
+and **appends** any new emails), then imports the result. Loading is
+**additive**: accounts in the lists are added or have their token refreshed, but
+accounts already in the app that aren't listed are left untouched — nothing is
+removed. Store these files with `chmod 600`; they contain live tokens.
+
 ## Direct API Access (no app needed)
 
 The whole app is just a wrapper around a single, cheap API call. With a

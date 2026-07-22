@@ -33,6 +33,48 @@ struct UsageRecord: Identifiable {
     let weeklySONnetPercent: Double?
     let sessionReset: String?
     let weeklyReset: String?
+
+    /// Premium/Fable weekly usage 0–100 (from the `7d_oi` bucket on the Fable
+    /// probe). nil if we don't have a recent premium-model probe.
+    var fablePercent: Double? = nil
+    /// Extra-usage (overage) consumed 0–100, as a fraction of the account's
+    /// configured budget. Stays 0 for unlimited/unmetered balances even while
+    /// active, so it's only meaningful when > 0.
+    var overagePercent: Double? = nil
+    /// Overage availability: "allowed", "rejected", etc.
+    var overageStatus: String? = nil
+    /// Why overage is unavailable (e.g. "org_level_disabled", "out_of_credits").
+    var overageDisabledReason: String? = nil
+    /// Whether the account is currently drawing on extra usage.
+    var overageInUse: Bool? = nil
+
+    /// Remaining Fable allocation 0–100, or nil if unknown.
+    var fableRemaining: Double? {
+        fablePercent.map { max(0, 100 - $0) }
+    }
+
+    /// Compact state of the extra-usage balance for display. `.percent` carries
+    /// a remaining figure only when the balance is actually metered (>0 used).
+    enum ExtraUsageState {
+        case unknown          // no premium probe yet
+        case off              // org-level disabled — extra usage not a thing here
+        case empty            // out of credits — needs a recharge
+        case active           // allowed and currently drawing
+        case ready            // allowed, available, not yet drawing
+        case percent(Double)  // allowed with a real remaining % (metered budget)
+    }
+
+    var extraUsageState: ExtraUsageState {
+        switch overageStatus {
+        case "allowed":
+            if let used = overagePercent, used > 0 { return .percent(max(0, 100 - used)) }
+            return (overageInUse == true) ? .active : .ready
+        case "rejected":
+            return overageDisabledReason == "out_of_credits" ? .empty : .off
+        default:
+            return .unknown
+        }
+    }
 }
 
 struct UsageDataPoint: Identifiable {
@@ -144,8 +186,18 @@ class UsageStore: ObservableObject {
                     key TEXT PRIMARY KEY,
                     value TEXT
                 );
+                CREATE TABLE IF NOT EXISTS probe_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    probe_model TEXT NOT NULL,
+                    http_status INTEGER,
+                    headers TEXT NOT NULL,
+                    FOREIGN KEY (account_id) REFERENCES accounts(id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_history(account_id);
                 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_history(timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_probe_account_time ON probe_snapshots(account_id, timestamp DESC);
                 CREATE TABLE IF NOT EXISTS oauth_credentials (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id TEXT,
@@ -216,6 +268,12 @@ class UsageStore: ObservableObject {
         return sorted.map { $0.account }
     }
 
+    /// Decode a `probe_snapshots.headers` JSON blob into a [String:String] map.
+    static func parseHeaders(_ json: String) -> [String: String]? {
+        guard let data = json.data(using: .utf8) else { return nil }
+        return (try? JSONDecoder().decode([String: String].self, from: data))
+    }
+
     func loadFromDatabase() {
         do {
             if !FileManager.default.fileExists(atPath: dbPath) {
@@ -271,7 +329,7 @@ class UsageStore: ObservableObject {
                     "SELECT id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset FROM usage_history WHERE account_id = ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 1"
                 )
                 for usageRow in latestStmt.bind(accountId, nowString) {
-                    let record = UsageRecord(
+                    var record = UsageRecord(
                         id: (usageRow[0] as? Int64) ?? 0,
                         accountId: accountId,
                         timestamp: parseDate(usageRow[1] as? String) ?? Date(),
@@ -282,6 +340,26 @@ class UsageStore: ObservableObject {
                         sessionReset: usageRow[6] as? String,
                         weeklyReset: usageRow[7] as? String
                     )
+
+                    // Premium/Fable allocation + overage come from the latest
+                    // Fable probe snapshot's raw headers.
+                    let fableStmt = try db.prepare(
+                        "SELECT headers FROM probe_snapshots WHERE account_id = ? AND probe_model = 'fable' ORDER BY timestamp DESC LIMIT 1"
+                    )
+                    for probeRow in fableStmt.bind(accountId) {
+                        guard let headersJSON = probeRow[0] as? String,
+                              let headers = Self.parseHeaders(headersJSON) else { continue }
+                        if let oi = Double(headers["anthropic-ratelimit-unified-7d_oi-utilization"] ?? "") {
+                            record.fablePercent = oi * 100
+                        }
+                        if let ov = Double(headers["anthropic-ratelimit-unified-overage-utilization"] ?? "") {
+                            record.overagePercent = ov * 100
+                        }
+                        record.overageStatus = headers["anthropic-ratelimit-unified-overage-status"]
+                        record.overageDisabledReason = headers["anthropic-ratelimit-unified-overage-disabled-reason"]
+                        record.overageInUse = headers["anthropic-ratelimit-unified-overage-in-use"] == "true"
+                    }
+
                     latestUsage[accountId] = record
                 }
             }

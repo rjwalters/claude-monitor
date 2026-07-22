@@ -43,6 +43,8 @@ enum SummaryColumns {
     static let account: CGFloat = 150
     static let headroom: CGFloat = 80
     static let percent: CGFloat = 60
+    static let fable: CGFloat = 66
+    static let extra: CGFloat = 62
     static let reset: CGFloat = 80
     static let dot: CGFloat = 40
     static let chart: CGFloat = 46
@@ -52,7 +54,7 @@ enum SummaryColumns {
 // MARK: - Sorting
 
 enum SummarySort: String {
-    case account, headroom, sessionPercent, sessionReset, weeklyPercent, weeklyReset, fresh, token
+    case account, headroom, sessionPercent, sessionReset, weeklyPercent, weeklyReset, fablePercent, extraUsage, fresh, token
 
     /// First-click direction for this column — "best first" intuition.
     var defaultDirection: SortDirection {
@@ -77,6 +79,20 @@ func headroomScore(_ usage: UsageRecord?) -> Double? {
     let weekly = usage.weeklyAllPercent ?? 0
     let used = max(session, weekly)
     return max(0, min(100, 100 - used))
+}
+
+/// Sort key for the Extra-usage column. Lower = more attention needed.
+/// nil (no probe yet) sorts last.
+func extraUsageUrgency(_ usage: UsageRecord?) -> Double? {
+    guard let usage = usage else { return nil }
+    switch usage.extraUsageState {
+    case .unknown:        return nil
+    case .empty:          return 0            // depleted — needs a recharge
+    case .percent(let r): return 1 + r        // metered: lower remaining sorts first
+    case .active:         return 200          // drawing (unmetered/unlimited) — fine
+    case .ready:          return 300          // available, unused
+    case .off:            return 400          // not configured
+    }
 }
 
 /// Seconds until reset for an ISO-8601 string; nil if unparseable/absent.
@@ -178,6 +194,12 @@ struct UsagePopoverView: View {
             return (a.1?.sessionPercent, b.1?.sessionPercent)
         case .weeklyPercent:
             return (a.1?.weeklyAllPercent, b.1?.weeklyAllPercent)
+        case .fablePercent:
+            // Sort by Fable used (asc = most remaining last, matching other % columns).
+            return (a.1?.fablePercent, b.1?.fablePercent)
+        case .extraUsage:
+            // Ascending = "needs attention first": empty → low balance → in use → ready → off.
+            return (extraUsageUrgency(a.1), extraUsageUrgency(b.1))
         case .sessionReset:
             return (resetSecondsForString(a.1?.sessionReset), resetSecondsForString(b.1?.sessionReset))
         case .weeklyReset:
@@ -362,6 +384,12 @@ struct SummaryHeaderRow: View {
                            sortBy: $sortBy, sortDir: $sortDir)
             SortableHeader(title: "Wk Reset", column: .weeklyReset,
                            width: SummaryColumns.reset, alignment: .trailing,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            SortableHeader(title: "Fable Left", column: .fablePercent,
+                           width: SummaryColumns.fable, alignment: .trailing,
+                           sortBy: $sortBy, sortDir: $sortDir)
+            SortableHeader(title: "Extra", column: .extraUsage,
+                           width: SummaryColumns.extra, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir)
             SortableHeader(title: "Fresh", column: .fresh,
                            width: SummaryColumns.dot, alignment: .center,
@@ -570,6 +598,12 @@ struct SummaryRow: View {
                 .lineLimit(1)
                 .frame(width: SummaryColumns.reset, alignment: .trailing)
 
+            fableCell
+                .frame(width: SummaryColumns.fable, alignment: .trailing)
+
+            extraCell
+                .frame(width: SummaryColumns.extra, alignment: .trailing)
+
             Circle()
                 .fill(freshnessDotColor)
                 .frame(width: 8, height: 8)
@@ -695,6 +729,62 @@ struct SummaryRow: View {
         if percent > 95 { return Color(nsColor: .systemRed) }
         if percent >= 90 { return Color(nsColor: .systemOrange) }
         return .primary
+    }
+
+    /// Fable/premium weekly allowance remaining, colored by how much is left.
+    @ViewBuilder
+    private var fableCell: some View {
+        if let remaining = usage?.fableRemaining {
+            Text("\(Int(remaining.rounded()))%")
+                .foregroundColor(colorForRemaining(remaining))
+                .help("Fable/premium weekly allowance remaining. At 0% the account switches to extra usage.")
+        } else {
+            Text("—")
+                .foregroundColor(.secondary)
+                .help("No premium-model probe yet")
+        }
+    }
+
+    private func colorForRemaining(_ remaining: Double) -> Color {
+        if remaining <= 0 { return Color(nsColor: .systemRed) }
+        if remaining < 10 { return Color(nsColor: .systemOrange) }
+        return .primary
+    }
+
+    /// Extra-usage (overage) balance. The API gives no dollar figure, and an
+    /// unlimited balance never meters (utilization stays 0), so we show a state
+    /// word and a percentage only when the budget is actually metered.
+    @ViewBuilder
+    private var extraCell: some View {
+        let display = extraDisplay
+        Text(display.0)
+            .foregroundColor(display.1)
+            .help(extraUsageTooltip)
+    }
+
+    private var extraDisplay: (String, Color) {
+        switch usage?.extraUsageState ?? .unknown {
+        case .unknown: return ("—", .secondary)
+        case .off:     return ("off", .secondary)
+        case .empty:   return ("empty", Color(nsColor: .systemRed))
+        case .active:  return ("on", Color(nsColor: .systemGreen))
+        case .ready:   return ("ready", .primary)
+        case .percent(let r):
+            let c: Color = r <= 0 ? Color(nsColor: .systemRed)
+                         : r < 15 ? Color(nsColor: .systemOrange) : .primary
+            return ("\(Int(r.rounded()))%", c)
+        }
+    }
+
+    private var extraUsageTooltip: String {
+        switch usage?.extraUsageState ?? .unknown {
+        case .unknown: return "No premium-model probe yet"
+        case .off:     return "Extra usage not enabled for this account (org_level_disabled)"
+        case .empty:   return "Extra usage exhausted — needs a recharge (out_of_credits)"
+        case .active:  return "Currently drawing on extra usage (unlimited/unmetered — no percentage to show)"
+        case .ready:   return "Extra usage available, not yet in use"
+        case .percent(let r): return "Extra usage: \(Int(r.rounded()))% of the configured budget remaining"
+        }
     }
 }
 
