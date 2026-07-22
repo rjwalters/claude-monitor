@@ -142,6 +142,46 @@ class OAuthPoller: ObservableObject {
         return results
     }
 
+    /// Serialize active accounts (email + access token) into ACCOUNT_EMAIL_N /
+    /// ACCOUNT_KEY_N env format, the same format the Bulk Import field and the
+    /// account list files accept. Returns nil if there are no exportable accounts
+    /// (so the caller can disable the Copy button). Order follows sort_order.
+    func exportAccountsEnv() -> String? {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
+        do {
+            let db = try openDatabase(dbPath, readonly: true)
+            let stmt = try db.prepare("""
+                SELECT COALESCE(a.email, a.account_name, c.label) AS email, c.access_token
+                FROM oauth_credentials c
+                JOIN accounts a ON a.id = c.account_id
+                WHERE c.is_active = 1 AND c.access_token IS NOT NULL
+                ORDER BY a.sort_order, a.id
+            """)
+
+            var lines: [String] = []
+            var n = 0
+            for row in stmt {
+                guard let token = row[1] as? String, !token.isEmpty else { continue }
+                n += 1
+                let email = (row[0] as? String) ?? "account-\(n)"
+                lines.append("ACCOUNT_EMAIL_\(n)=\(email)")
+                lines.append("ACCOUNT_KEY_\(n)=\(token)")
+            }
+
+            guard n > 0 else { return nil }
+
+            let header = """
+                # Claude Monitor accounts — \(n) account(s)
+                # Paste into the app (Add Account → Bulk Import) or save as ~/.claude-monitor/accounts.env
+
+                """
+            return header + lines.joined(separator: "\n") + "\n"
+        } catch {
+            flog.error("exportAccountsEnv failed: \(error.localizedDescription)", category: fcat)
+            return nil
+        }
+    }
+
     /// Parse env content into ordered (email, token) pairs from ACCOUNT_EMAIL_N /
     /// ACCOUNT_KEY_N. Gaps in numbering are skipped; order follows the index N.
     private func parseAccountPairs(_ content: String) -> [(email: String, token: String)] {

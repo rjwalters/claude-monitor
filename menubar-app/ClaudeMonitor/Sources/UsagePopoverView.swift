@@ -130,6 +130,11 @@ struct UsagePopoverView: View {
     @State private var accountToRemove: Account?
     @State private var sortBy: SummarySort = .headroom
     @State private var sortDir: SortDirection = .desc
+    @State private var clipboardHasAccounts = false
+    @State private var transferStatus: String?
+
+    /// Polls the pasteboard so the Copy/Paste toggle reflects clipboard contents.
+    private let clipboardTimer = Timer.publish(every: 1.5, on: .main, in: .common).autoconnect()
 
     /// Space available for the scrolling row list = popover height minus fixed chrome.
     private var scrollViewMaxHeight: CGFloat {
@@ -312,6 +317,29 @@ struct UsagePopoverView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
 
+                // Copy accounts to the clipboard for transfer to another machine,
+                // or — when the clipboard already holds account data — paste it in.
+                if clipboardHasAccounts {
+                    Button(action: { pasteAccounts() }) {
+                        Label("Paste Accounts", systemImage: "arrow.down.doc.on.clipboard")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                } else {
+                    Button(action: { copyAccounts() }) {
+                        Label("Copy Accounts", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(store.accounts.isEmpty)
+                }
+
+                if let status = transferStatus {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
                 Spacer()
 
                 Button("Quit") {
@@ -325,7 +353,13 @@ struct UsagePopoverView: View {
         }
         .frame(width: PopoverHeightManager.popoverWidth, height: heightManager.currentHeight)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onAppear { heightManager.update(rowCount: effectiveRowCount) }
+        .onAppear {
+            heightManager.update(rowCount: effectiveRowCount)
+            clipboardHasAccounts = Self.clipboardContainsAccounts()
+        }
+        .onReceive(clipboardTimer) { _ in
+            clipboardHasAccounts = Self.clipboardContainsAccounts()
+        }
         .onChange(of: effectiveRowCount) { _, newCount in
             heightManager.update(rowCount: newCount)
         }
@@ -353,6 +387,72 @@ struct UsagePopoverView: View {
             oauthPoller.deactivateCredential(cred)
         }
         store.clearAccountData(accountId: account.id)
+    }
+
+    // MARK: - Copy / Paste Accounts
+
+    /// True when the general pasteboard holds text with ACCOUNT_EMAIL_N /
+    /// ACCOUNT_KEY_N pairs — i.e. accounts copied from this or another instance.
+    static func clipboardContainsAccounts() -> Bool {
+        guard let s = NSPasteboard.general.string(forType: .string) else { return false }
+        return s.contains("ACCOUNT_EMAIL_") && s.contains("ACCOUNT_KEY_")
+    }
+
+    /// Serialize active accounts into env format and put them on the clipboard so
+    /// they can be pasted into a Claude Monitor on another machine.
+    private func copyAccounts() {
+        guard let env = oauthPoller.exportAccountsEnv() else {
+            flashTransferStatus("Nothing to copy")
+            return
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(env, forType: .string)
+        clipboardHasAccounts = true
+        let count = store.accounts.count
+        flashTransferStatus("Copied \(count) account\(count == 1 ? "" : "s")")
+    }
+
+    /// Import accounts from env-formatted text on the clipboard.
+    private func pasteAccounts() {
+        guard let content = NSPasteboard.general.string(forType: .string) else { return }
+        transferStatus = "Importing…"
+        store.ensureDatabase()
+        Task {
+            let results = await oauthPoller.importFromEnvString(content)
+            await MainActor.run {
+                let ok = results.filter { $0.success }.count
+                guard ok > 0 else {
+                    flashTransferStatus(results.first?.error ?? "No accounts imported")
+                    return
+                }
+
+                store.loadFromDatabase()
+
+                // Replace semantics: the pasted list is now the full set. Remove any
+                // account whose email isn't in the paste (compared case-insensitively).
+                // Emails come from the paste even for entries whose token failed to
+                // import, so a transient failure won't delete an account that's listed.
+                let pastedEmails = Set(results.map { $0.email.lowercased() })
+                let toRemove = store.accounts.filter {
+                    !pastedEmails.contains(($0.email ?? "").lowercased())
+                }
+                for account in toRemove { removeAccount(account) }
+                if !toRemove.isEmpty { store.loadFromDatabase() }
+
+                let removedNote = toRemove.isEmpty ? "" : " · removed \(toRemove.count)"
+                flashTransferStatus("Imported \(ok) of \(results.count)\(removedNote)")
+            }
+        }
+    }
+
+    /// Show a transient status message next to the button, then clear it.
+    private func flashTransferStatus(_ message: String) {
+        transferStatus = message
+        Task {
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            await MainActor.run { transferStatus = nil }
+        }
     }
 }
 
