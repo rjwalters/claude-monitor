@@ -247,6 +247,22 @@ final class RollTokenWindowController {
     static var windows: [String: NSWindow] = [:]
 
     static func show(for account: Account, store: UsageStore, oauthPoller: OAuthPoller) {
+        // Dismiss the menu-bar popover first so the wizard doesn't open behind the
+        // semitransient token table, then build the window after a short delay to
+        // avoid the AppKit layout crash during popover dismissal (same guard the
+        // Add Account flow uses).
+        let popover = AppDelegate.shared?.popover
+        let hadPopover = popover?.isShown ?? false
+        popover?.performClose(nil)
+
+        let delay: TimeInterval = hadPopover ? 0.3 : 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            NSApp.activate(ignoringOtherApps: true)
+            present(for: account, store: store, oauthPoller: oauthPoller)
+        }
+    }
+
+    private static func present(for account: Account, store: UsageStore, oauthPoller: OAuthPoller) {
         if let existing = windows[account.id] {
             existing.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)

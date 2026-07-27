@@ -59,6 +59,11 @@ struct ClaudeMonitorApp: App {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Set at launch so windows opened deep in the SwiftUI view tree can reach the
+    /// popover to dismiss it. `NSApp.delegate as? AppDelegate` is unreliable under
+    /// the SwiftUI @NSApplicationDelegateAdaptor lifecycle, so we hold it directly.
+    static weak var shared: AppDelegate?
+
     var statusItem: NSStatusItem?
     var popover: NSPopover?
     var timer: Timer?
@@ -74,6 +79,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
         flog.info("ClaudeMonitor launched (v\(AppVersion.current))", category: "App")
 
         // Ensure database exists (standalone mode without native host)
