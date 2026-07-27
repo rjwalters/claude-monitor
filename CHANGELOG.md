@@ -150,3 +150,12 @@ multiple usage-history charts from a popover that stays open.
 - Vertical scroll-card popover and the underlying `AccountCard`,
   `ClickableAccountCard`, `EditableAccountCard`, `CardButtonStyle`, and
   `UsageRow` view types.
+
+## [1.11.0] - 2026-02-21
+
+Placeholder entry — this release predates the CHANGELOG and its notes were not
+recorded at the time. Reconstructed from git history:
+
+### Added
+
+- Account Summary shows separate session and weekly reset columns.
