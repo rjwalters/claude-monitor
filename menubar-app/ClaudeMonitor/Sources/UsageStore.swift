@@ -216,9 +216,15 @@ class UsageStore: ObservableObject {
                     is_active INTEGER DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    token_rolled_at TEXT,
                     FOREIGN KEY (account_id) REFERENCES accounts(id)
                 );
             """)
+
+            // Migration: add token_rolled_at to older DBs. `updated_at` can't serve
+            // this — it's bumped on every poll — so we track token changes separately.
+            // ADD COLUMN throws if it already exists; that's the expected no-op path.
+            try? db.execute("ALTER TABLE oauth_credentials ADD COLUMN token_rolled_at TEXT")
         } catch {
             FileLogger.shared.error("Failed to create database: \(error)", category: "DB")
         }

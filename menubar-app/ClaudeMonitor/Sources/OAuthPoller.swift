@@ -59,7 +59,10 @@ class OAuthPoller: ObservableObject {
     /// Validate a token via a ping, identify org via headers, create/update the account.
     /// Returns the account org ID on success. If email is provided (e.g. from .env), it's stored.
     func addAccountWithToken(_ token: String, email: String? = nil) async -> (orgId: String?, error: String?) {
-        let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Strip ALL whitespace, not just the ends: pasting a token copied from a
+        // terminal often carries embedded newlines/spaces from line-wrapping.
+        // OAuth tokens never legitimately contain whitespace, so this is safe.
+        let token = token.filter { !$0.isWhitespace }
         guard !token.isEmpty else {
             return (nil, "Token is empty")
         }
@@ -289,22 +292,38 @@ class OAuthPoller: ObservableObject {
                 "SELECT id FROM oauth_credentials WHERE account_id = ? LIMIT 1",
                 accountId
             ) as? Int64
+            let existingToken = try db.scalar(
+                "SELECT access_token FROM oauth_credentials WHERE account_id = ? LIMIT 1",
+                accountId
+            ) as? String
 
             if let credId = existingCred {
-                try db.run("""
-                    UPDATE oauth_credentials SET
-                        access_token = ?, source = ?,
-                        is_active = 1, updated_at = ?
-                    WHERE id = ?
-                """, accessToken, source, now, credId)
-                flog.info("Updated credential for account \(accountId)", category: fcat)
+                // Only stamp token_rolled_at when the token value actually changes,
+                // so the periodic .env re-sync (same token) doesn't reset the clock.
+                let tokenChanged = existingToken != accessToken
+                if tokenChanged {
+                    try db.run("""
+                        UPDATE oauth_credentials SET
+                            access_token = ?, source = ?,
+                            is_active = 1, updated_at = ?, token_rolled_at = ?
+                        WHERE id = ?
+                    """, accessToken, source, now, now, credId)
+                    flog.info("Rolled credential for account \(accountId)", category: fcat)
+                } else {
+                    try db.run("""
+                        UPDATE oauth_credentials SET
+                            source = ?, is_active = 1, updated_at = ?
+                        WHERE id = ?
+                    """, source, now, credId)
+                    flog.info("Updated credential for account \(accountId)", category: fcat)
+                }
             } else {
                 try db.run("""
                     INSERT INTO oauth_credentials (
                         account_id, label, source,
-                        access_token, is_active, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, 1, ?, ?)
-                """, accountId, label, source, accessToken, now, now)
+                        access_token, is_active, created_at, updated_at, token_rolled_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                """, accountId, label, source, accessToken, now, now, now)
                 flog.info("Created new credential for account \(accountId)", category: fcat)
             }
         } catch {
@@ -352,6 +371,48 @@ class OAuthPoller: ObservableObject {
 
     var hasCredentials: Bool {
         !loadActiveCredentials().isEmpty
+    }
+
+    // MARK: - Token Rolling Support
+
+    /// The active access token currently stored for an account, if any.
+    func currentToken(for accountId: String) -> String? {
+        loadActiveCredentials().first { $0.accountId == accountId }?.accessToken
+    }
+
+    /// When this account's token was last set/rolled (token value last changed),
+    /// or nil if unknown (older credential written before we tracked this).
+    func tokenRolledAt(for accountId: String) -> Date? {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
+        do {
+            let db = try openDatabase(dbPath, readonly: true)
+            guard let iso = try db.scalar(
+                "SELECT token_rolled_at FROM oauth_credentials WHERE account_id = ? AND token_rolled_at IS NOT NULL LIMIT 1",
+                accountId
+            ) as? String else { return nil }
+            return ISO8601DateFormatter().date(from: iso)
+        } catch {
+            flog.error("tokenRolledAt failed: \(error.localizedDescription)", category: fcat)
+            return nil
+        }
+    }
+
+    /// Ping a token to see whether it has been revoked. Returns `true` if the API
+    /// rejects it with 401 (dead), `false` if it still authenticates (200/429),
+    /// and `nil` if the check itself failed (network/other) so the caller can say
+    /// "couldn't verify" rather than claim success. A depleted-but-valid account
+    /// answers 429, which correctly reads as "still alive."
+    func verifyTokenRevoked(_ token: String) async -> Bool? {
+        do {
+            _ = try await apiClient.pingToken(accessToken: token)
+            return false  // 200/429 → still valid
+        } catch AnthropicAPIError.unauthorized {
+            return true   // 401 → revoked
+        } catch let error as AnthropicAPIError where error.isTransient {
+            return nil    // network/5xx → indeterminate
+        } catch {
+            return nil
+        }
     }
 
     // MARK: - Deactivate Credential

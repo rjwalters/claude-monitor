@@ -743,6 +743,9 @@ struct SummaryRow: View {
             Button(action: startRename) {
                 Label("Rename", systemImage: "pencil")
             }
+            Button(action: openRollToken) {
+                Label("Roll Token…", systemImage: "arrow.triangle.2.circlepath")
+            }
             Divider()
             Button(role: .destructive, action: { onRemove?() }) {
                 Label("Remove", systemImage: "trash")
@@ -752,6 +755,10 @@ struct SummaryRow: View {
 
     private func openChart() {
         ChartWindowController.showChart(for: account, store: store, oauthPoller: oauthPoller)
+    }
+
+    private func openRollToken() {
+        RollTokenWindowController.show(for: account, store: store, oauthPoller: oauthPoller)
     }
 
     private func togglePrimary() {
