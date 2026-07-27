@@ -4,6 +4,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-07-26
+
+### Summary
+
+Multi-account token management. Adds a guided workflow for rotating long-lived
+OAuth tokens, cross-machine account transfer, and premium/Fable usage tracking.
+
+### Added
+
+- **Roll Token workflow.** A per-account "Roll Token…" context-menu action opens
+  a guided wizard to rotate a Claude Code long-lived token: open the claude.ai
+  token settings, run a generated revoke-all browser-console script, mint a fresh
+  token with `claude setup-token`, and paste it back. The app imports the new
+  token and independently verifies the old one is revoked via a ping check. This
+  is a temporary workaround pending an official Anthropic token-management API
+  (see issue #6).
+- **Copy/Paste Accounts buttons.** Export the active account list (email + token
+  pairs) to the clipboard and import it on another machine for cross-machine
+  transfer.
+- **Fable/premium usage tracking.** Probes the premium (Opus/Fable) tier and
+  surfaces its weekly allocation and extra-usage (overage) columns, alongside a
+  master account list.
+- **Ranking export.** Emits `~/.claude-monitor/ranking.json` for external load
+  balancers.
+
+### Changed
+
+- Token paste now strips all whitespace, so tokens copied line-wrapped from a
+  terminal import correctly.
+- Popover height auto-fits the number of accounts.
+- Each account is polled once per 10 minutes instead of round-robin.
+
 ## [1.14.0] - 2026-07-11
 
 ### Summary

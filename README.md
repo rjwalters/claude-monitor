@@ -297,8 +297,10 @@ claude-monitor/
 │       ├── SQLiteDB.swift          # Minimal system-libsqlite3 wrapper (zero deps)
 │       ├── UsagePopoverView.swift  # Summary table, sortable headers, add-account dialog
 │       ├── UsageChartView.swift    # Per-account chart window
-│       ├── OAuthPoller.swift       # API pings, token add/import
+│       ├── OAuthPoller.swift       # API pings, token add/import, token rolling
 │       ├── AnthropicAPI.swift      # API client
+│       ├── RollTokenView.swift     # Roll Token wizard window (rotate long-lived tokens)
+│       ├── TokenRoller.swift       # Revoke-all browser-console script generator
 │       ├── RankingExporter.swift   # Emits ~/.claude-monitor/ranking.json for load balancers
 │       └── FileLogger.swift        # Debug logging
 └── scripts/
