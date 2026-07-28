@@ -32,7 +32,7 @@
   - `Sources/OAuthPoller.swift` - Ping-based usage polling, token add/import, Fable probes
   - `Sources/UsagePopoverView.swift` - Summary-table popover, sortable headers, add-account dialog
   - `Sources/UsageChartView.swift` - Per-account usage-history chart window
-  - `Sources/RollTokenView.swift` / `Sources/TokenRoller.swift` - Roll Token wizard + revoke-script generator
+  - `Sources/RollTokenView.swift` / `Sources/TokenRoller.swift` - Roll Token wizard + revoke-script generator. The workflow depends on undocumented, web-session-cookie-authenticated `claude.ai/api/oauth` endpoints; if they change, `TokenRoller.revokeAllScript` is the single place to update (see README "Rolling a Token").
   - `Sources/UsageStore.swift` - SQLite-backed data store, account/usage models
   - `Sources/SQLiteDB.swift` - Minimal wrapper over system libsqlite3 (zero package deps)
   - `Sources/RankingExporter.swift` - Emits `~/.claude-monitor/ranking.json`

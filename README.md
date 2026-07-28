@@ -38,6 +38,10 @@ OAuth tokens you provide, and renders the data locally on your Mac.
 - **Multi-account.** Add accounts one-by-one via a token from
   `claude setup-token`, or bulk-import from a `.env` file with
   `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` pairs.
+- **Roll Token wizard.** Guided revoke-all + re-mint for an account's
+  long-lived token (right-click its row → "Roll Token…"). A temporary stopgap
+  until Anthropic ships a token-management API — see
+  [Rolling a Token](#rolling-a-token-revoke--re-mint).
 - **All data stored locally** in SQLite at `~/.claude-monitor/usage.db`.
 
 ## Quick Install
@@ -67,7 +71,8 @@ claude setup-token
 It opens a browser, asks you to authorize, and prints a token like
 `sk-ant-oat01-…`. These tokens are **long-lived (~1 year)** so a single
 authorization powers the menu bar for the entire lifetime — no refresh dance
-needed.
+needed. If you ever need to revoke and replace one (e.g., after a leak), see
+[Rolling a Token](#rolling-a-token-revoke--re-mint).
 
 ### 4. Add the Account
 
@@ -108,6 +113,78 @@ and **appends** any new emails), then imports the result. Loading is
 **additive**: accounts in the lists are added or have their token refreshed, but
 accounts already in the app that aren't listed are left untouched — nothing is
 removed. Store these files with `chmod 600`; they contain live tokens.
+
+### Rolling a Token (revoke + re-mint)
+
+> **Temporary workaround.** Anthropic exposes no supported API to list, revoke,
+> or programmatically mint long-lived `sk-ant-oat01` tokens, so this workflow
+> leans on undocumented claude.ai internals plus manual browser steps. It
+> should be revisited (and ideally replaced) once Anthropic ships a real
+> token-management API — see
+> [anthropics/claude-code#43801](https://github.com/anthropics/claude-code/issues/43801)
+> (revocation doesn't reliably invalidate tokens),
+> [#22995](https://github.com/anthropics/claude-code/issues/22995)
+> (token/session management dashboard request),
+> [#48373](https://github.com/anthropics/claude-code/issues/48373)
+> (`claude setup-token --list` / `--revoke` request), and
+> [#59378](https://github.com/anthropics/claude-code/issues/59378)
+> (per-session token minting).
+
+If a token leaks — or you just want to rotate one — right-click the account's
+row in the popover and choose **"Roll Token…"**. A per-account wizard window
+opens (its header shows a "Last rolled …" timestamp) and walks you through
+four steps:
+
+1. **Log in as this account.** A button opens
+   `https://claude.ai/settings/claude-code` in your browser; make sure the
+   browser is signed in as the account being rolled.
+2. **Revoke the old tokens.** A button copies a browser-console script with
+   the account's org id baked in. Paste it into the browser console (⌥⌘J) on
+   the logged-in claude.ai page and press Return. It revokes **every**
+   authorization token on the account — this signs out all devices using it.
+3. **Mint a new token.** Run `claude setup-token` in a terminal (copy button
+   provided), complete the browser login, and paste the printed
+   `sk-ant-oat01-…` back into the wizard. The wizard verifies the token and
+   **rejects it if its org id doesn't match the account being rolled** — a
+   guard against accidentally pasting a different account's token into the
+   wrong roll.
+4. **Verify the old token is revoked.** After a successful import, the wizard
+   pings the token this account had *before* the roll. If the API rejects it
+   with 401 you get "Revoked ✓"; if it still answers (200 or 429 — both mean
+   the token still authenticates) you get "Still valid!"; a network or server
+   error shows "Couldn't check".
+
+#### Why it works this way (undocumented endpoints)
+
+The console script hits internal claude.ai endpoints with no public,
+documented equivalent:
+
+- List tokens:
+  `GET https://claude.ai/api/oauth/organizations/{org}/oauth_tokens`
+- Revoke one:
+  `POST https://claude.ai/api/oauth/organizations/{org}/oauth_tokens/{id}/revoke`
+
+Both authenticate with the **claude.ai web session cookie**
+(`credentials: 'include'`), not the Bearer token — the OAuth token itself gets
+`account_session_invalid`. That's why revocation can only run pasted into a
+browser console on a logged-in claude.ai page, never from the app itself.
+Minting can't be automated either: `claude setup-token` requires interactive
+browser OAuth.
+
+The script is defensive about known flakiness: it re-lists live tokens between
+revoke rounds and retries stragglers for up to 10 rounds, and a 403 on the
+list call means the browser is logged into a different account (the script
+aborts with a clear error).
+
+Because these endpoints are undocumented, they may change without notice. If a
+roll stops working, the script template in `TokenRoller.revokeAllScript`
+(`menubar-app/ClaudeMonitor/Sources/TokenRoller.swift`) is the single place to
+update.
+
+Finally, server-side revocation is known to lag or silently fail (see
+anthropics/claude-code#43801 above) — which is exactly why step 4 exists: the
+app independently verifies the old token with its own ping rather than
+trusting that the revoke succeeded.
 
 ## Direct API Access (no app needed)
 
@@ -290,6 +367,18 @@ The import dialog calls `refreshAll` after a successful add, so all 10/13/etc.
 accounts should appear when the popover reopens. If a token dot stays gray,
 the next 30 s poll tick hasn't filled in token status yet — click the
 ↻ refresh icon in the popover header.
+
+### Rolled token still shows as valid
+
+Anthropic-side revocation is known to be unreliable or slow to take effect
+([anthropics/claude-code#43801](https://github.com/anthropics/claude-code/issues/43801)),
+which is why the [Roll Token wizard](#rolling-a-token-revoke--re-mint)'s final
+step pings the old token itself — still answers (200/429) means still valid,
+rejected (401) means revoked — instead of trusting the revoke call. If the
+badge says "Still valid!", re-run the revoke console script from step 2 (it
+automatically retries tokens that survive a round) and click **Verify old
+token revoked** again. "Couldn't check" means the ping itself failed
+(network/5xx) — try again later.
 
 ### Logs
 
