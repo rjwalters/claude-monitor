@@ -1,7 +1,5 @@
 import Foundation
-import os
 
-private let logger = Logger(subsystem: "com.claude-monitor.app", category: "OAuthPoller")
 private let flog = FileLogger.shared
 private let fcat = "OAuth"
 
@@ -435,8 +433,9 @@ class OAuthPoller: ObservableObject {
 
     // MARK: - Polling (each account once per interval, staggered)
 
-    /// How often each account should be polled (seconds)
-    private let pollInterval: TimeInterval = 600  // 10 minutes
+    /// How often each account should be polled (seconds). Headless mode may
+    /// override this via --interval; the app keeps the default.
+    var pollInterval: TimeInterval = 600  // 10 minutes
 
     /// Last poll time per credential ID
     private var lastPollTimes: [Int64: Date] = [:]

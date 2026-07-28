@@ -56,6 +56,12 @@ enum RankingExporter {
         queue.async { exportSync() }
     }
 
+    /// Export and wait for the write to finish. Headless mode uses this so a
+    /// --once run can't exit before ranking.json lands on disk.
+    static func exportNow() {
+        queue.sync { exportSync() }
+    }
+
     // MARK: - Status mapping
 
     /// Maps the app's ping signals to the schema's `status` enum. Explicit and

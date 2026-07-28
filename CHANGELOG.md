@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Headless mode / Linux support.** The package now builds on Linux
+  (`libsqlite3-dev` + Swift toolchain) as a UI-less daemon for Loom hosts: the
+  same poll loop (account-file sync, 10-min usage pings, 20-min Fable probes)
+  writing the same `~/.claude-monitor/usage.db` and `ranking.json`. On macOS
+  the loop is reachable via `ClaudeMonitor --headless`. Flags: `--once`,
+  `--interval <sec>`, `--version`; account list files are re-imported on
+  change while running. Includes a sample systemd unit
+  (`scripts/claude-monitor.service`). UI sources are fenced with
+  `#if os(macOS)`; a new `CSQLite` system-library target maps Linux's
+  libsqlite3, and rate-limit headers are now parsed from the lowercased
+  captured map (Linux `allHeaderFields` lookups are case-sensitive).
+
 - **App icon.** Custom gauge-dial icon (generated with
   [Imagine](https://github.com/rjwalters/imagine)); `Assets/AppIcon.icns` is
   now bundled by `build-macos-app.sh` and referenced via `CFBundleIconFile`.

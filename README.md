@@ -205,6 +205,44 @@ When replacing `/Applications/ClaudeMonitor.app`, you must `rm -rf` the old
 bundle before copying — `cp -R` over a running app does not replace the
 binary. See `CLAUDE.md` for the exact sequence.
 
+## Headless Mode / Linux
+
+The same package builds on Linux as a headless daemon — no UI, same poll loop
+(account-file sync, 10-minute usage pings, 20-minute Fable probes) writing the
+same `~/.claude-monitor/usage.db` and `ranking.json`. This is what Loom hosts
+run.
+
+### Build (Linux)
+
+Requires a Swift toolchain ([swift.org](https://www.swift.org/install/) or the
+`swift:6.1` Docker image) and the SQLite dev headers:
+
+```bash
+sudo apt-get install libsqlite3-dev   # (yum: sqlite-devel)
+cd claude-monitor/menubar-app/ClaudeMonitor
+swift build -c release
+sudo cp .build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+```
+
+### Run
+
+Put your accounts in `~/.claude-monitor/accounts.env`
+(`ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` pairs, same format as the app's bulk
+import — see [Multiple Accounts](#multiple-accounts)), then:
+
+```bash
+claude-monitor                  # poll loop, logs to stdout + ~/.claude-monitor/debug.log
+claude-monitor --once           # one poll cycle, write ranking.json, exit
+claude-monitor --interval 300   # override per-account poll interval (seconds, min 60)
+```
+
+Edits to `accounts.env` / `accounts.local.env` are picked up automatically
+while the daemon runs. A sample systemd user unit is provided at
+`scripts/claude-monitor.service`.
+
+On macOS the same headless loop is available as `ClaudeMonitor --headless`
+(the bare binary or the app bundle's `Contents/MacOS/ClaudeMonitor`).
+
 ## Auto-Start on Login (Optional)
 
 ```bash
@@ -289,11 +327,14 @@ rm -rf /Applications/ClaudeMonitor.app
 
 ```
 claude-monitor/
-├── menubar-app/ClaudeMonitor/   # macOS menu-bar app (Swift Package)
+├── menubar-app/ClaudeMonitor/   # Swift Package: macOS menu-bar app + Linux headless daemon
 │   ├── Package.swift
 │   ├── Assets/                     # App icon (AppIcon.icns + 1024px master PNG)
+│   ├── CSQLite/                    # System-library shim mapping Linux libsqlite3
 │   └── Sources/
-│       ├── main.swift              # AppDelegate, menubar icon, popover wiring
+│       ├── main.swift              # macOS entry: AppDelegate, menubar icon, popover wiring
+│       ├── HeadlessMain.swift      # Linux entry (always headless)
+│       ├── HeadlessRunner.swift    # UI-less poll loop (Linux daemon / --headless on macOS)
 │       ├── UsageStore.swift        # SQLite store, settings, primary-account pin
 │       ├── SQLiteDB.swift          # Minimal system-libsqlite3 wrapper (zero deps)
 │       ├── UsagePopoverView.swift  # Summary table, sortable headers, add-account dialog
@@ -303,9 +344,11 @@ claude-monitor/
 │       ├── RollTokenView.swift     # Roll Token wizard window (rotate long-lived tokens)
 │       ├── TokenRoller.swift       # Revoke-all browser-console script generator
 │       ├── RankingExporter.swift   # Emits ~/.claude-monitor/ranking.json for load balancers
-│       └── FileLogger.swift        # Debug logging
+│       ├── FileLogger.swift        # Debug logging
+│       └── LinuxCompat.swift       # ObservableObject/@Published stand-ins for Linux
 └── scripts/
-    └── build-macos-app.sh          # Release build script
+    ├── build-macos-app.sh          # macOS release build script
+    └── claude-monitor.service      # Sample systemd user unit for Linux headless mode
 ```
 
 ## Related Projects

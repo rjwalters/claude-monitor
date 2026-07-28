@@ -13,10 +13,21 @@
   open /Applications/ClaudeMonitor.app
   ```
 
+## Headless / Linux
+
+- The same package builds on Linux (`swift build` with `libsqlite3-dev` installed) as a headless daemon for Loom hosts — no UI, same poll loop, same `usage.db`/`ranking.json` outputs. See README "Headless Mode / Linux".
+- UI sources are fenced with `#if os(macOS)`; portable core must stay free of AppKit/SwiftUI/Combine/os.Logger. On Linux, `LinuxCompat.swift` shims `ObservableObject`/`@Published`, and `CSQLite/` maps the system libsqlite3 (macOS uses the SDK's `SQLite3` module).
+- Entry points: `main.swift` (macOS, dispatches to `HeadlessRunner` on `--headless`) and `HeadlessMain.swift` (Linux, always headless). Flags: `--once`, `--interval <sec>`, `--version`.
+- Parse response headers via `extractAnthropicHeaders` (lowercased map), never `allHeaderFields` subscripts — those are case-sensitive on Linux.
+- Verify Linux builds from macOS with the `swift:6.1` Docker image (`apt-get install libsqlite3-dev`, then `swift build`).
+
 ## Project Structure
 
 - `menubar-app/ClaudeMonitor/` - Swift Package Manager project
-  - `Sources/main.swift` - App entry point, AppDelegate, popover/window management
+  - `Sources/main.swift` - macOS entry point, AppDelegate, popover/window management
+  - `Sources/HeadlessMain.swift` / `Sources/HeadlessRunner.swift` - Linux entry point + UI-less poll loop (also `--headless` on macOS)
+  - `Sources/LinuxCompat.swift` - `ObservableObject`/`@Published` stand-ins for Linux (no Combine)
+  - `CSQLite/` - System-library target mapping Linux libsqlite3
   - `Sources/AnthropicAPI.swift` - API client (usage, profile, token refresh)
   - `Sources/OAuthPoller.swift` - Ping-based usage polling, token add/import, Fable probes
   - `Sources/UsagePopoverView.swift` - Summary-table popover, sortable headers, add-account dialog
@@ -28,6 +39,7 @@
   - `Sources/FileLogger.swift` - Debug log at `~/.claude-monitor/debug.log`
   - `Assets/` - App icon (`AppIcon.icns` + 1024px master PNG)
 - `scripts/build-macos-app.sh` - Build script that compiles and creates the .app bundle (bundles the icon)
+- `scripts/claude-monitor.service` - Sample systemd user unit for Linux headless mode
 - `build/` - Build output (ClaudeMonitor.app and .zip)
 
 ## Version Management

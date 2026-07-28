@@ -1,3 +1,4 @@
+#if os(macOS)
 import SwiftUI
 
 // MARK: - Popover Height Manager
@@ -48,6 +49,16 @@ class PopoverHeightManager: ObservableObject {
 }
 
 @main
+enum ClaudeMonitorEntry {
+    static func main() {
+        if CommandLine.arguments.contains("--headless") {
+            HeadlessRunner.main()
+        } else {
+            ClaudeMonitorApp.main()
+        }
+    }
+}
+
 struct ClaudeMonitorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
@@ -388,3 +399,5 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
 }
+
+#endif  // os(macOS)

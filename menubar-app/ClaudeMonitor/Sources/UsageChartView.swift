@@ -1,3 +1,4 @@
+#if os(macOS)
 import SwiftUI
 import Charts
 
@@ -1127,3 +1128,5 @@ class ChartWindowController {
         NSApp.activate(ignoringOtherApps: true)
     }
 }
+
+#endif  // os(macOS)
