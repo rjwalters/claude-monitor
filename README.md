@@ -412,6 +412,14 @@ rm -rf ~/.claude-monitor
 rm -rf /Applications/ClaudeMonitor.app
 ```
 
+### Upgrading from pre-2.0
+
+Versions before 2.0 shipped a Node CLI (`dist/cli.js`) that was removed in the 2.0 rewrite. Its build artifacts are untracked, so they linger in old checkouts and fail confusingly if run (e.g. `node dist/cli.js` errors with `ERR_MODULE_NOT_FOUND` for `commander`). Clean them up:
+
+```bash
+rm -rf dist node_modules
+```
+
 ## Project Structure
 
 ```
