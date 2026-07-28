@@ -1,7 +1,8 @@
 import Foundation
-import os
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
-private let logger = Logger(subsystem: "com.claude-monitor.app", category: "AnthropicAPI")
 private let flog = FileLogger.shared
 private let fcat = "API"
 
@@ -130,23 +131,24 @@ class AnthropicAPIClient {
             throw AnthropicAPIError.httpError(status)
         }
 
-        let headers = httpResponse.allHeaderFields
-
-        let rawHeaders = Self.extractAnthropicHeaders(headers)
+        // Parse from the lowercased captured map, not allHeaderFields directly:
+        // on Linux allHeaderFields lookups are case-sensitive, so header-name
+        // casing from the server would otherwise change behavior per platform.
+        let rawHeaders = Self.extractAnthropicHeaders(httpResponse.allHeaderFields)
         Self.logUnknownHeaderKeys(rawHeaders.keys)
 
-        let orgId = headers["anthropic-organization-id"] as? String ?? ""
+        let orgId = rawHeaders["anthropic-organization-id"] ?? ""
 
         let pingResponse = PingResponse(
             organizationId: orgId,
             httpStatus: status,
-            sessionUtilization: parseDouble(headers["anthropic-ratelimit-unified-5h-utilization"]),
-            sessionReset: parseEpoch(headers["anthropic-ratelimit-unified-5h-reset"]),
-            sessionStatus: headers["anthropic-ratelimit-unified-5h-status"] as? String,
-            weeklyUtilization: parseDouble(headers["anthropic-ratelimit-unified-7d-utilization"]),
-            weeklyReset: parseEpoch(headers["anthropic-ratelimit-unified-7d-reset"]),
-            weeklyStatus: headers["anthropic-ratelimit-unified-7d-status"] as? String,
-            overallStatus: headers["anthropic-ratelimit-unified-status"] as? String,
+            sessionUtilization: parseDouble(rawHeaders["anthropic-ratelimit-unified-5h-utilization"]),
+            sessionReset: parseEpoch(rawHeaders["anthropic-ratelimit-unified-5h-reset"]),
+            sessionStatus: rawHeaders["anthropic-ratelimit-unified-5h-status"],
+            weeklyUtilization: parseDouble(rawHeaders["anthropic-ratelimit-unified-7d-utilization"]),
+            weeklyReset: parseEpoch(rawHeaders["anthropic-ratelimit-unified-7d-reset"]),
+            weeklyStatus: rawHeaders["anthropic-ratelimit-unified-7d-status"],
+            overallStatus: rawHeaders["anthropic-ratelimit-unified-status"],
             rawHeaders: rawHeaders
         )
 
@@ -276,7 +278,8 @@ class AnthropicAPIClient {
             throw AnthropicAPIError.httpError(httpResponse.statusCode)
         }
 
-        guard let orgId = httpResponse.allHeaderFields["anthropic-organization-id"] as? String, !orgId.isEmpty else {
+        let idHeaders = Self.extractAnthropicHeaders(httpResponse.allHeaderFields)
+        guard let orgId = idHeaders["anthropic-organization-id"], !orgId.isEmpty else {
             throw AnthropicAPIError.invalidResponse
         }
 
@@ -286,19 +289,12 @@ class AnthropicAPIClient {
 
     // MARK: - Helpers
 
-    private func parseDouble(_ value: Any?) -> Double? {
-        if let str = value as? String { return Double(str) }
-        if let num = value as? Double { return num }
-        if let num = value as? NSNumber { return num.doubleValue }
-        return nil
+    private func parseDouble(_ value: String?) -> Double? {
+        value.flatMap { Double($0) }
     }
 
-    private func parseEpoch(_ value: Any?) -> Date? {
-        let epoch: TimeInterval?
-        if let str = value as? String { epoch = TimeInterval(str) }
-        else if let num = value as? NSNumber { epoch = num.doubleValue }
-        else { return nil }
-        guard let epoch = epoch else { return nil }
+    private func parseEpoch(_ value: String?) -> Date? {
+        guard let epoch = value.flatMap({ TimeInterval($0) }) else { return nil }
         return Date(timeIntervalSince1970: epoch)
     }
 }

@@ -1,0 +1,23 @@
+# systemd unit for claude-monitor headless mode (Linux / Loom hosts).
+#
+# Install:
+#   sudo cp ClaudeMonitor /usr/local/bin/claude-monitor
+#   cp scripts/claude-monitor.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now claude-monitor
+#
+# Logs: journalctl --user -u claude-monitor -f
+# (also written to ~/.claude-monitor/debug.log)
+
+[Unit]
+Description=Claude Monitor headless usage poller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/claude-monitor
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,5 +1,9 @@
 import Foundation
+#if canImport(SQLite3)
 import SQLite3
+#else
+import CSQLite
+#endif
 
 /// Minimal wrapper over the system SQLite C API (libsqlite3 ships with macOS),
 /// mirroring the subset of the SQLite.swift API this app uses: raw SQL with `?`

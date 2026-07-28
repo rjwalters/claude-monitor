@@ -1,5 +1,7 @@
 import Foundation
-import AppKit
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 /// Opens a SQLite connection with a busy timeout so concurrent access from
 /// other processes waits briefly for locks instead of failing immediately.

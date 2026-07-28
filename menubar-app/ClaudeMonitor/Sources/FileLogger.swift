@@ -5,6 +5,10 @@ import Foundation
 final class FileLogger {
     static let shared = FileLogger()
 
+    /// When true (headless mode), every line is also printed to stdout so
+    /// journald/docker logs capture it alongside the debug.log file.
+    var echoToStdout = false
+
     private let queue = DispatchQueue(label: "com.claude-monitor.file-logger")
     private let maxBytes: UInt64 = 1_048_576 // 1 MB
     private let logDir: String
@@ -27,6 +31,10 @@ final class FileLogger {
     func log(_ message: String, category: String = "App", level: Level = .info) {
         let ts = Self.formatter.string(from: Date())
         let line = "\(ts) [\(level.rawValue)] [\(category)] \(message)\n"
+        if echoToStdout {
+            print(line, terminator: "")
+            fflush(stdout)
+        }
         queue.async { [weak self] in
             self?.writeLine(line)
         }

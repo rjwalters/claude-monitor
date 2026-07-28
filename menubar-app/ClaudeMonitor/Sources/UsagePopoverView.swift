@@ -1,3 +1,4 @@
+#if os(macOS)
 import SwiftUI
 
 /// Format a time interval using a single unit with decreasing precision:
@@ -1137,3 +1138,5 @@ struct AddAccountView: View {
         }
     }
 }
+
+#endif  // os(macOS)

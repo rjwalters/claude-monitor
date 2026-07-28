@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import SwiftUI
 
@@ -294,3 +295,5 @@ final class RollTokenWindowController {
         NSApp.activate(ignoringOtherApps: true)
     }
 }
+
+#endif  // os(macOS)

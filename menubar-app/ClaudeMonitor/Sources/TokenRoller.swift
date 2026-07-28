@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 import Foundation
 
@@ -73,3 +74,5 @@ enum TokenRoller {
         pb.setString("claude setup-token", forType: .string)
     }
 }
+
+#endif  // os(macOS)
