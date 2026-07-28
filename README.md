@@ -291,6 +291,7 @@ rm -rf /Applications/ClaudeMonitor.app
 claude-monitor/
 ├── menubar-app/ClaudeMonitor/   # macOS menu-bar app (Swift Package)
 │   ├── Package.swift
+│   ├── Assets/                     # App icon (AppIcon.icns + 1024px master PNG)
 │   └── Sources/
 │       ├── main.swift              # AppDelegate, menubar icon, popover wiring
 │       ├── UsageStore.swift        # SQLite store, settings, primary-account pin

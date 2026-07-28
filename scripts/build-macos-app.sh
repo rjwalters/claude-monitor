@@ -35,6 +35,9 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 # Copy executable
 cp ".build/release/ClaudeMonitor" "$APP_BUNDLE/Contents/MacOS/"
 
+# Copy app icon
+cp "$APP_DIR/Assets/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
+
 # Create Info.plist
 cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -55,6 +58,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
     <string>1.15.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>

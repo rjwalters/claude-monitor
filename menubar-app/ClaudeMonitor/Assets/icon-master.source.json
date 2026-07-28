@@ -1,0 +1,12 @@
+{
+  "tool": "imagine 0.1.0",
+  "provider": "gemini",
+  "model": "gemini-3-pro-image",
+  "alias": "nano-banana-pro",
+  "prompt": "macOS app icon, modern flat design, rounded squircle shape filling the frame on a transparent background. A minimalist analog gauge / speedometer dial with a needle pointing to about 70 percent, drawn in warm coral orange (#DA7756) strokes on a deep charcoal background. Subtle tick marks around the dial arc. Clean, geometric, Big Sur style with soft inner gradient. No text.",
+  "refs": [],
+  "aspect_ratio": null,
+  "size": null,
+  "sha256": "9adc48d500c3cb35b7f2301687254093f2846739cbfe076c4f257606e071c130",
+  "created": "2026-07-28T12:36:57-0700"
+}
