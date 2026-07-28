@@ -1,7 +1,5 @@
 node_modules/
-dist/
 .env
-profiles/
 *.log
 .DS_Store
 build/
@@ -10,7 +8,6 @@ build/
 *.xcodeproj/
 .claude/*
 !.claude/commands/
-*.xpi
 *.zip
 .loom/locks/
 .loom/sweep-checkpoint/

@@ -18,9 +18,16 @@
 - `menubar-app/ClaudeMonitor/` - Swift Package Manager project
   - `Sources/main.swift` - App entry point, AppDelegate, popover/window management
   - `Sources/AnthropicAPI.swift` - API client (usage, profile, token refresh)
-  - `Sources/UsagePopoverView.swift` - All SwiftUI views (popover, account cards, summary table)
+  - `Sources/OAuthPoller.swift` - Ping-based usage polling, token add/import, Fable probes
+  - `Sources/UsagePopoverView.swift` - Summary-table popover, sortable headers, add-account dialog
+  - `Sources/UsageChartView.swift` - Per-account usage-history chart window
+  - `Sources/RollTokenView.swift` / `Sources/TokenRoller.swift` - Roll Token wizard + revoke-script generator
   - `Sources/UsageStore.swift` - SQLite-backed data store, account/usage models
-- `scripts/build-macos-app.sh` - Build script that compiles and creates the .app bundle
+  - `Sources/SQLiteDB.swift` - Minimal wrapper over system libsqlite3 (zero package deps)
+  - `Sources/RankingExporter.swift` - Emits `~/.claude-monitor/ranking.json`
+  - `Sources/FileLogger.swift` - Debug log at `~/.claude-monitor/debug.log`
+  - `Assets/` - App icon (`AppIcon.icns` + 1024px master PNG)
+- `scripts/build-macos-app.sh` - Build script that compiles and creates the .app bundle (bundles the icon)
 - `build/` - Build output (ClaudeMonitor.app and .zip)
 
 ## Version Management
