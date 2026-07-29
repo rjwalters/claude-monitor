@@ -4,7 +4,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.16.0] - 2026-07-28
+
+### Summary
+
+Headless Linux support. The package now builds and runs on Linux hosts as a
+UI-less daemon for Loom worker fleets — same poll loop, same `usage.db` and
+`ranking.json` — plus a new app icon and a documentation catch-up.
 
 ### Added
 
