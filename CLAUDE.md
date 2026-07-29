@@ -37,7 +37,7 @@
   - `Sources/SQLiteDB.swift` - Minimal wrapper over system libsqlite3 (zero package deps)
   - `Sources/RankingExporter.swift` - Emits `~/.claude-monitor/ranking.json`
   - `Sources/FileLogger.swift` - Debug log at `~/.claude-monitor/debug.log`
-  - `Assets/` - App icon (`AppIcon.icns` + 1024px master PNG)
+  - `Assets/` - App icon (`AppIcon.icns` + 1024px master PNG + `icon-master.source.json` generation recipe)
 - `scripts/build-macos-app.sh` - Build script that compiles and creates the .app bundle (bundles the icon)
 - `scripts/claude-monitor.service` - Sample systemd user unit for Linux headless mode
 - `build/` - Build output (ClaudeMonitor.app and .zip)

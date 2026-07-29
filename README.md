@@ -85,7 +85,8 @@ Your usage data shows up in the menu bar immediately.
 ### Multiple Accounts
 
 If you maintain tokens for several accounts (e.g., in a `.env` for an agent
-pool), use the **Bulk Import** field in the Add Account dialog:
+pool), use the **Bulk Import** field in the Add Account dialog
+(`.env.example` in the repo is a starter template):
 
 ```env
 ACCOUNT_EMAIL_1=you@example.com
@@ -426,7 +427,7 @@ rm -rf dist node_modules
 claude-monitor/
 ├── menubar-app/ClaudeMonitor/   # Swift Package: macOS menu-bar app + Linux headless daemon
 │   ├── Package.swift
-│   ├── Assets/                     # App icon (AppIcon.icns + 1024px master PNG)
+│   ├── Assets/                     # App icon (AppIcon.icns + 1024px master PNG + generation recipe)
 │   ├── CSQLite/                    # System-library shim mapping Linux libsqlite3
 │   └── Sources/
 │       ├── main.swift              # macOS entry: AppDelegate, menubar icon, popover wiring
