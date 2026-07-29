@@ -313,10 +313,11 @@ loom-recover-orphans --verbose
 loom-recover-orphans --json
 ```
 
-`loom-recover-orphans` (Python entry point `loom_tools.orphan_recovery`; the
-`./.loom/scripts/recover-orphaned-shepherds.sh` wrapper delegates to it) detects
-orphaned work by cross-referencing GitHub `loom:building` labels against an
-authoritative liveness source (the `loom-daemon` registry / `.loom/locks/issue-<N>/`).
+`loom-recover-orphans` (native `loom-daemon recover-orphans` subcommand as of
+issue #4272; the `./.loom/scripts/recover-orphaned-shepherds.sh` wrapper
+delegates to it) detects orphaned work by cross-referencing GitHub
+`loom:building` labels against an authoritative liveness source (the
+`loom-daemon` registry / `.loom/locks/issue-<N>/`).
 
 **Recovery cases and actions:**
 

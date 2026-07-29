@@ -315,21 +315,25 @@ is invisible to Linux CI by construction — see
 
 ## Stuck Agent Detection
 
-`loom-stuck-detection` checks for stuck sweep children by reading the per-task heartbeats in `.loom/spawn-loop-state.json::running[].last_heartbeat`.
-
-> **Note (post-v0.11.0):** `spawn-loop.sh` — the only writer of `.loom/spawn-loop-state.json` — was deleted, so this file no longer has a writer. `loom-stuck-detection` therefore currently reports nothing (a safe no-op: it only reports, it never tears down work). Repointing it to the `loom-daemon` sweep registry (`mcp__loom__list_sweeps`) and `.loom/sweep-checkpoint/issue-<N>.json` timestamps is tracked as a follow-up (see `docs/migration/daemon-state-consumers.md`).
+> **Note (post-#4274):** the Python `loom-stuck-detection` CLI was removed in
+> epic #4081 phase 3. It read `.loom/spawn-loop-state.json::running[].last_heartbeat`,
+> a file whose only writer (`spawn-loop.sh`) was deleted in v0.11.0 — so it had
+> already been a safe no-op (report-only, never tears down work). Live sweep
+> liveness is now owned by the Rust `loom-daemon` sweep registry.
 
 ### Check for stuck agents
 
+The native surfaces replace the former CLI:
+
 ```bash
-# Run stuck detection check
-loom-stuck-detection check
+# Daemon + registry health summary (sweeps, PIDs, quarantine state)
+loom health                # execs `loom-daemon status`
+loom-daemon status --json  # machine-readable
 
-# Check with JSON output
-loom-stuck-detection check --json
-
-# Check a specific issue
-loom-stuck-detection check-issue 123
+# Per-sweep liveness (MCP): list sweeps and their last activity
+#   mcp__loom__list_sweeps / mcp__loom__get_sweep_status
+# plus the per-issue checkpoint timestamps under
+#   .loom/sweep-checkpoint/issue-<N>.json
 ```
 
 ### Stuck indicators (post-v0.10.0)

@@ -29,14 +29,16 @@
 
 set -euo pipefail
 
-# Use loom-forge for forge-agnostic issue/PR operations (supports GitHub + Gitea)
-# Validate loom-forge actually works (not just on PATH) — editable pip installs
-# can leave a broken binary after worktree cleanup (see issue #3205)
-if command -v loom-forge &>/dev/null && loom-forge --version &>/dev/null; then
-    FORGE="loom-forge"
+# Forge-agnostic issue/PR operations via the native `loom-daemon forge`
+# subcommand (port of the retired `loom-forge`). On GitHub it is a byte-identical
+# passthrough to `gh`; on Gitea it declines (exit 3) and the caller degrades to
+# the `gh` fallback. Validate loom-daemon actually works (not just on PATH), then
+# keep the `gh` fallback so a workspace with no loom-daemon still functions.
+if command -v loom-daemon &>/dev/null && loom-daemon --version &>/dev/null; then
+    FORGE="loom-daemon forge"
 else
-    if command -v loom-forge &>/dev/null; then
-        echo "WARNING: loom-forge is on PATH but non-functional, falling back to gh" >&2
+    if command -v loom-daemon &>/dev/null; then
+        echo "WARNING: loom-daemon is on PATH but non-functional, falling back to gh" >&2
     fi
     FORGE="gh"
 fi
@@ -499,9 +501,10 @@ main() {
         exit 2
     fi
 
-    # Check for forge CLI
-    if ! command -v "$FORGE" &> /dev/null; then
-        print_error "$FORGE CLI not found. Please install loom-forge or GitHub CLI."
+    # Check for forge CLI. $FORGE may be two words ("loom-daemon forge"), so
+    # probe only the binary name (its first word).
+    if ! command -v "${FORGE%% *}" &> /dev/null; then
+        print_error "$FORGE CLI not found. Please install loom-daemon or GitHub CLI."
         exit 2
     fi
 

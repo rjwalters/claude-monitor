@@ -14,9 +14,12 @@
 
 set -e
 
-# Use loom-forge for forge-agnostic issue/PR operations (supports GitHub + Gitea)
-if command -v loom-forge &>/dev/null; then
-    FORGE="loom-forge"
+# Forge-agnostic issue/PR operations via the native `loom-daemon forge`
+# subcommand (port of the retired `loom-forge`). GitHub: passthrough to `gh`.
+# Gitea: declines (exit 3), degrading to the `gh` fallback. Fall back to `gh`
+# when loom-daemon is absent so a bare workspace still works.
+if command -v loom-daemon &>/dev/null; then
+    FORGE="loom-daemon forge"
 else
     FORGE="gh"
 fi

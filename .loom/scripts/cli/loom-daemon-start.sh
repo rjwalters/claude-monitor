@@ -454,6 +454,41 @@ EOF
     )
 }
 
+# ---------- safehouse fleet-comms status (#4345) ----------
+# Reuses the same env>config>default resolvers `mcp-config.sh` already defines
+# for the safehouse-mcp worker injection (phase 2, #3999) — this is a purely
+# static, PRE-CONNECT check: "would the daemon even try?" It can only report
+# "not configured" vs "configured", never "connected" (proving a live
+# connection needs the daemon's own socket, surfaced instead by
+# `loom-daemon status` --- see .loom/docs/safehouse.md "New-host onboarding").
+_LOOM_MCP_CONFIG_LIB="$_LOOM_LAUNCHD_LIB_DIR/mcp-config.sh"
+if [[ -r "$_LOOM_MCP_CONFIG_LIB" ]]; then
+    # shellcheck source=../lib/mcp-config.sh
+    source "$_LOOM_MCP_CONFIG_LIB"
+fi
+print_safehouse_status() {
+    if ! command -v loom_mcp_safehouse_enabled >/dev/null 2>&1; then
+        return 0 # mcp-config.sh missing (stale/partial install) — skip silently
+    fi
+    local enabled socket
+    enabled=$(loom_mcp_safehouse_enabled "$REPO_ROOT")
+    if [[ "$enabled" != "true" ]]; then
+        echo "Safehouse:     not configured (safehouse.enabled is false/absent)"
+        return 0
+    fi
+    socket=$(loom_mcp_safehouse_socket "$REPO_ROOT")
+    if [[ -z "$socket" ]]; then
+        warn "Safehouse:     configured, unreachable (enabled but no socket path resolved -- set" \
+             "safehouse.socket, \$LOOM_SAFEHOUSE_SOCKET, or \$SAFEHOUSED_SOCKET)"
+        return 0
+    fi
+    if [[ -S "$socket" ]]; then
+        ok "Safehouse:     configured (socket present at $socket) -- see 'loom-daemon status' for live connection state"
+    else
+        warn "Safehouse:     configured, unreachable (socket $socket does not exist -- is safehoused running?)"
+    fi
+}
+
 # ---------- watchdog LaunchAgent / systemd timer (#4011, #4260 sub-issue D) ----------
 # The watchdog is the payload of a SECOND, SEPARATE scheduled job from the
 # daemon job/unit itself, and reports when intent (the marker above) diverges
@@ -1030,6 +1065,7 @@ if [[ "$USE_LAUNCHD" == "true" ]]; then
     ok "loom-daemon started under launchd (pid $daemon_pid, label $LAUNCHD_LABEL)."
     echo "PID file: $PID_FILE"
     echo "Intent marker: $INTENT_MARKER"
+    print_safehouse_status
     if [[ "$MACHINE_MODE" == "true" ]]; then
         echo "Stop with: loom stop"
     else
@@ -1103,6 +1139,7 @@ if [[ "$IS_LINUX_SYSTEMD" == "true" ]]; then
     ok "loom-daemon started under systemd (pid $daemon_pid, unit $SYSTEMD_UNIT)."
     echo "PID file: $PID_FILE"
     echo "Intent marker: $INTENT_MARKER"
+    print_safehouse_status
     warn "Reboot survival requires lingering: run 'loginctl enable-linger \"\$USER\"' once (SSH-only / headless hosts)."
     if [[ "$MACHINE_MODE" == "true" ]]; then
         echo "Stop with: loom stop"
@@ -1140,6 +1177,7 @@ write_intent_marker "false" ""
 provision_watchdog_job_none
 ok "loom-daemon started (pid $daemon_pid). PID file: $PID_FILE"
 echo "Intent marker: $INTENT_MARKER"
+print_safehouse_status
 if [[ "$MACHINE_MODE" == "true" ]]; then
     echo "Stop with: loom stop"
 else

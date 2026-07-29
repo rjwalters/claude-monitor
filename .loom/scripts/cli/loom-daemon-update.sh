@@ -14,11 +14,22 @@
 # `loom-daemon --version`) against the LOCAL source tree's current HEAD short
 # commit. This answers the directly actionable question — "would rebuilding
 # right now produce a different binary?" — without touching the network.
-# Secondary (advisory only, never gates the rebuild): a bounded, best-effort
-# check of how far local HEAD is behind origin/<default-branch>, mirroring
-# check-main-freshness.sh's pattern, so an operator running this cron-style
-# learns "you're up to date with local HEAD, but HEAD itself is behind
-# origin" instead of being told nothing needs doing.
+#
+# Checkout freshness (default, ff-first — #4330): the whole point of running
+# this script is to get the daemon onto the LATEST code, so before resolving
+# the local HEAD used for the staleness comparison above, this script attempts
+# a bounded, best-effort `git fetch` of origin/<default-branch> and, if local
+# HEAD is behind, a `git merge --ff-only`. On success the rebuild below builds
+# the freshly-synced HEAD. If the ff-merge cannot apply (diverged local
+# commits, or a dirty tracked file conflicts with the incoming change) the
+# script ABORTS (exit 1) rather than guessing or hard-resetting — a stale
+# rebuild silently missing merged commits (the 2026-07-29 incident this issue
+# closes) is worse than a loud abort asking the operator to resolve it by
+# hand. A fetch failure/timeout (offline, network degraded) is NOT treated as
+# "behind" — the script warns and proceeds with local HEAD as-is, so this
+# check never makes the script hard-network-dependent. `--allow-stale`
+# restores the pre-#4330 build-what's-here behavior (skips the fetch+merge
+# entirely) for deliberate use (bisecting, testing a local patch) — see below.
 #
 # It:
 #   - detects whether the resolved binary is stale vs. the local source tree,
@@ -90,6 +101,7 @@
 #   ./.loom/scripts/cli/loom-daemon-update.sh --force       Rebuild + provision + restart even if already up to date
 #   ./.loom/scripts/cli/loom-daemon-update.sh --no-restart  Rebuild + provision only; leave the running daemon untouched
 #   ./.loom/scripts/cli/loom-daemon-update.sh --relaunch    Launchd/systemd only: after a refused restart, re-render the plist/unit and relaunch under supervision (SIGTERMs the daemon so sweep children reparent; preserves the live LOOM_* env)
+#   ./.loom/scripts/cli/loom-daemon-update.sh --allow-stale Skip the default ff-first sync with origin/<default-branch> and build the current (possibly stale) checkout as-is (#4330) — for deliberate use: bisecting, testing a local patch
 #   ./.loom/scripts/cli/loom-daemon-update.sh --help
 #
 # Environment:
@@ -132,10 +144,24 @@
 #                          checkout. Direct invocation of this script (no
 #                          dispatcher -- the existing dev workflow) never sets
 #                          it and is unaffected.
+#   LOOM_DAEMON_RESTART_POLL_SECS  macOS/launchd only: seconds to poll for a
+#                          NEW, live pid after a `restart` ack before falling
+#                          back to `launchctl kickstart` (default 30, #4232).
+#   LOOM_DAEMON_RESTART_POLL_INTERVAL  Poll interval in seconds between pid
+#                          checks (default 1; may be fractional, e.g. 0.5).
+#   LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS  macOS/launchd only: seconds to
+#                          re-poll for a new, live pid after the `launchctl
+#                          kickstart` fallback before giving up (default 15,
+#                          #4232).
 #
 # Exit codes:
 #   0  up to date (no-op) OR rebuild+provision+restart succeeded
-#   1  usage error / not a source checkout / build or provision failure
+#   1  usage error / not a source checkout / build or provision failure /
+#      the default ff-first sync with origin/<default-branch> could not apply
+#      (diverged local commits, a dirty tracked file conflicting with the
+#      incoming change, or HEAD is not on <default-branch>) — the script
+#      NEVER guesses or hard-resets; resolve manually or pass --allow-stale
+#      (#4330)
 #   3  (--check only) update available
 #   4  build verification FAILED: the freshly-built binary's embedded commit
 #      does not match the source HEAD it was built from. This is a BUILD-SYSTEM
@@ -155,6 +181,14 @@
 #      with --relaunch (or LOOM_DAEMON_UPDATE_RELAUNCH=1) it performs that
 #      re-render+relaunch itself, propagating loom-daemon-start.sh's exit code
 #      (#4042, #4118, #4260 sub-issue C).
+#   7  launchd restart ACK'd but never took effect (#4232): the running (old)
+#      binary accepted the `restart` IPC request (exit 0), but launchd never
+#      relaunched the job onto a NEW, live pid within the poll window, AND the
+#      `launchctl kickstart` fallback (plain, never -k) also failed to bring it
+#      up within its own poll window. The fresh binary IS provisioned, but the
+#      daemon's live status is NOT confirmed — this is the "restart scheduled
+#      but launchd silently never relaunched" outage this issue closes; the
+#      script refuses to report success on the ack alone.
 #
 # See also: loom-daemon-start.sh (writes .loom/.daemon.flags), loom-daemon-stop.sh
 # (SIGTERM -> grace -> SIGKILL; in-flight sweeps survive by design — this
@@ -259,6 +293,7 @@ FORCE=false
 CHECK_ONLY=false
 NO_RESTART=false
 RELAUNCH=false
+ALLOW_STALE=false
 [[ "${LOOM_DAEMON_UPDATE_RELAUNCH:-}" =~ ^(1|true|yes)$ ]] && RELAUNCH=true
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -268,6 +303,7 @@ while [[ $# -gt 0 ]]; do
         --check) CHECK_ONLY=true; shift ;;
         --no-restart) NO_RESTART=true; shift ;;
         --relaunch) RELAUNCH=true; shift ;;
+        --allow-stale) ALLOW_STALE=true; shift ;;
         *) err "Unknown option '$1'"; echo "Use --help for usage" >&2; exit 1 ;;
     esac
 done
@@ -333,6 +369,99 @@ if [[ -z "$START_SCRIPT" || -z "$STOP_SCRIPT" ]]; then
     exit 1
 fi
 
+# ---------- sync with origin/<default-branch> (ff-first default, #4330) ----------
+# Runs BEFORE the staleness detection below resolves SOURCE_COMMIT, so a
+# successful ff-sync is reflected in the rebuild decision (rebuilding the
+# freshly-synced HEAD, not the pre-merge one). Never touches the network or
+# the tree in --check / --dry-run (both are documented "no writes" contracts)
+# or under --allow-stale (today's build-what's-here behavior) — those paths
+# fall through to the read-only advisory branch below instead.
+#
+# Globals set for downstream consumers (staleness echo + the final
+# "installed" summary, AC4):
+#   DEFAULT_BRANCH        resolved default branch name, or "" if unresolvable
+#   ORIGIN_COMMIT         short commit of origin/<DEFAULT_BRANCH> at fetch
+#                         time, or "unknown" if unreachable/unresolvable
+#   ORIGIN_BEHIND_COUNT   commits local <DEFAULT_BRANCH> was behind origin
+#                         BEFORE any sync (0 if unknown or already current)
+#   FF_SYNCED             true if this run fast-forwarded local HEAD
+DEFAULT_BRANCH=""
+ORIGIN_COMMIT="unknown"
+ORIGIN_BEHIND_COUNT=0
+FF_SYNCED=false
+
+sync_with_origin() {
+    local repo_root="$1"
+    # shellcheck disable=SC1091
+    if [[ -r "$SCRIPT_DIR/../lib/default-branch.sh" ]]; then
+        source "$SCRIPT_DIR/../lib/default-branch.sh" 2>/dev/null || return 0
+    else
+        return 0
+    fi
+    declare -F loom_default_branch >/dev/null 2>&1 || return 0
+    DEFAULT_BRANCH="$(cd "$repo_root" && loom_default_branch origin 2>/dev/null)" || { DEFAULT_BRANCH=""; return 0; }
+    [[ -z "$DEFAULT_BRANCH" ]] && return 0
+
+    # Bounded, best-effort fetch — a fetch failure/timeout must NOT make this
+    # script network-dependent: warn and proceed with local HEAD as-is (behind
+    # count stays unknown, not "known stale").
+    local fetch_ok=true
+    if command -v timeout >/dev/null 2>&1; then
+        (cd "$repo_root" && timeout 5 git fetch origin "$DEFAULT_BRANCH" --quiet >/dev/null 2>&1) || fetch_ok=false
+    else
+        (cd "$repo_root" && git fetch origin "$DEFAULT_BRANCH" --quiet >/dev/null 2>&1) || fetch_ok=false
+    fi
+    if [[ "$fetch_ok" == "false" ]]; then
+        warn "note: could not reach origin to check ${DEFAULT_BRANCH} for updates (fetch failed or timed out) — proceeding with local HEAD as-is."
+        return 0
+    fi
+
+    ORIGIN_COMMIT="$(cd "$repo_root" && git rev-parse --short "origin/${DEFAULT_BRANCH}" 2>/dev/null || echo "unknown")"
+
+    local n
+    n="$(cd "$repo_root" && git rev-list --count "${DEFAULT_BRANCH}..origin/${DEFAULT_BRANCH}" 2>/dev/null || echo 0)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    ORIGIN_BEHIND_COUNT="$n"
+    [[ "$n" -eq 0 ]] && return 0
+
+    # Read-only modes and --allow-stale never write — just advise, mirroring
+    # the pre-#4330 advisory-only behavior.
+    if [[ "$CHECK_ONLY" == "true" || "$DRY_RUN" == "true" ]]; then
+        warn "note: local ${DEFAULT_BRANCH} is ${n} commit(s) behind origin/${DEFAULT_BRANCH}."
+        return 0
+    fi
+    if [[ "$ALLOW_STALE" == "true" ]]; then
+        warn "note: local ${DEFAULT_BRANCH} is ${n} commit(s) behind origin/${DEFAULT_BRANCH} — building the current (stale) checkout as-is per --allow-stale."
+        return 0
+    fi
+
+    # Default: attempt the ff-sync. Only well-defined when HEAD IS the default
+    # branch — on a feature branch or detached HEAD, `git merge --ff-only
+    # origin/<default>` would merge into the WRONG ref, so refuse instead of
+    # guessing (an operator deliberately elsewhere, e.g. bisecting, is exactly
+    # the --allow-stale use case).
+    local current_branch
+    current_branch="$(cd "$repo_root" && git symbolic-ref --short HEAD 2>/dev/null || true)"
+    if [[ "$current_branch" != "$DEFAULT_BRANCH" ]]; then
+        err "Local ${DEFAULT_BRANCH} is ${n} commit(s) behind origin/${DEFAULT_BRANCH}, but the checkout HEAD is on '${current_branch:-<detached HEAD>}', not '${DEFAULT_BRANCH}' — refusing to guess which branch to sync."
+        err "Check out ${DEFAULT_BRANCH} and re-run, or pass --allow-stale to build the current checkout as-is (e.g. bisecting, testing a local patch)."
+        return 1
+    fi
+
+    echo "Local ${DEFAULT_BRANCH} is ${n} commit(s) behind origin/${DEFAULT_BRANCH} — fast-forwarding before building (default; pass --allow-stale to build the current checkout as-is)..."
+    if ! (cd "$repo_root" && git merge --ff-only "origin/${DEFAULT_BRANCH}" --quiet); then
+        err "Fast-forward merge from origin/${DEFAULT_BRANCH} did not apply — local commits have diverged, or a dirty tracked file conflicts with the incoming change."
+        err "Refusing to guess or hard-reset: resolve manually (rebase/merge by hand), or pass --allow-stale to build the current (stale) checkout as-is."
+        return 1
+    fi
+    ok "Fast-forwarded local ${DEFAULT_BRANCH} to origin/${DEFAULT_BRANCH} (${n} commit(s))."
+    FF_SYNCED=true
+    return 0
+}
+if ! sync_with_origin "$REPO_ROOT"; then
+    exit 1
+fi
+
 # ---------- staleness detection ----------
 DAEMON_BIN=$(locate_daemon_bin "$REPO_ROOT")
 
@@ -350,6 +479,9 @@ echo "Source tree HEAD:  ${SOURCE_COMMIT}"
 if [[ -n "$MACHINE_CHECKOUT" ]]; then
     echo "Source tree:       $REPO_ROOT (machine checkout, LOOM_MACHINE_CHECKOUT)"
 fi
+if [[ "$FF_SYNCED" == "true" ]]; then
+    echo "Source tree:       fast-forwarded to origin/${DEFAULT_BRANCH} before this run (#4330)."
+fi
 
 UPDATE_NEEDED=false
 if [[ -z "$DAEMON_BIN" ]]; then
@@ -362,34 +494,22 @@ elif [[ "$INSTALLED_COMMIT" != "$SOURCE_COMMIT" ]]; then
     UPDATE_NEEDED=true
 fi
 
-# ---------- advisory: local HEAD vs origin/<default-branch> (non-blocking) ----------
-# Never gates the rebuild decision above — purely informational, mirrors
-# check-main-freshness.sh's bounded-fetch pattern.
-advisory_behind_origin() {
-    local repo_root="$1"
-    # shellcheck disable=SC1091
-    if [[ -r "$SCRIPT_DIR/../lib/default-branch.sh" ]]; then
-        source "$SCRIPT_DIR/../lib/default-branch.sh" 2>/dev/null || return 0
+# print_final_installed_line <commit> — the AC4 "final installed line": states
+# the built/installed commit AND whether it matches origin/<default-branch> at
+# build time. Uses ORIGIN_COMMIT resolved by sync_with_origin above (no
+# re-fetch). Prints an honest "unknown" comparison when the default branch or
+# origin commit could not be resolved (offline, no origin remote, etc.) rather
+# than silently omitting the currency claim.
+print_final_installed_line() {
+    local commit="$1"
+    if [[ -z "$DEFAULT_BRANCH" || "$ORIGIN_COMMIT" == "unknown" ]]; then
+        echo "Installed: ${commit} (currency vs origin/<default-branch> unknown — unresolvable or unreachable)"
+    elif [[ "$commit" == "$ORIGIN_COMMIT" ]]; then
+        echo "Installed: ${commit} (matches origin/${DEFAULT_BRANCH})"
     else
-        return 0
-    fi
-    declare -F loom_default_branch >/dev/null 2>&1 || return 0
-    local branch
-    branch="$(cd "$repo_root" && loom_default_branch origin 2>/dev/null)" || return 0
-    [[ -z "$branch" ]] && return 0
-    if command -v timeout >/dev/null 2>&1; then
-        (cd "$repo_root" && timeout 5 git fetch origin "$branch" --quiet >/dev/null 2>&1) || true
-    else
-        (cd "$repo_root" && git fetch origin "$branch" --quiet >/dev/null 2>&1) || true
-    fi
-    local n
-    n="$(cd "$repo_root" && git rev-list --count "${branch}..origin/${branch}" 2>/dev/null || echo 0)"
-    [[ "$n" =~ ^[0-9]+$ ]] || n=0
-    if [[ "$n" -gt 0 ]]; then
-        warn "note: local ${branch} is ${n} commit(s) behind origin/${branch} — rebuilding now will NOT pick those up. Run 'git merge --ff-only origin/${branch}' first if you want them."
+        echo "Installed: ${commit} (origin/${DEFAULT_BRANCH} is at ${ORIGIN_COMMIT} — does NOT match; built from a checkout that was behind or diverged, e.g. --allow-stale)"
     fi
 }
-advisory_behind_origin "$REPO_ROOT"
 
 # ---------- launchd ownership detection (macOS, mirrors loom-daemon-stop.sh #4042) ----------
 # launchd is checked AHEAD of the .loom/.daemon.pid tier because the plist's
@@ -475,6 +595,54 @@ systemd_unit_loaded() {
 }
 systemd_unit_pid() {
     systemctl --user show -p MainPID --value "$SYSTEMD_UNIT" 2>/dev/null
+}
+
+# ---------- verify a launchd restart actually relaunched the job (#4232) ----------
+# THE PROBLEM: the launchd branch below used to treat a successful `restart`
+# ack (the RUNNING binary accepting the IPC request, exit 0) as success and
+# exit 0 immediately — fire-and-forget. On 2026-07-28 that ack was honest (the
+# supervised daemon exited 0 per its #4054 contract) but launchd's own
+# KeepAlive:SuccessfulExit relaunch never fired, so the script reported success
+# while the daemon silently stayed down for ~4 minutes until an operator ran
+# `launchctl kickstart` by hand. This closes that gap: verify a NEW pid before
+# reporting success, and self-heal via `kickstart` when launchd doesn't.
+#
+# wait_for_new_launchd_pid <pre_pid> <timeout_secs> <interval_secs> — poll
+# `launchd_job_pid` until it reports a pid that is BOTH different from
+# <pre_pid> AND alive (`kill -0`), for up to <timeout_secs>. A pid that merely
+# differs but is already dead (a race artifact) — or that still equals
+# <pre_pid> (the old process lingering mid-teardown during the poll window) —
+# must NEVER be mistaken for a successful relaunch. On success, echoes the new
+# pid on stdout and returns 0; on timeout, returns 1 with no output.
+# <interval_secs> may be fractional (e.g. 0.2), matching `sleep`'s own support.
+wait_for_new_launchd_pid() {
+    local pre_pid="$1" timeout_secs="$2" interval_secs="$3"
+    local deadline cur_pid
+    deadline=$(( $(date +%s) + timeout_secs ))
+    while true; do
+        cur_pid="$(launchd_job_pid)"
+        if [[ -n "$cur_pid" && "$cur_pid" != "$pre_pid" ]] && kill -0 "$cur_pid" 2>/dev/null; then
+            echo "$cur_pid"
+            return 0
+        fi
+        if (( $(date +%s) >= deadline )); then
+            return 1
+        fi
+        sleep "$interval_secs"
+    done
+}
+
+# log_launchd_diagnostics — dump `launchctl print`'s current state as a
+# diagnostic breadcrumb (state / last exit status) when a relaunch cannot be
+# verified, so an operator (or the PR/issue this failure is reported to) has
+# the exact evidence needed to tell "launchd never relaunched" apart from "the
+# daemon crashed immediately after relaunching" (#4232).
+log_launchd_diagnostics() {
+    warn "launchctl print $LAUNCHD_SERVICE diagnostic snapshot:"
+    local line
+    while IFS= read -r line; do
+        warn "  $line"
+    done < <(launchctl print "$LAUNCHD_SERVICE" 2>&1)
 }
 
 # ---------- re-render + relaunch on a refused restart (#4118) ----------
@@ -711,6 +879,7 @@ if [[ "$CHECK_ONLY" == "true" ]]; then
         exit 3
     fi
     ok "loom-daemon binary is already up to date with source HEAD (${SOURCE_COMMIT})."
+    print_final_installed_line "$SOURCE_COMMIT"
     exit 0
 fi
 
@@ -721,6 +890,7 @@ fi
 
 if [[ "$UPDATE_NEEDED" == "false" ]]; then
     ok "loom-daemon binary is already up to date with source HEAD (${SOURCE_COMMIT}). Nothing to do."
+    print_final_installed_line "$SOURCE_COMMIT"
     exit 0
 fi
 
@@ -743,6 +913,11 @@ PROVISION_TARGET="${LOOM_DAEMON_BIN:-$DEST_DIR/loom-daemon}"
 
 if [[ "$DRY_RUN" == "true" ]]; then
     echo
+    if [[ "$ALLOW_STALE" == "true" ]]; then
+        echo "[dry-run] --allow-stale given: would build the current checkout as-is (no fetch/ff-merge)."
+    elif [[ -n "$DEFAULT_BRANCH" && "$ORIGIN_BEHIND_COUNT" -gt 0 ]]; then
+        echo "[dry-run] Plan includes fast-forwarding local ${DEFAULT_BRANCH} to origin/${DEFAULT_BRANCH} (${ORIGIN_BEHIND_COUNT} commit(s) behind) before building; would abort instead of building stale if the ff-merge cannot apply."
+    fi
     echo "[dry-run] Would run: (cd $DAEMON_DIR && cargo build --release)"
     echo "[dry-run] Would provision the fresh binary to: $PROVISION_TARGET"
     if [[ "$NO_RESTART" == "true" ]]; then
@@ -890,12 +1065,14 @@ if [[ "$NO_RESTART" == "true" ]]; then
             echo "  $STOP_SCRIPT && $START_SCRIPT ${RESTART_ARGS[*]:-}"
         fi
     fi
+    print_final_installed_line "$BUILT_COMMIT"
     exit 0
 fi
 
 if [[ "$WAS_RUNNING" != "true" ]]; then
     ok "Rebuilt + provisioned. loom-daemon was not running — nothing to restart."
     echo "Start it with: $START_SCRIPT [flags]"
+    print_final_installed_line "$BUILT_COMMIT"
     exit 0
 fi
 
@@ -909,9 +1086,45 @@ if [[ "$DAEMON_MANAGER" == "launchd" ]]; then
     echo "loom-daemon is launchd-managed (label ${LAUNCHD_LABEL})."
     echo "Restarting via the supervised restart primitive: $PROVISION_TARGET restart"
     echo "(.daemon.flags is NOT consulted — the plist's EnvironmentVariables carries the equivalent config.)"
+
+    # Capture the pre-restart pid BEFORE the request so the poll below can tell
+    # "launchd relaunched onto a new pid" apart from "the same job never moved".
+    PRE_RESTART_PID="$(launchd_job_pid)"
+
     if "$PROVISION_TARGET" restart; then
-        ok "loom-daemon restart scheduled — launchd will relaunch it onto the freshly-provisioned binary."
-        exit 0
+        # The RUNNING (old) binary accepted the request — but that ack is the
+        # daemon's promise, not proof launchd actually honored it (#4232: the
+        # daemon can exit 0 and launchd can still fail to relaunch it). Verify
+        # a NEW, live pid before reporting success; the success message below
+        # is intentionally the ONLY "restart scheduled"-style success line in
+        # this branch, and it is unreachable until verification passes.
+        RESTART_POLL_SECS="${LOOM_DAEMON_RESTART_POLL_SECS:-30}"
+        RESTART_POLL_INTERVAL="${LOOM_DAEMON_RESTART_POLL_INTERVAL:-1}"
+        KICKSTART_POLL_SECS="${LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS:-15}"
+        echo "Restart request accepted (pre-restart pid: ${PRE_RESTART_PID:-<none>}). Verifying launchd relaunches onto a NEW, live pid within ${RESTART_POLL_SECS}s before reporting success (#4232)..."
+
+        if NEW_PID="$(wait_for_new_launchd_pid "$PRE_RESTART_PID" "$RESTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
+            ok "loom-daemon restart scheduled — launchd relaunched it onto the freshly-provisioned binary (new pid ${NEW_PID}, verified within ${RESTART_POLL_SECS}s)."
+            print_final_installed_line "$BUILT_COMMIT"
+            exit 0
+        fi
+
+        warn "launchd did NOT relaunch within ${RESTART_POLL_SECS}s of the restart ack — no new, live pid observed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."
+        log_launchd_diagnostics
+        warn "Falling back to 'launchctl kickstart $LAUNCHD_SERVICE' (plain — NEVER -k — so a daemon that DID relaunch during the race window above is never killed)."
+        launchctl kickstart "$LAUNCHD_SERVICE" >/dev/null 2>&1
+
+        if NEW_PID="$(wait_for_new_launchd_pid "$PRE_RESTART_PID" "$KICKSTART_POLL_SECS" "$RESTART_POLL_INTERVAL")"; then
+            ok "loom-daemon restart scheduled — launchd's own relaunch did not occur within ${RESTART_POLL_SECS}s, but the 'launchctl kickstart' fallback relaunched it (new pid ${NEW_PID}, verified within ${KICKSTART_POLL_SECS}s). Remediation note: the kickstart fallback was required (#4232) — investigate why launchd did not relaunch the job on its own."
+            print_final_installed_line "$BUILT_COMMIT"
+            exit 0
+        fi
+
+        err "loom-daemon restart FAILED: no new, live pid was observed even after the 'launchctl kickstart' fallback."
+        log_launchd_diagnostics
+        err "The freshly-built binary IS provisioned, but the daemon's live status is NOT confirmed (pre-restart pid was ${PRE_RESTART_PID:-<none>})."
+        err "Investigate manually: launchctl print $LAUNCHD_SERVICE"
+        exit 7
     fi
     # The restart request is served by the RUNNING (old) binary. A pre-#4077
     # daemon has no RestartDaemon handler (and an unsupervised/dead socket also
@@ -959,6 +1172,7 @@ if [[ "$DAEMON_MANAGER" == "systemd" ]]; then
     echo "(.daemon.flags is NOT consulted — the unit's Environment= lines carry the equivalent config.)"
     if "$PROVISION_TARGET" restart; then
         ok "loom-daemon restart scheduled — systemd will relaunch it onto the freshly-provisioned binary."
+        print_final_installed_line "$BUILT_COMMIT"
         exit 0
     fi
     # The restart request is served by the RUNNING (old) binary. A pre-#4267
@@ -1023,3 +1237,8 @@ if [[ "${#RESTART_ARGS[@]}" -gt 0 ]]; then
 else
     "$START_SCRIPT"
 fi
+START_RC=$?
+if [[ "$START_RC" -eq 0 ]]; then
+    print_final_installed_line "$BUILT_COMMIT"
+fi
+exit "$START_RC"

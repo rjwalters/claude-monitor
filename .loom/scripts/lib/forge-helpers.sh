@@ -448,8 +448,8 @@ forge_check_auto_delete() {
 # than reacting to the post-mutation error string (#3820).
 #
 # Gitea returns "unknown" (there is no equivalent single repo flag consumed
-# here; Gitea auto-merge goes through loom-auto-merge's own poll-and-merge, which
-# this probe must not perturb). A probe failure (network/auth/unexpected value)
+# here; Gitea auto-merge goes through forge_auto_merge's own curl poll-and-merge,
+# which this probe must not perturb). A probe failure (network/auth/unexpected value)
 # also returns "unknown" so callers preserve their existing behavior fail-safe.
 forge_check_auto_merge_allowed() {
   local nwo="$1"

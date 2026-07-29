@@ -348,53 +348,77 @@ check_stop_signal() {
     return 1
 }
 
-# Resolve workspace root for MCP config lookup.
-# In worktrees, WORKSPACE may point to the worktree itself; the MCP config
-# (.mcp.json) lives in the git common directory (the main checkout).
-resolve_mcp_workspace() {
-    # If .mcp.json exists in WORKSPACE, use it directly
+# Resolve the ordered list of MCP config candidate directories for
+# pre-flight (#4349). In worktrees, WORKSPACE may point to the worktree
+# itself, whose own .mcp.json (if any) can dangle after that worktree's
+# mcp-loom build is deleted (e.g. a stale/half-removed worktree left
+# registered — the #4349 incident); the git common directory (the primary
+# checkout, where mcp-loom always actually lives, per scripts/setup-mcp.sh)
+# is the durable fallback candidate. Emits one directory per line, in
+# priority order: WORKSPACE first (if it carries its own .mcp.json), then
+# the git common directory's repo root (if distinct and it also carries a
+# .mcp.json). Emits nothing when neither candidate has a .mcp.json — that is
+# the #4230 non-fatal "no MCP configured" case, handled by the caller.
+mcp_candidate_workspaces() {
+    local -a candidates=()
+
     if [[ -f "${WORKSPACE}/.mcp.json" ]]; then
-        echo "${WORKSPACE}"
-        return
+        candidates+=("${WORKSPACE}")
     fi
 
-    # In a worktree, try the git common directory (main checkout)
-    local common_dir
+    local common_dir repo_root
     if common_dir=$(git -C "${WORKSPACE}" rev-parse --git-common-dir 2>/dev/null); then
         # common_dir is the .git dir; parent is the repo root
-        local repo_root
         repo_root=$(cd "${common_dir}/.." 2>/dev/null && pwd)
-        if [[ -f "${repo_root}/.mcp.json" ]]; then
-            echo "${repo_root}"
-            return
+        if [[ -n "${repo_root}" ]] && [[ -f "${repo_root}/.mcp.json" ]]; then
+            local already_listed="" c
+            for c in ${candidates[@]+"${candidates[@]}"}; do
+                [[ "${c}" == "${repo_root}" ]] && already_listed=1
+            done
+            [[ -z "${already_listed}" ]] && candidates+=("${repo_root}")
         fi
     fi
 
-    # Fallback to WORKSPACE
-    echo "${WORKSPACE}"
+    if [[ ${#candidates[@]} -gt 0 ]]; then
+        printf '%s\n' "${candidates[@]}"
+    fi
+    # Always return success — an empty candidate list is a valid, expected
+    # outcome (#4230), not an error. A bare `false`-valued last test above
+    # would otherwise propagate as this function's exit status and trip
+    # `set -e` at any future direct (non-pipeline) call site.
+    return 0
 }
 
-# Pre-flight check: verify MCP server can start
-# Attempts to launch the mcp-loom Node.js server and checks for the startup
-# message on stderr. If the built bundle is missing, or is stale (older than
-# any file under the sibling src/ tree), it rebuilds before the smoke test; a
-# smoke-test failure also triggers a rebuild-and-retry.
-check_mcp_server() {
-    local mcp_workspace
-    mcp_workspace=$(resolve_mcp_workspace)
-
-    local mcp_config="${mcp_workspace}/.mcp.json"
-    if [[ ! -f "${mcp_config}" ]]; then
-        # Non-fatal skip. Absent .mcp.json is now the NORMAL, healthy state under
-        # user-scope `loom` registration (#4230, epic #3835 Phase 3c): the loom
-        # server is machine-level, not project-scoped, so there is no per-repo
-        # config to smoke-test here. The per-session bundle-staleness gate this
-        # skip removes moves to `loom update` (which rebuilds the served
-        # mcp-loom bundle for every repo at once). This skip must NOT be promoted
-        # to a failure — doing so would spuriously fail every migrated repo.
-        log_warn "MCP config not found at ${mcp_config} - skipping MCP pre-flight (expected under user-scope loom, #4230)"
-        return 0  # Non-fatal: MCP may not be configured (or is user-scoped)
+# Resolve workspace root for MCP config lookup (back-compat single-candidate
+# form — the highest-priority candidate from mcp_candidate_workspaces, or
+# WORKSPACE itself when no candidate has a .mcp.json).
+resolve_mcp_workspace() {
+    local first
+    first=$(mcp_candidate_workspaces | head -n1)
+    if [[ -n "${first}" ]]; then
+        echo "${first}"
+    else
+        echo "${WORKSPACE}"
     fi
+}
+
+# Attempt MCP pre-flight for ONE candidate workspace directory: extract the
+# entry point from ${1}/.mcp.json, ensure it exists (rebuilding if
+# missing/stale), and smoke-test it. Split out of check_mcp_server so the
+# latter can iterate an ordered candidate list and fall back to the next
+# candidate on a real failure (#4349), rather than hard-failing on the
+# first candidate's broken bundle.
+#
+# Return codes distinguish "not a real candidate" from "a real, configured
+# candidate that is unhealthy" — only the latter should make an
+# all-candidates-failed case a hard failure rather than a #4230-style skip:
+#   0 = healthy candidate (pre-flight for this candidate passes)
+#   1 = real but unhealthy candidate (entry missing & unrebuildable, or the
+#       smoke test still fails after a rebuild attempt)
+#   2 = not a real candidate (mcp.json present but no parseable entry point)
+_check_mcp_candidate() {
+    local mcp_workspace="$1"
+    local mcp_config="${mcp_workspace}/.mcp.json"
 
     # Extract the MCP server entry point from .mcp.json
     # Use timeout to prevent hanging on resource-contended systems (see issue #2472).
@@ -412,15 +436,17 @@ for name, srv in servers.items():
 " 2>/dev/null || echo "")
 
     if [[ -z "${mcp_entry}" ]]; then
-        log_warn "Could not extract MCP entry point from ${mcp_config} - skipping MCP pre-flight"
-        return 0
+        log_warn "Could not extract MCP entry point from ${mcp_config} - not a usable pre-flight candidate"
+        return 2
     fi
 
     # Check if the entry point file exists
     if [[ ! -f "${mcp_entry}" ]]; then
         log_warn "MCP entry point missing: ${mcp_entry}"
-        _try_mcp_rebuild "${mcp_entry}"
-        return $?
+        if _try_mcp_rebuild "${mcp_entry}"; then
+            return 0
+        fi
+        return 1
     fi
 
     # Staleness check: a bundle older than any file under the sibling src/ tree
@@ -434,12 +460,11 @@ for name, srv in servers.items():
     if [[ -d "${mcp_src}" ]] && \
        [[ -n "$(find "${mcp_src}" -type f -newer "${mcp_entry}" -print -quit 2>/dev/null)" ]]; then
         log_warn "MCP bundle is stale (src newer than dist) - rebuilding: ${mcp_entry}"
-        if ! _try_mcp_rebuild "${mcp_entry}"; then
-            log_warn "MCP rebuild for stale bundle failed - continuing with existing bundle"
-        else
+        if _try_mcp_rebuild "${mcp_entry}"; then
             # Rebuild succeeded and already re-verified the smoke test.
             return 0
         fi
+        log_warn "MCP rebuild for stale bundle failed - continuing with existing bundle"
     fi
 
     # Smoke test: start MCP server and verify it emits the startup message
@@ -449,19 +474,77 @@ for name, srv in servers.items():
     mcp_stderr=$(timeout 5 node "${mcp_entry}" </dev/null 2>&1 || true)
 
     if echo "${mcp_stderr}" | grep -qi "running on stdio"; then
-        log_info "MCP server health check passed"
+        log_info "MCP server health check passed (${mcp_config})"
         return 0
     fi
 
     # MCP server failed to start - log the error
-    log_warn "MCP server health check failed"
+    log_warn "MCP server health check failed (${mcp_config})"
     if [[ -n "${mcp_stderr}" ]]; then
         log_warn "MCP stderr: ${mcp_stderr}"
     fi
 
     # Attempt rebuild and retry
-    _try_mcp_rebuild "${mcp_entry}"
-    return $?
+    if _try_mcp_rebuild "${mcp_entry}"; then
+        return 0
+    fi
+    return 1
+}
+
+# Pre-flight check: verify an MCP server can start.
+# Iterates the ordered candidate list from mcp_candidate_workspaces (#4349):
+# WORKSPACE's own .mcp.json first, falling back to the git common
+# directory's .mcp.json when the first candidate's bundle is missing and
+# unrebuildable (e.g. a broken/half-deleted worktree). The session only
+# hard-fails when NO candidate config is healthy AND at least one candidate
+# was a real, parseable config (preserving the #4230 skip when every
+# candidate is unparseable or absent).
+check_mcp_server() {
+    local -a candidates=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "${line}" ]] && candidates+=("${line}")
+    done < <(mcp_candidate_workspaces)
+
+    if [[ ${#candidates[@]} -eq 0 ]]; then
+        # Non-fatal skip. Absent .mcp.json (in WORKSPACE and, for a worktree,
+        # the git common dir) is now the NORMAL, healthy state under
+        # user-scope `loom` registration (#4230, epic #3835 Phase 3c): the
+        # loom server is machine-level, not project-scoped, so there is no
+        # per-repo config to smoke-test here. This skip must NOT be promoted
+        # to a failure — doing so would spuriously fail every migrated repo.
+        log_warn "MCP config not found at ${WORKSPACE}/.mcp.json (or the git common dir) - skipping MCP pre-flight (expected under user-scope loom, #4230)"
+        return 0
+    fi
+
+    local saw_real_candidate=0
+    local idx=0
+    local candidate rc
+    for candidate in "${candidates[@]}"; do
+        idx=$((idx + 1))
+        # Capture the return code without letting a non-zero result trip
+        # `set -e` (a bare failing statement would abort the whole script
+        # instead of falling through to the next candidate).
+        rc=0
+        _check_mcp_candidate "${candidate}" || rc=$?
+        if [[ ${rc} -eq 0 ]]; then
+            if [[ ${idx} -gt 1 ]]; then
+                log_warn "MCP pre-flight: falling back to ${candidate}/.mcp.json (candidate #1 was unusable)"
+            fi
+            return 0
+        elif [[ ${rc} -eq 1 ]]; then
+            saw_real_candidate=1
+        fi
+        # rc == 2 (unparseable): not a real candidate, keep trying the rest.
+    done
+
+    if [[ ${saw_real_candidate} -eq 0 ]]; then
+        log_warn "No candidate MCP config had a parseable entry point - skipping MCP pre-flight (expected under user-scope loom, #4230)"
+        return 0
+    fi
+
+    log_error "MCP pre-flight failed for all ${#candidates[@]} candidate config(s): ${candidates[*]}"
+    return 1
 }
 
 # Check global MCP configurations from ~/.claude.json for missing binaries.

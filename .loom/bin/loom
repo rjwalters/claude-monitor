@@ -103,13 +103,22 @@ case "${1:-help}" in
         ;;
     health)
         shift
-        loom_venv="$REPO_ROOT/loom-tools/.venv/bin/loom-daemon-diagnostic"
-        if [[ -n "$REPO_ROOT" && -x "$loom_venv" ]]; then
-            exec "$loom_venv" "$@"
-        elif command -v loom-daemon-diagnostic &>/dev/null; then
-            exec loom-daemon-diagnostic "$@"
+        # The former Python daemon-diagnostic CLI was removed in epic #4081
+        # phase 3 (#4274). Daemon/registry health is now reported natively by
+        # `loom-daemon status` (Issue #3891). Resolve the binary the same way the
+        # daemon update wrapper does: PATH first, then the local build outputs.
+        loom_daemon_bin=""
+        if command -v loom-daemon &>/dev/null; then
+            loom_daemon_bin="$(command -v loom-daemon)"
+        elif [[ -x "$REPO_ROOT/loom-daemon/target/release/loom-daemon" ]]; then
+            loom_daemon_bin="$REPO_ROOT/loom-daemon/target/release/loom-daemon"
+        elif [[ -x "$REPO_ROOT/loom-daemon/target/debug/loom-daemon" ]]; then
+            loom_daemon_bin="$REPO_ROOT/loom-daemon/target/debug/loom-daemon"
+        fi
+        if [[ -n "$loom_daemon_bin" ]]; then
+            exec "$loom_daemon_bin" status "$@"
         else
-            echo -e "${RED}Error: health command not installed (install loom-tools)${NC}" >&2
+            echo -e "${RED}Error: health command requires the loom-daemon binary (build loom-daemon or add it to PATH)${NC}" >&2
             exit 1
         fi
         ;;

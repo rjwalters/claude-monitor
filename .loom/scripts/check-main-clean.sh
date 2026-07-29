@@ -52,6 +52,18 @@
 #     correctly in its own worktree leaves the main worktree pristine.
 #   - Issue worktrees live under <main>/.loom/worktrees/ which is gitignored, so
 #     their existence does NOT make the main worktree dirty.
+#   - Does NOT adopt the installed-surface byte-match ignore class added to
+#     `main_health_gate.rs`'s `is_ignorable_dirt` (#4332) — a deliberate
+#     divergence, not an oversight. That class exists to protect a *different*
+#     property: "this dirt is provably `resync-installed.sh` output, not an
+#     operator hand-edit worth halting the dispatch gate over." This script's
+#     job is the opposite kind of check — catching a *builder* accidentally
+#     writing into the MAIN worktree instead of its issue worktree (#2802 /
+#     #3513) — and a builder-written file that happens to byte-match
+#     `defaults/` is still a real out-of-worktree write bug the backstop must
+#     not mask. It would also be a no-op in the common case anyway: this
+#     script is the manual/consumer-repo backstop and most consumer installs
+#     have no local `defaults/` tree to byte-match against.
 
 set -euo pipefail
 

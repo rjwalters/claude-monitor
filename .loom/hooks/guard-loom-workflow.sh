@@ -4,16 +4,18 @@
 # Claude Code PreToolUse hook that intercepts Bash commands before execution.
 # Receives JSON on stdin with tool_input.command and cwd fields.
 #
-# This hook carries ONLY the two Loom-workflow-specific guards that were
-# extracted from guard-destructive.sh (issue #3604):
+# This hook carries the Loom-workflow-specific guards that were extracted from
+# guard-destructive.sh (issue #3604), plus later Loom-specific additions:
 #
 #   1. LOOM: Prefer merge-pr.sh over 'gh pr merge'
 #   2. LOOM: Block 'pip install -e' inside worktrees (issue #2495)
+#   3. LOOM: Ask before real-registry-mutating `loom-daemon workspace
+#      add|remove|set-priority` (issue #4326)
 #
 # The generic repository-hygiene guards (catastrophic denies, SQL/cloud toggles,
 # ASK patterns) live in guard-destructive.sh and are being migrated toward Repo
-# Skills (rjwalters/repo#13). This file stays Loom-owned because both guards are
-# specific to the Loom worktree/merge workflow.
+# Skills (rjwalters/repo#13). This file stays Loom-owned because these guards
+# are specific to the Loom worktree/merge/daemon workflow.
 #
 # IMPORTANT: This hook only fires when Claude Code is invoked with:
 #   --dangerously-skip-permissions  ← hooks FIRE (used by Loom agents)
@@ -140,6 +142,48 @@ decision_log_enabled() {
         _DECISION_LOG_CACHE="$enabled"
     fi
     [[ "$_DECISION_LOG_CACHE" == "true" ]]
+}
+
+# =============================================================================
+# Workspace-registry guard toggle — default ON (issue #4326).
+#
+# The `loom-daemon workspace add|remove|set-priority` ask (below) is a useful
+# default backstop against accidentally mutating the operator's real
+# ~/.loom/workspaces.json, but — like every other category guard in this
+# file — a repo/session can opt out via the same
+# `guards.<name>` config key + `LOOM_GUARD_<NAME>` env override convention
+# used throughout `guard-destructive-generic.sh` (sql_guard_enabled(),
+# cloud_guard_enabled(), …). This is INDEPENDENT of `LOOM_WORKSPACES_PATH`
+# (the sanctioned scratch-registry seam that allows a specific mutating
+# command through regardless of this toggle) — this toggle instead disables
+# the ask machinery entirely, for an operator who finds it pure friction.
+#
+# Resolution order (highest precedence first):
+#   1. LOOM_GUARD_WORKSPACE_REGISTRY env var (0/false/no disables, 1/true/yes
+#      forces on). Overrides config.
+#   2. .loom/config.json (or a higher config-resolver tier) ->
+#      guards.workspaceRegistry (default true when absent)
+#   3. Default: true (guard on)
+#
+# Resolved LAZILY (only once a mutating `workspace` subcommand has already
+# matched) and cached, mirroring every other toggle in this file. The config
+# read is best-effort: any parse failure falls through to guard-ON.
+# =============================================================================
+_WORKSPACE_REGISTRY_GUARD_CACHE=""
+workspace_registry_guard_enabled() {
+    if [[ -z "$_WORKSPACE_REGISTRY_GUARD_CACHE" ]]; then
+        local enabled=true raw
+        if [[ -n "$REPO_ROOT" ]]; then
+            raw=$(loom_config_get "$REPO_ROOT" "guards.workspaceRegistry" "true" 2>/dev/null) || raw=true
+            [[ "$raw" == "false" ]] && enabled=false
+        fi
+        case "${LOOM_GUARD_WORKSPACE_REGISTRY:-}" in
+            0|false|no)  enabled=false ;;
+            1|true|yes)  enabled=true ;;
+        esac
+        _WORKSPACE_REGISTRY_GUARD_CACHE="$enabled"
+    fi
+    [[ "$_WORKSPACE_REGISTRY_GUARD_CACHE" == "true" ]]
 }
 
 log_guard_decision() {
@@ -279,6 +323,39 @@ if [[ -n "$WORKTREE_PATH" ]]; then
     if echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*-e\s' || \
        echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*--editable\s'; then
         deny "BLOCKED: 'pip install -e' is not allowed inside worktrees. Editable installs overwrite the global .pth file, breaking parallel builders (see issue #2495). PYTHONPATH is already configured for this worktree — imports resolve correctly without editable installs." "loom:pip-install-editable-worktree"
+    fi
+fi
+
+# =============================================================================
+# LOOM: Ask before registry-mutating `loom-daemon workspace` commands
+# (Issue #4326)
+#
+# `loom-daemon workspace add|remove|set-priority` mutate the machine-level
+# workspace registry (Issue #3926), normally `~/.loom/workspaces.json` — a
+# SHARED file, not scoped to any one repo/worktree/session. An ad-hoc
+# verification step (a builder/auditor sweep exercising registry behavior)
+# that invokes the real CLI without redirecting it leaves stray/incorrect
+# entries in the OPERATOR's actual registry: #4326 found a leaked
+# `/private/tmp/mig-test` entry sitting at dispatch priority 3 — ahead of
+# every real managed repo — for most of a day, because the directory was
+# deleted after registration without a matching `workspace remove`.
+#
+# `LOOM_WORKSPACES_PATH` (`loom-daemon/src/workspace_registry.rs`) already
+# exists as the sanctioned scratch-registry seam — every daemon unit test
+# points at it instead of the real file (see
+# `defaults/docs/machine-dispatcher.md`). So this guard ASKS (never a hard
+# deny — an operator legitimately managing their own real registry must still
+# be able to proceed) whenever a mutating `workspace` subcommand runs with
+# NEITHER the env var already set in the environment NOR an inline
+# `LOOM_WORKSPACES_PATH=` assignment on the same command line. `workspace
+# list` is read-only and is NEVER matched by this guard.
+# =============================================================================
+
+if echo "$COMMAND" | grep -qE '(^|[/[:space:];&|])loom-daemon[[:space:]]+workspace[[:space:]]+(add|remove|set-priority)([[:space:]]|$)'; then
+    if workspace_registry_guard_enabled; then
+        if [[ -z "${LOOM_WORKSPACES_PATH:-}" ]] && ! echo "$COMMAND" | grep -qE 'LOOM_WORKSPACES_PATH='; then
+            ask "This mutates the machine-level workspace registry ('loom-daemon workspace add/remove/set-priority') — by default that is the operator's REAL ~/.loom/workspaces.json, shared across every repo/session (Issue #4326: a leaked test entry once sat at top dispatch priority for most of a day). If this is a test/verification step, prefix the command with LOOM_WORKSPACES_PATH=<scratch-file> to isolate it from the real registry. If this IS an intentional real-registry change, confirm to proceed."
+        fi
     fi
 fi
 

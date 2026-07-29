@@ -62,7 +62,7 @@ merge) to preserve the #3687 fork budget on the hottest guard invocation.
 Loom ships with several built-in `PreToolUse` guard hooks, registered independently under the `Bash` or `Edit|Write` matcher as noted below:
 
 - **`guard-destructive.sh`** (`Bash` matcher) — the generic repository-hygiene guard (catastrophic denies like `rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction; the segment-parsed lifecycle/cloud-CLI checks; and the `guards.sqlDdl` / `guards.cloudCli` / `guards.reversibleGh` / `guards.rmScope` / `guards.forceScope` toggle machinery documented below). Nothing about this guard is Loom-specific, so as of **#4041 its canonical home is [Repo Skills](https://github.com/rjwalters/repo)** (installed at `.claude/skills/repo/hooks/guard-destructive.sh`, carrying the rjwalters/repo#29 curl-pipe fix). In Loom, `guard-destructive.sh` is now a thin **dispatcher**: when the canonical Repo Skills guard is present it defers to it at runtime (and the installer does not install a second generic guard); otherwise it falls back to a clearly-marked **vendored copy** (`guard-destructive-generic.sh`) that Loom ships so standalone-Loom repos — those without Repo Skills — keep full coverage. Exactly one generic guard ever runs; the behavior and all the toggles below are unchanged either way. The pattern list itself is maintained upstream in Repo Skills, not forked in Loom. **One Loom-specific exception:** the vendored copy also carries the Bash-tool **write-confinement** category (`>`/`>>` redirection, `tee`, `sed -i`, `cp`/`mv`, issue #4178) — see `guards.worktreeIsolation` below; this stays Loom-owned even though the rest of the file mirrors upstream, the same way `resolve_worktree_root()`/`guards.rmScope` already do.
-- **`guard-loom-workflow.sh`** (`Bash` matcher) — the thin, Loom-workflow-specific guard (issue #3604): the `gh pr merge` → `merge-pr.sh` redirect and the `pip install -e` worktree block (keyed on `LOOM_WORKTREE_PATH`, issue #2495). This guard and `guard-worktree-paths.sh` below are specific to the Loom worktree/merge workflow and stay Loom-owned.
+- **`guard-loom-workflow.sh`** (`Bash` matcher) — the thin, Loom-workflow-specific guard (issue #3604): the `gh pr merge` → `merge-pr.sh` redirect, the `pip install -e` worktree block (keyed on `LOOM_WORKTREE_PATH`, issue #2495), and the `loom-daemon workspace` registry-mutation ask (issue #4326, below). This guard and `guard-worktree-paths.sh` below are specific to the Loom worktree/merge/daemon workflow and stay Loom-owned.
 - **`guard-worktree-paths.sh`** (`Edit|Write` matcher, issue #2441 / #4007) — confines Edit/Write tool calls to a builder's issue worktree, denying writes that resolve into the main checkout. Two mechanisms: the `LOOM_WORKTREE_PATH` env fast path (tmux/manual sessions pinned to one worktree) and, when that env var is absent, a **path-derived fallback** — it walks up from the target path looking for the `.loom-managed` sentinel `worktree.sh` writes at every worktree root, and denies a write that lands in the main checkout while at least one managed worktree exists. The fallback exists because a daemon-dispatched sweep hosts multiple Task-subagent builders in one shared process env, so a single process-wide `LOOM_WORKTREE_PATH` cannot cover that path (#3719). Toggle: `guards.worktreeIsolation` / `LOOM_GUARD_WORKTREE_ISOLATION`, documented alongside the other guard toggles below. **This confines the Edit/Write tool matcher only** — a session denied here could historically fall back to a Bash-tool write (`>`, `tee`, `sed -i`, `cp`/`mv`) targeting the same path with nothing to stop it (the #4178 incident: sweep #4063 used exactly this to edit live guard hooks in the main checkout). `guard-destructive-generic.sh`'s write-confinement category (bullet above) now closes that gap under the identical toggle.
 - **`guard-background-subagents.sh`** (`Stop` hook, issue #4257) — a mechanical backstop for the hazard documented in `defaults/.claude/commands/loom/sweep.md` under "Subagent dispatch is async-only" (#3822): in headless `claude -p` mode, ending the orchestrator's turn **terminates the process**, which kills every still-running background Task subagent (the #4195/#4243 incident this issue traces). This hook fires when the session is about to stop, scans the transcript JSONL for `Task` tool_use entries with no matching `tool_result`, and **blocks the stop once** with a loud reason explaining the hazard when it finds any unresolved dispatch. It uses `stop_hook_active` to block **at most once per stop sequence** — this is a heuristic over the transcript file (not a live process check), so a second consecutive block could wedge the session on a false positive (e.g. a slow transcript flush); after one block, the guard always allows. Toggle: `guards.backgroundSubagents` / `LOOM_GUARD_BACKGROUND_SUBAGENTS`, documented alongside the other guard toggles below.
 
@@ -252,6 +252,27 @@ The guard is **on by default**. It is resolved in this order (highest precedence
 
 The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero; a missing/unreadable/unparseable transcript, or a missing `jq`, also fails open (allow the stop) rather than wedging the session.
 
+### Workspace Registry Guard (`guards.workspaceRegistry` / `LOOM_GUARD_WORKSPACE_REGISTRY`)
+
+`guard-loom-workflow.sh` (issue #4326) ASKS for confirmation before a `loom-daemon workspace add|remove|set-priority` command runs — these mutate the machine-level workspace registry (Issue #3926), normally the operator's **real** `~/.loom/workspaces.json`, a file shared across every repo and session on the host. The hazard it backstops: an ad-hoc verification step (a builder/auditor sweep exercising registry behavior) that calls the real CLI directly leaves dangling or incorrect entries in the operator's actual registry. Issue #4326 found exactly this — a leaked `/private/tmp/mig-test` entry sat at explicit dispatch priority `3`, ahead of every real managed repo, for most of a day, because the scratch directory was deleted without a matching `workspace remove`. `loom-daemon workspace list` is read-only and is **never** matched by this guard.
+
+`LOOM_WORKSPACES_PATH` (`loom-daemon/src/workspace_registry.rs`) already exists as the sanctioned scratch-registry seam — every daemon unit test points at it instead of the real file (see `defaults/docs/machine-dispatcher.md`'s "Testing against a scratch registry" section). The guard therefore allows the command through, with **no** ask, whenever `LOOM_WORKSPACES_PATH` is already set in the environment, or assigned inline on the same command line (e.g. `LOOM_WORKSPACES_PATH=/tmp/scratch.json loom-daemon workspace add /tmp/x`) — this check runs regardless of the toggle below, since it identifies a specific *safe* command, not a category opt-out.
+
+The category guard itself is **on by default**, resolved in this order (highest precedence first), independently of the `LOOM_WORKSPACES_PATH` allowance above:
+
+1. **`LOOM_GUARD_WORKSPACE_REGISTRY` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.workspaceRegistry` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "workspaceRegistry": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero. This is an **ask**, never a hard deny — an operator legitimately managing their own real registry (e.g. permanently deregistering a decommissioned repo) can confirm and proceed.
+
 ### Repo-Scoped rm Guard (`guards.rmScope` / `LOOM_RM_SCOPE`)
 
 By default (as of #3628), `guard-destructive.sh` runs in **`repo` mode**: it blocks the **catastrophic** `rm -rf` targets — root (`/`), the user's `$HOME`, and any bare top-level directory (`/tmp`, `/var`, `/etc`, …) — **and** additionally denies any `rm -rf` target that is neither inside the repo/worktree areas nor on a built-in **ephemeral allowlist**. So an outside-repo deep path like `rm -rf /Users/someone/important` is **denied** out of the box. This is the safe-by-default behaviour (ADR Option B); it is a **behaviour change** from the pre-#3628 permissive default.
@@ -381,6 +402,88 @@ LOOM_FORCE_SCOPE=protected git push --force origin feature/x   # allowed
 
 # Force the old always-ask behaviour even when the repo opts into protected:
 LOOM_FORCE_SCOPE=all git reset --hard HEAD~1   # ASK
+```
+
+### Stash-Stack Scope Guard (`guards.stashScope` / `LOOM_GUARD_STASH_SCOPE`)
+
+**The main checkout's stash stack is operator-owned, not scratch space.**
+Preserved diagnostic state (e.g. contamination evidence intentionally
+`git stash`-parked for later investigation) and in-progress operator WIP can
+sit on the main checkout's stash stack indefinitely, with no marker
+distinguishing "safe to pop" from "evidence, do not touch." A role subagent
+doing an ad-hoc integration check (a throwaway test-merge branch, a conflict
+inspection) has no way to tell the difference before running `git stash pop`.
+
+The 2026-07-28 incident this guard exists for (#4281): a Judge, reviewing a
+PR, ran a local test-merge **in the main checkout** and inadvertently
+`git stash pop`'d a stash entry that had been deliberately preserved — "sweep
+contamination, preserved for investigation." The pop happened to conflict, so
+nothing was lost this time (the Judge ran `git reset --hard` to discard the
+partial application and verified the stash stack was intact afterward) — but a
+**clean** pop would have silently dropped the preserved entry with no recovery
+path. See `defaults/roles/judge.md`'s "Rebase Check" section for the
+prescribed alternative (merge `origin/main` into the PR branch inside an
+isolated worktree, never a main-checkout test-merge).
+
+`guard-destructive-generic.sh` asks for confirmation on `git stash pop`,
+`git stash drop`, and `git stash clear` **only when the command's cwd resolves
+to the main checkout** — never in a linked worktree, where a stash operation
+cannot touch the main checkout's stack at all. `git stash push` / `git stash
+apply` / `git stash list` (and the bare `git stash`, which defaults to `push`)
+are **not** gated — none of them can remove an entry from the stack.
+
+The main-checkout test compares `git rev-parse --show-toplevel` against
+`git rev-parse --git-common-dir/..`, both resolved from the command's cwd: they
+are equal only when cwd **is** the main checkout, and diverge when cwd is a
+linked worktree. This is deliberately **not** a subdirectory-prefix comparison
+against the main-checkout root, because Loom's own managed worktrees live
+**nested inside** the main checkout's directory tree
+(`<main>/.loom/worktrees/issue-N`) — a prefix test would ask inside a
+builder's own worktree too, since that path is textually "under" the main
+root even though it is a distinct working tree.
+
+The guard is **on by default**. It is resolved in this order (highest precedence first):
+
+1. **`LOOM_GUARD_STASH_SCOPE` env var** — `0`/`false`/`no` disables the guard; `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.stashScope` (default `true` when absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "stashScope": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config read is best-effort: a missing, empty, or malformed `.loom/config.json` falls through to guard-ON and never causes the hook to exit non-zero. Disabling this guard does not weaken any other guard.
+
+**Known limitation.** Unlike the force-op guard's `parse_force_ops` (which
+threads a `git -C <path>` argument through to resolve the real target), this
+check does not parse `-C`: `git -C <main-checkout-path> stash pop` run from a
+worktree cwd is **not** caught today. If this bypass shows up in practice,
+extend the check to thread `-C` the same way `parse_force_ops` does.
+
+**Examples**:
+
+```bash
+# In the main checkout — ASK (operator-owned stash stack):
+git stash pop
+git stash drop stash@{1}
+git stash clear
+
+# In a linked worktree (.loom/worktrees/issue-N) — allowed, no ask:
+cd .loom/worktrees/issue-42 && git stash pop
+
+# Never gated, in either location — these cannot remove a stash entry:
+git stash push -m "wip"
+git stash apply
+git stash list
+
+# Opt out for a whole repo:
+#   .loom/config.json  ->  { "guards": { "stashScope": false } }
+
+# One-off env opt-out for a single command:
+LOOM_GUARD_STASH_SCOPE=0 git stash pop
 ```
 
 ### Read-Only Fast-Path Guard Toggle (`guards.readOnlyFastPath` / `LOOM_GUARD_READONLY_FASTPATH`)

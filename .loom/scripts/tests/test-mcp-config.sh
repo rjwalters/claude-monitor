@@ -377,6 +377,102 @@ fi
 rm -rf "$_empty_repo"
 
 # ============================================================
+# Section 7: claude-wrapper.sh MCP pre-flight candidate-list fallback (#4349)
+#
+# A broken worktree's dangling .mcp.json must not hard-fail the pre-flight
+# when the git common dir (primary checkout) carries a healthy config —
+# check_mcp_server() now tries an ORDERED candidate list (WORKSPACE first,
+# then the git common dir) instead of pinning to whichever resolves first.
+# ============================================================
+echo ""
+echo "Testing claude-wrapper.sh MCP pre-flight candidate-list fallback (#4349)..."
+
+WRAPPER="$SCRIPTS_DIR/claude-wrapper.sh"
+HAVE_NODE=false
+command -v node >/dev/null 2>&1 && HAVE_NODE=true
+HAVE_GIT=false
+command -v git >/dev/null 2>&1 && HAVE_GIT=true
+
+# Healthy mcp-loom stub: writes the exact startup line check_mcp_server greps for.
+_write_healthy_mcp_stub() {
+    local dir="$1" # e.g. .../mcp-loom
+    mkdir -p "$dir/dist"
+    cat >"$dir/dist/index.js" <<'JS'
+process.stderr.write("Loom MCP server running on stdio\n");
+JS
+}
+
+if $HAVE_NODE && $HAVE_GIT; then
+    _fx="$(mktemp -d)"
+    git init -q "$_fx/main"
+    git -C "$_fx/main" config user.email t@t.com
+    git -C "$_fx/main" config user.name t
+    echo x >"$_fx/main/README.md"
+    git -C "$_fx/main" add -A
+    git -C "$_fx/main" commit -qm init
+    _main_root="$(cd "$_fx/main" && pwd)" # resolve any /private symlink up front
+
+    _write_healthy_mcp_stub "$_main_root/mcp-loom"
+    cat >"$_main_root/.mcp.json" <<JSON
+{ "mcpServers": { "loom": { "command": "node", "args": ["$_main_root/mcp-loom/dist/index.js"] } } }
+JSON
+    git -C "$_main_root" add -A
+    git -C "$_main_root" commit -qm "add mcp"
+    git -C "$_main_root" worktree add -q -b feature/pf-test "$_fx/wt"
+    _wt_root="$(cd "$_fx/wt" && pwd)"
+
+    # 7a. Broken worktree candidate (no rebuildable package) + healthy common-dir
+    #     candidate -> pre-flight PASSES via fallback, with one WARN naming it.
+    _write_healthy_mcp_stub "$_wt_root/mcp-loom"
+    cat >"$_wt_root/.mcp.json" <<JSON
+{ "mcpServers": { "loom": { "command": "node", "args": ["$_wt_root/mcp-loom/dist/index.js"] } } }
+JSON
+    rm -rf "$_wt_root/mcp-loom" # dangling entry point, no package.json to rebuild
+
+    _fallback_out="$(LOOM_WORKSPACE="$_wt_root" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_mcp_server
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_contains "RC=0" "$_fallback_out" \
+        "broken worktree + healthy common-dir config: pre-flight passes via fallback (#4349)"
+    assert_contains "falling back to" "$_fallback_out" \
+        "fallback path logs one WARN naming the fallback candidate (#4349)"
+    assert_not_contains "MCP_PREFLIGHT_FAILED" "$_fallback_out" \
+        "fallback path never emits the MCP_PREFLIGHT_FAILED sentinel"
+
+    # 7b. Both candidates broken (no rebuildable package anywhere) -> hard FAIL.
+    rm -rf "$_main_root/mcp-loom"
+    _both_broken_out="$(LOOM_WORKSPACE="$_wt_root" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_mcp_server
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1 || true)"
+    assert_not_contains "RC=0" "$_both_broken_out" \
+        "both candidates broken: pre-flight does NOT report success"
+    assert_contains "MCP pre-flight failed for all" "$_both_broken_out" \
+        "both candidates broken: hard failure names all failed candidates (#4349)"
+
+    # 7c. Neither candidate has a .mcp.json at all -> #4230 non-fatal skip preserved.
+    _no_cfg_ws="$(mktemp -d)"
+    _no_cfg_out="$(LOOM_WORKSPACE="$_no_cfg_ws" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_mcp_server
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_contains "RC=0" "$_no_cfg_out" \
+        "no .mcp.json anywhere: pre-flight is a non-fatal skip (#4230 preserved)"
+    assert_contains "#4230" "$_no_cfg_out" \
+        "no .mcp.json anywhere: skip message cites #4230"
+    rm -rf "$_no_cfg_ws"
+
+    git -C "$_main_root" worktree remove --force "$_wt_root" >/dev/null 2>&1 || true
+    rm -rf "$_fx"
+else
+    echo -e "  ${YELLOW}SKIP${NC}: MCP pre-flight fallback tests (node and/or git not installed)"
+fi
+
+# ============================================================
 # Summary
 # ============================================================
 echo ""

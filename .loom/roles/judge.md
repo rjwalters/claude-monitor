@@ -457,15 +457,17 @@ This check applies everywhere the judge would run `gh pr checkout`:
 
 This catches merge conflicts early in the evaluation cycle, preventing wasted effort on code that will need to be rebased anyway.
 
-> ### ⛔ NEVER mutate the main checkout's real git index during a merge simulation or inspection
+> ### ⛔ NEVER mutate the main checkout's real git index, run a throwaway test-merge, or touch the stash stack during a merge simulation or inspection
 >
-> **You run in the shared main checkout** — you either reuse the builder's `.loom/worktrees/issue-N` worktree or `gh pr checkout` in place. You do **not** own a disposable git index. Any command that writes the repository's real staging index corrupts the live checkout for every role that touches it next.
+> **You run in the shared main checkout** — you either reuse the builder's `.loom/worktrees/issue-N` worktree or `gh pr checkout` in place. You do **not** own a disposable git index, a disposable branch, or a disposable stash stack. Any command that writes the repository's real staging index, creates a throwaway test-merge branch, or pops/drops/clears an entry off the main checkout's stash corrupts or destroys shared state for every role that touches it next.
 >
-> **NEVER run any of these against the main checkout's real index** to "simulate a merge", preview a tree, or inspect conflicts:
+> **NEVER run any of these against the main checkout** to "simulate a merge", preview a tree, or inspect conflicts:
 >
 > - **`git read-tree`** (bare, or `git read-tree <tree>` **without** an isolated `GIT_INDEX_FILE`) — a bare `git read-tree` is equivalent to `git read-tree --empty`: it silently empties the index, turning **every tracked file into a phantom staged deletion**. The working tree and `HEAD` are untouched and **no reflog entry is written**, so the damage is near-invisible until the next `git add -A` commits it.
 > - **`git commit-tree`** piped from a `read-tree`-populated index.
 > - **`git reset`**, **`git rm --cached`**, **`git add`**, or **`git checkout .`** used "just to simulate" a merge or a conflicting state.
+> - **A throwaway test-merge branch** (`git checkout -b tmp-test && git merge <pr-branch>`, or the reverse — merging the PR branch into main on a scratch branch) created **in the main checkout** to eyeball how a merge resolves. There is no such thing as a disposable branch in shared state: the checkout, the index, and the stash stack it touches are all live for every other role.
+> - **Any stash-stack mutation** (`git stash pop` / `git stash drop` / `git stash clear`) run **in the main checkout** for any reason, including "just to get a clean tree for a test-merge." The main checkout's stash stack is **operator-owned** — it may hold deliberately preserved diagnostic state (e.g. sweep-contamination evidence parked for investigation) with no marker distinguishing "safe to pop" from "evidence, do not touch." The 2026-07-28 incident this rule exists for: a Judge's throwaway main-checkout test-merge inadvertently `git stash pop`'d a preserved stash entry; the pop happened to conflict, so nothing was lost that time, but a clean pop would have silently destroyed it with no recovery path. (`git stash push` / `apply` / `list` are non-destructive and are not the concern here — the danger is specifically `pop`/`drop`/`clear`.) The destructive-command guard asks for confirmation on these three subcommands when the cwd resolves to the main checkout (`guards.stashScope` / `LOOM_GUARD_STASH_SCOPE`, see `defaults/docs/guard-hooks.md`) — but do not rely on the guard catching it; the rule is to never issue the command there in the first place.
 >
 > **Instead, use the index-free approach** (the same one `doctor.md` uses — see `doctor.md`'s merge-conflict check, `git merge-tree origin/main | grep -q "^+<<<<<<<"`):
 >
@@ -477,13 +479,25 @@ This catches merge conflicts early in the evaluation cycle, preventing wasted ef
 > git merge-tree <base> <branch>
 > ```
 >
+> `git merge-tree` is the right tool for **conflict detection only** — it answers "does this merge cleanly?" without a working tree. When an integration check genuinely needs a real working tree (e.g. to run the test suite against the merged result, not just detect conflicts), do it **inside the already-isolated worktree you're evaluating in** (the builder's `.loom/worktrees/issue-N`, or one created via `pr-worktree.sh`) — merge `origin/main` **into the PR branch there**, never the reverse, and never in the main checkout:
+>
+> ```bash
+> # Inside the isolated PR-branch worktree (NOT the main checkout):
+> git fetch origin
+> git merge --no-commit --no-ff origin/main
+> # ...inspect the merged working tree / run tests...
+> git merge --abort   # always undo — this worktree stays on the PR branch, not a merge commit
+> ```
+>
+> This gives the identical integration signal a main-checkout test-merge would, with zero main-checkout mutation: the worktree's own index and working tree are disposable, the main checkout's are not.
+>
 > If you genuinely must populate an index (you almost never do), **isolate it** so the real index is never touched:
 >
 > ```bash
 > GIT_INDEX_FILE="$(mktemp)" git read-tree <tree>
 > ```
 >
-> **Why this matters:** bare `read-tree` empties the live index, leaves the working tree and `HEAD` untouched, and writes **no reflog entry**, so recovery is hard and the corruption is easy to miss. Every role that operates in the main checkout (Judge, Champion, Auditor, Guide) is exposed to the same hazard — prefer `git merge-tree --write-tree` for any merge preview and reach for index-mutating plumbing only under an isolated `GIT_INDEX_FILE`.
+> **Why this matters:** bare `read-tree` empties the live index, leaves the working tree and `HEAD` untouched, and writes **no reflog entry**, so recovery is hard and the corruption is easy to miss; a stash pop is similarly silent-on-conflict-free-success with no reflog trace of what was lost. Every role that operates in the main checkout (Judge, Champion, Auditor, Guide) is exposed to the same hazard — prefer `git merge-tree --write-tree` for conflict detection, the merge-origin-into-the-PR-branch-worktree pattern for anything needing a working tree, and reach for index-mutating plumbing only under an isolated `GIT_INDEX_FILE`. Never touch the main checkout's stash stack.
 
 ### Check Merge State
 

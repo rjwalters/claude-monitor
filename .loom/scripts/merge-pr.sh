@@ -820,9 +820,9 @@ _wait_for_checks_then_sync_merge() {
 # See issue #3279.
 if [[ "$AUTO_MERGE" == "true" ]]; then
   # Bounded poll window for the UNSTABLE-because-checks-are-still-running case
-  # (#3664). Reuses the same env-var names/semantics as the Gitea auto-merge
-  # poller (loom-tools/src/loom_tools/auto_merge.py) so both forges share
-  # configuration. Defaults match that CLI: 30s interval, 600s ceiling.
+  # (#3664). Reuses the same env-var names/semantics as the shell Gitea
+  # auto-merge poller (forge_auto_merge in lib/forge-helpers.sh) so both forges
+  # share configuration. Defaults: 30s interval, 600s ceiling.
   # (Also consumed by the #3820 auto-merge-disabled wait path below.)
   LOOM_AUTO_MERGE_POLL_INTERVAL="${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}"
   LOOM_AUTO_MERGE_TIMEOUT="${LOOM_AUTO_MERGE_TIMEOUT:-600}"
@@ -864,15 +864,32 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     # merge (AUTO_MERGE flipped false above), do NOT attempt the enable mutation.
     [[ "$AUTO_MERGE" == "true" ]] || break
     AUTO_MERGE_OUTPUT=""
-    # Prefer loom-auto-merge CLI (forge-agnostic, with poll-and-merge for Gitea)
-    if command -v loom-auto-merge &>/dev/null; then
-      [[ $MERGE_ATTEMPT -eq 1 ]] && info "Using loom-auto-merge (forge-agnostic auto-merge)"
-      if AUTO_MERGE_OUTPUT=$(loom-auto-merge "$PR_NUMBER" --method squash 2>&1); then
+    # Prefer the native `loom-daemon forge auto-merge` (forge-agnostic; GitHub
+    # via the enablePullRequestAutoMerge GraphQL mutation — a pure API call with
+    # no working-tree checkout). It exits 3 to *decline* Gitea, in which case we
+    # fall through to the shell forge_auto_merge below (which carries the Gitea
+    # curl poll-and-merge). A native GitHub *failure* (exit 1) is NOT a decline:
+    # its gh error is left in AUTO_MERGE_OUTPUT so the disabled/clean/unstable
+    # detection further down fires exactly as it did for loom-auto-merge.
+    _AM_DECLINED=true
+    if command -v loom-daemon &>/dev/null; then
+      [[ $MERGE_ATTEMPT -eq 1 ]] && info "Using loom-daemon forge auto-merge (native forge-agnostic auto-merge)"
+      # `|| _AM_RC=$?` keeps the failing substitution from tripping `set -e`
+      # and captures the native exit code (0=merged, 3=Gitea decline, else fail).
+      _AM_RC=0
+      AUTO_MERGE_OUTPUT=$(loom-daemon forge auto-merge "$PR_NUMBER" --method squash 2>&1) || _AM_RC=$?
+      if [[ $_AM_RC -eq 0 ]]; then
         AUTO_MERGE_OK=true
         break
+      elif [[ $_AM_RC -ne 3 ]]; then
+        # Native attempted and failed (not a Gitea decline) — keep the gh error
+        # in AUTO_MERGE_OUTPUT and fall through to the recheck/retry logic.
+        _AM_DECLINED=false
       fi
-    else
-      # Fallback: shell-based forge_auto_merge
+    fi
+    if [[ "$_AM_DECLINED" == true ]]; then
+      # loom-daemon absent, or it declined (e.g. Gitea) — shell-based
+      # forge_auto_merge carries the poll-and-merge for both forges.
       if AUTO_MERGE_OUTPUT=$(forge_auto_merge "$REPO_NWO" "$PR_NUMBER" 2>&1); then
         AUTO_MERGE_OK=true
         break

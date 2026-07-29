@@ -252,6 +252,7 @@ Root cause verification (for process/behavior issues):
 
 Local verification:
 - [ ] The project's check command passes (see `buildGate.command` in `.loom/config.json`, or the repo's documented CI command, e.g. `pnpm check:ci`)
+- [ ] Commits are signed off if required (`commit.signoff: true` in `.loom/config.json`, or a DCO/`sign-off` requirement — `git commit --signoff`; see "DCO sign-off" above)
 - [ ] Relevant tests pass
 - [ ] Each criterion has explicit verification (not "I think it works")
 ```
@@ -476,6 +477,22 @@ These patterns are **WRONG** — sweep phase validation will reject PRs with tit
 | `feat: implement feature from issue #N` | Generic — could be any feature |
 | `<copy of issue title>` | Issue titles describe problems; commits describe solutions |
 
+### DCO sign-off
+
+If `commit.signoff` is `true` in `.loom/config.json`, pass `--signoff` on **every**
+commit you author (including `git commit --amend`) so each carries a
+`Signed-off-by:` trailer — DCO-requiring repos gate PRs on it:
+
+```bash
+git commit --signoff -m "fix: validate PR title format in sweep phase validation"
+```
+
+If the knob is unset, do a one-time check before your first commit: if
+`CONTRIBUTING.md`/a `DCO` file mentions `Signed-off-by`/DCO **or** a required status
+check name matches `dco`/`sign-?off`, use `--signoff` too and note it in the PR
+body. `--signoff` is harmless when not required. See
+`defaults/docs/commit-signoff.md`.
+
 ---
 
 ## Creating Pull Requests: Label and Auto-Close Requirements
@@ -596,6 +613,7 @@ When creating a PR, verify:
 6. All CI checks pass locally (the project's check command — `buildGate.command` in `.loom/config.json`, e.g. `pnpm check:ci`)
 7. PR description includes verification table for each criterion
 8. Tests added/updated as needed
+9. Commits carry a `Signed-off-by:` trailer if required (`commit.signoff: true` in `.loom/config.json`, or a DCO/`sign-off` check — see "DCO sign-off")
 
 ### Creating the PR
 

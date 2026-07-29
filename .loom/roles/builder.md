@@ -813,6 +813,33 @@ git diff   # Read the actual changes
 
 **The PR title and commit message MUST describe what the code change does, not reference the issue.** See builder-pr.md for the full rules, anti-patterns, and examples.
 
+### Commit Conventions: DCO / sign-off
+
+Some repos require a DCO `Signed-off-by:` trailer on **every** commit (enforced by
+a required `sign-off`/`DCO` status check). Honor it so your PR passes on the first
+Judge pass instead of burning a Doctor cycle on `git commit --amend --signoff`:
+
+```bash
+# Load-bearing: if commit.signoff is true in .loom/config.json, pass --signoff
+# on EVERY commit you author (including --amend).
+if [ "$(jq -r '.commit.signoff // false' .loom/config.json 2>/dev/null)" = "true" ]; then
+  git commit --signoff -m "fix: ..."
+else
+  git commit -m "fix: ..."
+fi
+```
+
+- **Knob (deterministic)**: `commit.signoff: true` in `.loom/config.json` ⇒ always
+  `--signoff`. Read it the same way you read `buildGate.command`. Absent ⇒ behavior
+  unchanged, except:
+- **Heuristic (advisory fallback, knob unset)**: before your first commit, if
+  `CONTRIBUTING.md`/a `DCO` file mentions `Signed-off-by`/DCO, **or** a required
+  status check name matches `dco`/`sign-?off`, use `--signoff` too and note it in
+  the PR body.
+- `--signoff` is harmless when not required (only adds a trailer); git does not add
+  a duplicate trailer for an identity already present. Full reference:
+  `defaults/docs/commit-signoff.md`.
+
 ### Closing vs Partial Increments (family/epic issues)
 
 Decide whether this PR **fully** resolves the issue (`Closes #N`) or is only a

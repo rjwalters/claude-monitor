@@ -258,6 +258,41 @@ dispatches into that workspace with no `WorkingDirectory` override needed. See
 [`daemon-reference.md`](daemon-reference.md) → `dispatch_sweep` for the full
 resolution precedence.
 
+### Testing against a scratch registry (`LOOM_WORKSPACES_PATH`, #4326)
+
+`~/.loom/workspaces.json` is a **machine-level, cross-repo, cross-session**
+file — never scope a test or an ad-hoc verification step at it directly. Both
+the `loom-daemon workspace add|remove|list|set-priority` CLI and the daemon
+itself honor `LOOM_WORKSPACES_PATH` (`loom-daemon/src/workspace_registry.rs`)
+as a redirect: when set, every registry read/write for that process goes to
+the given file instead of the real one. This is the sanctioned seam for
+**any** code that needs to exercise registry behavior — every registry unit
+test in `loom-daemon/src/workspace_registry.rs` already uses a tempdir this
+way, and it is the correct tool for a builder/auditor session manually
+verifying `workspace add`/`status`/priority behavior too:
+
+```bash
+LOOM_WORKSPACES_PATH=/tmp/scratch-workspaces.json loom-daemon workspace add /tmp/some-dir --priority 3
+LOOM_WORKSPACES_PATH=/tmp/scratch-workspaces.json loom-daemon workspace list
+```
+
+Skipping this and calling the real CLI directly leaves stray entries in the
+operator's actual registry. Issue #4326 is the incident that motivated this
+note: an agent session's ad-hoc registry verification (during a migration/
+registry-adjacent sweep) registered `/private/tmp/mig-test` against the real
+file, the scratch directory was later deleted, and the dangling entry sat at
+explicit dispatch priority `3` — ahead of every real managed repo — for most
+of a day, until `loom-daemon workspace remove /private/tmp/mig-test` cleared
+it manually. Two structural backstops now exist for the residual case (an
+operator or agent forgetting the env var, or a directory going missing after
+correct registration): a `PreToolUse` guard hook asks for confirmation before
+a real-registry-mutating `workspace` command runs without
+`LOOM_WORKSPACES_PATH` in play (`guards.workspaceRegistry`, see
+[`guard-hooks.md`](guard-hooks.md) → "Workspace Registry Guard"), and both
+`loom-daemon status` and the autonomous work-finder flag/skip a registered
+root whose directory no longer exists on disk (warn-and-skip, never
+auto-remove — a root can be transiently absent, e.g. an unmounted volume).
+
 ### Supervision (reboot/crash) — macOS via launchd, Linux via systemd `--user`
 
 Reboot/crash supervision itself (as opposed to the workdir/pid-file relocation

@@ -14,7 +14,7 @@
 # timeline API for open issues/PRs that cross-reference N, emitting a
 # RELATED_OPEN_WORK block distinct from DUPLICATE_FOUND. This is a
 # black-box test: check-duplicate.sh is a full CLI script (main "$@" at
-# EOF, not sourced functions), so we stub `gh` and `loom-forge` on PATH and
+# EOF, not sourced functions), so we stub `gh` and `loom-daemon` on PATH and
 # invoke the real script as a subprocess, asserting on stdout/exit code.
 #
 # Usage:
@@ -84,16 +84,16 @@ fi
 STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 
-# --- Stub loom-forge: present on PATH but deliberately non-functional, so
-# check-duplicate.sh's `loom-forge --version` probe fails and it falls back
+# --- Stub loom-daemon: present on PATH but deliberately non-functional, so
+# check-duplicate.sh's `loom-daemon --version` probe fails and it falls back
 # to the `gh` stub below (byte-for-byte the documented fallback path,
-# defaults/scripts/check-duplicate.sh:35-42). Keeps this test independent of
-# whether a real loom-forge happens to be installed on the host. ---
-cat > "$STUB_DIR/loom-forge" <<'STUB'
+# defaults/scripts/check-duplicate.sh). Keeps this test independent of
+# whether a real loom-daemon happens to be installed on the host. ---
+cat > "$STUB_DIR/loom-daemon" <<'STUB'
 #!/usr/bin/env bash
 exit 1
 STUB
-chmod +x "$STUB_DIR/loom-forge"
+chmod +x "$STUB_DIR/loom-daemon"
 
 # --- Stub gh on PATH ---
 #   gh auth status                                     -> exit 0 (authenticated)

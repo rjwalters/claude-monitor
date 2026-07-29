@@ -24,14 +24,15 @@ are two delivery paths, tried in order; the same degradation contract from
 1. **MCP tools (`safehouse_send` / `safehouse_read`)** — present when
    `spawn-claude.sh` injected the safehouse MCP server *and* your runtime/role
    exposes MCP tools. Prefer these when available.
-2. **Bash helper (`.loom/scripts/fleet-send.sh`)** — the fallback for roles
-   whose tool allowlists exclude MCP tools. Lifecycle role subagents
-   (`loom-builder` / `loom-judge` / `loom-doctor`) pin their tools to
-   Read/Glob/Grep/Bash(/Write/Edit) with no MCP tools, so the injected
-   `safehouse_send` is invisible to them — but they all have Bash. The helper
-   resolves the socket/persona from `$SAFEHOUSED_SOCKET` + `$SAFEHOUSE_PERSONA`
-   (exported into the session by `spawn-claude.sh`) and is a thin JSON-lines
-   client for the same wire protocol. It posts only (no read op yet).
+2. **Bash helpers (`.loom/scripts/fleet-send.sh` / `.loom/scripts/fleet-check.sh`)**
+   — the fallback for roles whose tool allowlists exclude MCP tools. Lifecycle
+   role subagents (`loom-builder` / `loom-judge` / `loom-doctor`) pin their
+   tools to Read/Glob/Grep/Bash(/Write/Edit) with no MCP tools, so the
+   injected `safehouse_send` / `safehouse_read` are invisible to them — but
+   they all have Bash. Both helpers resolve the socket/persona from
+   `$SAFEHOUSED_SOCKET` + `$SAFEHOUSE_PERSONA` (exported into the session by
+   `spawn-claude.sh`) and speak the same JSON-lines wire protocol:
+   `fleet-send.sh` posts (`send` op), `fleet-check.sh` reads (`check` op).
 
 - **If a path is available**: use it per the guidance below (MCP first, then the
   helper).
@@ -85,6 +86,19 @@ Via the Bash helper (the fallback for roles without MCP tools):
 The helper defaults `to` to `"*"`, reads persona/socket from the session env,
 and exits 0 silently when the room is unreachable — call it unconditionally.
 
+To read back pending mail without MCP tools, use the read/check counterpart:
+
+```
+.loom/scripts/fleet-check.sh [--peek] [--limit <n>]
+```
+
+`fleet-check.sh` reads persona/socket from the same session env, prints each
+pending message as one JSON object per line to stdout on success, and prints
+nothing (exit 0) on any failure or an empty mailbox — treat empty output as
+"no mail" uniformly. By default a `check` **advances the persona's read
+cursor** (mail is consumed once read); pass `--peek` to read without
+consuming. `--limit <n>` caps how many messages come back in one call.
+
 - **`task_id`**: the repo-qualified `<repo>_<issue>` form the daemon narrates on
   (post-#4224 — e.g. `loom_4199`, the workspace-root basename plus the issue
   number), so your message threads alongside the daemon's phase narration for
@@ -117,6 +131,18 @@ guardrails (scope discipline, label discipline, the "issues are suggestions"
 guardrails, etc.) — it's a hint from a human watching the fleet, not a
 privilege escalation. If it conflicts with your role's mandatory rules, follow
 your role's rules and, if useful, say why in a reply.
+
+For roles without MCP tools, `.loom/scripts/fleet-check.sh` is the non-MCP
+path to this read-back (`safehouse_read`'s Bash-fallback counterpart to
+`safehouse_send`/`fleet-send.sh`) — poll it at the same natural checkpoints,
+never as a wait loop.
+
+**Shared-cursor caveat**: a persona's mailbox cursor is shared by every
+process using that persona. A default (advancing) `check` consumes mail for
+*all* consumers sharing the persona, not just the caller — if another process
+(or a later checkpoint in your own role) expected to see that mail, it won't.
+Use `--peek` when you're not sure you're the sole consumer of the persona's
+mailbox at that checkpoint.
 
 ## Summary for role authors
 

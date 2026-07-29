@@ -116,11 +116,11 @@
 
 # Core Workflow States
 - name: loom:triage
-  description: "New issue awaiting Curator enhancement. Applied by: humans or any agent filing a new issue (intake label)."
+  description: "New issue awaiting Curator enhancement. Applied by: humans or any agent filing an issue (intake)."
   color: "9CA3AF"  # gray-400 - neutral initial state
 
 - name: loom:issue
-  description: "Approved for work (ready for Builder to claim). Applied by: humans, Champion, or a /loom:sweep orchestrator's Approval gate — see .loom/roles/curator.md 'Who promotes loom:curated → loom:issue' for the authoritative rule."
+  description: "Approved for work. Applied by: humans, Champion, or sweep Approval gate — see curator.md for rule."
   color: "3B82F6"  # blue-500
 
 # DEPRECATED: loom:in-progress removed (use role-specific labels)
@@ -143,7 +143,7 @@
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:reviewing
-  description: "Judge is actively reviewing this PR. Applied by: Judge only (claim label). Stale after LOOM_STALE_REVIEWING_MINUTES (default 30) with no follow-up comment — may be reclaimed by a new Judge."
+  description: "Judge is reviewing this PR. Applied by: Judge only. Stale after LOOM_STALE_REVIEWING_MINUTES (30m)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:review-requested
@@ -188,7 +188,7 @@
   color: "6366F1"  # indigo-500 - indicates meta/tooling request
 
 - name: loom:curated
-  description: "Curator-enriched, awaiting human approval. Additive marker; coexists with loom:issue (highest-quality state for Builders). Applied by: Curator only."
+  description: "Curator-enriched, awaiting approval. Additive; coexists with loom:issue. Applied by: Curator only."
   color: "10B981"  # emerald-500
 
 # Status Labels
@@ -240,6 +240,6 @@
 # (see builder.md "Ignore External Issues") — a non-collaborator submission needs
 # maintainer approval before Curator/Builder process it.
 - name: external
-  description: "Submitted by a non-collaborator; requires maintainer approval before Curator/Builder process it. Applied by: humans only."
+  description: "Non-collaborator submission; needs maintainer approval before curation. Applied by: humans only."
   color: "E5E7EB"  # gray-200 - external/hold marker
 # END LOOM LABELS

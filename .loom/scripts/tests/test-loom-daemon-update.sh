@@ -120,6 +120,44 @@ EOF
     ( cd "$root" && git init -q && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m init )
 }
 
+# new_fixture_with_origin <root> <bare_dir> (#4330) — builds on new_fixture(),
+# adding a local BARE repo as `origin` so the ff-first sync path (which
+# resolves the default branch via refs/remotes/origin/HEAD, then fetches and
+# compares against origin/<branch>) has a real remote to talk to — entirely
+# offline (a plain filesystem path, no network). Forces the branch name to
+# `main` (deterministic regardless of the test host's init.defaultBranch) and
+# sets refs/remotes/origin/HEAD via `git remote set-head origin -a` so
+# loom_default_branch() resolves it the same way a real clone would.
+new_fixture_with_origin() {
+    local root="$1" bare="$2"
+    new_fixture "$root"
+    ( cd "$root" && git branch -q -M main )
+    git init -q --bare "$bare"
+    ( cd "$root" && git remote add origin "$bare" && git push -q origin HEAD:refs/heads/main )
+    git -C "$bare" symbolic-ref HEAD refs/heads/main
+    ( cd "$root" && git remote set-head origin -a >/dev/null 2>&1 )
+}
+
+# push_extra_commits_to_origin <bare_dir> <n> — advances the bare `origin`
+# repo `n` commits ahead of whatever a fixture repo's `main` currently is, by
+# cloning it into a throwaway dir, committing there, and pushing back. Echoes
+# the new origin tip's short commit on stdout. The fixture repo passed to
+# new_fixture_with_origin is left untouched (still behind by exactly <n>).
+push_extra_commits_to_origin() {
+    local bare="$1" n="$2" tmpclone
+    tmpclone="$(mktemp -d)"
+    git clone -q "$bare" "$tmpclone"
+    local i
+    for i in $(seq 1 "$n"); do
+        ( cd "$tmpclone" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "extra ${i}" )
+    done
+    ( cd "$tmpclone" && git push -q origin HEAD:refs/heads/main )
+    local tip
+    tip="$(cd "$tmpclone" && git rev-parse --short HEAD)"
+    rm -rf "$tmpclone"
+    echo "$tip"
+}
+
 # Writes a fake daemon binary at $1 that reports commit $2 on --version and,
 # on a normal run, appends its inherited LOOM_WORK_FINDER / LOOM_MAIN_HEALTH_GATE
 # to marker file $3 before looping forever (so it stays alive for kill -0).
@@ -165,16 +203,73 @@ EOF
 # simulating a launchd-managed loom-daemon for the #4042 ownership-detection
 # tests. Paired with a fake `uname`->Darwin so the update script's Darwin-gated
 # launchd path fires deterministically on any host.
+#
+# Optional $3/$4 (#4232): when a <post_restart_marker> file path is given,
+# `print` reports pid 4242 until that file EXISTS, at which point it reports
+# <post_restart_pid> instead — simulating "launchd relaunched the job onto a
+# new (real, live) pid the instant the restart request was accepted". Tests
+# that don't pass $3/$4 keep the old static-4242-forever behavior (they never
+# exercise the #4232 pid-verification poll).
 write_fake_launchd_loaded_bin() {
-    local bin_dir="$1" log="$2"
+    local bin_dir="$1" log="$2" post_restart_marker="${3:-}" post_restart_pid="${4:-}"
     mkdir -p "$bin_dir"
     : > "$log"
     cat > "$bin_dir/launchctl" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "${log}"
 case "\${1:-}" in
-  print) echo "	pid = 4242" ; exit 0 ;;
+  print)
+    if [[ -n "${post_restart_marker}" && -e "${post_restart_marker}" ]]; then
+      echo "	pid = ${post_restart_pid}"
+    else
+      echo "	pid = 4242"
+    fi
+    exit 0 ;;
   *)     exit 0 ;;
+esac
+EOF
+    chmod +x "$bin_dir/launchctl"
+    cat > "$bin_dir/uname" <<'EOF'
+#!/usr/bin/env bash
+echo "Darwin"
+EOF
+    chmod +x "$bin_dir/uname"
+}
+
+# Writes a fake `launchctl` at $1 for the #4232 restart-VERIFICATION tests: the
+# reported pid lives in a state file ($3) rather than being hardcoded, so a
+# test can hold it "stuck" on the pre-restart pid to simulate launchd failing
+# to relaunch on its own. `print` reports whatever pid (if any) is currently in
+# the state file plus a "last exit status" line (diagnostic breadcrumb,
+# #4232). `kickstart` is recorded VERBATIM to $2 (so a test can assert it was
+# never invoked with `-k`) and, only when $4 (<kickstart_new_pid>) is given,
+# overwrites the state file with it — simulating a kickstart-triggered
+# relaunch; when $4 is omitted, `kickstart` is a no-op (a kickstart that also
+# fails to bring the job up).
+write_fake_launchd_pid_bin() {
+    local bin_dir="$1" log="$2" state_file="$3" kickstart_new_pid="${4:-}"
+    mkdir -p "$bin_dir"
+    : > "$log"
+    cat > "$bin_dir/launchctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "${log}"
+case "\${1:-}" in
+  print)
+    pid="\$(cat "${state_file}" 2>/dev/null)"
+    if [[ -n "\$pid" ]]; then
+      echo "	state = running"
+      echo "	pid = \$pid"
+    else
+      echo "	state = not running"
+    fi
+    echo "	last exit status = 0"
+    exit 0 ;;
+  kickstart)
+    if [[ -n "${kickstart_new_pid}" ]]; then
+      echo "${kickstart_new_pid}" > "${state_file}"
+    fi
+    exit 0 ;;
+  *) exit 0 ;;
 esac
 EOF
     chmod +x "$bin_dir/launchctl"
@@ -861,11 +956,13 @@ else
 fi
 
 # ============================================================
-# 15. Launchd ownership + restart (#4042): a launchd-managed daemon (stub
+# 15. Launchd ownership + restart (#4042/#4232): a launchd-managed daemon (stub
 #     launchctl reports a LOADED job + pid) with NO .loom/.daemon.pid file ->
 #     the updater plans/executes a RESTART (not "was not running"), drives it
 #     through the `restart` subcommand (stub records the invocation), does NOT
-#     consult .daemon.flags, and exits 0.
+#     consult .daemon.flags, and exits 0. The stub relaunches onto a NEW, real,
+#     live pid the instant the restart is accepted (#4232 case (a): relaunch
+#     observed -> success, no kickstart fallback ever invoked).
 # ============================================================
 W15="$BASE_WORKDIR/w15"
 new_fixture "$W15"
@@ -881,13 +978,18 @@ write_fake_daemon_restart "$NEW_FAKE15" "$HEAD15" "$RESTART_MARKER15" 0
 # A .daemon.flags that MUST NOT be consulted in launchd mode (would otherwise
 # add --work-finder to a stop+start path).
 echo "--work-finder" > "$W15/.loom/.daemon.flags"
+# A real, live process standing in for "the relaunched job's new pid" — the
+# #4232 poll requires a live pid (kill -0), not just a differing number.
+sleep 60 >/dev/null 2>&1 &
+RELAUNCHED_PID15=$!
 LD_BIN15="$W15/launchd-bin"
-write_fake_launchd_loaded_bin "$LD_BIN15" "$W15/launchctl.log"
+write_fake_launchd_loaded_bin "$LD_BIN15" "$W15/launchctl.log" "$RESTART_MARKER15" "$RELAUNCHED_PID15"
 
 out15=$( cd "$W15" && PATH="$LD_BIN15:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
     LOOM_DAEMON_BIN="$INSTALLED15" NEW_FAKE_BIN_SRC="$NEW_FAKE15" \
     bash "$UPDATE_SCRIPT" 2>&1 )
 rc15=$?
+kill "$RELAUNCHED_PID15" 2>/dev/null || true
 assert_eq "0" "$rc15" "launchd-managed update (no pid file) exits 0"
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -s "$RESTART_MARKER15" ]]; then
@@ -906,6 +1008,24 @@ if echo "$out15" | grep -qi 'not running'; then
 else
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "${GREEN}✓${NC} launchd-loaded job is NOT mistaken for 'was not running'"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q "^${RELAUNCHED_PID15}$\|new pid ${RELAUNCHED_PID15}" <<< "$out15" || echo "$out15" | grep -q "new pid ${RELAUNCHED_PID15}"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success message reports the VERIFIED new pid (#4232)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success message reports the VERIFIED new pid (#4232)"
+    echo "  output: $out15"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q '^kickstart ' "$W15/launchctl.log" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} relaunch observed immediately -> kickstart fallback is NEVER invoked (#4232 case a)"
+    echo "  launchctl.log: $(cat "$W15/launchctl.log" 2>/dev/null)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} relaunch observed immediately -> kickstart fallback is NEVER invoked (#4232 case a)"
 fi
 TESTS_RUN=$((TESTS_RUN + 1))
 if echo "$out15" | grep -qi 'FLAGS-OFF'; then
@@ -1637,6 +1757,364 @@ else
     echo -e "${RED}✗${NC} --relaunch with an absent unit fails loudly (names the path) and renders nothing"
     echo "  rc=$rc34 unit-exists=$([[ -e "$UNIT_PATH34" ]] && echo yes || echo no)"
     echo "  output: $out34"
+fi
+
+# ============================================================
+# 35. Restart ack'd but launchd never relaunches -> kickstart fallback DOES
+#     relaunch it (#4232 case (b)): the restart request is accepted (exit 0)
+#     but the reported pid never moves off the pre-restart pid on its own;
+#     the updater falls back to a PLAIN 'launchctl kickstart' (never -k),
+#     which (per the stub) IS what finally moves the pid — success, with a
+#     remediation note in the output. Poll windows are shrunk via env so the
+#     test runs fast without changing the production defaults.
+# ============================================================
+W35="$BASE_WORKDIR/w35"
+new_fixture "$W35"
+INSTALLED35="$W35/installed/loom-daemon"
+mkdir -p "$W35/installed"
+RESTART_MARKER35="$W35/restart-invoked"
+write_fake_daemon_restart "$INSTALLED35" "deadbee" "$RESTART_MARKER35" 0
+NEW_FAKE35="$W35/new-fake-daemon"
+HEAD35="$(cd "$W35" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE35" "$HEAD35" "$RESTART_MARKER35" 0
+
+sleep 60 >/dev/null 2>&1 &
+OLD_PID26=$!
+sleep 60 >/dev/null 2>&1 &
+KICKSTART_PID35=$!
+STATE35="$W35/launchd-pid-state"
+echo "$OLD_PID26" > "$STATE35"
+LD_BIN35="$W35/launchd-bin"
+write_fake_launchd_pid_bin "$LD_BIN35" "$W35/launchctl.log" "$STATE35" "$KICKSTART_PID35"
+
+out35=$( cd "$W35" && PATH="$LD_BIN35:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED35" NEW_FAKE_BIN_SRC="$NEW_FAKE35" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=3 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc26=$?
+kill "$OLD_PID26" "$KICKSTART_PID35" 2>/dev/null || true
+assert_eq "0" "$rc26" "no spontaneous relaunch -> kickstart fallback relaunches it -> exit 0 (#4232 case b)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out35" | grep -qi 'kickstart' && echo "$out35" | grep -qi 'remediation'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} success output names the kickstart fallback + a remediation note"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} success output names the kickstart fallback + a remediation note"
+    echo "  output: $out35"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -qE '^kickstart [^ ]+$' "$W35/launchctl.log" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} kickstart is invoked PLAIN — never with -k"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} kickstart is invoked PLAIN — never with -k"
+    echo "  launchctl.log: $(cat "$W35/launchctl.log" 2>/dev/null)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '-k' "$W35/launchctl.log" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} kickstart is NEVER invoked with -k (would risk killing a daemon that relaunched during the race window)"
+    echo "  launchctl.log: $(cat "$W35/launchctl.log" 2>/dev/null)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} kickstart is NEVER invoked with -k (would risk killing a daemon that relaunched during the race window)"
+fi
+
+# ============================================================
+# 36. Restart ack'd, launchd never relaunches, AND the kickstart fallback also
+#     never brings it up -> exit NON-ZERO (7), loudly, rather than a silent
+#     half-update success (#4232 case (c)).
+# ============================================================
+W36="$BASE_WORKDIR/w36"
+new_fixture "$W36"
+INSTALLED36="$W36/installed/loom-daemon"
+mkdir -p "$W36/installed"
+RESTART_MARKER36="$W36/restart-invoked"
+write_fake_daemon_restart "$INSTALLED36" "deadbee" "$RESTART_MARKER36" 0
+NEW_FAKE36="$W36/new-fake-daemon"
+HEAD36="$(cd "$W36" && git rev-parse --short HEAD)"
+write_fake_daemon_restart "$NEW_FAKE36" "$HEAD36" "$RESTART_MARKER36" 0
+
+sleep 60 >/dev/null 2>&1 &
+OLD_PID27=$!
+STATE36="$W36/launchd-pid-state"
+echo "$OLD_PID27" > "$STATE36"
+LD_BIN36="$W36/launchd-bin"
+# No kickstart_new_pid given -> kickstart is a no-op; the pid never moves.
+write_fake_launchd_pid_bin "$LD_BIN36" "$W36/launchctl.log" "$STATE36"
+
+out36=$( cd "$W36" && PATH="$LD_BIN36:$TEST_PATH" LOOM_DAEMON_LAUNCHD=1 \
+    LOOM_DAEMON_BIN="$INSTALLED36" NEW_FAKE_BIN_SRC="$NEW_FAKE36" \
+    LOOM_DAEMON_RESTART_POLL_SECS=1 LOOM_DAEMON_RESTART_POLL_INTERVAL=0.2 \
+    LOOM_DAEMON_RESTART_KICKSTART_POLL_SECS=1 \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc27=$?
+kill "$OLD_PID27" 2>/dev/null || true
+assert_eq "7" "$rc27" "no relaunch even after kickstart -> exit 7 (never a silent half-update, #4232 case c)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out36" | grep -qi 'FAILED' && echo "$out36" | grep -qi 'kickstart'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} failure output loudly reports the exhausted kickstart fallback"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} failure output loudly reports the exhausted kickstart fallback"
+    echo "  output: $out36"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out36" | grep -qi 'last exit status'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} failure output includes launchctl print diagnostics (state/last exit status)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} failure output includes launchctl print diagnostics (state/last exit status)"
+    echo "  output: $out36"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -q -- '-k' "$W36/launchctl.log" 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} exhausted kickstart fallback was still never invoked with -k"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} exhausted kickstart fallback was still never invoked with -k"
+fi
+
+# ============================================================
+# 37. ff-first default (#4330): local main is behind origin/main with a
+#     CLEAN tree -> the ff-merge applies, and the rebuild below builds the
+#     freshly-synced (post-merge) HEAD, not the stale pre-merge one.
+# ============================================================
+W37="$BASE_WORKDIR/w37"
+BARE37="$BASE_WORKDIR/w37-origin.git"
+new_fixture_with_origin "$W37" "$BARE37"
+ORIGIN_TIP37="$(push_extra_commits_to_origin "$BARE37" 2)"
+NEW_FAKE37="$W37/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE37" "$ORIGIN_TIP37" "$W37/new-marker"
+out37=$( cd "$W37" && PATH="$TEST_PATH" NEW_FAKE_BIN_SRC="$NEW_FAKE37" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc37=$?
+assert_eq "0" "$rc37" "ff-first: behind origin + clean tree -> update succeeds (ff-merge applied)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out37" | grep -qi 'Fast-forwarded'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} ff-first: reports the fast-forward sync"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} ff-first: reports the fast-forward sync"
+    echo "  output: $out37"
+fi
+HEAD_AFTER37="$(cd "$W37" && git rev-parse --short HEAD)"
+assert_eq "$ORIGIN_TIP37" "$HEAD_AFTER37" "ff-first: local HEAD now equals origin tip after the sync"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out37" | grep -qi "Build verification: freshly-built binary embeds source HEAD commit (${ORIGIN_TIP37})"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} ff-first: the rebuild is verified against the POST-merge HEAD, not the stale pre-merge one"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} ff-first: the rebuild is verified against the POST-merge HEAD, not the stale pre-merge one"
+    echo "  output: $out37"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out37" | grep -qE "Installed: ${ORIGIN_TIP37} \(matches origin/main\)"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} final installed line states the built commit AND that it matches origin/main (AC4)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} final installed line states the built commit AND that it matches origin/main (AC4)"
+    echo "  output: $out37"
+fi
+
+# ============================================================
+# 38. ff-first default: local main is behind origin/main AND has a DIVERGED
+#     local commit -> the ff-merge cannot apply -> abort exit 1, no merge, no
+#     build, working tree untouched. Never guesses or hard-resets.
+# ============================================================
+W38="$BASE_WORKDIR/w38"
+BARE38="$BASE_WORKDIR/w38-origin.git"
+new_fixture_with_origin "$W38" "$BARE38"
+push_extra_commits_to_origin "$BARE38" 2 >/dev/null
+# Diverge: a local commit that is NOT on origin (so the merge is not a plain
+# fast-forward — `git merge --ff-only` must refuse).
+( cd "$W38" && git -c user.email=test@test -c user.name=test commit -q --allow-empty -m "local diverged commit" )
+HEAD_BEFORE38="$(cd "$W38" && git rev-parse --short HEAD)"
+out38=$( cd "$W38" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" 2>&1 )
+rc38=$?
+assert_eq "1" "$rc38" "ff-first: diverged local commit -> abort exit 1 (never guess or hard-reset)"
+HEAD_AFTER38="$(cd "$W38" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE38" "$HEAD_AFTER38" "ff-first: diverged case leaves local HEAD completely untouched"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out38" | grep -qi 'Refusing to guess or hard-reset'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} ff-first: diverged case reports the abort rationale"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} ff-first: diverged case reports the abort rationale"
+    echo "  output: $out38"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -e "$W38/loom-daemon/target/release/loom-daemon" ]]; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} ff-first: diverged case performs no build"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} ff-first: diverged case performs no build"
+fi
+
+# ============================================================
+# 39. --allow-stale restores the pre-#4330 build-what's-here behavior: the
+#     ff-merge is skipped entirely, the current (stale) checkout is built,
+#     and the behind-origin advisory warning is still printed.
+# ============================================================
+W39="$BASE_WORKDIR/w39"
+BARE39="$BASE_WORKDIR/w39-origin.git"
+new_fixture_with_origin "$W39" "$BARE39"
+push_extra_commits_to_origin "$BARE39" 3 >/dev/null
+HEAD_BEFORE39="$(cd "$W39" && git rev-parse --short HEAD)"
+NEW_FAKE39="$W39/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE39" "$HEAD_BEFORE39" "$W39/new-marker"
+out39=$( cd "$W39" && PATH="$TEST_PATH" NEW_FAKE_BIN_SRC="$NEW_FAKE39" \
+    bash "$UPDATE_SCRIPT" --allow-stale 2>&1 )
+rc39=$?
+assert_eq "0" "$rc39" "--allow-stale: builds the current (stale) checkout, exits 0"
+HEAD_AFTER39="$(cd "$W39" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE39" "$HEAD_AFTER39" "--allow-stale: local HEAD is never merged/advanced"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out39" | grep -qi 'behind origin/main.*--allow-stale'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --allow-stale: the behind-origin advisory warning is still printed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --allow-stale: the behind-origin advisory warning is still printed"
+    echo "  output: $out39"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out39" | grep -qE "Installed: ${HEAD_BEFORE39} \(origin/main is at .* does NOT match"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --allow-stale: final installed line reports the built commit does NOT match origin/main (AC4)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --allow-stale: final installed line reports the built commit does NOT match origin/main (AC4)"
+    echo "  output: $out39"
+fi
+
+# ============================================================
+# 40. --check / --dry-run stay read-only even when behind origin: no fetch
+#     result may write to the tree — HEAD is unchanged after either mode, and
+#     --check reports the behind-origin status informationally while
+#     --dry-run's printed plan mentions the ff-sync.
+# ============================================================
+W40="$BASE_WORKDIR/w40"
+BARE40="$BASE_WORKDIR/w40-origin.git"
+new_fixture_with_origin "$W40" "$BARE40"
+push_extra_commits_to_origin "$BARE40" 1 >/dev/null
+HEAD_BEFORE40="$(cd "$W40" && git rev-parse --short HEAD)"
+out40_check=$( cd "$W40" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --check 2>&1 )
+HEAD_AFTER40_CHECK="$(cd "$W40" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE40" "$HEAD_AFTER40_CHECK" "--check while behind origin: HEAD unchanged (no writes contract holds)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out40_check" | grep -qi 'behind origin/main'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --check reports the behind-origin status informationally"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --check reports the behind-origin status informationally"
+    echo "  output: $out40_check"
+fi
+out40_dry=$( cd "$W40" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" --dry-run 2>&1 )
+HEAD_AFTER40_DRY="$(cd "$W40" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE40" "$HEAD_AFTER40_DRY" "--dry-run while behind origin: HEAD unchanged (no writes contract holds)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out40_dry" | grep -qi 'fast-forward.*origin/main'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --dry-run's printed plan mentions the ff-sync"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --dry-run's printed plan mentions the ff-sync"
+    echo "  output: $out40_dry"
+fi
+
+# ============================================================
+# 41. HEAD on a non-default branch while behind origin -> abort, naming
+#     --allow-stale (an operator deliberately elsewhere — e.g. bisecting — is
+#     exactly the --allow-stale use case, never a guess-which-branch merge).
+# ============================================================
+W41="$BASE_WORKDIR/w41"
+BARE41="$BASE_WORKDIR/w41-origin.git"
+new_fixture_with_origin "$W41" "$BARE41"
+push_extra_commits_to_origin "$BARE41" 1 >/dev/null
+( cd "$W41" && git checkout -q -b feature-branch )
+HEAD_BEFORE41="$(cd "$W41" && git rev-parse --short HEAD)"
+out41=$( cd "$W41" && PATH="$TEST_PATH" bash "$UPDATE_SCRIPT" 2>&1 )
+rc41=$?
+assert_eq "1" "$rc41" "non-default branch while behind -> abort exit 1"
+HEAD_AFTER41="$(cd "$W41" && git rev-parse --short HEAD)"
+assert_eq "$HEAD_BEFORE41" "$HEAD_AFTER41" "non-default branch while behind: HEAD untouched"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out41" | grep -q -- '--allow-stale'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} abort message names --allow-stale as the deliberate escape hatch"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} abort message names --allow-stale as the deliberate escape hatch"
+    echo "  output: $out41"
+fi
+
+# ============================================================
+# 42. Fetch failure (origin unreachable) must NOT make the script
+#     network-dependent: warn and proceed with local HEAD as-is, exactly like
+#     today's behavior — never abort, never hang past the bounded fetch.
+# ============================================================
+W42="$BASE_WORKDIR/w42"
+BARE42="$BASE_WORKDIR/w42-origin.git"
+new_fixture_with_origin "$W42" "$BARE42"
+# refs/remotes/origin/HEAD is now cached locally (set by new_fixture_with_origin
+# above), so loom_default_branch() can still name "main" via its offline,
+# no-network tier even though the URL below makes the ACTUAL fetch fail —
+# isolating "fetch failed" from "branch unresolvable" (test 43 covers the latter).
+( cd "$W42" && git remote set-url origin "$BASE_WORKDIR/does-not-exist-w42.git" )
+HEAD42="$(cd "$W42" && git rev-parse --short HEAD)"
+INSTALLED42="$W42/installed/loom-daemon"
+mkdir -p "$W42/installed"
+write_fake_daemon "$INSTALLED42" "$HEAD42" "$W42/old-marker"
+out42=$( cd "$W42" && PATH="$TEST_PATH" LOOM_DAEMON_BIN="$INSTALLED42" \
+    bash "$UPDATE_SCRIPT" --check 2>&1 )
+rc42=$?
+assert_eq "0" "$rc42" "fetch failure: proceeds as today (installed already matches local HEAD) -> exit 0"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out42" | grep -qi 'could not reach origin'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} fetch failure surfaces a warning instead of aborting"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} fetch failure surfaces a warning instead of aborting"
+    echo "  output: $out42"
+fi
+
+# ============================================================
+# 43. Signaling "unknown currency" honestly: a fixture with NO origin remote
+#     at all (loom_default_branch cannot resolve a default branch) still
+#     completes normally, and the final installed line says so explicitly
+#     rather than silently omitting the currency claim.
+# ============================================================
+W43="$BASE_WORKDIR/w43"
+new_fixture "$W43"
+HEAD43="$(cd "$W43" && git rev-parse --short HEAD)"
+NEW_FAKE43="$W43/new-fake-daemon"
+write_fake_daemon "$NEW_FAKE43" "$HEAD43" "$W43/new-marker"
+out43=$( cd "$W43" && PATH="$TEST_PATH" NEW_FAKE_BIN_SRC="$NEW_FAKE43" \
+    bash "$UPDATE_SCRIPT" 2>&1 )
+rc43=$?
+assert_eq "0" "$rc43" "no origin remote at all: update still succeeds"
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$out43" | grep -qi 'currency vs origin/<default-branch> unknown'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} final installed line honestly reports unknown currency when origin is unresolvable"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} final installed line honestly reports unknown currency when origin is unresolvable"
+    echo "  output: $out43"
 fi
 
 # ============================================================

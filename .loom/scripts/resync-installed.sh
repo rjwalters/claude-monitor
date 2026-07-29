@@ -46,6 +46,15 @@
 # still untracked-and-unignored under .loom/ afterward is reported as an audit
 # warning so the pattern list can be extended.
 #
+# In the loom source repo itself (tracked installed surfaces + a local
+# defaults/ tree), a non-dry-run that updates a file leaves the tree dirty
+# until that resync output is committed. If the only remaining dirt is resync
+# output, the summary block prints the exact `git add … && git commit`
+# command to run (#4332) — worth doing, since `main_health_gate.rs`'s
+# dirty-tree check treats byte-identical installed-surface dirt as ignorable
+# (never a reason to skip the gate) but does not commit on the operator's
+# behalf.
+#
 # EXPLICITLY OUT OF SCOPE (never touched by resync — updated by other mechanisms):
 #   .loom/config.json       - operator-owned; needs merge-semantics design
 #   CLAUDE.md               - repo-customized at install; needs managed-section markers
@@ -590,6 +599,51 @@ audit_untracked_loom_paths() {
     warn "If these are Loom runtime state, add them to EPHEMERAL_PATTERNS (loom-daemon/src/init/post_init.rs)."
 }
 audit_untracked_loom_paths
+
+# ---------- hint: stage + commit resync-only dirt (#4332) ----------
+#
+# In the loom source repo itself (DEFAULTS_DIR resolved locally, i.e. this
+# repo tracks its own installed surfaces under git), a resync that changed
+# tracked files leaves the tree dirty until that dirt is committed — and
+# `main_health_gate.rs`'s dirty-tree check (#4332) only recognizes it as safe
+# *resync* dirt (ignorable, not an operator edit worth halting the gate for),
+# it never commits on the operator's behalf. Print the exact command so this
+# doesn't linger as a standing "not evaluated (dirty-tree)" skip. Cheap and
+# best-effort: only fires when every dirty/untracked path is one this run's
+# surfaces cover (or the re-stamped install-metadata.json); any other dirt
+# (a genuine operator edit) suppresses the hint entirely.
+suggest_commit_if_resync_only_dirt() {
+    [[ "$REPO_ROOT/defaults" == "$DEFAULTS_DIR" ]] || return 0
+    local status
+    status="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)"
+    [[ -z "$status" ]] && return 0
+
+    local line path
+    local -a resync_paths=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        path="${line:3}"
+        [[ "$path" == *" -> "* ]] && path="${path##* -> }"
+        path="${path%\"}"
+        path="${path#\"}"
+        case "$path" in
+            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json)
+                resync_paths+=("$path")
+                ;;
+            *)
+                # Non-resync dirt present — do not suggest a commit that would
+                # also stage an unrelated (possibly operator) change.
+                return 0
+                ;;
+        esac
+    done <<< "$status"
+    [[ "${#resync_paths[@]}" -eq 0 ]] && return 0
+
+    echo ""
+    note "${BLUE}[resync] The tree is dirty with only resync output above — stage and commit it so the main-health gate doesn't skip on it:${NC}"
+    printf '%b\n' "    ${BOLD}git add ${resync_paths[*]} && git commit -m 'chore: resync installed Loom surfaces'${NC}"
+}
+[[ "$DRY_RUN" -eq 1 ]] || suggest_commit_if_resync_only_dirt
 
 # ---------- summary ----------
 

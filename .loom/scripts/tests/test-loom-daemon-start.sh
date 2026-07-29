@@ -563,6 +563,113 @@ out=$( LOOM_LAUNCHD_DOMAIN="gui/${UID_NOW}" PATH="$DOMAIN_STUB_DIR/nogui:$PATH" 
     bash -c "source '$LAUNCHD_DOMAIN_LIB'; resolve_launchd_domain" )
 assert_eq "gui/${UID_NOW}" "$out" "override to a non-resolving domain is honored verbatim (no silent fallback)"
 
+# ---------- safehouse fleet-comms status surfacing (#4345) ----------
+# One-line static visibility check at start time: `loom-daemon-start.sh` can
+# only tell "configured" from "not configured" (a live connection needs the
+# daemon's own socket -- `loom-daemon status` covers that, see
+# .loom/docs/safehouse.md "New-host onboarding"). Uses the nohup fallback path
+# (--no-launchd --no-systemd) so this never touches real launchd/systemd, and a
+# background daemon fake bin that stays alive long enough for the "started"
+# banner (which the safehouse line is printed alongside) to run.
+SH_BG_FAKE_BIN="$WORKDIR/fake-loom-daemon-safehouse-bg"
+cat > "$SH_BG_FAKE_BIN" <<'EOF'
+#!/usr/bin/env bash
+sleep 5
+EOF
+chmod +x "$SH_BG_FAKE_BIN"
+
+# SH1. No `safehouse` block at all -> "not configured".
+SH1_HOME="$(mktemp -d)"
+mkdir -p "$SH1_HOME/.loom"
+sh1_out=$( ( cd "$SH1_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
+    LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
+    LOOM_SOCKET_PATH="$SH1_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$SH1_HOME/.loom/autonomy-desired" \
+    LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh1-watchdog" \
+    bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$sh1_out" | grep -q '^Safehouse:.*not configured'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} safehouse: no config block -> 'not configured' (#4345)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} safehouse: no config block -> 'not configured' (#4345)"
+    echo "  output: $sh1_out"
+fi
+if [[ -f "$SH1_HOME/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$SH1_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+rm -rf "$SH1_HOME"
+
+# SH2. safehouse.enabled=true + socket configured but the path does not exist
+#      -> "configured, unreachable" (stderr warn -- captured via 2>&1).
+SH2_HOME="$(mktemp -d)"
+mkdir -p "$SH2_HOME/.loom"
+cat > "$SH2_HOME/.loom/config.json" <<EOF
+{"safehouse": {"enabled": true, "socket": "$SH2_HOME/.loom/does-not-exist.sock"}}
+EOF
+sh2_out=$( ( cd "$SH2_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
+    LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
+    LOOM_SOCKET_PATH="$SH2_HOME/.loom/loom-daemon.sock" \
+    LOOM_AUTONOMY_MARKER="$SH2_HOME/.loom/autonomy-desired" \
+    LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh2-watchdog" \
+    bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$sh2_out" | grep -q '^Safehouse:.*configured, unreachable' \
+    && echo "$sh2_out" | grep -q 'does-not-exist.sock'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} safehouse: enabled + missing socket -> 'configured, unreachable' with the resolved path (#4345)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} safehouse: enabled + missing socket -> 'configured, unreachable' with the resolved path (#4345)"
+    echo "  output: $sh2_out"
+fi
+if [[ -f "$SH2_HOME/.loom/.daemon.pid" ]]; then
+    kill "$(cat "$SH2_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+fi
+rm -rf "$SH2_HOME"
+
+# SH3. safehouse.enabled=true + socket path IS a real bound AF_UNIX socket file
+#      -> "configured (socket present ...)". Only `bind()`s (no accept loop
+#      needed -- the start wrapper only stat()s the path, it never connects).
+SH3_HOME="$(mktemp -d)"
+mkdir -p "$SH3_HOME/.loom"
+SH3_SOCK="$SH3_HOME/.loom/safehoused.sock"
+if command -v python3 >/dev/null 2>&1 \
+    && python3 -c "
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind('$SH3_SOCK')
+" 2>/dev/null; then
+    cat > "$SH3_HOME/.loom/config.json" <<EOF
+{"safehouse": {"enabled": true, "socket": "$SH3_SOCK"}}
+EOF
+    sh3_out=$( ( cd "$SH3_HOME" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+        -u LOOM_SAFEHOUSE_ENABLED -u LOOM_SAFEHOUSE_SOCKET -u SAFEHOUSED_SOCKET \
+        LOOM_DAEMON_BIN="$SH_BG_FAKE_BIN" \
+        LOOM_SOCKET_PATH="$SH3_HOME/.loom/loom-daemon.sock" \
+        LOOM_AUTONOMY_MARKER="$SH3_HOME/.loom/autonomy-desired" \
+        LOOM_WATCHDOG_LABEL="com.example.loom-sandbox-$$-sh3-watchdog" \
+        bash "$START_SCRIPT" --no-launchd --no-systemd 2>&1 ) )
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if echo "$sh3_out" | grep -q '^Safehouse:.*configured (socket present'; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} safehouse: enabled + socket file present -> 'configured (socket present ...)' (#4345)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} safehouse: enabled + socket file present -> 'configured (socket present ...)' (#4345)"
+        echo "  output: $sh3_out"
+    fi
+    if [[ -f "$SH3_HOME/.loom/.daemon.pid" ]]; then
+        kill "$(cat "$SH3_HOME/.loom/.daemon.pid" 2>/dev/null)" 2>/dev/null || true
+    fi
+else
+    echo "  (skipping SH3: python3 AF_UNIX bind unavailable on this host)"
+fi
+rm -rf "$SH3_HOME"
+
 # ---------- summary ----------
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
