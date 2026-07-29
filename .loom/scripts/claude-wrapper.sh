@@ -70,8 +70,53 @@ STARTUP_GRACE_PERIOD="${LOOM_STARTUP_GRACE_PERIOD:-20}"
 
 # Terminal identification for stop signals
 TERMINAL_ID="${LOOM_TERMINAL_ID:-}"
-# Note: WORKSPACE may fail if CWD is invalid at startup - recover_cwd handles this
-WORKSPACE="${LOOM_WORKSPACE:-$(pwd 2>/dev/null || echo "$HOME")}"
+# Note: WORKSPACE may fail if CWD is invalid at startup - recover_cwd handles this.
+# Fallback is /tmp, NOT $HOME (issue #3980): $HOME is outside the daemon's TCC-safe
+# working-set contract (workspace roots + .loom + .claude* + /private/tmp) and
+# landing a spawned `claude` child there triggers macOS folder-access prompts for
+# Desktop/Documents/Downloads/Photos/Music/iCloud on an unsigned launchd binary.
+WORKSPACE="${LOOM_WORKSPACE:-$(pwd 2>/dev/null || echo "/tmp")}"
+
+# Python interpreter — still used by several NON-token helpers further down
+# this script (auth-status caching, MCP config parsing). The token-path
+# account-rotation calls (mark-bad / re-select, #3738) were cut over to the
+# native `loom-daemon tokens` CLI in issue #4228 (epic #4081 Phase 2) and no
+# longer consult this variable.
+LOOM_PYTHON="${LOOM_PYTHON:-python3}"
+# The account name whose OAuth token is currently exported. spawn-claude.sh
+# exports LOOM_TOKEN_NAME before exec'ing this wrapper; when the wrapper is
+# invoked directly (token pre-set by some other caller) it is derived by
+# content-matching the token against the pool at rotation time.
+ACTIVE_TOKEN_NAME="${LOOM_TOKEN_NAME:-}"
+
+# Directory of this script — used to source the shared error classifier and
+# to locate the native `loom-daemon` binary for the mark-bad / re-select
+# calls (#3738, cut over to `loom-daemon tokens` in #4228).
+_WRAPPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source the shared error classifier so the wrapper's account-exhaustion
+# detection stays byte-identical to spawn-claude's classification — the two
+# patterns must NOT drift (issue #3738). Resolved relative to this script so it
+# works from both the installed .loom/scripts copy and the tracked
+# defaults/scripts source. If absent (older install), is_account_exhaustion
+# falls back to an inline regex.
+if [[ -f "${_WRAPPER_DIR}/lib/classify-error.sh" ]]; then
+    # shellcheck source=lib/classify-error.sh
+    # shellcheck disable=SC1091
+    source "${_WRAPPER_DIR}/lib/classify-error.sh"
+fi
+
+# Source the shared loom-daemon binary resolver (issue #4228) so account
+# rotation's mark-bad / re-select calls resolve the SAME binary
+# probe-tokens.sh / spawn-claude.sh do: $LOOM_DAEMON_BIN -> `loom-daemon` on
+# PATH -> build-output-relative candidates under the repo. If absent (older
+# install mid-resync), rotate_exhausted_account / reselect_account_no_mark
+# fail soft (return 1, same observable behavior as a Python selection error).
+if [[ -f "${_WRAPPER_DIR}/lib/locate-daemon-bin.sh" ]]; then
+    # shellcheck source=lib/locate-daemon-bin.sh
+    # shellcheck disable=SC1091
+    source "${_WRAPPER_DIR}/lib/locate-daemon-bin.sh"
+fi
 
 # Whether --dangerously-skip-permissions was passed (detected in main())
 SKIP_PERMISSIONS_MODE=false
@@ -242,6 +287,15 @@ clear_retry_state() {
 # Recover from deleted working directory
 # This handles the case where the agent's worktree is deleted while it's running
 # (e.g., by loom-clean, merge-pr.sh, or agent-destroy.sh)
+#
+# NOTE (issue #3980): $HOME is deliberately NOT a recovery target. The daemon's
+# TCC-safe working-set contract is workspace roots + .loom + .claude* +
+# /private/tmp — $HOME is outside it. Landing a spawned `claude` child (and any
+# subsequent relative-path tool calls it makes) in $HOME risks macOS folder-access
+# prompts for Desktop/Documents/Downloads/Photos/Music/iCloud under launchd, where
+# the daemon is its own TCC-responsible process (unlike the old nohup-from-terminal
+# model, which silently inherited the terminal app's grants). /tmp is TCC-safe and
+# serves the same "always exists, always cd-able" purpose.
 recover_cwd() {
     # Check if current directory is still valid
     if pwd &>/dev/null 2>&1; then
@@ -267,13 +321,7 @@ recover_cwd() {
         fi
     fi
 
-    # Last resort: home directory
-    if cd "$HOME" 2>/dev/null; then
-        log_warn "Recovered to HOME (worktree likely removed): $HOME"
-        return 0
-    fi
-
-    # Absolute last resort: /tmp
+    # Last resort: /tmp (TCC-safe; see NOTE above — never $HOME)
     if cd /tmp 2>/dev/null; then
         log_warn "Recovered to /tmp (all other recovery paths failed)"
         return 0
@@ -328,16 +376,24 @@ resolve_mcp_workspace() {
 
 # Pre-flight check: verify MCP server can start
 # Attempts to launch the mcp-loom Node.js server and checks for the startup
-# message on stderr. If the dist/ directory is missing or stale, attempts
-# a rebuild before retrying.
+# message on stderr. If the built bundle is missing, or is stale (older than
+# any file under the sibling src/ tree), it rebuilds before the smoke test; a
+# smoke-test failure also triggers a rebuild-and-retry.
 check_mcp_server() {
     local mcp_workspace
     mcp_workspace=$(resolve_mcp_workspace)
 
     local mcp_config="${mcp_workspace}/.mcp.json"
     if [[ ! -f "${mcp_config}" ]]; then
-        log_warn "MCP config not found at ${mcp_config} - skipping MCP pre-flight"
-        return 0  # Non-fatal: MCP may not be configured
+        # Non-fatal skip. Absent .mcp.json is now the NORMAL, healthy state under
+        # user-scope `loom` registration (#4230, epic #3835 Phase 3c): the loom
+        # server is machine-level, not project-scoped, so there is no per-repo
+        # config to smoke-test here. The per-session bundle-staleness gate this
+        # skip removes moves to `loom update` (which rebuilds the served
+        # mcp-loom bundle for every repo at once). This skip must NOT be promoted
+        # to a failure — doing so would spuriously fail every migrated repo.
+        log_warn "MCP config not found at ${mcp_config} - skipping MCP pre-flight (expected under user-scope loom, #4230)"
+        return 0  # Non-fatal: MCP may not be configured (or is user-scoped)
     fi
 
     # Extract the MCP server entry point from .mcp.json
@@ -365,6 +421,25 @@ for name, srv in servers.items():
         log_warn "MCP entry point missing: ${mcp_entry}"
         _try_mcp_rebuild "${mcp_entry}"
         return $?
+    fi
+
+    # Staleness check: a bundle older than any file under the sibling src/ tree
+    # is startable but lacks recent fixes (a smoke test passes on it silently).
+    # Rebuild before the smoke test. This mirrors the predicate in
+    # scripts/setup-mcp.sh (the one-shot .mcp.json generator) exactly so the two
+    # gates cannot drift (issue #4043). Rebuild failure on an otherwise-startable
+    # bundle is non-fatal — fall through to the smoke test below.
+    local mcp_src
+    mcp_src="$(dirname "$(dirname "${mcp_entry}")")/src"
+    if [[ -d "${mcp_src}" ]] && \
+       [[ -n "$(find "${mcp_src}" -type f -newer "${mcp_entry}" -print -quit 2>/dev/null)" ]]; then
+        log_warn "MCP bundle is stale (src newer than dist) - rebuilding: ${mcp_entry}"
+        if ! _try_mcp_rebuild "${mcp_entry}"; then
+            log_warn "MCP rebuild for stale bundle failed - continuing with existing bundle"
+        else
+            # Rebuild succeeded and already re-verified the smoke test.
+            return 0
+        fi
     fi
 
     # Smoke test: start MCP server and verify it emits the startup message
@@ -824,6 +899,15 @@ is_transient_error() {
         "MCP.*failed"
         "plugins failed"
         "plugin.*failed to install"
+        # Issue #4255: the Claude CLI's bare `Execution error` fatal. This is the
+        # single most common unattended-death signature — 21% of daemon sweep
+        # logs terminated on it — yet it matched NONE of the patterns above, and
+        # because the CLI prints it (non-empty output) the empty-output-with-
+        # exit-1 heuristic below never fired either, so the wrapper died on
+        # attempt 1 without a single retry. Treat it as transient/retryable
+        # (bounded by MAX_RETRIES): it is an opaque transport/harness fault, not
+        # a deterministic build failure, so a retry frequently succeeds.
+        "Execution error"
     )
 
     for pattern in "${patterns[@]}"; do
@@ -840,6 +924,236 @@ is_transient_error() {
     fi
 
     return 1
+}
+
+# Issue #4255: emit a structured, self-diagnosing block when the wrapper gives
+# up on a child PERMANENTLY (a non-transient error, or the retry budget
+# exhausted). Before this, a daemon-dispatched sweep that died left only the
+# child's raw output — often the single opaque line `Execution error` — in
+# `.loom/logs/sweep-issue-<N>.log`, with no exit code, no error classification,
+# and no stderr context, so every forensic pass had to guess. This records the
+# exit code, the `classify-error.sh` verdict, and the tail of the captured
+# stdout+stderr so a permanent death is diagnosable straight from the sweep log.
+#
+#   log_permanent_death <exit_code> <output> [reason]
+LOOM_DEATH_TAIL_LINES="${LOOM_DEATH_TAIL_LINES:-20}"
+log_permanent_death() {
+    local exit_code="$1"
+    local output="$2"
+    local reason="${3:-permanent failure}"
+
+    local classification="UNCLASSIFIED"
+    if declare -F classify_error >/dev/null 2>&1; then
+        classification="$(classify_error "${output}" "${exit_code}" 2>/dev/null || echo "UNCLASSIFIED")"
+    fi
+
+    local tail_text
+    tail_text="$(printf '%s\n' "${output}" | tail -n "${LOOM_DEATH_TAIL_LINES}")"
+
+    log_error "=== claude-wrapper: permanent death (${reason}) ==="
+    log_error "exit_code=${exit_code} classification=${classification}"
+    log_error "stderr/stdout tail (last ${LOOM_DEATH_TAIL_LINES} lines):"
+    # Emit the tail as discrete log lines so timestamps and the [ERROR] prefix
+    # bracket the captured block in the sweep log.
+    while IFS= read -r _line; do
+        log_error "  | ${_line}"
+    done <<< "${tail_text}"
+    log_error "=== end permanent-death diagnostics ==="
+}
+
+# --- Account rotation on usage/session-limit exhaustion (issue #3738) ---
+#
+# When the active OAuth account hits a session / weekly / usage limit, the
+# right response is NOT to die (the historical behaviour: the RATE_LIMIT_ABORT
+# sentinel was classified fatal, killing the whole worker) and NOT to burn a
+# transient-backoff retry against the same, now-exhausted account. Instead we
+# mark the account exhausted, re-run Loom token selection (which now skips it),
+# and retry on a fresh account WITHOUT consuming a MAX_RETRIES attempt. The
+# pool is finite and each rotation marks one account bad, so this terminates:
+# when selection reports no eligible account we emit a distinct
+# ACCOUNT_POOL_EXHAUSTED sentinel and exit non-zero.
+
+# Return 0 if the captured output indicates the active account is exhausted.
+is_account_exhaustion() {
+    local output="$1"
+    local exit_code="${2:-1}"
+
+    # The output/startup monitors kill the CLI and emit this sentinel on the
+    # interactive usage/plan-limit modal and the 100%-weekly banner. Treat it
+    # as exhaustion regardless of what the classifier makes of the text.
+    if echo "${output}" | grep -q "RATE_LIMIT_ABORT"; then
+        return 0
+    fi
+
+    # Otherwise defer to the shared classifier (widened TOKEN_EXHAUSTED set).
+    # Fall back to an inline regex if the classifier lib was not sourced.
+    if declare -F classify_error >/dev/null 2>&1; then
+        [[ "$(classify_error "${output}" "${exit_code}")" == "TOKEN_EXHAUSTED" ]]
+        return
+    fi
+    [[ "${exit_code}" -ne 0 ]] && echo "${output}" \
+        | grep -qiE "hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage"
+}
+
+# Return 0 if the captured output indicates a concurrent-session-limit fault
+# (#3947): the active account is healthy but cannot start another simultaneous
+# session right now. This is a capacity signal from per-token session stacking,
+# NOT quota exhaustion — the caller re-selects a different account WITHOUT
+# marking the current one bad. Defers to the shared classifier's distinct
+# SESSION_LIMIT category, with an inline regex fallback if the lib wasn't sourced.
+is_account_session_limit() {
+    local output="$1"
+    local exit_code="${2:-1}"
+
+    if declare -F classify_error >/dev/null 2>&1; then
+        [[ "$(classify_error "${output}" "${exit_code}")" == "SESSION_LIMIT" ]]
+        return
+    fi
+    [[ "${exit_code}" -ne 0 ]] && echo "${output}" \
+        | grep -qiE "concurrent (session|sessions|request)|maximum number of concurrent|too many concurrent|simultaneous session|another session is (already )?(active|running)"
+}
+
+# Re-select a DIFFERENT rotation account WITHOUT marking the current one bad
+# (#3947). Used for concurrent-session-limit faults: the account isn't broken,
+# it just can't take another simultaneous session, so we spread to a sibling
+# and retry. Advances the rotation cursor (native `loom-daemon tokens select`,
+# cut over from `loom_tools.tokens.select` in issue #4228) so a healthy
+# sibling is preferred over re-picking the saturated account. Returns 0 when a
+# new token was exported, 1 when selection yielded nothing (including "no
+# loom-daemon binary resolved" — the same observable failure a broken Python
+# selector used to produce).
+reselect_account_no_mark() {
+    local ws daemon_bin
+    ws="$(_resolve_token_workspace)"
+    daemon_bin="$(declare -F loom_locate_daemon_bin >/dev/null 2>&1 && loom_locate_daemon_bin "${ws}" || true)"
+    if [[ -z "${daemon_bin}" ]]; then
+        log_warn "No loom-daemon binary resolved — cannot re-select an OAuth account"
+        return 1
+    fi
+
+    local sel_output _sel_rc
+    set +e
+    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export 2>/dev/null)"
+    _sel_rc=$?
+    set -e
+    if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
+        return 1
+    fi
+
+    # `--export` emits shell-evalable `export CLAUDE_CODE_OAUTH_TOKEN=...` /
+    # `export LOOM_TOKEN_NAME=...` lines (issue #4228) — no more round-trip
+    # through `python3 -c 'import json...'` to pull the two fields back out.
+    eval "${sel_output}"
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        return 1
+    fi
+
+    ACTIVE_TOKEN_NAME="${LOOM_TOKEN_NAME:-}"
+    log_info "Re-selected OAuth account → '${ACTIVE_TOKEN_NAME}' after concurrent-session limit (token NOT marked bad)"
+    return 0
+}
+
+# Echo a short human phrase describing why the account was considered
+# exhausted (used as the .bad_tokens reason string).
+_exhaustion_phrase() {
+    local output="$1"
+    if echo "${output}" | grep -q "RATE_LIMIT_ABORT"; then
+        echo "usage/plan limit modal (RATE_LIMIT_ABORT)"
+        return
+    fi
+    local m
+    m="$(echo "${output}" | grep -ioE "hit your (limit|session limit|weekly limit)|monthly usage limit|out of extra usage|used 100% of your weekly limit" | head -1)"
+    echo "${m:-usage limit}"
+}
+
+# Resolve the workspace whose .loom/tokens/ holds the account pool. Mirrors
+# spawn-claude.sh: LOOM_WORKSPACE wins, else the canonical repo root (so a
+# worktree shares the main checkout's token pool), else the wrapper's WORKSPACE.
+_resolve_token_workspace() {
+    if [[ -n "${LOOM_WORKSPACE:-}" ]]; then
+        printf '%s\n' "${LOOM_WORKSPACE}"
+        return
+    fi
+    local gcd
+    if gcd="$(git rev-parse --git-common-dir 2>/dev/null)"; then
+        [[ "${gcd}" = /* ]] || gcd="$(cd "${gcd}" && pwd 2>/dev/null || echo "${gcd}")"
+        printf '%s\n' "$(dirname "${gcd}")"
+        return
+    fi
+    printf '%s\n' "${WORKSPACE}"
+}
+
+# Fallback identification of the active account when LOOM_TOKEN_NAME is unset:
+# content-match the exported token against .loom/tokens/*.token. Deterministic
+# (exact content compare) — deliberately avoids lean-genius's `ls -t | head -1`
+# mtime heuristic, which mispicks the wrong account under concurrent spawns.
+_derive_token_name() {
+    local ws="$1" tok="$2"
+    [[ -n "${tok}" ]] || return 1
+    local tokens_dir="${ws}/.loom/tokens" f content
+    [[ -d "${tokens_dir}" ]] || return 1
+    for f in "${tokens_dir}"/*.token; do
+        [[ -e "${f}" ]] || continue
+        content="$(cat "${f}" 2>/dev/null)"
+        if [[ "${content}" == "${tok}" ]]; then
+            basename "${f}" .token
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Mark the active account exhausted in .loom/tokens/.bad_tokens, then re-run
+# Loom token selection (which now skips it) and re-export
+# CLAUDE_CODE_OAUTH_TOKEN. Reuses the existing Loom primitives via the native
+# `loom-daemon tokens mark-bad` / `tokens select` CLI (cut over from
+# `loom_tools.tokens.bad_tokens.mark_bad` + `loom_tools.tokens.select` in
+# issue #4228) rather than reimplementing lean-genius's raw file-glob.
+# Returns 0 on success (a new account is exported), 1 when the pool has no
+# eligible account left (or no loom-daemon binary resolves).
+rotate_exhausted_account() {
+    local reason="$1"
+    local ws daemon_bin
+    ws="$(_resolve_token_workspace)"
+    daemon_bin="$(declare -F loom_locate_daemon_bin >/dev/null 2>&1 && loom_locate_daemon_bin "${ws}" || true)"
+
+    if [[ -z "${ACTIVE_TOKEN_NAME}" ]]; then
+        ACTIVE_TOKEN_NAME="$(_derive_token_name "${ws}" "${CLAUDE_CODE_OAUTH_TOKEN:-}" || true)"
+    fi
+
+    if [[ -z "${daemon_bin}" ]]; then
+        log_warn "No loom-daemon binary resolved — cannot mark '${ACTIVE_TOKEN_NAME:-unknown}' bad or re-select"
+        return 1
+    fi
+
+    if [[ -n "${ACTIVE_TOKEN_NAME}" ]]; then
+        if "${daemon_bin}" tokens mark-bad "${ACTIVE_TOKEN_NAME}" \
+            --reason "exhausted: ${reason}" --workspace "${ws}" >/dev/null 2>&1; then
+            log_info "Marked account '${ACTIVE_TOKEN_NAME}' exhausted in .bad_tokens (${reason})"
+        else
+            log_warn "Could not record '${ACTIVE_TOKEN_NAME}' in .bad_tokens (continuing to re-select)"
+        fi
+    else
+        log_warn "Active account name unknown — cannot mark it bad; re-selecting anyway"
+    fi
+
+    local sel_output _sel_rc
+    set +e
+    sel_output="$("${daemon_bin}" tokens select --workspace "${ws}" --export 2>/dev/null)"
+    _sel_rc=$?
+    set -e
+    if [[ ${_sel_rc} -ne 0 || -z "${sel_output}" ]]; then
+        return 1
+    fi
+
+    eval "${sel_output}"
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+        return 1
+    fi
+
+    ACTIVE_TOKEN_NAME="${LOOM_TOKEN_NAME:-}"
+    log_info "Rotated OAuth account → '${ACTIVE_TOKEN_NAME}' (token tail=…${CLAUDE_CODE_OAUTH_TOKEN: -4})"
+    return 0
 }
 
 # Check if error output specifically indicates an MCP/plugin failure.
@@ -1172,9 +1486,22 @@ start_startup_monitor() {
                                 break
                             fi
                         done
+                    elif [[ ! -f "${mcp_json}" ]]; then
+                        # No project .mcp.json at all. Under user-scope `loom`
+                        # registration (#4230, epic #3835 Phase 3c) the loom
+                        # server is machine-level (registered via `claude mcp add
+                        # --scope user`), not project-scoped, so there are NO
+                        # project MCP servers to verify beyond loom — and loom
+                        # already connected (loom_connected==true above). So this
+                        # is the healthy user-scope path: continue. Killing here
+                        # (the pre-#4230 conservative behavior) would wedge every
+                        # no-.mcp.json repo in a pointless restart loop.
+                        log_info "Startup monitor: no project .mcp.json (user-scope loom server) and loom connected — continuing"
+                        all_project_ok=true
                     else
-                        # Can't determine project MCPs — fall back to
-                        # conservative kill behavior (see issue #2652).
+                        # .mcp.json present but jq missing — can't enumerate the
+                        # project MCPs it declares. Fall back to conservative kill
+                        # behavior (see issue #2652).
                         all_project_ok=false
                     fi
 
@@ -1249,11 +1576,60 @@ format_duration() {
     fi
 }
 
+# _run_via_script <temp_output_file> <cmd...>
+#
+# Runs <cmd...> under script(1) so a TTY-attached retry attempt preserves
+# interactive mode, capturing output to <temp_output_file>. util-linux
+# script(1) and BSD/macOS script(1) take their arguments in incompatible
+# orders. The BSD form `script -q FILE cmd args...` makes util-linux parse
+# the command's own flags as script's, so an agent launched with
+# --dangerously-skip-permissions dies instantly with "script: unrecognized
+# option" and the retry ladder in run_with_retry then burns every attempt on
+# a failure that will never clear.
+#
+# Extracted into its own function (issue #4192) so tests can exercise the
+# calling-convention selection directly, without needing a real TTY on
+# stdin to reach it through run_with_retry's `[ -t 0 ]` branch.
+_run_via_script() {
+    local temp_output="$1"
+    shift
+    if script --version 2>/dev/null | grep -q util-linux; then
+        # util-linux `script -c` exits 0 regardless of the child's exit
+        # status unless `-e`/`--return` is passed, and the retry/error-
+        # classification ladder in run_with_retry keys off `exit_code` --
+        # so `-e` is required, not optional, or every Linux-side claude
+        # failure would silently report success.
+        #
+        # util-linux `script -c` also runs the `-c` string via $SHELL
+        # (falling back to /bin/sh). The `printf '%q'` quoting below is
+        # bash-specific ($'...' ANSI-C strings for newlines/specials), which
+        # dash (/bin/sh on Debian/Ubuntu) cannot parse, and claude args can
+        # contain newlines (prompts). Pin the executing shell to bash for
+        # this one invocation so the quoting round-trips.
+        SHELL=/bin/bash script -q -e -c "$(printf '%q ' "$@")" "${temp_output}"
+    else
+        script -q "${temp_output}" "$@"
+    fi
+}
+
 # Main retry loop with exponential backoff
 run_with_retry() {
     local attempt=1
     local exit_code=0
     local output=""
+    # Account-rotation bookkeeping (#3738). Rotations do NOT consume a
+    # MAX_RETRIES attempt; this independent cap is a loop guard for the
+    # pathological case where the active account can't be identified and marked
+    # bad, so re-selection could otherwise keep returning it forever.
+    local rotations=0
+    local max_rotations="${LOOM_MAX_ACCOUNT_ROTATIONS:-20}"
+    # Concurrent-session-limit bookkeeping (#3947). Distinct from account
+    # rotation: a session-limit fault is a *capacity* signal (the account is
+    # healthy but cannot start another simultaneous session), so we re-select a
+    # DIFFERENT account WITHOUT marking the current one bad and retry. Bounded by
+    # its own cap so a fully-saturated pool doesn't spin forever.
+    local session_limit_retries=0
+    local max_session_limit_retries="${LOOM_MAX_SESSION_LIMIT_RETRIES:-10}"
 
     # Recover CWD if it was deleted before we started
     if ! recover_cwd; then
@@ -1367,7 +1743,7 @@ run_with_retry() {
 
         if [ -t 0 ]; then
             # No prompt, TTY available - use script to preserve interactive mode
-            script -q "${temp_output}" claude "$@"
+            _run_via_script "${temp_output}" claude "$@"
             exit_code=$?
         else
             # No TTY (socket/pipe) - run claude directly, tee output for error detection
@@ -1439,10 +1815,67 @@ run_with_retry() {
 
         log_warn "Claude CLI exited with code ${exit_code}"
 
+        # Concurrent-session-limit fault (#3947) → the active account is healthy
+        # but cannot start another simultaneous session. Re-select a DIFFERENT
+        # account WITHOUT marking this one bad (a capacity fault must not poison
+        # .bad_tokens and shrink the healthy pool) and retry the SAME attempt.
+        # Checked BEFORE is_account_exhaustion so the "session limit" wording is
+        # handled as a capacity signal, not quota exhaustion. Bounded by its own
+        # cap; when exhausted it falls through to the transient-backoff path
+        # (which retries on the next tick without poisoning the token).
+        if is_account_session_limit "${output}" "${exit_code}"; then
+            session_limit_retries=$((session_limit_retries + 1))
+            if [[ "${session_limit_retries}" -le "${max_session_limit_retries}" ]]; then
+                log_warn "Concurrent-session limit hit on '${ACTIVE_TOKEN_NAME:-?}' — backing off stacking for this account and re-selecting (attempt ${attempt}/${MAX_RETRIES} NOT consumed)"
+                if reselect_account_no_mark; then
+                    write_retry_state "running" "${attempt}"
+                    # Brief backoff so a different account's session frees up /
+                    # the cursor spreads load before retrying the same attempt.
+                    sleep "${LOOM_SESSION_LIMIT_BACKOFF:-5}"
+                    continue
+                fi
+                log_warn "Concurrent-session limit hit but re-selection found no alternate account — falling through to transient backoff"
+            else
+                log_warn "Concurrent-session-limit retry cap (${max_session_limit_retries}) reached — falling through to transient backoff (token still NOT marked bad)"
+            fi
+        fi
+
+        # Account exhaustion (session / weekly / usage limit) → rotate to a
+        # different account and retry WITHOUT consuming a MAX_RETRIES attempt
+        # (#3738). Rotation is not transient backoff: charging it against
+        # MAX_RETRIES could burn the whole retry budget before every account
+        # gets a fair shot. Terminates when the pool has no eligible account,
+        # with a distinct ACCOUNT_POOL_EXHAUSTED sentinel (not the generic
+        # "Max retries exceeded" path below).
+        if is_account_exhaustion "${output}" "${exit_code}"; then
+            rotations=$((rotations + 1))
+            if [[ "${rotations}" -gt "${max_rotations}" ]]; then
+                log_error "Account rotation cap (${max_rotations}) exceeded — aborting to avoid a loop"
+                echo "# ACCOUNT_POOL_EXHAUSTED" >&2
+                clear_retry_state
+                return 1
+            fi
+            local _exh_phrase
+            _exh_phrase="$(_exhaustion_phrase "${output}")"
+            log_warn "Account exhaustion detected (${_exh_phrase}) — rotating account (attempt ${attempt}/${MAX_RETRIES} NOT consumed)"
+            if rotate_exhausted_account "${_exh_phrase}"; then
+                write_retry_state "running" "${attempt}"
+                # Retry the SAME attempt number on the fresh account.
+                continue
+            fi
+            log_error "Whole account pool exhausted — every account is marked bad or rate-limited."
+            log_error "Retry after the soonest account reset, or run 'loom-tokens unblock <name>'."
+            echo "# ACCOUNT_POOL_EXHAUSTED" >&2
+            clear_retry_state
+            return 1
+        fi
+
         # Check if this is a transient error worth retrying
         if ! is_transient_error "${output}" "${exit_code}"; then
             log_error "Non-transient error detected - not retrying"
-            log_error "Output: ${output}"
+            # Issue #4255: structured permanent-death diagnostics (exit code +
+            # classification + stderr tail) in place of a bare `Output: ...`.
+            log_permanent_death "${exit_code}" "${output}" "non-transient error"
             clear_retry_state
             return "${exit_code}"
         fi
@@ -1486,7 +1919,10 @@ run_with_retry() {
     done
 
     log_error "Max retries (${MAX_RETRIES}) exceeded"
-    log_error "Last error: ${output}"
+    # Issue #4255: structured permanent-death diagnostics (exit code +
+    # classification + stderr tail) so an exhausted-retry death is diagnosable
+    # from the sweep log instead of only a bare `Last error: ...` line.
+    log_permanent_death "${exit_code}" "${output}" "max retries (${MAX_RETRIES}) exceeded"
     clear_retry_state
 
     # When the last failure was MCP-related, exit with code 7 so the
@@ -1625,5 +2061,12 @@ main() {
     exit "${exit_code}"
 }
 
-# Run main with all script arguments
-main "$@"
+# Run main with all script arguments.
+#
+# CLAUDE_WRAPPER_SOURCE_ONLY lets a test harness `source` this file to reach
+# its function definitions (e.g. _run_via_script, issue #4192) without
+# triggering the full CLI entry point. Unset/any other value preserves
+# exact current behavior -- main always runs.
+if [[ "${CLAUDE_WRAPPER_SOURCE_ONLY:-}" != "1" ]]; then
+    main "$@"
+fi

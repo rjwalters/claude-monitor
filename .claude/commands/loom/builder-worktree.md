@@ -45,6 +45,12 @@ gh issue edit 84 --remove-label "loom:issue" --add-label "loom:building"
 WORKTREE_ABS="$(cd .loom/worktrees/issue-84 && pwd)"
 # -> e.g. /Users/you/repo/.loom/worktrees/issue-84
 
+# 3a. Assert it's really a managed worktree BEFORE any edit — the same two
+#     checks guard-worktree-paths.sh applies to every Edit/Write/Bash write
+#     it confines (#4178):
+[[ -f "$WORKTREE_ABS/.loom-managed" ]] || echo "FATAL: no .loom-managed sentinel"
+[[ "$(git -C "$WORKTREE_ABS" rev-parse --show-toplevel)" == "$WORKTREE_ABS" ]] || echo "FATAL: toplevel mismatch"
+
 # 4. Do your work using ABSOLUTE paths (implement, test, commit)
 #    - Write/Edit: pass "$WORKTREE_ABS/<file>"
 #    - Bash:       git -C "$WORKTREE_ABS" ...  OR  cd "$WORKTREE_ABS" && <cmd>
@@ -84,6 +90,16 @@ silently contaminating main (#3513, recurrence of #2802).
    git -C "$WORKTREE_ABS" status        # changes should be HERE
    ./.loom/scripts/check-main-clean.sh  # backstop: exits 3 if main is dirty
    ```
+
+**A guard denial is not a signal to retry via a different tool.** Two
+independent PreToolUse guards confine writes to your worktree while any
+managed worktree exists: `guard-worktree-paths.sh` on the Edit/Write matcher,
+and `guard-destructive-generic.sh` on the Bash matcher for the common write
+idioms (`>`/`>>` redirection, `tee`, `sed -i`, `cp`/`mv`) (#4178). If one
+denies, the fix is always to re-derive `$WORKTREE_ABS` and use it — never to
+fall back from Edit/Write to a Bash write (or vice versa) for the same target.
+That fallback is exactly how sweep #4063 escaped worktree isolation and edited
+live guard hooks in the main checkout.
 
 ### Collision Detection
 
@@ -339,7 +355,7 @@ done
 ### When to Use Parallel Mode
 
 **Use atomic claiming when:**
-- Multiple Builder agents run simultaneously (Daemon Mode with shepherd pool)
+- Multiple Builder agents run simultaneously (Daemon Mode dispatching parallel sweeps)
 - Risk of two agents picking the same issue
 - Need graceful shutdown capability
 

@@ -660,6 +660,82 @@ else
     echo -e "  ${GREEN}PASS${NC}: merge-pr.sh no longer collapses a failed check-runs fetch to empty JSON"
 fi
 
+# --- Test the no-required-checks fallback (#3720) ---
+# When the repo defines ZERO required status checks, GitHub's
+# enablePullRequestAutoMerge mutation is rejected outright (nothing to queue the
+# merge behind). That rejection matches neither the CLEAN nor the UNSTABLE grep,
+# so pre-#3720 it fell through to the generic terminal error. The #3720 fallback
+# is STRING-INDEPENDENT and self-gating: it fires only when the base branch has
+# NO required status check contexts AND the PR is mergeable (.mergeable == true),
+# in which case an immediate synchronous merge is exactly equivalent to a
+# server-side auto-merge. It preserves the #3664/#3486/#3678 required-check
+# gating BY CONSTRUCTION — any required context present skips the branch.
+echo ""
+echo "Testing the no-required-checks fallback decision (#3720)..."
+
+# Mirror the merge-pr.sh callsite's self-gating predicate. Returns "merge" when
+# the fallback fires (no required checks + mergeable + clean lookup), else
+# "preserve" (the existing CLEAN/UNSTABLE/terminal path stays in charge).
+_nrc_decision() {
+    local required="$1" mergeable="$2" lookup_rc="$3"
+    if [[ "$lookup_rc" -eq 0 ]] && [[ -z "$required" ]] && [[ "$mergeable" == "true" ]]; then
+        echo "merge"
+    else
+        echo "preserve"
+    fi
+}
+
+# Core #3720 case: no required checks + mergeable + successful lookup -> merge.
+assert_eq "merge" "$(_nrc_decision "" "true" 0)" "#3720: no required checks + mergeable -> immediate merge"
+
+# Required checks present -> preserve (UNSTABLE classifier stays in charge). This
+# is the by-construction #3664/#3486/#3678 gating guarantee.
+assert_eq "preserve" "$(_nrc_decision "Code Ownership" "true" 0)" "#3720: required checks present -> fallback does NOT fire (gating preserved)"
+assert_eq "preserve" "$(_nrc_decision $'Code Ownership\nRequired Build' "true" 0)" "#3720: multiple required checks -> fallback does NOT fire"
+
+# Not mergeable -> preserve (a conflicting PR must not be force-merged).
+assert_eq "preserve" "$(_nrc_decision "" "false" 0)" "#3720: no required checks but NOT mergeable -> preserve"
+
+# .mergeable still null (GitHub not yet computed / jq // empty) -> preserve.
+assert_eq "preserve" "$(_nrc_decision "" "" 0)" "#3720: mergeable unknown (empty) -> preserve (do not merge blind)"
+
+# Lookup failure (nonzero exit) -> fail closed even when required is empty.
+assert_eq "preserve" "$(_nrc_decision "" "true" 1)" "#3720: required-checks lookup failure -> fail closed (preserve)"
+
+# End-to-end with the real helper (GitHub stub): a branch with no protection
+# rule yields empty required contexts, so a mergeable PR fires the fallback.
+required="$(forge_get_required_status_check_contexts "owner/repo" "no-protection-branch" "$STUB_DIR/gh")"
+assert_eq "merge" "$(_nrc_decision "$required" "true" 0)" "#3720: GitHub no-protection branch + mergeable -> fallback fires (real helper)"
+
+# End-to-end with the real helper: a branch WITH required contexts preserves.
+required="$(forge_get_required_status_check_contexts "owner/repo" "main" "$STUB_DIR/gh")"
+assert_eq "preserve" "$(_nrc_decision "$required" "true" 0)" "#3720: GitHub protected branch with required contexts -> preserve (real helper)"
+
+# Assert the merge-pr.sh source actually wires the #3720 fallback so a refactor
+# that drops it fails this test. The fallback must be STRING-INDEPENDENT: it
+# calls forge_get_required_status_check_contexts and checks .mergeable rather
+# than grepping AUTO_MERGE_OUTPUT.
+if grep -q '_NRC_REQUIRED' "$MERGE_PR_SRC" && grep -q 'no required status checks' "$MERGE_PR_SRC"; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh wires the #3720 no-required-checks fallback"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: merge-pr.sh missing the #3720 no-required-checks fallback"
+fi
+# The #3720 fallback must sit BEFORE the CLEAN/UNSTABLE greps so the
+# zero-required-checks rejection (which matches neither) is caught first.
+_nrc_line=$(grep -n '_NRC_REQUIRED=' "$MERGE_PR_SRC" | head -1 | cut -d: -f1)
+# Anchor on the actual CLEAN-grep code line (not a comment mention of the
+# substring) so the ordering check reflects execution order.
+_clean_line=$(grep -n 'grep -q "is in clean status"' "$MERGE_PR_SRC" | head -1 | cut -d: -f1)
+if [[ -n "$_nrc_line" ]] && [[ -n "$_clean_line" ]] && [[ "$_nrc_line" -lt "$_clean_line" ]]; then
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: #3720 fallback is inserted BEFORE the clean/unstable greps"
+else
+    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: #3720 fallback must precede the clean/unstable greps (nrc=$_nrc_line clean=$_clean_line)"
+fi
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

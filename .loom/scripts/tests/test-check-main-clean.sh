@@ -18,6 +18,8 @@
 #   - --baseline FILE ignores pre-existing dirt but flags genuinely-new changes
 #   - missing baseline file falls back to whole-status hard-fail (fail-safe)
 #   - no-arg invocation remains a byte-for-byte whole-status hard-fail (back-compat)
+#   - Loom-owned transient state (.loom/sweep-checkpoint/, etc.) is excluded
+#     internally even when the repo's .gitignore has drifted and omits it (#3778)
 #
 # Usage:
 #   ./.loom/scripts/tests/test-check-main-clean.sh
@@ -213,6 +215,129 @@ else
     fail "expected 2/2, got snapshot=$RC1 baseline=$RC2"
 fi
 
+rm -rf "$REPO"
+
+# ========================================================================
+# cwd-reset contamination stand-in: a NEW TRACKED-FILE change on main (#3719)
+# ========================================================================
+# Tests 12/13 exercise an *untracked* stray file. This case covers the shape
+# builders actually hit: after a cwd reset a repo-relative Write lands a new
+# SOURCE MODULE in the main worktree, and the builder `git add`s it — a staged
+# (tracked) change, not just an untracked one. The baseline backstop must still
+# flag it (exit 3, naming the path) while ignoring a change that was already
+# recorded in the pre-sweep snapshot. This is the detection defense the issue's
+# "test simulating a cwd-reset mid-build" AC retargets at (the prevention guard
+# `guard-worktree-paths.sh` cannot fire on the Task-subagent path — see PR body).
+
+# -------- Test 17: baseline flags a NEW staged source module (exit 3) --------
+echo "Test 17: baseline flags a new tracked-file change, ignores a baselined one"
+REPO=$(make_repo)
+# A change that predates the sweep and IS captured in the snapshot: a staged file.
+printf 'baseline = 1\n' > "$REPO/baseline_mod.py"
+git -C "$REPO" add baseline_mod.py
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 ); RC=$?
+if [[ "$RC" -ne 0 ]]; then fail "Test 17 setup: --snapshot expected 0, got $RC"; fi
+
+# Simulate the cwd-reset trap: a NEW source module written to main root, staged.
+printf 'def widget():\n    return 42\n' > "$REPO/stray_module.py"
+git -C "$REPO" add stray_module.py
+
+out=$( cd "$REPO" && "$SCRIPT" --baseline "$SNAP" 2>&1 ); RC=$?
+offending=$(echo "$out" | sed -n '/Offending changes:/,$p')
+if [[ "$RC" -eq 3 ]] \
+   && echo "$offending" | grep -q "stray_module.py" \
+   && ! echo "$offending" | grep -q "baseline_mod.py"; then
+    pass "exit 3 naming the new staged module, ignoring the baselined change"
+else
+    fail "expected 3 reporting only stray_module.py, got rc=$RC; offending=$offending"
+fi
+rm -rf "$REPO"
+
+# ========================================================================
+# Stale-.gitignore drift: Loom-owned transient state excluded internally (#3778)
+# ========================================================================
+# Reproduces the rjwalters/anvil false positive: a consumer repo whose installed
+# loom-managed .gitignore block predates newer Loom-owned entries (here it omits
+# .loom/sweep-checkpoint/) surfaces the orchestrator's own checkpoint bookkeeping
+# as an untracked path. The backstop must NOT flag that as builder contamination —
+# check-main-clean.sh excludes known Loom-owned transient paths internally,
+# regardless of the consumer's .gitignore currency, while still catching a real
+# stray.
+
+# Build a repo whose .gitignore has DRIFTED: it only ignores .loom/worktrees/,
+# NOT the newer .loom/sweep-checkpoint/ (and friends).
+make_repo_stale_gitignore() {
+    local dir
+    dir=$(mktemp -d)
+    git -C "$dir" init -q
+    git -C "$dir" config user.email t@t.t
+    git -C "$dir" config user.name test
+    printf '.loom/worktrees/\n' > "$dir/.gitignore"   # note: no sweep-checkpoint entry
+    # A real consumer repo has committed files under .loom/ (scripts, config), so
+    # git reports newly-untracked transients at full granularity
+    # (?? .loom/sweep-checkpoint/) rather than collapsing the whole dir to
+    # ?? .loom/. Commit a tracked .loom/ file so the fixture mirrors that.
+    mkdir -p "$dir/.loom"
+    echo '{}' > "$dir/.loom/config.json"
+    git -C "$dir" add .gitignore .loom/config.json
+    git -C "$dir" commit -q -m init
+    echo "$dir"
+}
+
+# -------- Test 18: Loom transient present + stale .gitignore -> exit 0 --------
+echo "Test 18: Loom-owned transient excluded despite stale .gitignore (exit 0)"
+REPO=$(make_repo_stale_gitignore)
+mkdir -p "$REPO/.loom/sweep-checkpoint"
+echo '{"phase":"builder-done"}' > "$REPO/.loom/sweep-checkpoint/issue-1.json"
+mkdir -p "$REPO/.loom/tokens"
+echo "secret" > "$REPO/.loom/tokens/agent-1.token"
+touch "$REPO/.loom-managed"
+# Sanity: without the internal filter these WOULD show as untracked dirt.
+if [[ -z "$(git -C "$REPO" status --porcelain)" ]]; then
+    fail "Test 18 setup: expected untracked Loom transients in a stale-gitignore repo"
+fi
+( cd "$REPO" && "$SCRIPT" >/dev/null 2>&1 ); RC=$?
+if [[ "$RC" -eq 0 ]]; then
+    pass "exit 0 with only Loom-owned transient state present (stale .gitignore)"
+else
+    fail "expected 0 (Loom transients filtered), got $RC"
+fi
+
+# -------- Test 19: Loom transient + real stray -> exit 3 naming only the stray --------
+echo "Test 19: real stray still flagged, Loom transient not (exit 3)"
+echo "real contamination" > "$REPO/stray_source.py"
+out=$( cd "$REPO" && "$SCRIPT" 2>&1 ); RC=$?
+if [[ "$RC" -eq 3 ]] \
+   && echo "$out" | grep -q "stray_source.py" \
+   && ! echo "$out" | grep -q "sweep-checkpoint" \
+   && ! echo "$out" | grep -q ".loom-managed"; then
+    pass "exit 3 naming the real stray, excluding Loom transients"
+else
+    fail "expected 3 reporting only stray_source.py, got rc=$RC; out=$out"
+fi
+rm -rf "$REPO"
+
+# -------- Test 20: baseline mode also excludes a mid-sweep checkpoint --------
+echo "Test 20: baseline mode ignores a checkpoint created after the snapshot (#3778)"
+REPO=$(make_repo_stale_gitignore)
+# Snapshot BEFORE the sweep writes any checkpoint (the checkpoint dir is created
+# during the sweep, so it cannot be in the pre-sweep baseline).
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 ); RC=$?
+if [[ "$RC" -ne 0 ]]; then fail "Test 20 setup: --snapshot expected 0, got $RC"; fi
+# Now the orchestrator writes a checkpoint (its own bookkeeping) AND a builder
+# genuinely contaminates main with a new source file.
+echo '{"phase":"judge-done"}' > "$REPO/.loom/sweep-checkpoint/issue-1.json"
+echo "def widget(): return 42" > "$REPO/leaked_module.py"
+out=$( cd "$REPO" && "$SCRIPT" --baseline "$SNAP" 2>&1 ); RC=$?
+if [[ "$RC" -eq 3 ]] \
+   && echo "$out" | grep -q "leaked_module.py" \
+   && ! echo "$out" | grep -q "sweep-checkpoint"; then
+    pass "exit 3 flags the real leak, ignores the mid-sweep checkpoint"
+else
+    fail "expected 3 reporting only leaked_module.py, got rc=$RC; out=$out"
+fi
 rm -rf "$REPO"
 
 # -------- Summary --------

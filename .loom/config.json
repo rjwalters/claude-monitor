@@ -8,6 +8,18 @@
       "known_hosts": []
     }
   },
+  "runtimes": {
+    "default": "claude"
+  },
+  "safehouse": {
+    "enabled": false,
+    "socket": null,
+    "room": null,
+    "persona": "loom_daemon",
+    "workerPersonas": [],
+    "mcpCommand": "safehouse-mcp",
+    "peerClaimTtlSecs": 120
+  },
   "health_monitoring": {
     "enabled": true,
     "collect_interval_minutes": 5,

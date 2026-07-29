@@ -75,12 +75,20 @@ USAGE:
     check-duplicate.sh --title "Issue title" [--body "Issue body"]
     check-duplicate.sh --threshold 50 --title "Title"
     check-duplicate.sh --include-merged-prs --title "Title"
+    check-duplicate.sh --issue 42 --title "Title"
 
 OPTIONS:
     --title TEXT            The title of the issue to check
     --body TEXT             The body/description of the issue (optional)
     --threshold NUM         Similarity threshold percentage (default: 60)
     --include-merged-prs    Also check recently merged PRs and closed issues
+    --issue N               Also probe for OPEN issues/PRs that cross-reference
+                             issue N (GitHub timeline API). Curator use --
+                             surfaces "related open work" distinct from
+                             duplicates: open items that may already argue for
+                             a different spec for N. GitHub-only; a non-GitHub
+                             forge or API failure skips the probe with a
+                             warning rather than failing the whole check.
     --json                  Output results as JSON
     --help                  Show this help message
 
@@ -97,9 +105,12 @@ EXAMPLES:
     # Also check recently merged PRs and closed issues
     check-duplicate.sh --include-merged-prs "Refactor authentication module"
 
+    # Also surface open work that cross-references issue #42
+    check-duplicate.sh --issue 42 --title "Refactor authentication module"
+
 EXIT CODES:
-    0  No duplicates found, safe to create issue
-    1  Potential duplicates found (listed to stdout)
+    0  No duplicates (and, with --issue, no related open work) found
+    1  Potential duplicates (or related open work) found (listed to stdout)
     2  Error (invalid arguments, gh command failed, etc.)
 
 INTEGRATION:
@@ -115,6 +126,14 @@ INTEGRATION:
 
     if ! ./.loom/scripts/check-duplicate.sh --include-merged-prs "$TITLE" "$BODY"; then
         echo "Potential overlap with merged PR or closed issue"
+    fi
+
+    Use with --issue N in the Curator role, before enriching issue N, to
+    surface open cross-referencing work that may already argue for a
+    different spec (issue #4162):
+
+    if ! ./.loom/scripts/check-duplicate.sh --include-merged-prs --issue "$N" "$TITLE" "$BODY"; then
+        echo "Read the DUPLICATE_FOUND / RELATED_OPEN_WORK output before curating"
     fi
 EOF
 }
@@ -337,6 +356,71 @@ search_closed_issues() {
     fi
 }
 
+# Probe for OPEN issues/PRs whose bodies or comments cross-reference the given
+# issue number (issue #4162). This answers a different question than
+# duplicate detection above: not "is this the same issue" but "is there open
+# work that already argues for a different/changed spec for this issue" --
+# e.g. an open issue that critiques/rewrites #N's acceptance criteria via a
+# cross-reference in its body. Uses GitHub's timeline API (the same
+# `cross-referenced` event already used for PR detection in
+# .claude/commands/loom/sweep.md's existing-PR probe), which surfaces every
+# `#N` mention regardless of similarity -- no local text/keyword matching.
+#
+# GitHub-specific. Gracefully degrades (stderr warning, empty result, does
+# NOT fail the whole duplicate check) when `gh` is missing, the repo can't be
+# resolved (e.g. a Gitea remote `gh` doesn't recognize), or the API call
+# fails -- same pattern as search_merged_prs() above.
+#
+# Outputs a JSON array of {number, title, is_pr} for OPEN, same-repo,
+# non-self cross-references, deduped by number. Emits "[]" on any failure.
+search_cross_references() {
+    local issue_num="$1"
+
+    if ! command -v gh &>/dev/null; then
+        print_warning "gh CLI not found; skipping cross-reference probe for #${issue_num}"
+        echo "[]"
+        return 0
+    fi
+
+    local repo_nwo
+    if ! repo_nwo=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>&1); then
+        print_warning "Failed to resolve repository for cross-reference probe (non-GitHub forge?): $repo_nwo"
+        echo "[]"
+        return 0
+    fi
+
+    local timeline
+    if ! timeline=$(gh api "repos/${repo_nwo}/issues/${issue_num}/timeline" --paginate 2>&1); then
+        print_warning "Failed to fetch timeline for #${issue_num}: $timeline"
+        echo "[]"
+        return 0
+    fi
+
+    echo "$timeline" | jq -c --arg repo "$repo_nwo" --argjson self "$issue_num" '
+        [.[] | select(.event == "cross-referenced"
+                       and .source.issue != null
+                       and (.source.issue.repository.full_name // "") == $repo
+                       and .source.issue.number != $self
+                       and .source.issue.state == "open")
+         | {number: .source.issue.number,
+            title: .source.issue.title,
+            is_pr: (.source.issue.pull_request != null)}]
+        | unique_by(.number)
+    ' 2>/dev/null || echo "[]"
+}
+
+# Format a RELATED_OPEN_WORK JSON array (from search_cross_references) into
+# the human-readable lines used by the text-output mode.
+format_related_open_work() {
+    local issue_num="$1"
+    local json_array="$2"
+
+    echo "$json_array" | jq -r --arg n "$issue_num" '
+        .[] | (if .is_pr then "PR #" else "#" end) + (.number | tostring) + ": " + .title +
+              (if .is_pr then " (open PR, cross-references #" else " (open issue, cross-references #" end) + $n + ")"
+    '
+}
+
 # Main function
 main() {
     local title=""
@@ -344,6 +428,7 @@ main() {
     local threshold=60
     local json_output=false
     local include_merged_prs=false
+    local issue=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -366,6 +451,10 @@ main() {
                 ;;
             --include-merged-prs)
                 include_merged_prs=true
+                ;;
+            --issue)
+                shift
+                issue="$1"
                 ;;
             --json)
                 json_output=true
@@ -401,6 +490,12 @@ main() {
     # Validate threshold is a number
     if ! [[ "$threshold" =~ ^[0-9]+$ ]]; then
         print_error "Threshold must be a number"
+        exit 2
+    fi
+
+    # Validate --issue is a number, when given
+    if [[ -n "$issue" ]] && ! [[ "$issue" =~ ^[0-9]+$ ]]; then
+        print_error "--issue must be a number"
         exit 2
     fi
 
@@ -444,11 +539,27 @@ main() {
         fi
     fi
 
+    # Cross-reference probe (--issue N only, issue #4162). Distinct from
+    # duplicate detection above: surfaces OPEN issues/PRs that already
+    # cross-reference N, as "related open work" the Curator must read. Skip
+    # entirely when the base similarity check already hard-failed (exit 2) --
+    # no point probing on top of an already-broken forge call.
+    local related_json="[]"
+    local related_count=0
+    if [[ -n "$issue" && $exit_code -ne 2 ]]; then
+        related_json=$(search_cross_references "$issue")
+        related_count=$(echo "$related_json" | jq 'length' 2>/dev/null || echo 0)
+        if [[ "$related_count" -gt 0 ]]; then
+            exit_code=1
+        fi
+    fi
+
     if $json_output; then
-        if [[ $exit_code -eq 0 ]]; then
-            echo '{"duplicate_found": false, "matches": []}'
-        elif [[ $exit_code -eq 1 ]]; then
-            # Parse duplicates into JSON
+        if [[ $exit_code -eq 2 ]]; then
+            echo '{"error": "Failed to check duplicates"}'
+        else
+            # Parse duplicates into JSON (unconditional -- harmless no-op on
+            # an empty $result, e.g. exit_code 0 or "related work only")
             local matches="[]"
             while IFS= read -r line; do
                 [[ "$line" == "DUPLICATE_FOUND" ]] && continue
@@ -478,15 +589,27 @@ main() {
                 fi
             done <<< "$result"
 
-            echo "{\"duplicate_found\": true, \"matches\": $matches}"
-        else
-            echo '{"error": "Failed to check duplicates"}'
+            if [[ "$related_count" -gt 0 ]]; then
+                local cross_matches
+                cross_matches=$(echo "$related_json" | jq '[.[] | {number, title, similarity: 0, type: "cross_reference"}]')
+                matches=$(echo "$matches" | jq --argjson extra "$cross_matches" '. + $extra')
+            fi
+
+            if [[ "$matches" == "[]" ]]; then
+                echo '{"duplicate_found": false, "matches": []}'
+            else
+                echo "{\"duplicate_found\": true, \"matches\": $matches}"
+            fi
         fi
     else
         if [[ $exit_code -eq 0 ]]; then
             print_success "No duplicates found"
         else
             echo "$result"
+            if [[ "$related_count" -gt 0 ]]; then
+                echo "RELATED_OPEN_WORK"
+                format_related_open_work "$issue" "$related_json"
+            fi
         fi
     fi
 

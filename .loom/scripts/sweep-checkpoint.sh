@@ -12,13 +12,22 @@
 #
 # Checkpoint file format (atomic write via .tmp + mv):
 #   {
-#     "phase": "<curator-done|builder-done|judge-done|doctor-done|merge-done>",
-#     "task_id": "<task identifier, e.g. sweep PID>",
+#     "phase": "<curator-done|builder-done|judge-rejected|judge-done|doctor-done|merge-done>",
+#     "task_id": "<stable per-sweep-run id>",
 #     "timestamp": "<ISO 8601 UTC>",
 #     "pr_number": <int or null>,
 #     "attempt": <int, optional - omitted when not provided; absent means attempt 1>,
 #     "model": "<string, optional - omitted when not provided; absent means default/unknown>"
 #   }
+#
+# The "task_id" field (#3768) identifies the sweep RUN that wrote the checkpoint.
+# It must be a STABLE per-sweep-run id (generated once at sweep start — see
+# sweep-run-registry.sh), NOT the PID of a Bash subshell. The historical
+# `sweep-$$` default was the wrong mental model: `$$` is re-evaluated per Bash
+# tool call within a single sweep, so it could not distinguish one sweep's
+# checkpoints from a concurrent peer sweep's. Callers (defaults/.claude/commands/
+# loom/sweep.md) now pass a stable `--task-id "$RUN_ID"`; the field is free-form,
+# so legacy checkpoints carrying a `sweep-<pid>` task_id still parse cleanly.
 #
 # The "attempt" field (#3481) is forward-compat bookkeeping for model
 # escalation: attempt 1 is the first Builder pass, attempt 2 is the Doctor
@@ -37,6 +46,18 @@
 # Phases are recorded *after* successful completion of the corresponding
 # lifecycle phase, so "curator-done" means the curator phase succeeded for
 # this issue and the next sweep should skip it.
+#
+# "judge-rejected" records a successful request-changes verdict from the
+# Judge that will be followed by another inline Doctor cycle (the initial
+# rejection, or a re-rejection still under sweep.max_doctor_cycles). It
+# REQUIRES `--pr-number` — the PR number is the durable routing key a
+# resumed sweep uses to re-enter the Doctor phase directly, without
+# repeating the Judge pass that already ran. Re-rejections should also
+# carry `--attempt` matching the value the *next* `doctor-done` write will
+# use, so resume re-enters the correct escalation cycle. When the
+# doctor-cycle cap is reached and the PR is instead being blocked, do NOT
+# write `judge-rejected` for that terminal rejection — leave the prior
+# checkpoint as-is for the stale-checkpoint cleanup path.
 #
 # On merge-done, callers should invoke `delete` to remove the checkpoint —
 # stale-checkpoint detection (closed issue + leftover checkpoint) is performed
@@ -61,7 +82,7 @@
 
 set -euo pipefail
 
-VALID_PHASES=(curator-done builder-done judge-done doctor-done merge-done)
+VALID_PHASES=(curator-done builder-done judge-rejected judge-done doctor-done merge-done)
 
 usage() {
     sed -n '3,55p' "$0" | sed 's/^# \{0,1\}//'
@@ -124,9 +145,17 @@ cmd_write() {
         esac
     done
 
-    [[ -z "$task_id" ]] && task_id="sweep-$$"
+    # Last-resort fallback ONLY: sweep.md always passes a stable --task-id "$RUN_ID"
+    # (see sweep-run-registry.sh). This default exists so a bare/manual write still
+    # produces a parseable checkpoint; `sweep-run-$$` is deliberately labelled a
+    # fallback rather than masquerading as a stable per-run id.
+    [[ -z "$task_id" ]] && task_id="sweep-run-fallback-$$"
     if [[ "$pr_number" != "null" && ! "$pr_number" =~ ^[0-9]+$ ]]; then
         echo "ERROR: --pr-number must be a positive integer or 'null'" >&2
+        exit 1
+    fi
+    if [[ "$phase" == "judge-rejected" && "$pr_number" == "null" ]]; then
+        echo "ERROR: judge-rejected requires --pr-number for resume routing" >&2
         exit 1
     fi
     if [[ -n "$attempt" && ! "$attempt" =~ ^[1-9][0-9]*$ ]]; then
