@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [Imagine](https://github.com/rjwalters/imagine)); `Assets/AppIcon.icns` is
   now bundled by `build-macos-app.sh` and referenced via `CFBundleIconFile`.
 
+### Changed
+
+- **Docs.** README now documents the Roll Token workflow — wizard steps, the
+  undocumented cookie-authenticated `claude.ai/api/oauth` endpoint dependency,
+  upstream tracking issues, and the ping-based revocation verification (#11) —
+  and gains an "Upgrading from pre-2.0" note in Uninstall about stale Node CLI
+  artifacts (#10). Both README screenshots retaken against the 1.15 UI (#12).
+
 ## [1.15.0] - 2026-07-26
 
 ### Summary
