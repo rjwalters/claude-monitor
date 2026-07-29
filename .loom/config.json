@@ -95,5 +95,13 @@
       },
       "theme": "midnight"
     }
-  ]
+  ],
+  "autonomous": {
+    "roleRunner": {
+      "enabled": true,
+      "onIdle": [
+        "champion"
+      ]
+    }
+  }
 }
