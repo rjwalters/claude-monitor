@@ -137,15 +137,25 @@ struct ProviderBadge: View {
 /// as image assets — the package ships no resources and has no dependencies,
 /// and a handful of filled rects stays crisp at any scale factor.
 private enum ProviderGlyph {
-    /// The Claude Code mascot, transcribed cell-for-cell from the 16×10
-    /// original: eyes in columns 4 and 11, four legs at 3/5/10/12.
+    /// The Claude Code mascot: eyes in columns 4 and 11, four legs at
+    /// 3/5/10/12, drawn 16×13.
+    ///
+    /// The source art is 16×10. Beside the rosette — which fills its whole
+    /// 16×16 box — that read noticeably light, so three rows are added to the
+    /// body and arm band. Growing those rather than scaling the whole sprite
+    /// keeps one cell = one point (a proportional 1.3× would land on
+    /// half-pixels and resample the art), and keeps the legs stubby: lengthening
+    /// them instead made the creature spindly.
     static let anthropic = [
         "..############..",
         "..############..",
+        "..############..",
         "..##.######.##..",
         "..##.######.##..",
         "################",
         "################",
+        "################",
+        "..############..",
         "..############..",
         "..############..",
         "...#.#....#.#...",
