@@ -919,7 +919,8 @@ class OAuthPoller: ObservableObject {
             weeklyReset: windows.weekly?.resetAtISO,
             rawFields: ping.rawHeaders,
             probeModel: "haiku",
-            httpStatus: ping.httpStatus
+            httpStatus: ping.httpStatus,
+            namedLimits: windows.named
         )
     }
 
@@ -939,12 +940,18 @@ class OAuthPoller: ObservableObject {
             weeklyReset: windows.weekly?.resetAtISO,
             rawFields: snapshot.rawFields,
             probeModel: "\(snapshot.provider.rawValue)-usage",
-            httpStatus: snapshot.httpStatus
+            httpStatus: snapshot.httpStatus,
+            namedLimits: windows.named
         )
     }
 
     /// The single write path for both providers: one `usage_history` row plus a
     /// verbatim `probe_snapshots` archive entry.
+    ///
+    /// `namedLimits` additionally writes one `named_limits` row per entry
+    /// (OpenAI's `additional_rate_limits[]`), stamped with the same timestamp
+    /// as the `usage_history` row. Empty for Anthropic pings today, so those
+    /// accounts continue to produce zero `named_limits` rows.
     private func writeUsageToDB(
         accountId: String,
         sessionPercent: Double?,
@@ -953,7 +960,8 @@ class OAuthPoller: ObservableObject {
         weeklyReset: String?,
         rawFields: [String: String],
         probeModel: String,
-        httpStatus: Int
+        httpStatus: Int,
+        namedLimits: [String: RateLimitWindow] = [:]
     ) {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
 
@@ -1004,6 +1012,8 @@ class OAuthPoller: ObservableObject {
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """, accountId, now, primaryPercent, sessionPercent,
                weeklyPercent, 0.0, sessionReset, weeklyReset, rawData)
+
+            UsageStore.insertNamedLimits(db, accountId: accountId, timestamp: now, named: namedLimits)
 
             try db.run("UPDATE accounts SET last_updated = ? WHERE id = ?", now, accountId)
 

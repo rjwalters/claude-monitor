@@ -49,6 +49,7 @@ enum SelfTest {
         testCodexAuthParsing()
         testSchemaMigrationFromPreMigrationDatabase()
         testRankingExportCarriesProvider()
+        testNamedLimitsRoundTrip()
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
             testMigrationOfExistingDatabase(at: arguments[idx + 1])
@@ -430,6 +431,60 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("Codex auth parsing test threw: \(error)")
+        }
+    }
+
+    // MARK: - Named limits (per-model sub-limits, #32)
+
+    /// Decodes a fixture carrying `additional_rate_limits[]`, writes the
+    /// resulting `named` map into a throwaway database via
+    /// `UsageStore.insertNamedLimits` (the same helper `OAuthPoller` calls on
+    /// every poll), then reads it back via `loadNamedLimitHistory` and
+    /// confirms `limit_name` / `used_percent` survive the round trip.
+    private static func testNamedLimitsRoundTrip() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+
+            let snapshot = try OpenAIAPIClient.snapshot(
+                from: Data(openAIUsageFixture.utf8), httpStatus: 200
+            )
+            let named = snapshot.rateLimit.named
+            expect(!named.isEmpty, "fixture must decode at least one named sub-limit")
+
+            let db = try openDatabase(dbPath)
+            let now = ISO8601DateFormatter().string(from: Date())
+            UsageStore.insertNamedLimits(db, accountId: "acct-fixture", timestamp: now, named: named)
+
+            let history = store.loadNamedLimitHistory(for: "acct-fixture")
+            expectEqual(history.count, 1, "one series per distinct limit_name")
+            let series = history["GPT-5.3-Codex-Spark"]
+            expect(series != nil, "the fixture's limit_name is preserved verbatim as the series key")
+            expectEqual(series?.first?.usedPercent, 62,
+                        "used_percent round-trips through named_limits")
+
+            // An account with no named limits at all must read back empty —
+            // this is what lets the chart overlay stay hidden for every
+            // Anthropic account.
+            let emptyHistory = store.loadNamedLimitHistory(for: "acct-with-no-named-limits")
+            expect(emptyHistory.isEmpty, "an account with zero named_limits rows reads back an empty dictionary")
+
+            // Anthropic's ping response never populates `named` — confirm the
+            // write path is a true no-op for it, not merely untested.
+            UsageStore.insertNamedLimits(db, accountId: "acct-anthropic", timestamp: now, named: [:])
+            let anthropicCount = try db.scalar(
+                "SELECT COUNT(*) FROM named_limits WHERE account_id = 'acct-anthropic'"
+            ) as? Int64
+            expectEqual(anthropicCount, 0, "an empty named map writes zero named_limits rows")
+        } catch {
+            checks += 1
+            failures.append("named limits round-trip test threw: \(error)")
         }
     }
 

@@ -26,6 +26,16 @@ struct TokenTrace: Identifiable {
     let isPrimary: Bool
 }
 
+/// One named sub-limit's overlay series (e.g. an OpenAI
+/// `additional_rate_limits[]` entry). Named by the provider — the label is
+/// used verbatim, never mapped to a fixed enum, since naming will churn.
+struct NamedLimitTrace: Identifiable {
+    let id: String  // the provider's limit_name, doubling as a stable-enough series key
+    let name: String
+    let dataPoints: [NamedLimitDataPoint]
+    let color: Color
+}
+
 struct UsageChartWindow: View {
     let account: Account
     let dataPoints: [UsageDataPoint]
@@ -35,6 +45,7 @@ struct UsageChartWindow: View {
     let oauthPoller: OAuthPoller?
     let otherAccountsData: [AccountTrace]  // Data for other accounts
     let otherTokenData: [TokenTrace]  // Token data for other accounts
+    let namedLimitTraces: [NamedLimitTrace]  // Per-model sub-limits for this account (empty for Anthropic)
     @Environment(\.colorScheme) var colorScheme
     @StateObject private var updateChecker = UpdateChecker.shared
     @State private var isEditingName = false
@@ -125,6 +136,23 @@ struct UsageChartWindow: View {
                 dataPoints: trace.dataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate },
                 color: trace.color,
                 isPrimary: trace.isPrimary
+            )
+        }
+    }
+
+    /// Filtered named-limit traces based on the current range selection.
+    /// Empty when the account has no named limits — callers must check this
+    /// before rendering anything so the overlay stays entirely hidden.
+    var filteredNamedLimitTraces: [NamedLimitTrace] {
+        guard !namedLimitTraces.isEmpty else { return [] }
+        let startDate = dateForRangePosition(rangeStart)
+        let endDate = dateForRangePosition(rangeEnd)
+        return namedLimitTraces.map { trace in
+            NamedLimitTrace(
+                id: trace.id,
+                name: trace.name,
+                dataPoints: trace.dataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate },
+                color: trace.color
             )
         }
     }
@@ -369,6 +397,28 @@ struct UsageChartWindow: View {
                             }
                         }
 
+                        // Named per-model sub-limits (OpenAI additional_rate_limits[]),
+                        // drawn beneath the primary trace. Empty (and therefore
+                        // invisible) for every account with no named limits.
+                        ForEach(filteredNamedLimitTraces) { trace in
+                            ForEach(trace.dataPoints) { point in
+                                LineMark(
+                                    x: .value("Time", point.timestamp),
+                                    y: .value("Usage %", point.usedPercent),
+                                    series: .value("NamedLimit", trace.id)
+                                )
+                                .foregroundStyle(trace.color)
+                                .lineStyle(StrokeStyle(lineWidth: 1.5, dash: [4, 3]))
+
+                                PointMark(
+                                    x: .value("Time", point.timestamp),
+                                    y: .value("Usage %", point.usedPercent)
+                                )
+                                .foregroundStyle(trace.color)
+                                .symbolSize(15)
+                            }
+                        }
+
                         // Primary account (blue)
                         ForEach(filteredDataPoints) { point in
                             LineMark(
@@ -489,6 +539,26 @@ struct UsageChartWindow: View {
                             ForEach(otherAccountsData) { trace in
                                 HStack(spacing: 4) {
                                     Circle().fill(trace.color).frame(width: 8, height: 8)
+                                    Text(trace.name)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                        .padding(.top, 4)
+                    }
+
+                    // Legend for named per-model sub-limits — only rendered when the
+                    // account actually has at least one, so an Anthropic account (or
+                    // an OpenAI account before this shipped) shows nothing extra.
+                    if chartMode == .percent && !namedLimitTraces.isEmpty {
+                        HStack(spacing: 16) {
+                            ForEach(namedLimitTraces) { trace in
+                                HStack(spacing: 4) {
+                                    Rectangle()
+                                        .fill(trace.color)
+                                        .frame(width: 10, height: 2)
                                     Text(trace.name)
                                         .font(.caption)
                                         .foregroundColor(.secondary)
@@ -1064,6 +1134,15 @@ class ChartWindowController {
         .orange, .green, .purple, .pink, .cyan, .yellow, .mint, .indigo
     ]
 
+    // Colors for named per-model sub-limit overlays. A separate palette from
+    // `otherAccountColors` so the two legends never read as related. Assigned
+    // positionally by sorted `limit_name` (not by hashing the name into this
+    // array), so a renamed model gets whatever slot its new name sorts into —
+    // never silently inheriting another model's prior color out of coincidence.
+    static let namedLimitColors: [Color] = [
+        .teal, .brown, .indigo, .pink, .mint, .orange, .purple, .cyan
+    ]
+
     static func showChart(for account: Account, store: UsageStore, oauthPoller: OAuthPoller? = nil) {
         // Close existing window for this account if open
         if let existing = windows[account.id] {
@@ -1074,6 +1153,23 @@ class ChartWindowController {
         let dataPoints = store.loadHistory(for: account.id)
         let fullDataPoints = store.loadFullHistory(for: account.id)
         let tokenDataPoints = store.loadTokenHistory(for: account.id)
+
+        // Named per-model sub-limits (OpenAI additional_rate_limits[]), one
+        // series per provider-chosen limit_name. Empty for Anthropic accounts
+        // and for any account with none recorded — the chart hides the
+        // overlay entirely in that case.
+        let namedLimitHistory = store.loadNamedLimitHistory(for: account.id)
+        let namedLimitTraces: [NamedLimitTrace] = namedLimitHistory.keys.sorted().enumerated().compactMap {
+            index, limitName in
+            guard let points = namedLimitHistory[limitName], !points.isEmpty else { return nil }
+            let colorIndex = index % namedLimitColors.count
+            return NamedLimitTrace(
+                id: limitName,
+                name: limitName,
+                dataPoints: points.sorted { $0.timestamp < $1.timestamp },
+                color: namedLimitColors[colorIndex]
+            )
+        }
 
         // Load data for other accounts
         var otherAccountsData: [AccountTrace] = []
@@ -1112,7 +1208,8 @@ class ChartWindowController {
             store: store,
             oauthPoller: oauthPoller,
             otherAccountsData: otherAccountsData,
-            otherTokenData: otherTokenData
+            otherTokenData: otherTokenData,
+            namedLimitTraces: namedLimitTraces
         )
         let hostingController = NSHostingController(rootView: chartView)
 
