@@ -227,8 +227,42 @@ class UsageStore: ObservableObject {
             // this — it's bumped on every poll — so we track token changes separately.
             // ADD COLUMN throws if it already exists; that's the expected no-op path.
             try? db.execute("ALTER TABLE oauth_credentials ADD COLUMN token_rolled_at TEXT")
+
+            // Migration: heal accounts left with email = NULL by earlier app
+            // versions — e.g. added via plain token paste (no email known) and
+            // later renamed to the real address, which only touched
+            // account_name. `email` is the join key downstream consumers (like
+            // loom-daemon's `tokens import-from-monitor`) key accounts on, so an
+            // account must never persist indefinitely without one (#15).
+            backfillMissingEmailsFromAccountName(db)
         } catch {
             FileLogger.shared.error("Failed to create database: \(error)", category: "DB")
+        }
+    }
+
+    /// One-time-per-launch healing pass: any account with `email IS NULL`
+    /// whose `account_name` is itself a well-formed address gets that address
+    /// copied into `email`. Idempotent and side-effect-free once every row is
+    /// backfilled — cheap enough to run unconditionally on every launch rather
+    /// than tracking a schema version for it.
+    private func backfillMissingEmailsFromAccountName(_ db: Connection) {
+        do {
+            let stmt = try db.prepare("SELECT id, account_name FROM accounts WHERE email IS NULL AND account_name IS NOT NULL")
+            var candidates: [(id: String, name: String)] = []
+            for row in stmt {
+                if let id = row[0] as? String, let name = row[1] as? String {
+                    candidates.append((id: id, name: name))
+                }
+            }
+            for candidate in candidates where looksLikeEmailAddress(candidate.name) {
+                try db.run("UPDATE accounts SET email = ? WHERE id = ? AND email IS NULL", candidate.name, candidate.id)
+                FileLogger.shared.info(
+                    "backfillMissingEmailsFromAccountName: healed email for account \(candidate.id) from account_name",
+                    category: "DB"
+                )
+            }
+        } catch {
+            FileLogger.shared.error("backfillMissingEmailsFromAccountName failed: \(error)", category: "DB")
         }
     }
 
@@ -684,13 +718,23 @@ class UsageStore: ObservableObject {
             let db = try openDatabase(dbPath)
             try db.run("UPDATE accounts SET account_name = ? WHERE id = ?", newName, accountId)
 
+            // Backfill email from a well-formed label — an account renamed to
+            // its real address must not keep email = NULL indefinitely just
+            // because a profile fetch never populated it (#15). Never
+            // overwrites an existing email.
+            var backfilledEmail: String?
+            if let newName, looksLikeEmailAddress(newName) {
+                try db.run("UPDATE accounts SET email = COALESCE(email, ?) WHERE id = ?", newName, accountId)
+                backfilledEmail = try db.scalar("SELECT email FROM accounts WHERE id = ?", accountId) as? String
+            }
+
             // Immediately update local state for instant UI feedback
             if let index = accounts.firstIndex(where: { $0.id == accountId }) {
                 let oldAccount = accounts[index]
                 let updatedAccount = Account(
                     id: oldAccount.id,
                     accountName: newName,
-                    email: oldAccount.email,
+                    email: backfilledEmail ?? oldAccount.email,
                     plan: oldAccount.plan,
                     lastUpdated: oldAccount.lastUpdated,
                     latestPercent: oldAccount.latestPercent
