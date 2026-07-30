@@ -93,6 +93,37 @@ func extraUsageUrgency(_ usage: UsageRecord?) -> Double? {
 // `UsageRecord.rateLimit`, so the string-parsing helper that used to live here
 // is gone; `UsageRecord.parseISO` is the single ISO-8601 parse point.
 
+// MARK: - Provider badge
+
+/// Compact per-provider tag shown ahead of the account name, so a row's upstream
+/// is visible at a glance in a mixed Anthropic/OpenAI list. It sits inside the
+/// existing Account column rather than adding a new one, keeping every other
+/// column (and the popover width) exactly where it was.
+struct ProviderBadge: View {
+    let provider: AccountProvider
+
+    private var tint: Color {
+        switch provider {
+        case .anthropic: return Color(nsColor: .systemOrange)
+        case .openai: return Color(nsColor: .systemTeal)
+        }
+    }
+
+    var body: some View {
+        Text(provider.shortCode)
+            .font(.system(size: 8, weight: .bold, design: .rounded))
+            .foregroundColor(tint)
+            .padding(.horizontal, 3)
+            .padding(.vertical, 1)
+            .overlay(
+                RoundedRectangle(cornerRadius: 3)
+                    .stroke(tint.opacity(0.6), lineWidth: 1)
+            )
+            .help(provider.displayName)
+            .accessibilityLabel(provider.displayName)
+    }
+}
+
 /// Lower rank = "better" status (valid first, missing last).
 func tokenStatusRank(_ status: TokenStatus) -> Int {
     switch status {
@@ -425,9 +456,15 @@ struct UsagePopoverView: View {
                 // account whose email isn't in the paste (compared case-insensitively).
                 // Emails come from the paste even for entries whose token failed to
                 // import, so a transient failure won't delete an account that's listed.
+                //
+                // Scoped to Anthropic rows: the env format can only *express*
+                // Anthropic credentials (see `exportAccountsEnv`), so an
+                // Anthropic-only paste must not silently delete the OpenAI
+                // accounts it was never able to describe.
                 let pastedEmails = Set(results.map { $0.email.lowercased() })
                 let toRemove = store.accounts.filter {
-                    !pastedEmails.contains(($0.email ?? "").lowercased())
+                    $0.provider == .anthropic
+                        && !pastedEmails.contains(($0.email ?? "").lowercased())
                 }
                 for account in toRemove { removeAccount(account) }
                 if !toRemove.isEmpty { store.loadFromDatabase() }
@@ -658,13 +695,16 @@ struct SummaryRow: View {
                         .buttonStyle(.plain)
                     }
                 } else {
-                    Text(account.displayName)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) { startRename() }
-                        .help("Double-click to rename")
+                    HStack(spacing: 4) {
+                        ProviderBadge(provider: account.provider)
+                        Text(account.displayName)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) { startRename() }
+                    .help("\(account.provider.displayName) — double-click to rename")
                 }
             }
             .frame(width: SummaryColumns.account, alignment: .leading)
@@ -738,8 +778,13 @@ struct SummaryRow: View {
             Button(action: startRename) {
                 Label("Rename", systemImage: "pencil")
             }
-            Button(action: openRollToken) {
-                Label("Roll Token…", systemImage: "arrow.triangle.2.circlepath")
+            // The Roll Token wizard drives undocumented claude.ai endpoints, so
+            // it only makes sense for Anthropic rows. OpenAI credentials are
+            // refreshed automatically and re-imported with `codex import`.
+            if account.provider == .anthropic {
+                Button(action: openRollToken) {
+                    Label("Roll Token…", systemImage: "arrow.triangle.2.circlepath")
+                }
             }
             Divider()
             Button(role: .destructive, action: { onRemove?() }) {
@@ -1024,6 +1069,32 @@ struct AddAccountView: View {
                 }
             }
 
+            Divider()
+
+            // OpenAI / Codex — imported from Codex CLI's own credential store
+            // rather than pasted, because a ChatGPT OAuth credential is a
+            // three-part (access + refresh + expiry) object, not a single
+            // long-lived string.
+            VStack(alignment: .leading, spacing: 6) {
+                Text("OpenAI (Codex)")
+                    .font(.caption.bold())
+                    .foregroundColor(.secondary)
+                Text("Imports the credential `codex login` stored at \(CodexAuth.defaultAuthPath)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+
+                Button(action: importCodex) {
+                    Label(isAdding ? "Importing…" : "Import Codex Account",
+                          systemImage: "person.badge.key")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(isAdding)
+            }
+
             // Import results
             if !envImportResults.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
@@ -1049,7 +1120,8 @@ struct AddAccountView: View {
             if let msg = statusMessage {
                 Text(msg)
                     .font(.caption)
-                    .foregroundColor(msg.contains("Error") || msg.contains("Invalid") || msg.contains("No ") ? .orange : .green)
+                    .foregroundColor(msg.contains("Error") || msg.contains("Invalid")
+                                     || msg.contains("Failed") || msg.contains("No ") ? .orange : .green)
             }
 
             Spacer()
@@ -1087,6 +1159,26 @@ struct AddAccountView: View {
                     onImported?()
                 } else {
                     statusMessage = error ?? "Failed to add account"
+                }
+            }
+        }
+    }
+
+    private func importCodex() {
+        isAdding = true
+        statusMessage = nil
+        store.ensureDatabase()
+
+        Task {
+            let (accountId, error) = await oauthPoller.importCodexCredential()
+            await MainActor.run {
+                isAdding = false
+                if accountId != nil {
+                    statusMessage = "Added OpenAI account"
+                    store.loadFromDatabase()
+                    onImported?()
+                } else {
+                    statusMessage = error ?? "Failed to import Codex credential"
                 }
             }
         }

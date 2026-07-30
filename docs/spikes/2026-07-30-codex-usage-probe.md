@@ -312,17 +312,55 @@ Authorization: Bearer <access_token from ~/.codex/auth.json>
    Fable tracking, and is a better-structured source than what Anthropic
    exposes.
 
+### Refresh endpoint (2026-07-30, phase 3) — request contract verified
+
+Phase 3 probed `POST https://auth.openai.com/oauth/token` with the **exact**
+request the shipped client sends, but a deliberately invalid `refresh_token`:
+
+```jsonc
+// Content-Type: application/json
+{ "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",  // Codex CLI's public client id
+  "grant_type": "refresh_token",
+  "refresh_token": "rt.invalid-probe-value-not-a-real-token",
+  "scope": "openid profile email" }
+```
+
+```jsonc
+// HTTP 401
+{ "error": { "message": "Invalid refresh token.",
+             "type": "invalid_request_error",
+             "param": null,
+             "code": "invalid_refresh_token" } }
+```
+
+What this establishes, and what it doesn't:
+
+- **Established:** the endpoint exists and accepts a **JSON** (not
+  form-encoded) body; the `client_id` and `grant_type` are accepted — a bad
+  client id answers `invalid_client` and a bad grant type
+  `unsupported_grant_type`, and neither happened. Only the token itself was
+  rejected. The error body is **nested** (`error.code`), not the flat RFC 6749
+  `{"error": "..."}` string, which is what the client's error extraction had to
+  be written against.
+- **Not established:** a *successful* exchange. It was deliberately not run:
+  OAuth refresh may rotate the refresh token, which would invalidate the copy
+  in `~/.codex/auth.json` and break the operator's Codex CLI login. The client
+  therefore handles both outcomes — it keeps the stored refresh token when the
+  reply carries none, and replaces it when one comes back — and surfaces any
+  refresh failure as a visible token-health state rather than polling on
+  silently.
+
 ### Still unverified
 
 - Cost/quota impact of polling this endpoint (it returned instantly and is
   what the CLI's own `/usage` hits, so it is very likely free, but no
   before/after quota comparison was made).
-- The `refresh_token` flow against `auth.openai.com/oauth/token` was **not**
-  exercised — the 10-day access-token lifetime finding above still stands as
-  the phase-2 design driver, but the refresh call itself remains untested.
+- A **successful** `refresh_token` exchange (see above) — and, consequently,
+  whether OpenAI rotates refresh tokens for this client.
 - Whether `secondary_window` populates on plans/accounts that do have an
   active 5h window (see finding 1) — worth re-probing when a session window is
-  actually in use.
+  actually in use. Re-confirmed on 2026-07-30: still `null` on this Pro
+  account, with a weekly `primary_window` at 14%.
 
 ## References
 

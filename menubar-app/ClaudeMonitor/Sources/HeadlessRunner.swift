@@ -96,9 +96,16 @@ enum HeadlessRunner {
             return
         }
         let parts = store.sortedAccountsForPopover.map { account -> String in
-            guard let usage = store.latestUsage[account.id] else { return "\(account.displayName): ?" }
-            let pct = Int(max(usage.sessionPercent ?? 0, usage.weeklyAllPercent ?? 0))
-            return "\(account.displayName): \(pct)%"
+            let label = "[\(account.provider.shortCode)] \(account.displayName)"
+            // Read through the shared window model: an account whose provider
+            // reports only a weekly window shows that figure rather than a
+            // fabricated 0% session.
+            guard let windows = store.latestUsage[account.id]?.rateLimit,
+                  let used = [windows.session?.usedPercent, windows.weekly?.usedPercent]
+                      .compactMap({ $0 }).max() else {
+                return "\(label): ?"
+            }
+            return "\(label): \(Int(used))%"
         }
         flog.info("Usage — " + parts.joined(separator: ", "), category: "Headless")
     }
@@ -136,6 +143,8 @@ enum HeadlessRunner {
 
         Subcommands:
           accounts            Export/import accounts + credentials
+          codex               Import an OpenAI/Codex credential from
+                              ~/.codex/auth.json (honors $CODEX_HOME)
           selftest            Run portable-core assertions (no network, no
                               credentials; exits non-zero on failure)
         """

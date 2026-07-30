@@ -101,6 +101,15 @@ struct OAuthCredential {
     }
 }
 
+/// Raised when a credential's access token is past expiry and could not be
+/// renewed. Distinct from `ProviderAPIError.unauthorized` so the retry loop can
+/// preserve the `.expired` token-health state (and its actionable message)
+/// instead of flattening it to the generic "revoked".
+struct CredentialExpiredError: Error, LocalizedError {
+    let reason: String
+    var errorDescription: String? { reason }
+}
+
 struct EnvImportResult {
     let email: String
     let success: Bool
@@ -109,12 +118,29 @@ struct EnvImportResult {
 
 class OAuthPoller: ObservableObject {
     private let apiClient = AnthropicAPIClient()
+    private let openAIClient = OpenAIAPIClient()
     @Published var lastError: String?
     @Published var credentialStatuses: [CredentialStatus] = []
 
-    private var dbPath: String {
-        FileManager.default.homeDirectoryForCurrentUser
+    private let dbPath: String
+
+    /// `dbPath` defaults to `~/.claude-monitor/usage.db`. An explicit path lets
+    /// the CLI (and tests) exercise the real add/poll paths against a throwaway
+    /// database — the same escape hatch `UsageStore(dbPath:)` provides, and the
+    /// only safe one: `homeDirectoryForCurrentUser` ignores a `HOME` override on
+    /// macOS, so redirecting via the environment silently hits the live store
+    /// (issue #16).
+    init(dbPath: String? = nil) {
+        self.dbPath = dbPath ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude-monitor/usage.db").path
+    }
+
+    /// The client that speaks a given provider's protocol.
+    private func client(for provider: AccountProvider) -> UsageProviderClient {
+        switch provider {
+        case .anthropic: return apiClient
+        case .openai: return openAIClient
+        }
     }
 
     // MARK: - Add Account with Token
@@ -169,6 +195,84 @@ class OAuthPoller: ObservableObject {
         return (orgId, nil)
     }
 
+    // MARK: - Add OpenAI / Codex Account
+
+    /// Validate an OpenAI credential against `GET /backend-api/wham/usage`,
+    /// then create/update the account from the identity that same response
+    /// carries (`account_id`, `email`, `plan_type` — no separate profile call).
+    ///
+    /// Returns the OpenAI account id on success.
+    func addOpenAIAccount(
+        accessToken: String,
+        refreshToken: String? = nil,
+        expiresAt: Date? = nil
+    ) async -> (accountId: String?, error: String?) {
+        let accessToken = accessToken.filter { !$0.isWhitespace }
+        guard !accessToken.isEmpty else { return (nil, "Token is empty") }
+
+        var credentials = ProviderCredentials(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            // Fall back to the token's own `exp` claim when the caller has no
+            // stated expiry — an OpenAI access token lives ~10 days and the
+            // poller must know when to renew it.
+            expiresAt: expiresAt ?? OpenAIAPIClient.accessTokenExpiry(accessToken)
+        )
+
+        // Renew up front if the imported credential is already stale, so an
+        // account added from an old auth.json works immediately.
+        if credentials.isExpiring(within: refreshLeadTime), credentials.isRefreshable {
+            if let refreshed = try? await openAIClient.refresh(credentials) {
+                credentials = refreshed
+            }
+        }
+
+        let snapshot: ProviderUsageSnapshot
+        do {
+            snapshot = try await openAIClient.fetchUsage(credentials)
+        } catch {
+            flog.error("addOpenAIAccount: usage fetch failed: \(error.localizedDescription)", category: fcat)
+            return (nil, "Invalid OpenAI credential: \(error.localizedDescription)")
+        }
+
+        saveCredentialForAccount(
+            accountId: snapshot.accountKey,
+            email: snapshot.email,
+            orgName: nil,
+            plan: snapshot.plan ?? "ChatGPT",
+            accessToken: credentials.accessToken,
+            source: "codex",
+            provider: .openai,
+            refreshToken: credentials.refreshToken,
+            tokenExpiresAt: credentials.expiresAt
+        )
+
+        writeSnapshotToDB(accountId: snapshot.accountKey, snapshot: snapshot)
+
+        flog.info("addOpenAIAccount: account \(snapshot.accountKey.prefix(8))... plan \(snapshot.plan ?? "?")", category: fcat)
+        return (snapshot.accountKey, nil)
+    }
+
+    /// Import the credential Codex CLI stores at `~/.codex/auth.json` (or
+    /// `$CODEX_HOME/auth.json`). `path` overrides the location — the self-test
+    /// and CLI pass an explicit scratch path rather than relying on a `HOME`
+    /// override, which `FileManager.homeDirectoryForCurrentUser` ignores on
+    /// macOS (issue #16).
+    func importCodexCredential(path: String? = nil) async -> (accountId: String?, error: String?) {
+        let credential: CodexAuth.Credential
+        do {
+            credential = try CodexAuth.load(path: path)
+        } catch {
+            flog.error("importCodexCredential: \(error.localizedDescription)", category: fcat)
+            return (nil, error.localizedDescription)
+        }
+        return await addOpenAIAccount(
+            accessToken: credential.accessToken,
+            refreshToken: credential.refreshToken,
+            expiresAt: credential.expiresAt
+        )
+    }
+
     // MARK: - Import from .env File
 
     /// Parse a .env file for ACCOUNT_EMAIL_N / ACCOUNT_KEY_N pairs and import each.
@@ -212,6 +316,12 @@ class OAuthPoller: ObservableObject {
     /// ACCOUNT_KEY_N env format, the same format the Bulk Import field and the
     /// account list files accept. Returns nil if there are no exportable accounts
     /// (so the caller can disable the Copy button). Order follows sort_order.
+    ///
+    /// **Anthropic accounts only.** The env format carries a single long-lived
+    /// bearer string; an OpenAI credential is an access token + refresh token +
+    /// expiry, and pasting its access token back in would be re-imported down
+    /// the Anthropic path and fail. Those accounts move between hosts via
+    /// `claude-monitor accounts export/import`, which carries all three fields.
     func exportAccountsEnv() -> String? {
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
         do {
@@ -221,6 +331,7 @@ class OAuthPoller: ObservableObject {
                 FROM oauth_credentials c
                 JOIN accounts a ON a.id = c.account_id
                 WHERE c.is_active = 1 AND c.access_token IS NOT NULL
+                  AND COALESCE(a.provider, 'anthropic') = 'anthropic'
                 ORDER BY a.sort_order, a.id
             """)
 
@@ -588,6 +699,9 @@ class OAuthPoller: ObservableObject {
         var probed = 0
 
         for credential in credentials {
+            // Fable is an Anthropic premium tier; other providers expose their
+            // per-model sub-limits in the usage response itself.
+            guard credential.provider == .anthropic else { continue }
             guard let accountId = credential.accountId,
                   let token = credential.accessToken else { continue }
             let last = lastFableProbeTimes[accountId]
@@ -617,6 +731,11 @@ class OAuthPoller: ObservableObject {
                 updateCredentialStatus(credential, status: .refreshing, error: "Retrying...")
                 try? await Task.sleep(nanoseconds: retryDelay)
                 retryDelay *= 2
+            } catch is CredentialExpiredError {
+                // The refresh path already recorded `.expired` plus an
+                // actionable message; retrying or downgrading it to the generic
+                // "revoked" would bury the reason. Stop here.
+                return
             } catch {
                 let isUnauthorized: Bool
                 if case AnthropicAPIError.unauthorized = error { isUnauthorized = true } else { isUnauthorized = false }
@@ -629,6 +748,15 @@ class OAuthPoller: ObservableObject {
     }
 
     private func pollSingle(_ credential: OAuthCredential) async throws {
+        switch credential.provider {
+        case .anthropic:
+            try await pollAnthropic(credential)
+        case .openai:
+            try await pollOpenAI(credential)
+        }
+    }
+
+    private func pollAnthropic(_ credential: OAuthCredential) async throws {
         guard let token = credential.accessToken else {
             updateCredentialStatus(credential, status: .missing, error: "No access token")
             throw AnthropicAPIError.unauthorized
@@ -650,58 +778,224 @@ class OAuthPoller: ObservableObject {
         }
     }
 
-    // MARK: - Write Ping Data to DB
+    private func pollOpenAI(_ credential: OAuthCredential) async throws {
+        guard let stored = credential.providerCredentials else {
+            updateCredentialStatus(credential, status: .missing, error: "No access token")
+            throw AnthropicAPIError.unauthorized
+        }
+
+        // Proactive, not reactive: renew ahead of expiry rather than waiting
+        // for a 401. Throws (loudly, with a visible token-health state) when the
+        // token is already dead and cannot be renewed.
+        let renewal = try await refreshIfNeeded(credential, stored)
+
+        let snapshot = try await openAIClient.fetchUsage(renewal.credentials)
+
+        // Prefer the stored account_id; fall back to the one the response
+        // carries so a credential imported before identification still lands.
+        let accountId = credential.accountId.flatMap { $0.isEmpty ? nil : $0 } ?? snapshot.accountKey
+        guard !accountId.isEmpty else {
+            flog.warning("Credential \(credential.label) has no account_id", category: fcat)
+            return
+        }
+
+        writeSnapshotToDB(accountId: accountId, snapshot: snapshot)
+
+        // A successful read does NOT clear a refresh warning: the usage figures
+        // are current, but the credential is still on a path to expiry that we
+        // could not renew. Surfacing that now (yellow dot + reason) is the whole
+        // point of refreshing proactively.
+        if let warning = renewal.warning {
+            updateCredentialLastPoll(credential, error: warning)
+            updateCredentialStatus(credential, status: .refreshing, error: warning)
+        } else {
+            updateCredentialLastPoll(credential, error: nil)
+            updateCredentialStatus(credential, status: .valid, error: nil)
+        }
+
+        await MainActor.run {
+            self.lastError = nil
+        }
+    }
+
+    // MARK: - Proactive Token Refresh
+
+    /// How far ahead of expiry a credential is renewed. Comfortably longer than
+    /// the poll interval, so a token never expires between two poll cycles.
+    let refreshLeadTime: TimeInterval = 6 * 3600
+
+    /// What `refreshIfNeeded` decided: the credential to poll with, plus a
+    /// non-nil `warning` when renewal was needed but didn't happen and the
+    /// current token is nonetheless still inside its validity window.
+    struct RenewalOutcome {
+        let credentials: ProviderCredentials
+        let warning: String?
+    }
+
+    /// Renew `credentials` when they are at or near expiry, persisting the
+    /// result. Anthropic credentials state no expiry and short-circuit here.
+    ///
+    /// Failure is **never silent**:
+    /// - token already past expiry and unrenewable → `.expired` (red dot) with
+    ///   an actionable message, and the caller throws rather than issuing a
+    ///   request with a token we already know is dead;
+    /// - renewal failed but the token is still valid → a `warning` the caller
+    ///   surfaces as `.refreshing` (yellow dot), and polling continues on the
+    ///   current token.
+    private func refreshIfNeeded(
+        _ credential: OAuthCredential,
+        _ credentials: ProviderCredentials
+    ) async throws -> RenewalOutcome {
+        guard credentials.isExpiring(within: refreshLeadTime) else {
+            return RenewalOutcome(credentials: credentials, warning: nil)
+        }
+
+        var reason: String
+        if !credentials.isRefreshable {
+            reason = "Access token expires soon and no refresh token is stored — re-import with `claude-monitor codex import`"
+        } else {
+            do {
+                if let refreshed = try await client(for: credential.provider)
+                    .refreshCredentials(credentials) {
+                    persistRefreshedCredential(credential, refreshed)
+                    return RenewalOutcome(credentials: refreshed, warning: nil)
+                }
+                // Provider has nothing to refresh (Anthropic's default).
+                return RenewalOutcome(credentials: credentials, warning: nil)
+            } catch {
+                reason = "Token refresh failed: \(error.localizedDescription)"
+            }
+        }
+
+        let alreadyExpired = credentials.expiresAt.map { $0 <= Date() } ?? false
+        if alreadyExpired {
+            updateCredentialLastPoll(credential, error: reason)
+            updateCredentialStatus(credential, status: .expired, error: reason)
+            flog.error("\(credential.label): \(reason) — token already expired, skipping poll", category: fcat)
+            throw CredentialExpiredError(reason: reason)
+        }
+
+        flog.warning("\(credential.label): \(reason) — token still valid, polling with it", category: fcat)
+        return RenewalOutcome(credentials: credentials, warning: reason)
+    }
+
+    /// Write a renewed access/refresh token pair back to `oauth_credentials`.
+    /// OpenAI rotates refresh tokens, so both halves are replaced together.
+    private func persistRefreshedCredential(_ credential: OAuthCredential, _ refreshed: ProviderCredentials) {
+        guard let credId = credential.id,
+              FileManager.default.fileExists(atPath: dbPath) else { return }
+        do {
+            let db = try openDatabase(dbPath)
+            let now = ISO8601DateFormatter().string(from: Date())
+            let expiryISO = refreshed.expiresAt.map { ISO8601DateFormatter().string(from: $0) }
+            try db.run("""
+                UPDATE oauth_credentials SET
+                    access_token = ?,
+                    refresh_token = COALESCE(?, refresh_token),
+                    token_expires_at = ?,
+                    is_active = 1, last_error = NULL,
+                    updated_at = ?, token_rolled_at = ?
+                WHERE id = ?
+            """, refreshed.accessToken, refreshed.refreshToken, expiryISO, now, now, credId)
+            flog.info("Persisted refreshed credential for \(credential.label)", category: fcat)
+        } catch {
+            flog.error("Failed to persist refreshed credential: \(error.localizedDescription)", category: fcat)
+        }
+    }
+
+    // MARK: - Write Usage Data to DB
 
     private func writePingToDB(accountId: String, ping: PingResponse) {
+        // `?? 0` preserves the long-standing Anthropic behavior of storing 0 for
+        // an absent header. Anthropic always reports both windows in practice,
+        // and existing history rows are all 0-filled, so keeping the coercion
+        // here avoids introducing NULLs into a series that has never had them.
+        let windows = ping.rateLimit
+        writeUsageToDB(
+            accountId: accountId,
+            sessionPercent: windows.session?.usedPercent ?? 0,
+            weeklyPercent: windows.weekly?.usedPercent ?? 0,
+            sessionReset: windows.session?.resetAtISO,
+            weeklyReset: windows.weekly?.resetAtISO,
+            rawFields: ping.rawHeaders,
+            probeModel: "haiku",
+            httpStatus: ping.httpStatus
+        )
+    }
+
+    /// Persist a provider-agnostic usage reading.
+    ///
+    /// Unlike the Anthropic path, an absent window is written as **NULL**, not
+    /// 0 — an OpenAI account may legitimately report no session window, and
+    /// storing 0 there would read downstream as "no session capacity used",
+    /// inflating the account's apparent headroom.
+    private func writeSnapshotToDB(accountId: String, snapshot: ProviderUsageSnapshot) {
+        let windows = snapshot.rateLimit
+        writeUsageToDB(
+            accountId: accountId,
+            sessionPercent: windows.session?.usedPercent,
+            weeklyPercent: windows.weekly?.usedPercent,
+            sessionReset: windows.session?.resetAtISO,
+            weeklyReset: windows.weekly?.resetAtISO,
+            rawFields: snapshot.rawFields,
+            probeModel: "\(snapshot.provider.rawValue)-usage",
+            httpStatus: snapshot.httpStatus
+        )
+    }
+
+    /// The single write path for both providers: one `usage_history` row plus a
+    /// verbatim `probe_snapshots` archive entry.
+    private func writeUsageToDB(
+        accountId: String,
+        sessionPercent: Double?,
+        weeklyPercent: Double?,
+        sessionReset: String?,
+        weeklyReset: String?,
+        rawFields: [String: String],
+        probeModel: String,
+        httpStatus: Int
+    ) {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
 
         do {
             let db = try openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
 
-            // Read through the shared, provider-agnostic window model rather
-            // than the Anthropic-specific header fields. `?? 0` preserves the
-            // long-standing Anthropic behavior of storing 0 for an absent
-            // header; a provider-agnostic writer for genuinely window-less
-            // accounts (OpenAI with no session window) arrives with the phase-3
-            // poller, and the columns are already nullable for it.
-            let windows = ping.rateLimit
-            let sessionPercent = windows.session?.usedPercent ?? 0
-            let weeklyAllPercent = windows.weekly?.usedPercent ?? 0
-            let primaryPercent = max(sessionPercent, weeklyAllPercent)
+            let primaryPercent = [sessionPercent, weeklyPercent].compactMap { $0 }.max()
 
-            let sessionReset = windows.session?.resetAtISO
-            let weeklyReset = windows.weekly?.resetAtISO
+            // Reset detection: a large drop in the weekly figure means the
+            // window rolled over. Only meaningful when this provider actually
+            // reports a weekly window.
+            if let weeklyPercent = weeklyPercent {
+                let prevStmt = try db.prepare(
+                    "SELECT primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, timestamp FROM usage_history WHERE account_id = ? ORDER BY timestamp DESC LIMIT 1"
+                )
+                for prev in prevStmt.bind(accountId) {
+                    let prevWeekly = (prev[2] as? Double) ?? 0
+                    if prevWeekly - weeklyPercent > 5 {
+                        let midpointDate = Date()
+                        let midpointISO = ISO8601DateFormatter().string(from: midpointDate.addingTimeInterval(-1))
 
-            // Reset detection: check previous reading
-            let prevStmt = try db.prepare(
-                "SELECT primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, timestamp FROM usage_history WHERE account_id = ? ORDER BY timestamp DESC LIMIT 1"
-            )
-            for prev in prevStmt.bind(accountId) {
-                let prevWeekly = (prev[2] as? Double) ?? 0
-                if prevWeekly - weeklyAllPercent > 5 {
-                    let midpointDate = Date()
-                    let midpointISO = ISO8601DateFormatter().string(from: midpointDate.addingTimeInterval(-1))
+                        try db.run(
+                            "INSERT INTO usage_history (account_id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data, is_synthetic) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 1)",
+                            accountId, midpointISO,
+                            (prev[0] as? Double) ?? 0, (prev[1] as? Double) ?? 0,
+                            prevWeekly, (prev[3] as? Double) ?? 0
+                        )
 
-                    try db.run(
-                        "INSERT INTO usage_history (account_id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data, is_synthetic) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 1)",
-                        accountId, midpointISO,
-                        (prev[0] as? Double) ?? 0, (prev[1] as? Double) ?? 0,
-                        prevWeekly, (prev[3] as? Double) ?? 0
-                    )
-
-                    let zeroISO = ISO8601DateFormatter().string(from: midpointDate)
-                    try db.run(
-                        "INSERT INTO usage_history (account_id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data, is_synthetic) VALUES (?, ?, 0, 0, 0, 0, NULL, NULL, NULL, 1)",
-                        accountId, zeroISO
-                    )
+                        let zeroISO = ISO8601DateFormatter().string(from: midpointDate)
+                        try db.run(
+                            "INSERT INTO usage_history (account_id, timestamp, primary_percent, session_percent, weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data, is_synthetic) VALUES (?, ?, 0, 0, 0, 0, NULL, NULL, NULL, 1)",
+                            accountId, zeroISO
+                        )
+                    }
+                    break
                 }
-                break
             }
 
-            // Store the full captured header set (not a hand-picked subset) so the
-            // archive keeps up with new fields the API adds.
-            let rawData = headersJSON(ping.rawHeaders)
+            // Store the full captured field set (not a hand-picked subset) so
+            // the archive keeps up with new fields the provider adds.
+            let rawData = headersJSON(rawFields)
 
             try db.run("""
                 INSERT INTO usage_history (
@@ -709,17 +1003,17 @@ class OAuthPoller: ObservableObject {
                     weekly_all_percent, weekly_sonnet_percent, session_reset, weekly_reset, raw_data, is_synthetic
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             """, accountId, now, primaryPercent, sessionPercent,
-               weeklyAllPercent, 0.0, sessionReset, weeklyReset, rawData)
+               weeklyPercent, 0.0, sessionReset, weeklyReset, rawData)
 
             try db.run("UPDATE accounts SET last_updated = ? WHERE id = ?", now, accountId)
 
         } catch {
-            flog.error("Failed to write ping to DB: \(error.localizedDescription)", category: fcat)
+            flog.error("Failed to write usage to DB: \(error.localizedDescription)", category: fcat)
         }
 
         // Archive the raw capture regardless of the curated write above.
-        archiveSnapshot(accountId: accountId, probeModel: "haiku",
-                        httpStatus: ping.httpStatus, headers: ping.rawHeaders)
+        archiveSnapshot(accountId: accountId, probeModel: probeModel,
+                        httpStatus: httpStatus, headers: rawFields)
     }
 
     // MARK: - Raw Snapshot Archive

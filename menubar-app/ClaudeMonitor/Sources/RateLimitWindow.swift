@@ -49,6 +49,16 @@ enum AccountProvider: String, CaseIterable, Codable {
         case .openai: return "OpenAI"
         }
     }
+
+    /// Two-letter badge shown in the popover's account column, where there is
+    /// no room for the full name. Lives here (portable core) rather than in the
+    /// macOS view so the headless daemon's log lines can use the same code.
+    var shortCode: String {
+        switch self {
+        case .anthropic: return "AN"
+        case .openai: return "OA"
+        }
+    }
 }
 
 // MARK: - Window kind

@@ -34,14 +34,16 @@
   - `Sources/RateLimitWindow.swift` - Provider-agnostic rate-limit model (`AccountProvider`, `RateLimitWindow`, `RateLimitSnapshot`). Window kind is **derived from the window's duration**, never its position in the provider response, and every window is optional — an account may legitimately report no session window.
   - `Sources/UsageProviderClient.swift` - `UsageProviderClient` protocol + `ProviderCredentials` / `ProviderUsageSnapshot` / `ProviderAPIError` (aliased as `AnthropicAPIError`)
   - `Sources/AnthropicAPI.swift` - API client (usage, profile, token refresh); conforms to `UsageProviderClient`
-  - `Sources/OAuthPoller.swift` - Ping-based usage polling, token add/import, Fable probes
-  - `Sources/SelfTest.swift` - `ClaudeMonitor selftest`: portable-core assertions (window model, schema migration) with no network/credentials. Run in CI on both macOS and Linux; there is no XCTest target because the package has zero dependencies.
+  - `Sources/OpenAIAPI.swift` - OpenAI/Codex client: `GET chatgpt.com/backend-api/wham/usage` (never `/backend-api/codex/usage` — Cloudflare-challenged), `POST auth.openai.com/oauth/token` refresh, and `CodexAuth` (reads `~/.codex/auth.json`, honoring `$CODEX_HOME`). Access tokens live ~10 days; expiry comes from the token's own `exp` claim. **Never log a token or a raw response body** — `OpenAIUsageResponse.flatten` redacts PII/credential keys at *every* nesting depth before anything is archived or logged.
+  - `Sources/CodexCLI.swift` - `claude-monitor codex import` (one-shot CLI, no `--headless` needed, works on Linux)
+  - `Sources/OAuthPoller.swift` - Per-provider usage polling (Anthropic ping / OpenAI usage GET), token add/import, proactive OpenAI token refresh, Fable probes (Anthropic only). Absent windows are stored as NULL, not 0, for non-Anthropic providers.
+  - `Sources/SelfTest.swift` - `ClaudeMonitor selftest`: portable-core assertions (window model, schema migration, OpenAI wire mapping + PII redaction, `ranking.json` provider field) with no network/credentials. Run in CI on both macOS and Linux; there is no XCTest target because the package has zero dependencies. `--wire <path>` decodes a captured `/wham/usage` body offline (prints only derived numbers, never identity).
+  - `Sources/RankingExporter.swift` - Emits `~/.claude-monitor/ranking.json`. Every account carries `provider`; `schema` stays **1** because the field is additive. A `provider: openai` account may omit `utilization["5h"]` — consumers must read a missing key as *unknown*, never 0.
   - `Sources/UsagePopoverView.swift` - Summary-table popover, sortable headers, add-account dialog
   - `Sources/UsageChartView.swift` - Per-account usage-history chart window
   - `Sources/RollTokenView.swift` / `Sources/TokenRoller.swift` - Roll Token wizard + revoke-script generator. The workflow depends on undocumented, web-session-cookie-authenticated `claude.ai/api/oauth` endpoints; if they change, `TokenRoller.revokeAllScript` is the single place to update (see README "Rolling a Token").
   - `Sources/UsageStore.swift` - SQLite-backed data store, account/usage models
   - `Sources/SQLiteDB.swift` - Minimal wrapper over system libsqlite3 (zero package deps)
-  - `Sources/RankingExporter.swift` - Emits `~/.claude-monitor/ranking.json`
   - `Sources/FileLogger.swift` - Debug log at `~/.claude-monitor/debug.log`
   - `Assets/` - App icon (`AppIcon.icns` + 1024px master PNG + `icon-master.source.json` generation recipe)
 - `scripts/build-macos-app.sh` - Build script that compiles and creates the .app bundle (bundles the icon)
