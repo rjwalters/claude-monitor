@@ -175,6 +175,15 @@ struct FullUsageDataPoint: Identifiable {
     let weeklyAllPercent: Double?
 }
 
+/// One reading of a single named sub-limit (`named_limits` table) — one series
+/// per provider-chosen `limit_name`, e.g. OpenAI's `additional_rate_limits[]`
+/// entries. Anthropic accounts never populate this today.
+struct NamedLimitDataPoint: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let usedPercent: Double
+}
+
 struct TokenDataPoint: Identifiable {
     let id = UUID()
     let timestamp: Date
@@ -294,9 +303,21 @@ class UsageStore: ObservableObject {
                 headers TEXT NOT NULL,
                 FOREIGN KEY (account_id) REFERENCES accounts(id)
             );
+            CREATE TABLE IF NOT EXISTS named_limits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                limit_name TEXT NOT NULL,
+                used_percent REAL,
+                window_seconds REAL,
+                reset_at TEXT,
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            );
             CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_history(account_id);
             CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_history(timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_probe_account_time ON probe_snapshots(account_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_named_limits_account_time
+                ON named_limits(account_id, limit_name, timestamp DESC);
             CREATE TABLE IF NOT EXISTS oauth_credentials (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account_id TEXT,
@@ -466,6 +487,36 @@ class UsageStore: ObservableObject {
     static func parseHeaders(_ json: String) -> [String: String]? {
         guard let data = json.data(using: .utf8) else { return nil }
         return (try? JSONDecoder().decode([String: String].self, from: data))
+    }
+
+    /// Write one `named_limits` row per entry in `named`, all stamped with the
+    /// same `timestamp` as the sibling `usage_history` row so the two can be
+    /// joined on `(account_id, timestamp)` if ever needed.
+    ///
+    /// `named` is empty for every Anthropic reading today (the ping response
+    /// never populates `RateLimitSnapshot.named`), so this is a silent no-op
+    /// for those accounts — exactly the "zero named_limits rows" behavior the
+    /// chart overlay depends on to stay hidden.
+    static func insertNamedLimits(
+        _ db: Connection,
+        accountId: String,
+        timestamp: String,
+        named: [String: RateLimitWindow]
+    ) {
+        for (limitName, window) in named {
+            do {
+                try db.run("""
+                    INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent, window_seconds, reset_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, accountId, timestamp, limitName, window.usedPercent,
+                   window.durationSeconds, window.resetAtISO)
+            } catch {
+                FileLogger.shared.error(
+                    "Failed to write named_limits row for \(limitName): \(error.localizedDescription)",
+                    category: "DB"
+                )
+            }
+        }
     }
 
     func loadFromDatabase() {
@@ -717,6 +768,47 @@ class UsageStore: ObservableObject {
         } catch {
             print("Error loading full history: \(error)")
             return []
+        }
+    }
+
+    /// Named per-model / per-feature sub-limit history (`named_limits`),
+    /// grouped by the provider-chosen `limit_name` — one time series per key,
+    /// ascending by timestamp. Returns an empty dictionary for every account
+    /// with no named limits (every Anthropic account today), which is what
+    /// lets `UsageChartView` hide the overlay entirely rather than rendering
+    /// an empty series.
+    func loadNamedLimitHistory(for accountId: String, daysBack: Int = 7) -> [String: [NamedLimitDataPoint]] {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return [:]
+            }
+
+            let db = try openDatabase(dbPath, readonly: true)
+            guard tableColumns(db, "named_limits").contains("limit_name") else { return [:] }
+
+            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let cutoffString = formatter.string(from: cutoffDate)
+
+            let stmt = try db.prepare("""
+                SELECT limit_name, timestamp, used_percent FROM named_limits
+                WHERE account_id = ? AND timestamp >= ?
+                ORDER BY limit_name, timestamp ASC
+            """)
+
+            var result: [String: [NamedLimitDataPoint]] = [:]
+            for row in stmt.bind(accountId, cutoffString) {
+                guard let limitName = row[0] as? String,
+                      let date = parseDate(row[1] as? String),
+                      let percent = row[2] as? Double else { continue }
+                result[limitName, default: []].append(NamedLimitDataPoint(timestamp: date, usedPercent: percent))
+            }
+            return result
+
+        } catch {
+            print("Error loading named limit history: \(error)")
+            return [:]
         }
     }
 
