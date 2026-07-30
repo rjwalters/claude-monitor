@@ -15,12 +15,17 @@ import Foundation
 enum AccountSync {
     static let formatVersion = 1
 
+    /// New optional fields (`provider`, `tokenExpiresAt`) decode as nil from a
+    /// pre-multi-provider bundle and resolve to Anthropic on import, so
+    /// `formatVersion` stays at 1 — old and new hosts still interoperate.
     struct ExportedCredential: Codable {
         var label: String
         var source: String
+        var provider: String?
         var accessToken: String?
         var refreshToken: String?
         var expiresAt: Int64?
+        var tokenExpiresAt: String?
         var scopes: String?
         var subscriptionType: String?
         var rateLimitTier: String?
@@ -32,6 +37,7 @@ enum AccountSync {
 
     struct ExportedAccount: Codable {
         var id: String
+        var provider: String?
         var accountName: String?
         var email: String?
         var plan: String?
@@ -78,16 +84,27 @@ enum AccountSync {
             let db = try openDatabase(dbPath, readonly: true)
             var accounts: [ExportedAccount] = []
 
-            let acctStmt = try db.prepare(
-                "SELECT id, account_name, email, plan, last_updated, sort_order FROM accounts ORDER BY sort_order, id"
-            )
+            // Provider columns are selected only when present, so exporting
+            // from a database that predates the migration still works.
+            let hasAcctProvider = tableColumns(db, "accounts").contains("provider")
+            let credColumns = tableColumns(db, "oauth_credentials")
+            let hasCredProvider = credColumns.contains("provider")
+            let hasTokenExpiry = credColumns.contains("token_expires_at")
+
+            let acctStmt = try db.prepare("""
+                SELECT id, account_name, email, plan, last_updated, sort_order,
+                       \(hasAcctProvider ? "provider" : "NULL")
+                FROM accounts ORDER BY sort_order, id
+            """)
             for row in acctStmt {
                 guard let id = row[0] as? String else { continue }
 
                 let credStmt = try db.prepare("""
                     SELECT label, source, access_token, refresh_token, expires_at,
                            scopes, subscription_type, rate_limit_tier, is_active,
-                           created_at, updated_at, token_rolled_at
+                           created_at, updated_at, token_rolled_at,
+                           \(hasCredProvider ? "provider" : "NULL"),
+                           \(hasTokenExpiry ? "token_expires_at" : "NULL")
                     FROM oauth_credentials WHERE account_id = ?
                 """)
                 var credentials: [ExportedCredential] = []
@@ -95,9 +112,11 @@ enum AccountSync {
                     credentials.append(ExportedCredential(
                         label: (c[0] as? String) ?? id,
                         source: (c[1] as? String) ?? "token",
+                        provider: AccountProvider(stored: c[12] as? String).rawValue,
                         accessToken: c[2] as? String,
                         refreshToken: c[3] as? String,
                         expiresAt: c[4] as? Int64,
+                        tokenExpiresAt: c[13] as? String,
                         scopes: c[5] as? String,
                         subscriptionType: c[6] as? String,
                         rateLimitTier: c[7] as? String,
@@ -110,6 +129,7 @@ enum AccountSync {
 
                 accounts.append(ExportedAccount(
                     id: id,
+                    provider: AccountProvider(stored: row[6] as? String).rawValue,
                     accountName: row[1] as? String,
                     email: row[2] as? String,
                     plan: row[3] as? String,
@@ -170,6 +190,10 @@ enum AccountSync {
         guard FileManager.default.fileExists(atPath: dbPath) else { throw SyncError.databaseMissing }
         do {
             let db = try openDatabase(dbPath)
+            // Bring the target database up to the current schema first — a host
+            // that has never launched the app still has a pre-migration
+            // database, and the upserts below write the provider columns.
+            try? UsageStore.applySchema(db)
             var summary = ImportSummary()
             for account in bundle.accounts {
                 summary.outcomes.append(try importAccount(account, db: db))
@@ -211,15 +235,20 @@ enum AccountSync {
         let now = ISO8601DateFormatter().string(from: Date())
         let lastUpdated = account.lastUpdated ?? now
 
+        // A bundle exported before multi-provider support carries no provider;
+        // it resolves to Anthropic, which is what those hosts were polling.
+        let provider = AccountProvider(stored: account.provider).rawValue
+
         try db.run("""
-            INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order)
-            VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0))
+            INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+            VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0), ?)
             ON CONFLICT(id) DO UPDATE SET
                 account_name = COALESCE(excluded.account_name, accounts.account_name),
                 email = COALESCE(excluded.email, accounts.email),
                 plan = COALESCE(excluded.plan, accounts.plan),
-                last_updated = excluded.last_updated
-        """, targetId, account.accountName, account.email, account.plan, lastUpdated)
+                last_updated = excluded.last_updated,
+                provider = excluded.provider
+        """, targetId, account.accountName, account.email, account.plan, lastUpdated, provider)
 
         for credential in account.credentials {
             try importCredential(credential, accountId: targetId, db: db)
@@ -237,29 +266,35 @@ enum AccountSync {
             "SELECT access_token FROM oauth_credentials WHERE account_id = ? LIMIT 1", accountId
         ) as? String
 
+        let provider = AccountProvider(stored: credential.provider).rawValue
+
         if let credId = existingId {
             // Only bump token_rolled_at when the token value actually changes,
             // mirroring saveCredentialForAccount's roll-clock semantics.
             let tokenChanged = existingToken != credential.accessToken
             try db.run("""
                 UPDATE oauth_credentials SET
-                    label = ?, source = ?, access_token = ?, refresh_token = ?,
-                    expires_at = ?, scopes = ?, subscription_type = ?, rate_limit_tier = ?,
+                    label = ?, source = ?, provider = ?, access_token = ?, refresh_token = ?,
+                    expires_at = ?, token_expires_at = ?,
+                    scopes = ?, subscription_type = ?, rate_limit_tier = ?,
                     is_active = ?, updated_at = ?,
                     token_rolled_at = CASE WHEN ? THEN ? ELSE token_rolled_at END
                 WHERE id = ?
-            """, credential.label, credential.source, credential.accessToken, credential.refreshToken,
-                 credential.expiresAt, credential.scopes, credential.subscriptionType, credential.rateLimitTier,
+            """, credential.label, credential.source, provider, credential.accessToken, credential.refreshToken,
+                 credential.expiresAt, credential.tokenExpiresAt,
+                 credential.scopes, credential.subscriptionType, credential.rateLimitTier,
                  credential.isActive, now, tokenChanged, credential.tokenRolledAt ?? now, credId)
         } else {
             try db.run("""
                 INSERT INTO oauth_credentials (
-                    account_id, label, source, access_token, refresh_token,
-                    expires_at, scopes, subscription_type, rate_limit_tier,
+                    account_id, label, source, provider, access_token, refresh_token,
+                    expires_at, token_expires_at, scopes, subscription_type, rate_limit_tier,
                     is_active, created_at, updated_at, token_rolled_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, accountId, credential.label, credential.source, credential.accessToken, credential.refreshToken,
-                 credential.expiresAt, credential.scopes, credential.subscriptionType, credential.rateLimitTier,
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, accountId, credential.label, credential.source, provider,
+                 credential.accessToken, credential.refreshToken,
+                 credential.expiresAt, credential.tokenExpiresAt,
+                 credential.scopes, credential.subscriptionType, credential.rateLimitTier,
                  credential.isActive, credential.createdAt ?? now, now, credential.tokenRolledAt)
         }
     }

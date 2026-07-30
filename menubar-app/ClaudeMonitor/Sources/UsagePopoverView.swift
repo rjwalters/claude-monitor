@@ -71,16 +71,9 @@ enum SortDirection {
     func toggled() -> SortDirection { self == .asc ? .desc : .asc }
 }
 
-/// "Which account should I use" score 0–100.
-/// 100 = no usage / max headroom; 0 = capped on either session or weekly.
-/// Returns nil if there's no usage data yet (sorts to bottom).
-func headroomScore(_ usage: UsageRecord?) -> Double? {
-    guard let usage = usage else { return nil }
-    let session = usage.sessionPercent ?? 0
-    let weekly = usage.weeklyAllPercent ?? 0
-    let used = max(session, weekly)
-    return max(0, min(100, 100 - used))
-}
+// `headroomScore` now lives in the portable core (UsageStore.swift) and reads
+// through `UsageRecord.rateLimit`, so the headless Linux daemon scores accounts
+// the same way this popover does.
 
 /// Sort key for the Extra-usage column. Lower = more attention needed.
 /// nil (no probe yet) sorts last.
@@ -96,16 +89,9 @@ func extraUsageUrgency(_ usage: UsageRecord?) -> Double? {
     }
 }
 
-/// Seconds until reset for an ISO-8601 string; nil if unparseable/absent.
-func resetSecondsForString(_ str: String?) -> Double? {
-    guard let str = str else { return nil }
-    let iso = ISO8601DateFormatter()
-    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let date = iso.date(from: str) ?? ISO8601DateFormatter().date(from: str) {
-        return date.timeIntervalSinceNow
-    }
-    return nil
-}
+// Reset-time sorting now reads `RateLimitWindow.resetAt` (already a `Date`) via
+// `UsageRecord.rateLimit`, so the string-parsing helper that used to live here
+// is gone; `UsageRecord.parseISO` is the single ISO-8601 parse point.
 
 /// Lower rank = "better" status (valid first, missing last).
 func tokenStatusRank(_ status: TokenStatus) -> Int {
@@ -197,9 +183,12 @@ struct UsagePopoverView: View {
         case .headroom:
             return (headroomScore(a.1), headroomScore(b.1))
         case .sessionPercent:
-            return (a.1?.sessionPercent, b.1?.sessionPercent)
+            // Read through the shared window model: a provider that reports no
+            // session window yields nil here and sorts last, rather than
+            // pretending to be at 0%.
+            return (a.1?.rateLimit.session?.usedPercent, b.1?.rateLimit.session?.usedPercent)
         case .weeklyPercent:
-            return (a.1?.weeklyAllPercent, b.1?.weeklyAllPercent)
+            return (a.1?.rateLimit.weekly?.usedPercent, b.1?.rateLimit.weekly?.usedPercent)
         case .fablePercent:
             // Sort by Fable used (asc = most remaining last, matching other % columns).
             return (a.1?.fablePercent, b.1?.fablePercent)
@@ -207,9 +196,11 @@ struct UsagePopoverView: View {
             // Ascending = "needs attention first": empty → low balance → in use → ready → off.
             return (extraUsageUrgency(a.1), extraUsageUrgency(b.1))
         case .sessionReset:
-            return (resetSecondsForString(a.1?.sessionReset), resetSecondsForString(b.1?.sessionReset))
+            return (a.1?.rateLimit.session?.resetAt?.timeIntervalSinceNow,
+                    b.1?.rateLimit.session?.resetAt?.timeIntervalSinceNow)
         case .weeklyReset:
-            return (resetSecondsForString(a.1?.weeklyReset), resetSecondsForString(b.1?.weeklyReset))
+            return (a.1?.rateLimit.weekly?.resetAt?.timeIntervalSinceNow,
+                    b.1?.rateLimit.weekly?.resetAt?.timeIntervalSinceNow)
         case .fresh:
             // Data age in seconds (lower = fresher). nil usage → nil → sorts last.
             return (a.1.map { -$0.timestamp.timeIntervalSinceNow },
@@ -681,19 +672,22 @@ struct SummaryRow: View {
             headroomCell
                 .frame(width: SummaryColumns.headroom, alignment: .trailing)
 
-            percentText(usage?.sessionPercent)
+            // Session and weekly cells both read the shared window model. When a
+            // provider reports no session window at all, `session` is nil and
+            // both cells render "—" rather than a misleading 0% / "now".
+            percentText(usage?.rateLimit.session?.usedPercent)
                 .frame(width: SummaryColumns.percent, alignment: .trailing)
 
-            Text(resetLabel(usage?.sessionReset))
+            Text(resetLabel(usage?.rateLimit.session?.resetAt))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .lineLimit(1)
                 .frame(width: SummaryColumns.reset, alignment: .trailing)
 
-            percentText(usage?.weeklyAllPercent)
+            percentText(usage?.rateLimit.weekly?.usedPercent)
                 .frame(width: SummaryColumns.percent, alignment: .trailing)
 
-            Text(resetLabel(usage?.weeklyReset))
+            Text(resetLabel(usage?.rateLimit.weekly?.resetAt))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .lineLimit(1)
@@ -789,17 +783,13 @@ struct SummaryRow: View {
         isEditingName = false
     }
 
-    private func resetLabel(_ str: String?) -> String {
-        guard let str = str else { return "—" }
-        let isoFormatter = ISO8601DateFormatter()
-        isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let date = isoFormatter.date(from: str) ?? ISO8601DateFormatter().date(from: str)
-        if let date = date {
-            let interval = date.timeIntervalSinceNow
-            if interval <= 0 { return "now" }
-            return formatInterval(interval)
-        }
-        return str
+    /// "—" when the window is absent or carries no reset instant — the same
+    /// rendering an OpenAI account with no session window gets.
+    private func resetLabel(_ date: Date?) -> String {
+        guard let date = date else { return "—" }
+        let interval = date.timeIntervalSinceNow
+        if interval <= 0 { return "now" }
+        return formatInterval(interval)
     }
 
     @ViewBuilder

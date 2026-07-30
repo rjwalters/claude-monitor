@@ -314,6 +314,7 @@ import — see [Multiple Accounts](#multiple-accounts)), then:
 claude-monitor                  # poll loop, logs to stdout + ~/.claude-monitor/debug.log
 claude-monitor --once           # one poll cycle, write ranking.json, exit
 claude-monitor --interval 300   # override per-account poll interval (seconds, min 60)
+claude-monitor selftest         # self-check (no network/credentials); non-zero exit on failure
 ```
 
 Edits to `accounts.env` / `accounts.local.env` are picked up automatically
