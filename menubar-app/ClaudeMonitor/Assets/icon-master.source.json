@@ -7,6 +7,7 @@
   "refs": [],
   "aspect_ratio": null,
   "size": null,
-  "sha256": "9adc48d500c3cb35b7f2301687254093f2846739cbfe076c4f257606e071c130",
-  "created": "2026-07-28T12:36:57-0700"
+  "sha256": "5a7e1f0abb644987665d3e4424fb4c2207dd1fe96c3b966b283294ba2ebb3733",
+  "created": "2026-07-28T12:36:57-0700",
+  "post_processing": "The imagine sidecar's raw sha256 (9adc48d5...) was for the unmasked model output. icon-master.png as committed is that output masked to a macOS squircle (see commit d5f47d7 'Add app icon (gauge dial) and bundle it at build time'), which changes the pixel/alpha data and therefore the hash. The sha256 above is recomputed against the tracked, post-processed icon-master.png so this recipe round-trips against the actual master."
 }
