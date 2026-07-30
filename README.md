@@ -269,6 +269,8 @@ swift build
 .build/debug/ClaudeMonitor &
 ```
 
+CI (`.github/workflows/build.yml`) runs the same `swift build` on every push.
+
 ### Build for Distribution
 
 ```bash
@@ -444,9 +446,16 @@ claude-monitor/
 │       ├── RankingExporter.swift   # Emits ~/.claude-monitor/ranking.json for load balancers
 │       ├── FileLogger.swift        # Debug logging
 │       └── LinuxCompat.swift       # ObservableObject/@Published stand-ins for Linux
-└── scripts/
-    ├── build-macos-app.sh          # macOS release build script
-    └── claude-monitor.service      # Sample systemd user unit for Linux headless mode
+├── scripts/
+│   ├── build-macos-app.sh          # macOS release build script
+│   └── claude-monitor.service      # Sample systemd user unit for Linux headless mode
+├── .github/workflows/build.yml  # CI: swift build on push
+├── build/                       # Build output (gitignored): ClaudeMonitor.app + .zip
+├── CHANGELOG.md
+├── .env.example                 # Sample accounts.env for bulk import
+├── window.png, plot_window.png  # README screenshots
+├── loom.sh, package.json        # Loom orchestration workspace files (not part of the app)
+└── .loom/, .claude/             # Loom + Claude Code tooling installs
 ```
 
 ## Related Projects

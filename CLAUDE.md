@@ -24,6 +24,7 @@
 ## Project Structure
 
 - `menubar-app/ClaudeMonitor/` - Swift Package Manager project
+  - `Package.swift` - Package manifest (zero package dependencies)
   - `Sources/main.swift` - macOS entry point, AppDelegate, popover/window management
   - `Sources/HeadlessMain.swift` / `Sources/HeadlessRunner.swift` - Linux entry point + UI-less poll loop (also `--headless` on macOS)
   - `Sources/LinuxCompat.swift` - `ObservableObject`/`@Published` stand-ins for Linux (no Combine)
