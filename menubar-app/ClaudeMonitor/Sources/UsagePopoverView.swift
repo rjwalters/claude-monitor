@@ -185,9 +185,10 @@ struct UsagePopoverView: View {
     /// Sort comparator for two rows under the current column/direction.
     /// Rows without data sort to the bottom regardless of direction.
     private func compareRows(_ a: (Account, UsageRecord?), _ b: (Account, UsageRecord?)) -> Bool {
-        // Account name is a string compare, not numeric
+        // Account name sorts naturally: digit runs compare by value, so
+        // agent-10 follows agent-9 instead of landing next to agent-1.
         if case .account = sortBy {
-            let cmp = a.0.displayName.localizedCaseInsensitiveCompare(b.0.displayName)
+            let cmp = NaturalSort.compare(a.0.displayName, b.0.displayName)
             if cmp == .orderedSame { return a.0.id < b.0.id }
             return sortDir == .asc
                 ? (cmp == .orderedAscending)

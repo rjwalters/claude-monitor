@@ -39,6 +39,7 @@ enum SelfTest {
             exit(0)
         }
 
+        testNaturalSort()
         testWindowKindDerivation()
         testSnapshotFromPositionalWindows()
         testMissingSessionWindow()
@@ -82,6 +83,18 @@ enum SelfTest {
         if actual != expected {
             failures.append("\(label): expected \(expected), got \(actual)")
         }
+    }
+
+    // MARK: - Account name ordering
+
+    /// Natural (hybrid lexical/numeric) ordering of account names. The rules
+    /// live beside the implementation in `NaturalSort.selfCheck()`, which
+    /// reports its own count and failures rather than depending on this file's
+    /// private helpers.
+    private static func testNaturalSort() {
+        let result = NaturalSort.selfCheck()
+        checks += result.checks
+        failures.append(contentsOf: result.failures.map { "naturalSort: \($0)" })
     }
 
     // MARK: - Window model
