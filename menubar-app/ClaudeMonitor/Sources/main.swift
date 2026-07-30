@@ -51,7 +51,12 @@ class PopoverHeightManager: ObservableObject {
 @main
 enum ClaudeMonitorEntry {
     static func main() {
-        if CommandLine.arguments.contains("--headless") {
+        // `accounts export|import` is a one-shot CLI operation, not a launch
+        // mode — route it before the --headless/GUI dispatch so it works
+        // without also passing --headless.
+        if CommandLine.arguments.dropFirst().first == "accounts" {
+            AccountSyncCLI.main(Array(CommandLine.arguments.dropFirst(2)))
+        } else if CommandLine.arguments.contains("--headless") {
             HeadlessRunner.main()
         } else {
             ClaudeMonitorApp.main()

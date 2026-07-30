@@ -130,5 +130,8 @@ enum HeadlessRunner {
         Accounts are read from ~/.claude-monitor/accounts.env and
         accounts.local.env (ACCOUNT_EMAIL_N / ACCOUNT_KEY_N pairs); edits are
         picked up automatically while running.
+
+        For multi-host sync of account records + credentials, see:
+          claude-monitor accounts --help
         """
 }

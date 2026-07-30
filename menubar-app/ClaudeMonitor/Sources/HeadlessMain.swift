@@ -5,7 +5,13 @@
 @main
 enum ClaudeMonitorEntry {
     static func main() {
-        HeadlessRunner.main()
+        // `accounts export|import` is a one-shot CLI operation, distinct from
+        // the always-on poll loop below.
+        if CommandLine.arguments.dropFirst().first == "accounts" {
+            AccountSyncCLI.main(Array(CommandLine.arguments.dropFirst(2)))
+        } else {
+            HeadlessRunner.main()
+        }
     }
 }
 #endif

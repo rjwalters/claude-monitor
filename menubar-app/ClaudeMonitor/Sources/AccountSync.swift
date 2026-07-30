@@ -1,0 +1,282 @@
+import Foundation
+
+/// Headless-safe account export/import for multi-host sync (issue #16). Reads
+/// and writes `~/.claude-monitor/usage.db` directly through `SQLiteDB.swift` —
+/// no AppKit/SwiftUI/Combine — so it works identically on macOS and Linux.
+///
+/// Export serializes account identity records plus their OAuth credentials
+/// (excluding host-local operational state: keychain refs, last_poll_at,
+/// last_error). Import upserts by email (falling back to id when email is
+/// absent), and never regresses a local record whose `last_updated` is newer
+/// than the imported one.
+///
+/// The exported bundle contains plaintext OAuth tokens — callers (see
+/// `AccountSyncCLI`) must treat it as a secret.
+enum AccountSync {
+    static let formatVersion = 1
+
+    struct ExportedCredential: Codable {
+        var label: String
+        var source: String
+        var accessToken: String?
+        var refreshToken: String?
+        var expiresAt: Int64?
+        var scopes: String?
+        var subscriptionType: String?
+        var rateLimitTier: String?
+        var isActive: Bool
+        var createdAt: String?
+        var updatedAt: String?
+        var tokenRolledAt: String?
+    }
+
+    struct ExportedAccount: Codable {
+        var id: String
+        var accountName: String?
+        var email: String?
+        var plan: String?
+        var lastUpdated: String?
+        var sortOrder: Int
+        var credentials: [ExportedCredential]
+    }
+
+    struct ExportBundle: Codable {
+        var formatVersion: Int
+        var exportedAt: String
+        var sourceHost: String
+        var accounts: [ExportedAccount]
+    }
+
+    enum SyncError: Error, LocalizedError {
+        case databaseMissing
+        case sqlite(Error)
+
+        var errorDescription: String? {
+            switch self {
+            case .databaseMissing:
+                return "No database found at ~/.claude-monitor/usage.db"
+            case .sqlite(let error):
+                return "Database error: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// `~/.claude-monitor/usage.db`, resolved the same way as
+    /// `UsageStore`/`OAuthPoller`. Every entry point below takes an explicit
+    /// `dbPath` (defaulting to this) so callers — including tests — can point
+    /// at an isolated database instead.
+    static var defaultDBPath: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude-monitor/usage.db").path
+    }
+
+    // MARK: - Export
+
+    static func exportBundle(dbPath: String = defaultDBPath) throws -> ExportBundle {
+        guard FileManager.default.fileExists(atPath: dbPath) else { throw SyncError.databaseMissing }
+        do {
+            let db = try openDatabase(dbPath, readonly: true)
+            var accounts: [ExportedAccount] = []
+
+            let acctStmt = try db.prepare(
+                "SELECT id, account_name, email, plan, last_updated, sort_order FROM accounts ORDER BY sort_order, id"
+            )
+            for row in acctStmt {
+                guard let id = row[0] as? String else { continue }
+
+                let credStmt = try db.prepare("""
+                    SELECT label, source, access_token, refresh_token, expires_at,
+                           scopes, subscription_type, rate_limit_tier, is_active,
+                           created_at, updated_at, token_rolled_at
+                    FROM oauth_credentials WHERE account_id = ?
+                """)
+                var credentials: [ExportedCredential] = []
+                for c in credStmt.bind(id) {
+                    credentials.append(ExportedCredential(
+                        label: (c[0] as? String) ?? id,
+                        source: (c[1] as? String) ?? "token",
+                        accessToken: c[2] as? String,
+                        refreshToken: c[3] as? String,
+                        expiresAt: c[4] as? Int64,
+                        scopes: c[5] as? String,
+                        subscriptionType: c[6] as? String,
+                        rateLimitTier: c[7] as? String,
+                        isActive: ((c[8] as? Int64) ?? 1) == 1,
+                        createdAt: c[9] as? String,
+                        updatedAt: c[10] as? String,
+                        tokenRolledAt: c[11] as? String
+                    ))
+                }
+
+                accounts.append(ExportedAccount(
+                    id: id,
+                    accountName: row[1] as? String,
+                    email: row[2] as? String,
+                    plan: row[3] as? String,
+                    lastUpdated: row[4] as? String,
+                    sortOrder: Int((row[5] as? Int64) ?? 0),
+                    credentials: credentials
+                ))
+            }
+
+            let now = ISO8601DateFormatter().string(from: Date())
+            return ExportBundle(
+                formatVersion: formatVersion,
+                exportedAt: now,
+                sourceHost: ProcessInfo.processInfo.hostName,
+                accounts: accounts
+            )
+        } catch let error as SyncError {
+            throw error
+        } catch {
+            throw SyncError.sqlite(error)
+        }
+    }
+
+    static func exportJSON(pretty: Bool = true, dbPath: String = defaultDBPath) throws -> Data {
+        let bundle = try exportBundle(dbPath: dbPath)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = pretty ? [.prettyPrinted, .sortedKeys] : [.sortedKeys]
+        return try encoder.encode(bundle)
+    }
+
+    // MARK: - Import
+
+    struct ImportOutcome {
+        let email: String?
+        let id: String
+        let action: Action
+
+        enum Action: String {
+            case created
+            case updated
+            case skippedNewer  // local record's last_updated is >= the imported one
+        }
+    }
+
+    struct ImportSummary {
+        var outcomes: [ImportOutcome] = []
+        var created: Int { outcomes.filter { $0.action == .created }.count }
+        var updated: Int { outcomes.filter { $0.action == .updated }.count }
+        var skipped: Int { outcomes.filter { $0.action == .skippedNewer }.count }
+    }
+
+    /// Upserts accounts by email (falling back to id when email is absent on
+    /// either side), skipping any account whose local `last_updated` is newer
+    /// than or equal to the imported record. Existing local ids are preserved
+    /// on match so `usage_history` / `probe_snapshots` rows stay attached.
+    @discardableResult
+    static func importBundle(_ bundle: ExportBundle, dbPath: String = defaultDBPath) throws -> ImportSummary {
+        guard FileManager.default.fileExists(atPath: dbPath) else { throw SyncError.databaseMissing }
+        do {
+            let db = try openDatabase(dbPath)
+            var summary = ImportSummary()
+            for account in bundle.accounts {
+                summary.outcomes.append(try importAccount(account, db: db))
+            }
+            return summary
+        } catch let error as SyncError {
+            throw error
+        } catch {
+            throw SyncError.sqlite(error)
+        }
+    }
+
+    private static func importAccount(_ account: ExportedAccount, db: Connection) throws -> ImportOutcome {
+        var existingId: String?
+        var existingLastUpdated: String?
+
+        if let email = account.email, !email.isEmpty {
+            let stmt = try db.prepare("SELECT id, last_updated FROM accounts WHERE email = ? LIMIT 1")
+            for r in stmt.bind(email) {
+                existingId = r[0] as? String
+                existingLastUpdated = r[1] as? String
+            }
+        }
+        if existingId == nil {
+            let stmt = try db.prepare("SELECT id, last_updated FROM accounts WHERE id = ? LIMIT 1")
+            for r in stmt.bind(account.id) {
+                existingId = r[0] as? String
+                existingLastUpdated = r[1] as? String
+            }
+        }
+
+        let isNewAccount = existingId == nil
+        let targetId = existingId ?? account.id
+
+        if !isNewAccount, isLocalAuthoritative(existingLastUpdated, incoming: account.lastUpdated) {
+            return ImportOutcome(email: account.email, id: targetId, action: .skippedNewer)
+        }
+
+        let now = ISO8601DateFormatter().string(from: Date())
+        let lastUpdated = account.lastUpdated ?? now
+
+        try db.run("""
+            INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order)
+            VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0))
+            ON CONFLICT(id) DO UPDATE SET
+                account_name = COALESCE(excluded.account_name, accounts.account_name),
+                email = COALESCE(excluded.email, accounts.email),
+                plan = COALESCE(excluded.plan, accounts.plan),
+                last_updated = excluded.last_updated
+        """, targetId, account.accountName, account.email, account.plan, lastUpdated)
+
+        for credential in account.credentials {
+            try importCredential(credential, accountId: targetId, db: db)
+        }
+
+        return ImportOutcome(email: account.email, id: targetId, action: isNewAccount ? .created : .updated)
+    }
+
+    private static func importCredential(_ credential: ExportedCredential, accountId: String, db: Connection) throws {
+        let now = ISO8601DateFormatter().string(from: Date())
+        let existingId = try db.scalar(
+            "SELECT id FROM oauth_credentials WHERE account_id = ? LIMIT 1", accountId
+        ) as? Int64
+        let existingToken = try db.scalar(
+            "SELECT access_token FROM oauth_credentials WHERE account_id = ? LIMIT 1", accountId
+        ) as? String
+
+        if let credId = existingId {
+            // Only bump token_rolled_at when the token value actually changes,
+            // mirroring saveCredentialForAccount's roll-clock semantics.
+            let tokenChanged = existingToken != credential.accessToken
+            try db.run("""
+                UPDATE oauth_credentials SET
+                    label = ?, source = ?, access_token = ?, refresh_token = ?,
+                    expires_at = ?, scopes = ?, subscription_type = ?, rate_limit_tier = ?,
+                    is_active = ?, updated_at = ?,
+                    token_rolled_at = CASE WHEN ? THEN ? ELSE token_rolled_at END
+                WHERE id = ?
+            """, credential.label, credential.source, credential.accessToken, credential.refreshToken,
+                 credential.expiresAt, credential.scopes, credential.subscriptionType, credential.rateLimitTier,
+                 credential.isActive, now, tokenChanged, credential.tokenRolledAt ?? now, credId)
+        } else {
+            try db.run("""
+                INSERT INTO oauth_credentials (
+                    account_id, label, source, access_token, refresh_token,
+                    expires_at, scopes, subscription_type, rate_limit_tier,
+                    is_active, created_at, updated_at, token_rolled_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, accountId, credential.label, credential.source, credential.accessToken, credential.refreshToken,
+                 credential.expiresAt, credential.scopes, credential.subscriptionType, credential.rateLimitTier,
+                 credential.isActive, credential.createdAt ?? now, now, credential.tokenRolledAt)
+        }
+    }
+
+    /// True if the local record should win: it has a timestamp at least as
+    /// recent as the incoming one, or the incoming record carries no
+    /// timestamp to compare against. False (incoming wins) when the local
+    /// record has no timestamp but the incoming one does.
+    private static func isLocalAuthoritative(_ existing: String?, incoming: String?) -> Bool {
+        guard let incoming = incoming, let incomingDate = parseISO(incoming) else { return true }
+        guard let existing = existing, let existingDate = parseISO(existing) else { return false }
+        return existingDate >= incomingDate
+    }
+
+    private static func parseISO(_ string: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: string) ?? ISO8601DateFormatter().date(from: string)
+    }
+}
