@@ -7,7 +7,7 @@ on:
     branches: [master, main]
 
 jobs:
-  build:
+  build-macos:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -16,3 +16,26 @@ jobs:
         run: |
           cd menubar-app/ClaudeMonitor
           swift build
+
+  build-linux:
+    runs-on: ubuntu-latest
+    container: swift:6.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SQLite dev headers
+        run: apt-get update && apt-get install -y libsqlite3-dev
+
+      - name: Build (Linux headless)
+        run: |
+          cd menubar-app/ClaudeMonitor
+          swift build
+
+      - name: Smoke run (no credentials)
+        run: |
+          cd menubar-app/ClaudeMonitor
+          .build/debug/ClaudeMonitor --once
+          # The binary resolves home via homeDirectoryForCurrentUser (passwd
+          # entry), while Actions containers set HOME elsewhere — check both.
+          passwd_home=$(getent passwd "$(id -u)" | cut -d: -f6)
+          test -f "$passwd_home/.claude-monitor/usage.db" || test -f "$HOME/.claude-monitor/usage.db"
