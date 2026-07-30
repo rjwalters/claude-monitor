@@ -102,10 +102,12 @@ func extraUsageUrgency(_ usage: UsageRecord?) -> Double? {
 struct ProviderBadge: View {
     let provider: AccountProvider
 
-    /// Fixed slot width so a 16-cell mascot and an 11-cell hexagon don't
-    /// ragged-edge the account names that follow them in the column.
-    private static let slotWidth: CGFloat = 16
-    private static let glyphHeight: CGFloat = 10
+    /// Both glyphs are drawn at one point per cell and centred in a common
+    /// 16×16 box: it keeps them pixel-crisp (one cell = two device pixels at
+    /// 2×) and stops a 16×10 mascot and a 16×16 rosette from ragged-edging the
+    /// account names that follow them in the column.
+    private static let box: CGFloat = 16
+    private static let cell: CGFloat = 1
 
     private var tint: Color {
         switch provider {
@@ -124,8 +126,8 @@ struct ProviderBadge: View {
     }
 
     var body: some View {
-        PixelSprite(rows: glyph, color: tint, height: Self.glyphHeight)
-            .frame(width: Self.slotWidth, alignment: .center)
+        PixelSprite(rows: glyph, color: tint, cell: Self.cell)
+            .frame(width: Self.box, height: Self.box, alignment: .center)
             .help(provider.displayName)
             .accessibilityLabel(provider.displayName)
     }
@@ -150,21 +152,31 @@ private enum ProviderGlyph {
         "...#.#....#.#...",
     ]
 
-    /// A thick hexagonal ring for OpenAI — an evocation of their mark's
-    /// silhouette, not a reproduction of it. The interwoven knot has no honest
-    /// reading at ten pixels tall, and thin strokes blur into a circle at this
-    /// size, so the ring is two cells thick to stay legible in the row.
+    /// OpenAI's rosette, as a 16×16 outline.
+    ///
+    /// An earlier pass tried to fit this into the mascot's ten-pixel height and
+    /// failed: thin strokes blur to a plain circle and thick ones fill the
+    /// centre hole, because the mark's legibility depends on *both* the hole
+    /// and the interweaving. Sixteen cells is the first size where the six-fold
+    /// structure survives 1-bit rendering, so the box is sized to the harder
+    /// glyph and the mascot is centred inside it.
     static let openai = [
-        "...#####...",
-        "..#######..",
-        ".##.....##.",
-        "##.......##",
-        "##.......##",
-        "##.......##",
-        "##.......##",
-        ".##.....##.",
-        "..#######..",
-        "...#####...",
+        ".......####.....",
+        "...#####...#....",
+        "..##.##....##...",
+        ".##..#..#####...",
+        ".#..##.#.....##.",
+        ".#..#.#.......##",
+        ".#..#.#######..#",
+        "###.###...#.##.#",
+        "#.##.#...###.###",
+        "#..#######.#..#.",
+        "##.......#.#..#.",
+        ".##.....#.##..#.",
+        "...#####..#..##.",
+        "...##....##.##..",
+        "....#...#####...",
+        ".....####.......",
     ]
 }
 
@@ -174,11 +186,12 @@ private enum ProviderGlyph {
 private struct PixelSprite: View {
     let rows: [String]
     let color: Color
-    /// Rendered height in points; width follows the bitmap's aspect ratio.
-    let height: CGFloat
+    /// Size of one bitmap cell in points. Fixed rather than derived from a
+    /// target height so every glyph lands on whole pixels regardless of its
+    /// grid, which is what keeps the art crisp instead of resampled.
+    let cell: CGFloat
 
     var body: some View {
-        let cell = height / CGFloat(max(rows.count, 1))
         let columns = rows.map(\.count).max() ?? 0
         Canvas { context, _ in
             for (rowIndex, row) in rows.enumerated() {
@@ -195,7 +208,7 @@ private struct PixelSprite: View {
                 }
             }
         }
-        .frame(width: cell * CGFloat(columns), height: height)
+        .frame(width: cell * CGFloat(columns), height: cell * CGFloat(rows.count))
     }
 }
 
