@@ -4,6 +4,45 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] - 2026-07-30
+
+### Summary
+
+Multi-host account sync. The headless binary gains `accounts export` /
+`accounts import` subcommands for converging account records and credentials
+across machines, alongside email-integrity fixes and a Linux CI job.
+
+### Added
+
+- **`accounts export` / `accounts import` CLI.** One-shot, headless-safe
+  subcommands to sync account records + credentials between hosts:
+  `claude-monitor accounts export --output accounts.json` on the source,
+  `claude-monitor accounts import accounts.json` (or stdin) on the target.
+  Exports carry plaintext OAuth tokens — `--output` files are written `0600`
+  and a warning prints either way. Imports are idempotent, match by email,
+  preserve local ids, respect newer local records, and support `--dry-run`
+  and `--db <path>` (#16, #22)
+- **Linux CI job.** `build-linux` builds the headless target in the
+  `swift:6.1` container and smoke-runs `--once` with no credentials; the
+  existing macOS job is renamed `build-macos` (#13, #24)
+
+### Fixed
+
+- **Accounts can no longer persist with `email=NULL`.** Email is backfilled
+  from a well-formed `account_name` label on rename, and a one-time healing
+  migration repairs already-broken rows at launch (#15, #23)
+- **`icon-master.source.json` sha256** now matches the tracked master PNG —
+  the recipe recorded the pre-squircle-mask hash; a `post_processing` note
+  prevents future drift (#19, #20)
+- **`claude-monitor.service`** drops the `network-online.target` ordering,
+  which is a no-op in the systemd user manager (#14, #17)
+
+### Changed
+
+- **`package.json` check scripts are real.** `check:ci`/`test`/`check:all`
+  now run `swift build`/`swift test`, so orchestration build gates actually
+  gate (#18, #21)
+
 ## [1.16.0] - 2026-07-28
 
 ### Summary

@@ -53,9 +53,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
     <key>CFBundleDisplayName</key>
     <string>Claude Monitor</string>
     <key>CFBundleVersion</key>
-    <string>1.16.0</string>
+    <string>1.17.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.16.0</string>
+    <string>1.17.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
