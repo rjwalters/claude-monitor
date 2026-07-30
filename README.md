@@ -323,6 +323,47 @@ while the daemon runs. A sample systemd user unit is provided at
 On macOS the same headless loop is available as `ClaudeMonitor --headless`
 (the bare binary or the app bundle's `Contents/MacOS/ClaudeMonitor`).
 
+## Multi-Host Sync
+
+When multiple hosts each run their own `claude-monitor` (e.g. two Macs + a
+fleet of headless Linux workers), account records and OAuth credentials added
+on one host don't automatically appear on the others. `claude-monitor
+accounts export` / `import` is the blessed, headless-safe way to converge
+them — no GUI required, works identically on macOS and Linux:
+
+```bash
+# On the source host: dump account records + credentials to a file (0600).
+claude-monitor accounts export --output accounts.json
+
+# Copy it to each destination host over a trusted channel (scp, etc.),
+# then converge that host's own usage.db:
+claude-monitor accounts import accounts.json
+```
+
+- **What's synced:** account identity (id, name, email, plan) and OAuth
+  credentials (access/refresh tokens, expiry, scopes, plan tier). Usage
+  history, rankings, and poll status are **not** synced — those stay local to
+  each host's own polling.
+- **Idempotent, upsert-by-email:** `import` matches accounts by email
+  (falling back to id when email is absent), creates any account it doesn't
+  find locally, and updates the rest — except it **never regresses a newer
+  local record**: if the local `last_updated` is at least as recent as the
+  imported one, that account is left untouched. Safe to re-run against the
+  same file, and safe to import an older export after newer local polls.
+  `--dry-run` previews the account count without writing anything.
+- **Credentials are secrets:** the export is plaintext JSON containing live
+  OAuth tokens. `--output <path>` writes it with `0600` permissions and the
+  command prints a warning either way; without `--output` (stdout, e.g. for
+  `> accounts.json`) permissions aren't set for you — `chmod 600` the result,
+  transfer it over a trusted channel, and delete it once every destination
+  host has imported. Full at-rest/in-transit encryption (age, openssl) is a
+  natural next step but out of scope for the first pass here.
+- **No `--headless` flag needed** — `accounts export`/`import` are one-shot
+  operations, reachable directly on both platforms even from the macOS GUI
+  build: `ClaudeMonitor accounts export ...`.
+
+Run `claude-monitor accounts --help` for the full flag list.
+
 ## Auto-Start on Login (Optional)
 
 ```bash
@@ -448,6 +489,8 @@ claude-monitor/
 │       ├── main.swift              # macOS entry: AppDelegate, menubar icon, popover wiring
 │       ├── HeadlessMain.swift      # Linux entry (always headless)
 │       ├── HeadlessRunner.swift    # UI-less poll loop (Linux daemon / --headless on macOS)
+│       ├── AccountSync.swift       # accounts export/import: multi-host record + credential sync
+│       ├── AccountSyncCLI.swift    # `claude-monitor accounts export|import` CLI surface
 │       ├── UsageStore.swift        # SQLite store, settings, primary-account pin
 │       ├── SQLiteDB.swift          # Minimal system-libsqlite3 wrapper (zero deps)
 │       ├── UsagePopoverView.swift  # Summary table, sortable headers, add-account dialog
