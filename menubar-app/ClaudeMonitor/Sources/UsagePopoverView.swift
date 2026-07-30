@@ -102,25 +102,100 @@ func extraUsageUrgency(_ usage: UsageRecord?) -> Double? {
 struct ProviderBadge: View {
     let provider: AccountProvider
 
+    /// Fixed slot width so a 16-cell mascot and an 11-cell hexagon don't
+    /// ragged-edge the account names that follow them in the column.
+    private static let slotWidth: CGFloat = 16
+    private static let glyphHeight: CGFloat = 10
+
     private var tint: Color {
         switch provider {
-        case .anthropic: return Color(nsColor: .systemOrange)
+        // The mascot's own terracotta (#B87352) rather than systemOrange, so
+        // it reads as the artwork instead of a recoloured approximation.
+        case .anthropic: return Color(red: 184 / 255, green: 115 / 255, blue: 82 / 255)
         case .openai: return Color(nsColor: .systemTeal)
         }
     }
 
+    private var glyph: [String] {
+        switch provider {
+        case .anthropic: return ProviderGlyph.anthropic
+        case .openai: return ProviderGlyph.openai
+        }
+    }
+
     var body: some View {
-        Text(provider.shortCode)
-            .font(.system(size: 8, weight: .bold, design: .rounded))
-            .foregroundColor(tint)
-            .padding(.horizontal, 3)
-            .padding(.vertical, 1)
-            .overlay(
-                RoundedRectangle(cornerRadius: 3)
-                    .stroke(tint.opacity(0.6), lineWidth: 1)
-            )
+        PixelSprite(rows: glyph, color: tint, height: Self.glyphHeight)
+            .frame(width: Self.slotWidth, alignment: .center)
             .help(provider.displayName)
             .accessibilityLabel(provider.displayName)
+    }
+}
+
+/// Pixel-art marks for each upstream, drawn from a bitmap rather than bundled
+/// as image assets — the package ships no resources and has no dependencies,
+/// and a handful of filled rects stays crisp at any scale factor.
+private enum ProviderGlyph {
+    /// The Claude Code mascot, transcribed cell-for-cell from the 16×10
+    /// original: eyes in columns 4 and 11, four legs at 3/5/10/12.
+    static let anthropic = [
+        "..############..",
+        "..############..",
+        "..##.######.##..",
+        "..##.######.##..",
+        "################",
+        "################",
+        "..############..",
+        "..############..",
+        "...#.#....#.#...",
+        "...#.#....#.#...",
+    ]
+
+    /// A thick hexagonal ring for OpenAI — an evocation of their mark's
+    /// silhouette, not a reproduction of it. The interwoven knot has no honest
+    /// reading at ten pixels tall, and thin strokes blur into a circle at this
+    /// size, so the ring is two cells thick to stay legible in the row.
+    static let openai = [
+        "...#####...",
+        "..#######..",
+        ".##.....##.",
+        "##.......##",
+        "##.......##",
+        "##.......##",
+        "##.......##",
+        ".##.....##.",
+        "..#######..",
+        "...#####...",
+    ]
+}
+
+/// Renders a row-per-string bitmap as filled cells. `#` fills, anything else
+/// stays clear. One `Canvas` per badge rather than a `ZStack` of ~160
+/// `Rectangle`s, since these redraw for every row on every table update.
+private struct PixelSprite: View {
+    let rows: [String]
+    let color: Color
+    /// Rendered height in points; width follows the bitmap's aspect ratio.
+    let height: CGFloat
+
+    var body: some View {
+        let cell = height / CGFloat(max(rows.count, 1))
+        let columns = rows.map(\.count).max() ?? 0
+        Canvas { context, _ in
+            for (rowIndex, row) in rows.enumerated() {
+                for (columnIndex, character) in row.enumerated() where character == "#" {
+                    context.fill(
+                        Path(CGRect(
+                            x: CGFloat(columnIndex) * cell,
+                            y: CGFloat(rowIndex) * cell,
+                            width: cell,
+                            height: cell
+                        )),
+                        with: .color(color)
+                    )
+                }
+            }
+        }
+        .frame(width: cell * CGFloat(columns), height: height)
     }
 }
 
