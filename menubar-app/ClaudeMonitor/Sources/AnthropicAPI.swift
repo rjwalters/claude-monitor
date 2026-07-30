@@ -47,40 +47,42 @@ struct PingResponse {
     var weeklyResetISO: String? {
         weeklyReset.map { ISO8601DateFormatter().string(from: $0) }
     }
+
+    /// This ping expressed in the shared, provider-agnostic window model.
+    ///
+    /// A window is present only when the corresponding header family actually
+    /// came back — an absent `-5h-utilization` header yields `session == nil`
+    /// rather than a fabricated 0%, which is the same "no session window"
+    /// state OpenAI accounts can legitimately be in.
+    var rateLimit: RateLimitSnapshot {
+        RateLimitSnapshot(
+            session: sessionUtilization.map {
+                RateLimitWindow(
+                    kind: .session,
+                    usedPercent: $0 * 100,
+                    resetAt: sessionReset,
+                    status: sessionStatus
+                )
+            },
+            weekly: weeklyUtilization.map {
+                RateLimitWindow(
+                    kind: .weekly,
+                    usedPercent: $0 * 100,
+                    resetAt: weeklyReset,
+                    status: weeklyStatus
+                )
+            },
+            overallStatus: overallStatus
+        )
+    }
 }
 
 // MARK: - API Errors
 
-enum AnthropicAPIError: Error, LocalizedError {
-    case unauthorized
-    case httpError(Int)
-    case invalidResponse
-    case networkError(Error)
-
-    var errorDescription: String? {
-        switch self {
-        case .unauthorized:
-            return "Unauthorized — token may be expired or revoked"
-        case .httpError(let code):
-            return "HTTP error \(code)"
-        case .invalidResponse:
-            return "Invalid response from API"
-        case .networkError(let error):
-            return "Network error: \(error.localizedDescription)"
-        }
-    }
-
-    var isTransient: Bool {
-        switch self {
-        case .httpError(let code):
-            return (500...599).contains(code)
-        case .networkError:
-            return true
-        case .unauthorized, .invalidResponse:
-            return false
-        }
-    }
-}
+/// Historical name for the shared provider error type. Kept so the many
+/// existing `catch AnthropicAPIError.unauthorized` / `if case
+/// AnthropicAPIError.unauthorized = error` sites keep compiling unchanged.
+typealias AnthropicAPIError = ProviderAPIError
 
 // MARK: - API Client
 
@@ -297,4 +299,37 @@ class AnthropicAPIClient {
         guard let epoch = value.flatMap({ TimeInterval($0) }) else { return nil }
         return Date(timeIntervalSince1970: epoch)
     }
+}
+
+// MARK: - UsageProviderClient conformance
+
+/// Anthropic as one provider among several. This is a pure adaptation layer —
+/// `fetchUsage` is `pingToken` and `identifyAccount` is `identifyToken`, both
+/// re-expressed in the shared types. Behavior for Anthropic accounts is
+/// unchanged; the poll loop still calls `pingToken` directly today.
+extension AnthropicAPIClient: UsageProviderClient {
+    var provider: AccountProvider { .anthropic }
+
+    func fetchUsage(_ credentials: ProviderCredentials) async throws -> ProviderUsageSnapshot {
+        let ping = try await pingToken(accessToken: credentials.accessToken)
+        return ProviderUsageSnapshot(
+            provider: .anthropic,
+            accountKey: ping.organizationId,
+            httpStatus: ping.httpStatus,
+            rateLimit: ping.rateLimit,
+            // Anthropic's rate-limit headers carry no identity beyond the org
+            // id; email/plan come from elsewhere (the account list files).
+            email: nil,
+            plan: nil,
+            rawFields: ping.rawHeaders
+        )
+    }
+
+    func identifyAccount(_ credentials: ProviderCredentials) async throws -> String {
+        try await identifyToken(accessToken: credentials.accessToken)
+    }
+
+    // refreshCredentials: the protocol's default (nil) is correct here —
+    // Anthropic subscription OAuth tokens are long-lived (~1yr) and this app
+    // never refreshes them; a dead token is rolled by the user instead.
 }

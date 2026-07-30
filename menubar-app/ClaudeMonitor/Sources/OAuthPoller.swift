@@ -45,14 +45,60 @@ struct CredentialStatus: Identifiable {
 struct OAuthCredential {
     let id: Int64?
     let accountId: String?
+    /// Which upstream this credential authenticates against. Pre-migration rows
+    /// resolve to `.anthropic`.
+    let provider: AccountProvider
     let label: String
     let source: String  // "token" or "env"
     let accessToken: String?
     let refreshToken: String?
-    let expiresAt: Int64?  // epoch ms
+    let expiresAt: Int64?  // epoch ms — vestigial keychain-era column
+    /// When `accessToken` expires, parsed from `oauth_credentials.token_expires_at`.
+    /// nil for Anthropic (long-lived tokens); OpenAI access tokens live ~10 days
+    /// and must be refreshed before this instant (spike #26).
+    let tokenExpiresAt: Date?
     let subscriptionType: String?
     let rateLimitTier: String?
     let isActive: Bool
+
+    init(
+        id: Int64?,
+        accountId: String?,
+        provider: AccountProvider = .anthropic,
+        label: String,
+        source: String,
+        accessToken: String?,
+        refreshToken: String?,
+        expiresAt: Int64?,
+        tokenExpiresAt: Date? = nil,
+        subscriptionType: String?,
+        rateLimitTier: String?,
+        isActive: Bool
+    ) {
+        self.id = id
+        self.accountId = accountId
+        self.provider = provider
+        self.label = label
+        self.source = source
+        self.accessToken = accessToken
+        self.refreshToken = refreshToken
+        self.expiresAt = expiresAt
+        self.tokenExpiresAt = tokenExpiresAt
+        self.subscriptionType = subscriptionType
+        self.rateLimitTier = rateLimitTier
+        self.isActive = isActive
+    }
+
+    /// This credential in the provider-agnostic shape a `UsageProviderClient`
+    /// consumes. nil when there is no access token to present.
+    var providerCredentials: ProviderCredentials? {
+        guard let accessToken = accessToken else { return nil }
+        return ProviderCredentials(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            expiresAt: tokenExpiresAt
+        )
+    }
 }
 
 struct EnvImportResult {
@@ -286,13 +332,17 @@ class OAuthPoller: ObservableObject {
 
     private func saveCredentialForAccount(
         accountId: String, email: String?, orgName: String?, plan: String,
-        accessToken: String, source: String = "token"
+        accessToken: String, source: String = "token",
+        provider: AccountProvider = .anthropic,
+        refreshToken: String? = nil, tokenExpiresAt: Date? = nil
     ) {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
         do {
             let db = try openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
             let label = orgName ?? email ?? accountId
+            let providerValue = provider.rawValue
+            let expiryISO = tokenExpiresAt.map { ISO8601DateFormatter().string(from: $0) }
 
             // When the profile/caller-supplied email is unavailable, fall back to
             // the label itself if it's a well-formed address — an account must
@@ -303,13 +353,14 @@ class OAuthPoller: ObservableObject {
 
             // Upsert account — never overwrite account_name (user may have renamed)
             try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order)
-                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0))
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0), ?)
                 ON CONFLICT(id) DO UPDATE SET
                     email = COALESCE(excluded.email, accounts.email),
                     plan = COALESCE(excluded.plan, accounts.plan),
-                    last_updated = excluded.last_updated
-            """, accountId, label, resolvedEmail, plan, now)
+                    last_updated = excluded.last_updated,
+                    provider = excluded.provider
+            """, accountId, label, resolvedEmail, plan, now, providerValue)
 
             // Look for existing credential for THIS account
             let existingCred = try db.scalar(
@@ -328,26 +379,30 @@ class OAuthPoller: ObservableObject {
                 if tokenChanged {
                     try db.run("""
                         UPDATE oauth_credentials SET
-                            access_token = ?, source = ?,
+                            access_token = ?, source = ?, provider = ?,
+                            refresh_token = COALESCE(?, refresh_token),
+                            token_expires_at = ?,
                             is_active = 1, updated_at = ?, token_rolled_at = ?
                         WHERE id = ?
-                    """, accessToken, source, now, now, credId)
+                    """, accessToken, source, providerValue, refreshToken, expiryISO, now, now, credId)
                     flog.info("Rolled credential for account \(accountId)", category: fcat)
                 } else {
                     try db.run("""
                         UPDATE oauth_credentials SET
-                            source = ?, is_active = 1, updated_at = ?
+                            source = ?, provider = ?, is_active = 1, updated_at = ?
                         WHERE id = ?
-                    """, source, now, credId)
+                    """, source, providerValue, now, credId)
                     flog.info("Updated credential for account \(accountId)", category: fcat)
                 }
             } else {
                 try db.run("""
                     INSERT INTO oauth_credentials (
-                        account_id, label, source,
-                        access_token, is_active, created_at, updated_at, token_rolled_at
-                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
-                """, accountId, label, source, accessToken, now, now, now)
+                        account_id, label, source, provider,
+                        access_token, refresh_token, token_expires_at,
+                        is_active, created_at, updated_at, token_rolled_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """, accountId, label, source, providerValue,
+                     accessToken, refreshToken, expiryISO, now, now, now)
                 flog.info("Created new credential for account \(accountId)", category: fcat)
             }
         } catch {
@@ -363,10 +418,18 @@ class OAuthPoller: ObservableObject {
             let db = try openDatabase(dbPath, readonly: true)
             var credentials: [OAuthCredential] = []
 
+            // The provider columns are selected only when present, so a
+            // database opened before the migration ran still loads (every row
+            // then resolves to the Anthropic fallback).
+            let columns = tableColumns(db, "oauth_credentials")
+            let hasProvider = columns.contains("provider")
+            let hasTokenExpiry = columns.contains("token_expires_at")
             let stmt = try db.prepare("""
                 SELECT id, account_id, label, source,
                        access_token, refresh_token, expires_at,
-                       subscription_type, rate_limit_tier, is_active
+                       subscription_type, rate_limit_tier, is_active,
+                       \(hasProvider ? "provider" : "NULL"),
+                       \(hasTokenExpiry ? "token_expires_at" : "NULL")
                 FROM oauth_credentials
                 WHERE is_active = 1 AND access_token IS NOT NULL
             """)
@@ -375,11 +438,13 @@ class OAuthPoller: ObservableObject {
                 credentials.append(OAuthCredential(
                     id: row[0] as? Int64,
                     accountId: row[1] as? String,
+                    provider: AccountProvider(stored: row[10] as? String),
                     label: (row[2] as? String) ?? "Unknown",
                     source: (row[3] as? String) ?? "token",
                     accessToken: row[4] as? String,
                     refreshToken: row[5] as? String,
                     expiresAt: row[6] as? Int64,
+                    tokenExpiresAt: UsageRecord.parseISO(row[11] as? String),
                     subscriptionType: row[7] as? String,
                     rateLimitTier: row[8] as? String,
                     isActive: (row[9] as? Int64 ?? 1) == 1
@@ -594,12 +659,19 @@ class OAuthPoller: ObservableObject {
             let db = try openDatabase(dbPath)
             let now = ISO8601DateFormatter().string(from: Date())
 
-            let sessionPercent = ping.sessionPercent
-            let weeklyAllPercent = ping.weeklyPercent
+            // Read through the shared, provider-agnostic window model rather
+            // than the Anthropic-specific header fields. `?? 0` preserves the
+            // long-standing Anthropic behavior of storing 0 for an absent
+            // header; a provider-agnostic writer for genuinely window-less
+            // accounts (OpenAI with no session window) arrives with the phase-3
+            // poller, and the columns are already nullable for it.
+            let windows = ping.rateLimit
+            let sessionPercent = windows.session?.usedPercent ?? 0
+            let weeklyAllPercent = windows.weekly?.usedPercent ?? 0
             let primaryPercent = max(sessionPercent, weeklyAllPercent)
 
-            let sessionReset = ping.sessionResetISO
-            let weeklyReset = ping.weeklyResetISO
+            let sessionReset = windows.session?.resetAtISO
+            let weeklyReset = windows.weekly?.resetAtISO
 
             // Reset detection: check previous reading
             let prevStmt = try db.prepare(

@@ -11,13 +11,46 @@ func openDatabase(_ path: String, readonly: Bool = false) throws -> Connection {
     return db
 }
 
+/// Column names present on `table`, or an empty set when the table doesn't
+/// exist. Lets read paths tolerate a database that hasn't been migrated yet
+/// (e.g. `accounts export` run before the app has launched once).
+func tableColumns(_ db: Connection, _ table: String) -> Set<String> {
+    guard let stmt = try? db.prepare("PRAGMA table_info(\(table))") else { return [] }
+    var names: Set<String> = []
+    for row in stmt {
+        if let name = row[1] as? String { names.insert(name) }
+    }
+    return names
+}
+
 struct Account: Identifiable {
     let id: String
+    /// Which upstream this account belongs to. Rows written before
+    /// multi-provider support resolve to `.anthropic` via the schema migration.
+    let provider: AccountProvider
     let accountName: String?
     let email: String?
     let plan: String?
     let lastUpdated: Date?
     let latestPercent: Double?
+
+    init(
+        id: String,
+        provider: AccountProvider = .anthropic,
+        accountName: String?,
+        email: String?,
+        plan: String?,
+        lastUpdated: Date?,
+        latestPercent: Double?
+    ) {
+        self.id = id
+        self.provider = provider
+        self.accountName = accountName
+        self.email = email
+        self.plan = plan
+        self.lastUpdated = lastUpdated
+        self.latestPercent = latestPercent
+    }
 
     /// Returns the best display name for the account
     var displayName: String {
@@ -55,6 +88,41 @@ struct UsageRecord: Identifiable {
         fablePercent.map { max(0, 100 - $0) }
     }
 
+    /// This stored reading expressed in the shared, provider-agnostic window
+    /// model. The `usage_history` columns are already kind-keyed (a session
+    /// column and a weekly column), so each window's kind is explicit and its
+    /// duration is the bucket's nominal length.
+    ///
+    /// A NULL column stays nil here — it is **not** coerced to 0%. That is what
+    /// makes "this provider reported no session window" survive the round trip
+    /// through the database (an OpenAI account may legitimately have none), and
+    /// what keeps `headroomScore` from reporting full capacity for an account
+    /// we know nothing about.
+    var rateLimit: RateLimitSnapshot {
+        var named: [String: RateLimitWindow] = [:]
+        if let fable = fablePercent {
+            named["fable"] = RateLimitWindow(kind: .weekly, usedPercent: fable)
+        }
+        return RateLimitSnapshot(
+            session: sessionPercent.map {
+                RateLimitWindow(kind: .session, usedPercent: $0, resetAt: UsageRecord.parseISO(sessionReset))
+            },
+            weekly: weeklyAllPercent.map {
+                RateLimitWindow(kind: .weekly, usedPercent: $0, resetAt: UsageRecord.parseISO(weeklyReset))
+            },
+            named: named
+        )
+    }
+
+    /// Parses the two ISO 8601 shapes this codebase writes (with and without
+    /// fractional seconds).
+    static func parseISO(_ string: String?) -> Date? {
+        guard let string = string, !string.isEmpty else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: string) ?? ISO8601DateFormatter().date(from: string)
+    }
+
     /// Compact state of the extra-usage balance for display. `.percent` carries
     /// a remaining figure only when the balance is actually metered (>0 used).
     enum ExtraUsageState {
@@ -77,6 +145,20 @@ struct UsageRecord: Identifiable {
             return .unknown
         }
     }
+}
+
+/// "Which account should I use" score 0–100.
+/// 100 = no usage / max headroom; 0 = capped on any known window.
+///
+/// Returns nil when there is no usage data at all — either no reading yet, or a
+/// reading whose provider reported neither a session nor a weekly window. The
+/// popover renders nil as "—" so an account we know nothing about never
+/// masquerades as fully available.
+///
+/// Lives in the portable core (not the macOS-only popover) because the headless
+/// Linux daemon and `ranking.json` reason about the same score.
+func headroomScore(_ usage: UsageRecord?) -> Double? {
+    usage?.rateLimit.headroomScore
 }
 
 struct UsageDataPoint: Identifiable {
@@ -145,9 +227,12 @@ class UsageStore: ObservableObject {
 
     private let dbPath: String
 
-    init() {
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        dbPath = homeDir.appendingPathComponent(".claude-monitor/usage.db").path
+    /// `dbPath` defaults to `~/.claude-monitor/usage.db`. An explicit path is
+    /// used by the self-test to exercise schema migration against a throwaway
+    /// database without touching the real one.
+    init(dbPath: String? = nil) {
+        self.dbPath = dbPath ?? FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude-monitor/usage.db").path
     }
 
     /// Creates the database and schema if they don't exist.
@@ -161,82 +246,143 @@ class UsageStore: ObservableObject {
         do {
             let db = try openDatabase(dbPath)
             try db.execute("PRAGMA journal_mode=WAL")
-            try db.execute("""
-                CREATE TABLE IF NOT EXISTS accounts (
-                    id TEXT PRIMARY KEY,
-                    account_name TEXT,
-                    email TEXT,
-                    plan TEXT,
-                    last_updated TEXT,
-                    sort_order INTEGER DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS usage_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    primary_percent REAL,
-                    session_percent REAL,
-                    weekly_all_percent REAL,
-                    weekly_sonnet_percent REAL,
-                    session_reset TEXT,
-                    weekly_reset TEXT,
-                    raw_data TEXT,
-                    is_synthetic INTEGER DEFAULT 0,
-                    FOREIGN KEY (account_id) REFERENCES accounts(id)
-                );
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                );
-                CREATE TABLE IF NOT EXISTS probe_snapshots (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    probe_model TEXT NOT NULL,
-                    http_status INTEGER,
-                    headers TEXT NOT NULL,
-                    FOREIGN KEY (account_id) REFERENCES accounts(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_history(account_id);
-                CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_history(timestamp DESC);
-                CREATE INDEX IF NOT EXISTS idx_probe_account_time ON probe_snapshots(account_id, timestamp DESC);
-                CREATE TABLE IF NOT EXISTS oauth_credentials (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id TEXT,
-                    label TEXT NOT NULL,
-                    source TEXT DEFAULT 'keychain',
-                    keychain_service TEXT,
-                    keychain_account TEXT,
-                    access_token TEXT,
-                    refresh_token TEXT,
-                    expires_at INTEGER,
-                    scopes TEXT,
-                    subscription_type TEXT,
-                    rate_limit_tier TEXT,
-                    last_poll_at TEXT,
-                    last_error TEXT,
-                    is_active INTEGER DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    token_rolled_at TEXT,
-                    FOREIGN KEY (account_id) REFERENCES accounts(id)
-                );
-            """)
-
-            // Migration: add token_rolled_at to older DBs. `updated_at` can't serve
-            // this — it's bumped on every poll — so we track token changes separately.
-            // ADD COLUMN throws if it already exists; that's the expected no-op path.
-            try? db.execute("ALTER TABLE oauth_credentials ADD COLUMN token_rolled_at TEXT")
-
-            // Migration: heal accounts left with email = NULL by earlier app
-            // versions — e.g. added via plain token paste (no email known) and
-            // later renamed to the real address, which only touched
-            // account_name. `email` is the join key downstream consumers (like
-            // loom-daemon's `tokens import-from-monitor`) key accounts on, so an
-            // account must never persist indefinitely without one (#15).
-            backfillMissingEmailsFromAccountName(db)
+            try UsageStore.applySchema(db)
         } catch {
             FileLogger.shared.error("Failed to create database: \(error)", category: "DB")
+        }
+    }
+
+    /// Idempotent schema creation plus healing migrations, against any
+    /// read-write connection. Safe to run on every launch — that is the
+    /// established pattern here (#15, #23): heal in place rather than make the
+    /// user re-add accounts.
+    static func applySchema(_ db: Connection) throws {
+        try db.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                id TEXT PRIMARY KEY,
+                account_name TEXT,
+                email TEXT,
+                plan TEXT,
+                last_updated TEXT,
+                sort_order INTEGER DEFAULT 0,
+                provider TEXT NOT NULL DEFAULT 'anthropic'
+            );
+            CREATE TABLE IF NOT EXISTS usage_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                primary_percent REAL,
+                session_percent REAL,
+                weekly_all_percent REAL,
+                weekly_sonnet_percent REAL,
+                session_reset TEXT,
+                weekly_reset TEXT,
+                raw_data TEXT,
+                is_synthetic INTEGER DEFAULT 0,
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            CREATE TABLE IF NOT EXISTS probe_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                probe_model TEXT NOT NULL,
+                http_status INTEGER,
+                headers TEXT NOT NULL,
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_account ON usage_history(account_id);
+            CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage_history(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_probe_account_time ON probe_snapshots(account_id, timestamp DESC);
+            CREATE TABLE IF NOT EXISTS oauth_credentials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT,
+                label TEXT NOT NULL,
+                source TEXT DEFAULT 'keychain',
+                keychain_service TEXT,
+                keychain_account TEXT,
+                access_token TEXT,
+                refresh_token TEXT,
+                expires_at INTEGER,
+                scopes TEXT,
+                subscription_type TEXT,
+                rate_limit_tier TEXT,
+                last_poll_at TEXT,
+                last_error TEXT,
+                is_active INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                token_rolled_at TEXT,
+                provider TEXT NOT NULL DEFAULT 'anthropic',
+                token_expires_at TEXT,
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            );
+        """)
+
+        // Migration: add token_rolled_at to older DBs. `updated_at` can't serve
+        // this — it's bumped on every poll — so we track token changes separately.
+        // ADD COLUMN throws if it already exists; that's the expected no-op path.
+        try? db.execute("ALTER TABLE oauth_credentials ADD COLUMN token_rolled_at TEXT")
+
+        // Migration (multi-provider, #28): provider identity + refresh-capable
+        // credentials. SQLite's ADD COLUMN with a constant DEFAULT backfills
+        // every existing row in place, so accounts written before this build
+        // become `provider = 'anthropic'` with no user action.
+        //
+        // The credential columns live on `oauth_credentials` rather than
+        // `accounts` because that is already the table that holds token
+        // material; `accounts` stays free of secrets (RankingExporter reads
+        // it directly and must never see one).
+        addColumnIfMissing(db, table: "accounts",
+                           column: "provider", definition: "TEXT NOT NULL DEFAULT 'anthropic'")
+        addColumnIfMissing(db, table: "oauth_credentials",
+                           column: "provider", definition: "TEXT NOT NULL DEFAULT 'anthropic'")
+        // `refresh_token` has been in the CREATE TABLE since the beginning,
+        // so this is a no-op on every database we have seen — kept so the
+        // migration is self-describing and heals a truncated schema.
+        addColumnIfMissing(db, table: "oauth_credentials",
+                           column: "refresh_token", definition: "TEXT")
+        // ISO 8601 expiry of the access token. Distinct from the vestigial
+        // epoch-ms `expires_at` column (a keychain-import-era field this app
+        // has never written), and consistent with `token_rolled_at`'s format.
+        // Stays NULL for Anthropic; OpenAI access tokens live ~10 days and
+        // must be refreshed before this instant (spike #26).
+        addColumnIfMissing(db, table: "oauth_credentials",
+                           column: "token_expires_at", definition: "TEXT")
+
+        // Heal rows whose provider is absent/blank — a database edited by an
+        // external tool, or one where an earlier ADD COLUMN raced.
+        try? db.run("UPDATE accounts SET provider = ? WHERE provider IS NULL OR TRIM(provider) = ''",
+                    AccountProvider.fallback.rawValue)
+        try? db.run("UPDATE oauth_credentials SET provider = ? WHERE provider IS NULL OR TRIM(provider) = ''",
+                    AccountProvider.fallback.rawValue)
+
+        // Migration: heal accounts left with email = NULL by earlier app
+        // versions — e.g. added via plain token paste (no email known) and
+        // later renamed to the real address, which only touched
+        // account_name. `email` is the join key downstream consumers (like
+        // loom-daemon's `tokens import-from-monitor`) key accounts on, so an
+        // account must never persist indefinitely without one (#15).
+        backfillMissingEmailsFromAccountName(db)
+    }
+
+    /// Adds a column only when it isn't already there. `ALTER TABLE ... ADD
+    /// COLUMN` throws on a duplicate; checking first keeps the (expected)
+    /// already-migrated path free of spurious errors and lets us log the one
+    /// launch where a real migration happens.
+    private static func addColumnIfMissing(
+        _ db: Connection, table: String, column: String, definition: String
+    ) {
+        let existing = tableColumns(db, table)
+        guard !existing.isEmpty, !existing.contains(column) else { return }
+        do {
+            try db.execute("ALTER TABLE \(table) ADD COLUMN \(column) \(definition)")
+            FileLogger.shared.info("Migrated \(table): added \(column)", category: "DB")
+        } catch {
+            FileLogger.shared.error("Migration failed adding \(table).\(column): \(error)", category: "DB")
         }
     }
 
@@ -245,7 +391,7 @@ class UsageStore: ObservableObject {
     /// copied into `email`. Idempotent and side-effect-free once every row is
     /// backfilled — cheap enough to run unconditionally on every launch rather
     /// than tracking a schema version for it.
-    private func backfillMissingEmailsFromAccountName(_ db: Connection) {
+    private static func backfillMissingEmailsFromAccountName(_ db: Connection) {
         do {
             let stmt = try db.prepare("SELECT id, account_name FROM accounts WHERE email IS NULL AND account_name IS NOT NULL")
             var candidates: [(id: String, name: String)] = []
@@ -266,15 +412,13 @@ class UsageStore: ObservableObject {
         }
     }
 
-    /// Seconds until reset (session first, then weekly). Returns large value if unknown.
+    /// Seconds until reset (session first, then weekly). Returns large value if
+    /// unknown — including when the provider reports no window at all.
     static func resetSeconds(_ usage: UsageRecord?) -> TimeInterval {
         guard let usage = usage else { return .greatestFiniteMagnitude }
-        for str in [usage.sessionReset, usage.weeklyReset].compactMap({ $0 }) {
-            let iso = ISO8601DateFormatter()
-            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = iso.date(from: str) ?? ISO8601DateFormatter().date(from: str) {
-                return date.timeIntervalSinceNow
-            }
+        let snapshot = usage.rateLimit
+        for date in [snapshot.session?.resetAt, snapshot.weekly?.resetAt].compactMap({ $0 }) {
+            return date.timeIntervalSinceNow
         }
         return .greatestFiniteMagnitude
     }
@@ -297,13 +441,21 @@ class UsageStore: ObservableObject {
     }
 
     /// Accounts sorted for popover display: most available (lowest usage) first.
+    /// Reads through the shared window model, so an account whose provider
+    /// reports only a weekly window is ranked on that window alone rather than
+    /// being credited with a fictitious 0% session.
     var sortedAccountsForPopover: [Account] {
         let pairs = accounts.map { account in
             (account: account, usage: latestUsage[account.id])
         }
         let sorted = pairs.sorted { a, b in
-            let aEffective = max(a.usage?.sessionPercent ?? 0, a.usage?.weeklyAllPercent ?? 0)
-            let bEffective = max(b.usage?.sessionPercent ?? 0, b.usage?.weeklyAllPercent ?? 0)
+            // An absent window contributes nothing (rather than a fabricated
+            // 0%), so an OpenAI account reporting only a weekly figure ranks on
+            // that figure. Unchanged for Anthropic rows, which always carry both.
+            let aWindows = a.usage?.rateLimit
+            let bWindows = b.usage?.rateLimit
+            let aEffective = max(aWindows?.session?.usedPercent ?? 0, aWindows?.weekly?.usedPercent ?? 0)
+            let bEffective = max(bWindows?.session?.usedPercent ?? 0, bWindows?.weekly?.usedPercent ?? 0)
             if aEffective != bEffective { return aEffective < bEffective }
             return UsageStore.resetSeconds(a.usage) < UsageStore.resetSeconds(b.usage)
         }
@@ -335,10 +487,15 @@ class UsageStore: ObservableObject {
             isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let nowString = isoFormatter.string(from: Date())
 
-            // Load accounts using raw SQL
-            let accountStmt = try db.prepare(
-                "SELECT id, account_name, email, plan, last_updated FROM accounts ORDER BY last_updated DESC"
-            )
+            // Load accounts using raw SQL. `provider` is selected only when the
+            // column exists, so a database that hasn't been migrated yet (an
+            // external tool opened it first) still loads — every row then
+            // resolves to the .anthropic fallback.
+            let hasProvider = tableColumns(db, "accounts").contains("provider")
+            let accountStmt = try db.prepare("""
+                SELECT id, account_name, email, plan, last_updated\(hasProvider ? ", provider" : "")
+                FROM accounts ORDER BY last_updated DESC
+            """)
 
             for row in accountStmt {
                 guard let accountId = row[0] as? String else { continue }
@@ -346,6 +503,7 @@ class UsageStore: ObservableObject {
                 let acctEmail = row[2] as? String
                 let acctPlan = row[3] as? String
                 let acctLastUpdated = row[4] as? String
+                let acctProvider = AccountProvider(stored: hasProvider ? row[5] as? String : nil)
 
                 // Get latest percent from usage_history
                 var percent: Double? = nil
@@ -358,6 +516,7 @@ class UsageStore: ObservableObject {
 
                 let account = Account(
                     id: accountId,
+                    provider: acctProvider,
                     accountName: acctName,
                     email: acctEmail,
                     plan: acctPlan,
@@ -733,6 +892,7 @@ class UsageStore: ObservableObject {
                 let oldAccount = accounts[index]
                 let updatedAccount = Account(
                     id: oldAccount.id,
+                    provider: oldAccount.provider,
                     accountName: newName,
                     email: backfilledEmail ?? oldAccount.email,
                     plan: oldAccount.plan,

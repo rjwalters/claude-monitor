@@ -17,6 +17,11 @@ jobs:
           cd menubar-app/ClaudeMonitor
           swift build
 
+      - name: Self-test (portable core)
+        run: |
+          cd menubar-app/ClaudeMonitor
+          .build/debug/ClaudeMonitor selftest
+
   build-linux:
     runs-on: ubuntu-latest
     container: swift:6.1
@@ -30,6 +35,11 @@ jobs:
         run: |
           cd menubar-app/ClaudeMonitor
           swift build
+
+      - name: Self-test (portable core)
+        run: |
+          cd menubar-app/ClaudeMonitor
+          .build/debug/ClaudeMonitor selftest
 
       - name: Smoke run (no credentials)
         run: |

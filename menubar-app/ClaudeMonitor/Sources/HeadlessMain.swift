@@ -9,6 +9,8 @@ enum ClaudeMonitorEntry {
         // the always-on poll loop below.
         if CommandLine.arguments.dropFirst().first == "accounts" {
             AccountSyncCLI.main(Array(CommandLine.arguments.dropFirst(2)))
+        } else if CommandLine.arguments.dropFirst().first == "selftest" {
+            SelfTest.main(Array(CommandLine.arguments.dropFirst(2)))
         } else {
             HeadlessRunner.main()
         }

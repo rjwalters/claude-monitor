@@ -133,5 +133,10 @@ enum HeadlessRunner {
 
         For multi-host sync of account records + credentials, see:
           claude-monitor accounts --help
+
+        Subcommands:
+          accounts            Export/import accounts + credentials
+          selftest            Run portable-core assertions (no network, no
+                              credentials; exits non-zero on failure)
         """
 }

@@ -17,7 +17,9 @@
 
 - The same package builds on Linux (`swift build` with `libsqlite3-dev` installed) as a headless daemon for Loom hosts — no UI, same poll loop, same `usage.db`/`ranking.json` outputs. See README "Headless Mode / Linux".
 - UI sources are fenced with `#if os(macOS)`; portable core must stay free of AppKit/SwiftUI/Combine/os.Logger. On Linux, `LinuxCompat.swift` shims `ObservableObject`/`@Published`, and `CSQLite/` maps the system libsqlite3 (macOS uses the SDK's `SQLite3` module).
-- Entry points: `main.swift` (macOS, dispatches to `HeadlessRunner` on `--headless`) and `HeadlessMain.swift` (Linux, always headless). Flags: `--once`, `--interval <sec>`, `--version`.
+- Entry points: `main.swift` (macOS, dispatches to `HeadlessRunner` on `--headless`) and `HeadlessMain.swift` (Linux, always headless). Flags: `--once`, `--interval <sec>`, `--version`. Subcommands: `accounts`, `selftest`.
+- Run the test suite with `swift build && .build/debug/ClaudeMonitor selftest` (exits non-zero on failure). CI runs it on macOS and Linux.
+- To verify a schema migration against real data, copy the live DB first — `cp ~/.claude-monitor/usage.db /tmp/ && .build/debug/ClaudeMonitor selftest --db /tmp/usage.db`. `--db` **writes** to the path it is given; never point it at `~/.claude-monitor/usage.db`.
 - Parse response headers via `extractAnthropicHeaders` (lowercased map), never `allHeaderFields` subscripts — those are case-sensitive on Linux.
 - Verify Linux builds from macOS with the `swift:6.1` Docker image (`apt-get install libsqlite3-dev`, then `swift build`).
 
@@ -29,8 +31,11 @@
   - `Sources/HeadlessMain.swift` / `Sources/HeadlessRunner.swift` - Linux entry point + UI-less poll loop (also `--headless` on macOS)
   - `Sources/LinuxCompat.swift` - `ObservableObject`/`@Published` stand-ins for Linux (no Combine)
   - `CSQLite/` - System-library target mapping Linux libsqlite3
-  - `Sources/AnthropicAPI.swift` - API client (usage, profile, token refresh)
+  - `Sources/RateLimitWindow.swift` - Provider-agnostic rate-limit model (`AccountProvider`, `RateLimitWindow`, `RateLimitSnapshot`). Window kind is **derived from the window's duration**, never its position in the provider response, and every window is optional — an account may legitimately report no session window.
+  - `Sources/UsageProviderClient.swift` - `UsageProviderClient` protocol + `ProviderCredentials` / `ProviderUsageSnapshot` / `ProviderAPIError` (aliased as `AnthropicAPIError`)
+  - `Sources/AnthropicAPI.swift` - API client (usage, profile, token refresh); conforms to `UsageProviderClient`
   - `Sources/OAuthPoller.swift` - Ping-based usage polling, token add/import, Fable probes
+  - `Sources/SelfTest.swift` - `ClaudeMonitor selftest`: portable-core assertions (window model, schema migration) with no network/credentials. Run in CI on both macOS and Linux; there is no XCTest target because the package has zero dependencies.
   - `Sources/UsagePopoverView.swift` - Summary-table popover, sortable headers, add-account dialog
   - `Sources/UsageChartView.swift` - Per-account usage-history chart window
   - `Sources/RollTokenView.swift` / `Sources/TokenRoller.swift` - Roll Token wizard + revoke-script generator. The workflow depends on undocumented, web-session-cookie-authenticated `claude.ai/api/oauth` endpoints; if they change, `TokenRoller.revokeAllScript` is the single place to update (see README "Rolling a Token").
