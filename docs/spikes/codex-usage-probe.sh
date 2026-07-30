@@ -2,19 +2,22 @@
 #
 # Scratch probe for issue #26 (part of the multi-provider epic, #25).
 #
-# NOT YET LIVE-VERIFIED. This script encodes the best hypothesis this spike
-# could derive from static analysis of the Codex CLI binary (see
-# docs/spikes/2026-07-30-codex-usage-probe.md) about how to fetch ChatGPT
-# subscription usage/rate-limit data using a Codex CLI OAuth credential. It
-# has deliberately NOT been run against a live account as part of this spike,
-# because the only credential available at spike time belonged to a primary
-# personal account, and the issue this script was written for explicitly
-# requires a disposable/low-value test account instead.
+# LIVE-VERIFIED 2026-07-30. Candidate 2 (/backend-api/wham/usage) returns
+# HTTP 200 with the rate-limit payload; candidate 1 (/backend-api/codex/usage)
+# returns a 403 Cloudflare bot challenge. See the "Live verification" section
+# of docs/spikes/2026-07-30-codex-usage-probe.md for the authoritative wire
+# contract — note the real field names are limit_window_seconds / reset_at
+# under rate_limit.primary_window, NOT the window_minutes / resets_at array
+# the static analysis predicted.
 #
 # SAFETY:
-#   - Only run this against a disposable/test ChatGPT Plus/Pro account that
-#     you are authorized to probe with. Do NOT run it against a primary
-#     account.
+#   - This is a read-only GET against the same endpoint Codex CLI's own
+#     /usage command calls, so it carries no account-modification risk. The
+#     original "disposable account only" guidance was relaxed on that basis
+#     (operator decision, 2026-07-30).
+#   - The response body contains PII (email, account_id, user_id). The
+#     redaction below strips all string/number values; keep it that way when
+#     sharing output or pasting into an agent transcript.
 #   - This script never echoes token values. It reads the access token
 #     directly into a curl Authorization header without passing through any
 #     command that would print it (no `echo $TOKEN`, no `set -x`).

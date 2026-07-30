@@ -11,6 +11,13 @@ equivalent for **ChatGPT subscription accounts** (Plus/Pro, as used by Codex
 CLI): a minimal authenticated request whose response carries session-window
 and weekly-window usage/reset data?
 
+> **UPDATE 2026-07-30 (live-verified).** The probe below was subsequently run
+> against a real ChatGPT Pro credential and **succeeded (HTTP 200)**. The
+> answer is now a confirmed **yes**, but the wire contract differs from the
+> static-analysis hypothesis in several load-bearing ways. See
+> "Live verification" at the end of this document — that section, not the
+> static analysis below, is the authoritative contract for epic phase 2.
+
 ## Short answer
 
 **Very likely yes, but not live-verified in this spike.** Static analysis of
@@ -227,6 +234,95 @@ and `Account` schema now — in particular:
   statically. Do not assume the exact route string in this document is
   correct without that check — treat it as a strong hypothesis, not a
   verified contract.
+
+## Live verification (2026-07-30) — AUTHORITATIVE
+
+The operator judged a disposable account unnecessary: the probe is a
+**read-only GET** against the same endpoint Codex CLI's own `/usage` command
+already calls with this credential, so it carries no account risk. The probe
+script was run as written. Results below supersede the static-analysis
+hypotheses above wherever they disagree.
+
+### The working call
+
+```
+GET https://chatgpt.com/backend-api/wham/usage
+Authorization: Bearer <access_token from ~/.codex/auth.json>
+```
+
+- **200 OK.** No `chatgpt-account-id` header required — the bearer token alone
+  carries account identity, exactly as Anthropic's does.
+- The **`/backend-api/codex/usage` variant returned 403** — a Cloudflare bot
+  challenge (an interstitial HTML page, not a JSON error). The `/wham/` prefix
+  is the one to use; the `/api/codex/` prefix appears to be browser-fronted and
+  bot-protected. This inverts the naive guess that `/api/codex/…` was the
+  "real" route.
+
+### Actual response shape (identity values redacted)
+
+```jsonc
+{
+  "user_id": "…", "account_id": "…", "email": "…", "plan_type": "…",
+  "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+      "used_percent": 14,
+      "limit_window_seconds": 604800,   // 7d
+      "reset_after_seconds": 524971,
+      "reset_at": 1785967226            // unix epoch seconds
+    },
+    "secondary_window": null
+  },
+  "code_review_rate_limit": null,
+  "additional_rate_limits": [
+    { "limit_name": "GPT-5.3-Codex-Spark", "metered_feature": "codex_bengalfox",
+      "rate_limit": { /* same shape */ } }
+  ],
+  // other top-level keys: credits, promo, spend_control,
+  // rate_limit_reset_credits, rate_limit_reached_type
+}
+```
+
+### Corrections to the static analysis
+
+| Static-analysis hypothesis | Actual wire contract |
+|---|---|
+| `rate_limits`: an **array** of windows | `rate_limit.primary_window` / `.secondary_window` — **named fields**, not an array |
+| `window_minutes` | **`limit_window_seconds`** (seconds, not minutes) |
+| `resets_at` | **`reset_at`** (unix epoch seconds), plus `reset_after_seconds` |
+| — | `allowed` / `limit_reached` booleans (a direct "are you cut off" signal Anthropic's headers don't give us) |
+| — | Identity comes back in the same call: `email`, `plan_type`, `account_id` |
+
+`used_percent` survives unchanged and is the field the headroom score needs.
+
+### Two genuinely new findings
+
+1. **The window model is not a guaranteed 5h+weekly pair.** On this Pro
+   account, `primary_window` was the **weekly** window (`604800`s) and
+   `secondary_window` was **null** — no 5h window was reported at all. Do
+   **not** hard-code "primary = session, secondary = weekly". Derive the window
+   kind from `limit_window_seconds` and tolerate a null second window. This
+   matters for the popover: an OpenAI account may legitimately have no session
+   figure to show.
+2. **Per-model sub-limits are a first-class part of the response.**
+   `additional_rate_limits[]` carries named per-model/feature limits (here
+   `GPT-5.3-Codex-Spark` / `codex_bengalfox`), each with the identical
+   `rate_limit` shape. This is a close analog of this app's existing per-model
+   Fable tracking, and is a better-structured source than what Anthropic
+   exposes.
+
+### Still unverified
+
+- Cost/quota impact of polling this endpoint (it returned instantly and is
+  what the CLI's own `/usage` hits, so it is very likely free, but no
+  before/after quota comparison was made).
+- The `refresh_token` flow against `auth.openai.com/oauth/token` was **not**
+  exercised — the 10-day access-token lifetime finding above still stands as
+  the phase-2 design driver, but the refresh call itself remains untested.
+- Whether `secondary_window` populates on plans/accounts that do have an
+  active 5h window (see finding 1) — worth re-probing when a session window is
+  actually in use.
 
 ## References
 
