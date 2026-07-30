@@ -59,36 +59,42 @@ enum CodexCLI {
             fail("No Codex credential at \(resolved) — run `codex login` first, or pass --auth <path>")
         }
 
+        // Freeze the parsed option into an immutable binding: everything the
+        // Task below touches must be a `let`. Strict concurrency checking
+        // rejects both mutating *and* merely referencing a captured `var` from
+        // concurrently-executing code, and the Xcode toolchain on CI's macOS
+        // runner enforces that as an error where newer ones only warn.
+        let storePath = dbPath
+
         // The import validates the credential against the live usage endpoint,
         // so the database must exist before the account row is written.
-        let store = UsageStore(dbPath: dbPath)
+        let store = UsageStore(dbPath: storePath)
         store.ensureDatabase()
 
-        let poller = OAuthPoller(dbPath: dbPath)
-        let semaphore = DispatchSemaphore(value: 0)
-        var result: (accountId: String?, error: String?) = (nil, nil)
+        let poller = OAuthPoller(dbPath: storePath)
 
+        // Bridge sync → async the way HeadlessRunner does: the whole
+        // continuation lives inside the Task, which ends the process itself,
+        // so no value is handed back across the concurrency boundary.
         Task {
-            result = await poller.importCodexCredential(path: resolved)
-            semaphore.signal()
-        }
-        semaphore.wait()
-
-        if let accountId = result.accountId {
+            let result = await poller.importCodexCredential(path: resolved)
+            guard let accountId = result.accountId else {
+                fail(result.error ?? "Import failed")
+            }
             print("Imported OpenAI account \(accountId.prefix(8))… from \(resolved)")
-            if let dbPath = dbPath {
+            if let storePath = storePath {
                 // Keep a scratch run entirely inside the scratch directory —
                 // never overwrite the real ranking.json from a test import.
                 RankingExporter.exportNow(
-                    dbPath: dbPath,
-                    outputPath: (dbPath as NSString).deletingLastPathComponent + "/ranking.json"
+                    dbPath: storePath,
+                    outputPath: (storePath as NSString).deletingLastPathComponent + "/ranking.json"
                 )
             } else {
                 RankingExporter.exportNow()
             }
             exit(0)
         }
-        fail(result.error ?? "Import failed")
+        dispatchMain()
     }
 
     private static func fail(_ message: String) -> Never {
