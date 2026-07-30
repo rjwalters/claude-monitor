@@ -17,6 +17,15 @@
 #   - `cleanup` — remove this run's own entry (and prune dead peers) at sweep end.
 #   - `list`    — dump all registry entries (debug).
 #
+# Per-run transients (#4450): a run's registry entry is not its only RUN_ID-keyed
+# file — `/loom:sweep` also writes a main-clean baseline at
+# `.loom/sweep-checkpoint/main-clean-baseline-<RUN_ID>.txt`. Both have the same
+# lifetime (one sweep invocation), so whenever this helper removes a registry
+# entry — `cleanup` for the run's own entry, or a dead-PID prune for a peer's —
+# it removes that run's baseline too. Without this the baselines accumulated
+# forever (200+ dead files observed). Bulk pruning of baselines left behind by a
+# SIGKILLed sweep is `loom-daemon clean`'s job.
+#
 # The run id is portable (macOS/Linux, no `uuidgen`): a compact UTC timestamp, a
 # PID component, and a random suffix, e.g.
 #   sweep-20260722T231500Z-84213-a3f9c1
@@ -40,7 +49,7 @@
 # Usage:
 #   sweep-run-registry.sh new [--pid P]     # print a fresh RUN_ID, register it
 #   sweep-run-registry.sh peers <RUN_ID>    # print live peers (one per line), prune dead
-#   sweep-run-registry.sh cleanup <RUN_ID>  # remove own entry + prune dead peers
+#   sweep-run-registry.sh cleanup <RUN_ID>  # remove own entry + baseline, prune dead peers
 #   sweep-run-registry.sh list              # print all entries (run_id pid timestamp)
 #
 # `peers` output format (one live peer per line):
@@ -54,7 +63,7 @@
 set -euo pipefail
 
 usage() {
-    sed -n '3,55p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,61p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
 }
 
@@ -68,8 +77,26 @@ registry_dir() {
     echo "$(repo_root)/.loom/sweep-run"
 }
 
+# Where /loom:sweep keeps its per-run transients (checkpoints + the RUN_ID-keyed
+# main-clean baseline). Same derivation as sweep-checkpoint.sh.
+checkpoint_dir() {
+    echo "$(repo_root)/.loom/sweep-checkpoint"
+}
+
 ensure_dir() {
     mkdir -p "$(registry_dir)"
+}
+
+# Remove every RUN_ID-keyed artifact of one run: the registry entry AND the
+# main-clean baseline the sweep keyed by the same RUN_ID (#4450). Both are
+# per-run transients with a one-invocation lifetime. Missing files are a
+# silent no-op; the RUN_ID charset is restricted to [A-Za-z0-9-] so the path
+# construction is injection-safe.
+remove_run_artifacts() {
+    local rid="${1:-}"
+    [[ -n "$rid" ]] || return 0
+    rm -f "$(registry_dir)/${rid}.json"
+    rm -f "$(checkpoint_dir)/main-clean-baseline-${rid}.txt"
 }
 
 iso_now() {
@@ -150,6 +177,10 @@ prune_dead() {
         [[ -n "$skip" && "$rid" == "$skip" ]] && continue
         pid=$(json_num "$file" pid)
         if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+            # Dead run: reap its baseline too, so a crashed sweep self-heals on
+            # the next sweep's peer scan instead of waiting for the bulk path.
+            remove_run_artifacts "$rid"
+            # Backstop for a malformed entry with no readable run_id.
             rm -f "$file"
         fi
     done
@@ -174,7 +205,9 @@ cmd_peers() {
             ts=$(json_field "$file" timestamp)
             echo "$rid $pid $ts"
         else
-            # Dead peer — prune so it never produces a false-positive warning forever.
+            # Dead peer — prune so it never produces a false-positive warning
+            # forever, and reap the baseline it left behind (#4450).
+            remove_run_artifacts "$rid"
             rm -f "$file"
         fi
     done
@@ -186,10 +219,10 @@ cmd_cleanup() {
         echo "ERROR: cleanup requires a RUN_ID argument" >&2
         exit 1
     fi
-    local target
-    target="$(registry_dir)/${self}.json"
-    rm -f "$target"
-    # Opportunistically prune any dead peers too.
+    # Remove this run's registry entry AND its RUN_ID-keyed main-clean baseline
+    # (#4450) — both are transients whose lifetime is this sweep invocation.
+    remove_run_artifacts "$self"
+    # Opportunistically prune any dead peers (and their baselines) too.
     prune_dead "$self"
 }
 

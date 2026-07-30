@@ -511,7 +511,7 @@ A `RELATED_OPEN_WORK` hit is **not** grounds for closing or auto-rescoping on it
 - Estimate complexity and effort when helpful
 - Break down large features into phased deliverables
 
-### Complexity routing marker (`<!-- loom:complexity=<tier> -->`, issues #3702, #4238)
+### Complexity routing marker (`<!-- loom:complexity=<tier> -->`, issues #3702, #4238, #4448)
 
 Emit a single machine-readable marker into the curated issue body so the sweep orchestrator routes the downstream Builder to the right model. Classify by **how expensive it is to be wrong**, not by how much work it looks like — the one question is *would a mistake be caught?*
 
@@ -519,25 +519,28 @@ Emit a single machine-readable marker into the curated issue body so the sweep o
 <!-- loom:complexity=mechanical -->
 ```
 
-There are **three** cost-of-being-wrong strata (issue #4238 added `mechanical` beneath `routine`):
+There are **three, and only three**, cost-of-being-wrong strata (issue #4238 added `mechanical` beneath `routine`). The value **MUST** be exactly one of `mechanical`, `routine`, or `complex` — no synonyms and no paraphrasing. Values like `trivial`, `large`, `moderate`, or `hard` are **not** valid; they fall through to `routine` at resolution time (see `resolve-tier-model.sh`) but corrupt the stratification signal, so treat an out-of-vocabulary value as a curation defect, not a style choice (issue #4448).
 
 | Value | Emit when |
 |---|---|
 | `mechanical` | A mistake is obvious just reading the change — file splits, dead-code deletion, renames, hardcoded constants, ARIA attributes, mock fixes. |
-| `routine` | The approach is clear once you've read the relevant code, and a mistake would surface in tests or review. Most bug fixes and small features. **Default.** |
+| `routine` | The approach is clear once you've read the relevant code, and a mistake would surface in tests or review. Most bug fixes and small features. **Default stratum** — take this one when genuinely torn between it and `mechanical`. |
 | `complex` | Deciding the approach takes judgement, and a mistake could pass tests and review unnoticed — architecture, cross-cutting change, subtle logic. Money, security, and destructive migrations are common cases, not the whole list. |
 
-- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Values are `mechanical` | `routine` | `complex`. Put it in your enhancement section (e.g. near the Problem Statement). **Absent marker ⇒ `routine`** — do **not** emit `<!-- loom:complexity=routine -->` explicitly.
+- **Format**: an HTML comment (invisible in rendered Markdown, trivially greppable). Put it in your enhancement section (e.g. near the Problem Statement). **Always emit the marker explicitly, including `routine`** — do not rely on omission. (`resolve-tier-model.sh` still treats an absent marker as `routine` for backward compatibility with issues curated before this rule, but that fallback is not a substitute for emitting one — the validator below blocks on an absent marker for exactly this reason.)
 - **What it does**: at Builder dispatch the sweep skill reads it as precedence **tier 2.5** (between tiers 2 and 3) and resolves the Builder's model from `sweep.tierModels[<runtime>][<tier>]` — `mechanical` routes cheaper, `complex` routes more capable. **Never name a model here; the tier is runtime-neutral.** See `sweep.md` → "Tier 2.5 — complexity marker".
 - **Hard bounds** (the router's authority is deliberately bounded): **never resolves to `fable`, and never a label.** The frontier model is reserved for the objective escalation ladder on Judge rejection or an explicit operator param. A `roleConfig.model` pin or explicit dispatch param (tiers 1–2) still overrides the marker.
 - **Cheap when the tier map is unconfigured.** With no `sweep.tierModels` in `.loom/config.json` and no `sweep.optimization` profile set (or set to `balanced`, the default), the marker is inert and dispatch falls through to the role default exactly as before — so adding markers is safe even before a workspace opts into cost/speed routing. A workspace opts in either by hand-authoring `sweep.tierModels`, or by setting `sweep.optimization: cost | speed` (a policy switch that materializes a preset over the same map — see `model-selection.md` "Optimization profile switch").
 - **Use sparingly / take the higher tier when torn.** Marking everything `complex` defeats the cheap-first default; marking real judgement calls `mechanical` risks a cheap model on expensive-to-be-wrong work. When genuinely torn, take the higher tier.
 
-Optionally verify a curated issue carries a valid marker before applying `loom:curated`:
+**Required before applying `loom:curated`**: run the validator below and confirm exit 0. This is not optional — do not apply `loom:curated` if it fails:
 
 ```bash
-./.loom/scripts/require-complexity-marker.sh <issue>   # exit 0 = has a valid tier
+./.loom/scripts/require-complexity-marker.sh <issue>   # exit 0 = has a valid tier; exit 1 = missing or out-of-vocabulary
+                                                       # exit 2 = could not fetch (retry/check quota, NOT a curation defect)
 ```
+
+Exit 2 means the issue body could not be fetched (both GraphQL and REST failed — usually API quota exhaustion), not that the marker is absent. Retry once quota recovers; do not re-edit the body on an exit-2.
 
 ## Where to Add Enhancements
 

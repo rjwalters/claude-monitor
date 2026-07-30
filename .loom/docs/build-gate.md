@@ -12,7 +12,7 @@ Builder agents (Claude Code as well as external engines invoked by parallel swar
 - commits containing only logfiles / scratch files,
 - no commits at all.
 
-Without a gate, the Judge phase has to catch every one of these post-hoc, which wastes review cycles and pollutes the queue. The gate moves that filter ~30s of CPU instead of a multi-minute Judge cycle, and on parallel-shepherd fleets the savings compound.
+Without a gate, the Judge phase has to catch every one of these post-hoc, which wastes review cycles and pollutes the queue. The gate moves that filter ~30s of CPU instead of a multi-minute Judge cycle, and on parallel-sweep fleets the savings compound.
 
 ## The three checks
 
@@ -27,7 +27,7 @@ When all three pass the builder phase proceeds normally to PR creation. When any
 - Atomically releases the claim: `loom:building` -> `loom:issue`.
 - Logs an `error` milestone with `reason=build_failed_post_builder` and `check=<failed_check>`.
 - Cleans up the stale worktree.
-- Returns a `FAILED` `PhaseResult` so the shepherd does not progress to Judge.
+- Returns a `FAILED` `PhaseResult` so the sweep does not progress to Judge.
 
 ## Configuration
 
@@ -52,6 +52,9 @@ The gate is **opt-in**. Repos with no `buildGate` block in `.loom/config.json` s
 | `command` | string | _(none)_ | Shell-style command run in the worktree (parsed with `shlex.split`). When omitted, the build check is skipped but the has-commits and has-real-changes checks still run. |
 | `realChangeGlobs` | array of strings | _(default exclusions)_ | Positive globs. A changed file must match at least one to count as "real." When omitted, every changed file counts unless it matches one of the default scratch exclusions: `.loom-*`, `*.log`, `.no-changes-needed`. |
 | `timeoutSeconds` | integer | `600` | Timeout for the `command` run. |
+| `loadThreshold` | number | `0.9` | Daemon main-health gate only (#4259): 1-minute load average per logical CPU at/above which the gate DEFERS instead of running the full suite. Env override `LOOM_BUILD_GATE_LOAD_THRESHOLD`. See "Tiered gate + load-aware deferral". |
+| `maxDeferSeconds` | integer | `1800` | Daemon main-health gate only (#4259): after this many seconds of consecutive load-deferred ticks, the FAST tier runs regardless of load so a permanently-loaded host still reaches a verdict. Env override `LOOM_BUILD_GATE_MAX_DEFER_SECS`. |
+| `fastCommand` | string | _(derived)_ | Daemon main-health gate only (#4259): the command run for the fast tier. When omitted, the base `command` is run with `LOOM_BUILD_GATE_TIER=fast` prefixed. |
 
 > **Not a `buildGate` key:** the daemon-side main-health gate's optional forge
 > verification-workflow name (`autonomous.mainHealthGate.ciWorkflow` /
@@ -110,7 +113,8 @@ The gate is **opt-in**. Repos with no `buildGate` block in `.loom/config.json` s
 
 Loom's own `.loom/config.json` points `buildGate.command` at a committed
 wrapper script rather than a single-language one-liner, because this repo is
-polyglot (Rust + Python + bash) and no single build tool covers it:
+polyglot (Rust + bash, plus an opt-in Python carve-out) and no single build tool
+covers it:
 
 ```json
 {
@@ -125,19 +129,28 @@ polyglot (Rust + Python + bash) and no single build tool covers it:
 
 The wrapper lives at [`defaults/scripts/build-gate.sh`](../scripts/build-gate.sh)
 (the installer-template source of truth; `.loom/scripts/build-gate.sh` resolves
-to it via the `.loom/scripts -> ../defaults/scripts` symlink). It runs three
+to it via the `.loom/scripts -> ../defaults/scripts` symlink). It runs these
 stages in order under `set -euo pipefail`, aborting on the first non-zero exit:
 
 1. `cargo test --workspace --lib --bins` — the Rust crates' **unit tests**
    (`loom-daemon`, `loom-api`). The integration test **targets** under
    `loom-daemon/tests/` are deliberately excluded here — see "Local gate vs.
    CI" below.
-2. `uv run pytest tests/ -q` in `loom-tools/`, scoped with
-   `--ignore=tests/integration` (live-network/credentials e2e) and
-   `--ignore=tests/tokens/test_agent_spawn_integration.py` (a slow real-time
-   modal-poll integration file). `uv run` is used so `loom_tools` is importable
-   from the project venv.
-3. `bash scripts/test-installer.sh` — the 131-case bash installer suite.
+2. `bash scripts/test-installer.sh` — the 131-case bash installer suite.
+3. **Best-effort only:** `python3 -m pytest tests/ -q` in `loom-tools/` with
+   `PYTHONPATH=src`, covering the opt-in
+   [`loom-search`](semantic-search.md) carve-out. **Skipped** — with a printed
+   note, not a failure — unless the host already has a `python3` that can
+   `import pytest`; it never runs `pip install` or materializes a `uv` venv.
+   Opt out explicitly with `LOOM_BUILD_GATE_SKIP_SEARCH=1`.
+
+**The gate no longer requires a Python toolchain (epic #4081 Phase 4, #4557).**
+Stage 2 used to be `cd loom-tools && uv run pytest tests/ -q
+--ignore=tests/integration` over the whole `loom_tools` package. That package was
+retired — everything it did is native in `loom-daemon` now — so that stage would
+fail against a deleted path. Only the `loom-search` module survived the deletion,
+and it is off the core daemon path, so its coverage moved to the non-blocking
+stage 3 above. See [ADR-0013](../../docs/adr/0013-loom-tools-python-retirement.md).
 
 **`mcp-loom` (TypeScript) is intentionally excluded** from the gate: it needs
 `npm install`/`npm ci` in a fresh worktree (no guaranteed warm `node_modules`),
@@ -281,6 +294,133 @@ self-inflicted contention. Raising `buildGate.timeoutSeconds` is deliberately
 *not* the lever here: the gate's cost scales with however many sweeps happen to
 be in flight, so any fixed budget large enough for the worst case makes a truly
 hung gate invisible for that long.
+
+### Tiered gate + load-aware deferral (#4259)
+
+`nice` (#4020/#4084) reordered the run queue but could not stop the gate's own
+`cargo` build from *racing* freshly-dispatched sweep builds for cores. Under
+6–7 concurrent sweeps the full suite blew past even the 1200s budget and was
+killed — so the main-health gate reported `not evaluated (timeout …)`
+**permanently**, silently disabling the red-main protection it exists for. Two
+composed mechanisms fix that so the gate always produces *some* signal:
+
+**1. A cheap FAST tier in `build-gate.sh`.** `LOOM_BUILD_GATE_TIER` selects the
+stage set the wrapper runs:
+
+| Tier | `LOOM_BUILD_GATE_TIER` | Stages | Cost |
+|------|------------------------|--------|------|
+| **full** (DEFAULT) | unset / `full` | `cargo test --lib --bins` + installer suite (+ best-effort `loom-search` pytest) | minutes, cold |
+| **fast** | `fast` | `cargo build --workspace --lib --bins` (compile) + a `loom-daemon --version` startup smoke | a few minutes cold, no test execution |
+
+The default is unchanged when the variable is absent, so **CI parity, manual
+invocations, and the per-builder post-builder gate all behave exactly as
+before**. The fast tier verifies the compile/startup breakage class (#3647
+step-8 — a `cargo build --workspace` catch) plus that the binary it just built
+actually starts.
+
+The fast tier's smoke step was `cd loom-tools && uv run python -c "import
+loom_tools"` until epic #4081 Phase 4 (#4557) retired the Python package; it is
+now `cargo run --package loom-daemon --bin loom-daemon -- --version`, which
+catches the same "compiles but won't start" class (a panic in a static
+initializer, a broken clap command tree, a missing dynamic dependency) with no
+Python involved. `--version` touches no repo state, no forge, and no daemon
+socket.
+
+> **A fast-tier GREEN is NOT equivalent to a full-suite GREEN.** It does **not**
+> run the Rust unit tests or the installer suite. `loom-daemon
+> status` labels a fast-tier verdict (`clear(fast)` / `… [fast tier — compile+smoke
+> only, NOT a full-suite green]`) precisely so the two are never confused.
+
+**2. Bounded, visible load-aware deferral in the daemon.** Each gate tick,
+`run_gate_tick` reads the host's 1-minute load average (reusing
+`cpu_headroom::read_loadavg_1m()` / `logical_cpu_count()`) and decides:
+
+- **load below threshold** (or **no load reading** — fail safe) → run the **full**
+  tier;
+- **host saturated, within the max-defer window** → **defer**: no command runs,
+  and `loom-daemon status` reports `deferred (load …)` — distinct from
+  `not evaluated (timeout …)`. A deferred tick is a *scheduling* decision, not
+  an evaluation: it never records the SHA memo, never arms the indeterminate
+  backoff, and never touches the halt flag;
+- **host saturated past the max-defer window** → run the **fast** tier regardless
+  of load, so a permanently-loaded host still reaches a verdict.
+
+Deferral is **bounded** on purpose: an unbounded defer on a host that is *always*
+at cap would re-disable the gate exactly like the timeout did, only more cheaply.
+After `maxDeferSeconds` (default 30 min) of consecutive deferred ticks the fast
+tier runs, guaranteeing a real (if narrower) Green/Red at least that often — a
+genuinely red `main` is still caught within one such cycle. A fast-tier Red halts
+dispatch with the same semantics as a full-tier Red.
+
+All three knobs honor **env > config > default**:
+
+| Knob | Env | Config (`buildGate.*`) | Default |
+|------|-----|------------------------|---------|
+| Saturation threshold (1m load ÷ logical CPUs) | `LOOM_BUILD_GATE_LOAD_THRESHOLD` | `loadThreshold` | `0.9` |
+| Max-defer window (seconds) | `LOOM_BUILD_GATE_MAX_DEFER_SECS` | `maxDeferSeconds` | `1800` (30 min) |
+| Fast-tier command | — | `fastCommand` | `LOOM_BUILD_GATE_TIER=fast <command>` |
+
+`fastCommand` is optional: when omitted the daemon runs the base `command` with
+`LOOM_BUILD_GATE_TIER=fast` prefixed (the shipped `build-gate.sh` honors it). The
+load average overstates consumption on macOS (see "measured idle fraction",
+#4031), so an operator on a chronically-loaded host may raise `loadThreshold`.
+
+Explicitly **out of scope** here (separable follow-ups): a dedicated gate cargo
+target-dir to isolate contention (never shipped by #4020); per-test timeouts
+(would require adopting cargo-nextest); and any change to sweep spawn priority
+(that is #4233). The **shared build lock** half of that first item did land
+later — see the next section.
+
+### Machine-wide build slot (#4512)
+
+`nice` (#4020) reorders the run queue and the gate-in-flight flag (#4084) holds
+*dispatch* off one root, but neither stops the genuinely concurrent case: N
+sweep worktrees each running their own post-Builder `build-gate.sh` in separate
+processes, plus the daemon's own main-health gate, all compiling at once. Until
+#4512 the daemon's admission formula tried to prevent that up front with a CPU
+estimate (`estCoresPerSweep × cpuUtilizationTarget` minus live idle) — which
+priced *every* sweep as a build and throttled a 95%-idle 8-core host to 2
+concurrent sweeps. #4512 deleted that term and moved the protection here, to the
+stage that actually burns the cores.
+
+**Every invocation of `build-gate.sh` takes one machine-wide build slot before
+compiling**, and releases it on exit (via an `EXIT` trap, so a failed or killed
+gate never leaks the slot). N sweeps run concurrently; at most
+`LOOM_BUILD_SLOTS` (default **1**) of them build at any moment.
+
+- **Mechanism**: `defaults/scripts/lib/build-slot.sh`, sourced by
+  `build-gate.sh` (`loom_build_slot_acquire` / `loom_build_slot_release`). A
+  slot is a lock **directory** created with `mkdir` — POSIX-atomic and available
+  on stock macOS, unlike `flock` — at `~/.loom/locks/build-slot/slot-<i>`,
+  machine-wide rather than per-repo, because cores are a machine-level resource
+  shared by every workspace and worktree on the host. The daemon's Rust half
+  (`loom-daemon/src/build_slot.rs`) implements the identical protocol and wraps
+  the main-health gate's own command, so the two serialize against each other.
+- **Never blocks the gate indefinitely**: the acquire waits at most
+  `LOOM_BUILD_SLOT_WAIT_SECS` (default 300s) and then **degrades open**,
+  proceeding unserialized. A wedged holder costs one build's worth of
+  serialization, never the gate's liveness.
+- **Never fails the gate**: an unusable lock directory (unwritable, missing
+  parent, a file in the way) also degrades open, with a warning. `mkdir` locks
+  carry no heartbeat, so an abandoned slot is reaped after
+  `LOOM_BUILD_SLOT_STALE_SECS` (default 1h — deliberately long, so a peer cannot
+  reap a healthy in-progress build).
+- **Re-entrant**: when the daemon already holds a slot around this gate command
+  it exports `LOOM_BUILD_SLOT_HELD=1`, and the acquire inside `build-gate.sh` is
+  a logged no-op instead of a wait on its own parent's slot.
+- **Opt out** with `LOOM_BUILD_SLOTS=0` (every acquire degrades open — exactly
+  the pre-#4512 behavior). If `lib/build-slot.sh` is missing from an install the
+  gate prints a note and runs unserialized.
+- **Interaction with the timeout**: the daemon acquires the slot **outside** the
+  `buildGate.timeoutSeconds` window, so queueing behind another build never eats
+  into the gate's own budget and turns contention into a false `UNEVALUATED`.
+- **Interaction with deferral**: the load-aware deferral above is a *scheduling*
+  decision made before any command runs; the slot is a *mutual-exclusion*
+  decision made at the moment of compiling. They compose — a deferred tick never
+  reaches the acquire at all.
+
+Full rationale, telemetry, and the env-knob table live in
+[`daemon-reference.md` → Machine-wide build slot](daemon-reference.md).
 
 > **Rule of thumb:** if a check's outcome can differ between an idle host and a
 > busy one — or between a host with tmux and one without — it is

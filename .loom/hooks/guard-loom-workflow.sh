@@ -8,7 +8,7 @@
 # guard-destructive.sh (issue #3604), plus later Loom-specific additions:
 #
 #   1. LOOM: Prefer merge-pr.sh over 'gh pr merge'
-#   2. LOOM: Block 'pip install -e' inside worktrees (issue #2495)
+#   2. LOOM: Block 'pip install -e' inside worktrees (issue #2495, #4079)
 #   3. LOOM: Ask before real-registry-mutating `loom-daemon workspace
 #      add|remove|set-priority` (issue #4326)
 #
@@ -307,22 +307,35 @@ if echo "$COMMAND" | grep -qE 'gh\s+pr\s+merge'; then
 fi
 
 # =============================================================================
-# LOOM: Block pip install -e inside worktrees (issue #2495)
+# LOOM: Block pip install -e inside worktrees (issue #2495, hardened by #4079)
 #
 # Editable pip installs overwrite a global .pth file in site-packages.
 # When multiple builders run in parallel worktrees, each 'pip install -e .'
 # clobbers the .pth to point at its own worktree, causing all other Python
 # processes to import from the wrong source tree.
 #
-# PYTHONPATH is already set by agent-spawn.sh and _build_worktree_env()
-# so editable installs are unnecessary inside worktrees.
+# The second, worse failure mode (incident #4079, which motivated epic #4081):
+# an editable install also drops FROZEN `<name> = <module>:main` console scripts
+# into ~/.local/bin. Those outlive the package — they keep shadowing whatever is
+# later installed under the same name on PATH, which is how a stale
+# `pip install -e loom-tools` kept shadowing the Rust `loom-daemon` binary long
+# after the Python package stopped being used. `loom-daemon-update.sh` warns
+# about survivors; this guard stops new ones being created.
+#
+# This guard is NOT specific to Loom's own (now Python-free) tree — it protects
+# any Python repo under Loom orchestration. The supported ways to run a
+# worktree's own code without an editable install:
+#   - `.loom/scripts/run-tests.sh`, which prepends the worktree's source root to
+#     PYTHONPATH before invoking pytest; and
+#   - `loom-daemon agent-spawn`, which pins PYTHONPATH into the spawned session
+#     for repos whose worktree has a src/ layout it recognizes.
 # =============================================================================
 
 WORKTREE_PATH="${LOOM_WORKTREE_PATH:-}"
 if [[ -n "$WORKTREE_PATH" ]]; then
     if echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*-e\s' || \
        echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*--editable\s'; then
-        deny "BLOCKED: 'pip install -e' is not allowed inside worktrees. Editable installs overwrite the global .pth file, breaking parallel builders (see issue #2495). PYTHONPATH is already configured for this worktree — imports resolve correctly without editable installs." "loom:pip-install-editable-worktree"
+        deny "BLOCKED: 'pip install -e' is not allowed inside worktrees. Editable installs overwrite the global .pth file, breaking parallel builders (issue #2495), and leave frozen console scripts on PATH that shadow later installs (incident #4079). Run the worktree's own code via '.loom/scripts/run-tests.sh' (it sets PYTHONPATH for you) instead of an editable install." "loom:pip-install-editable-worktree"
     fi
 fi
 

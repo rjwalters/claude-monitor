@@ -10,8 +10,9 @@ After evaluating both queues:
 
 1. Report PRs evaluated and merged
 2. Report issues evaluated and promoted
-3. Report rejections with reasons
-4. List merged PR numbers and promoted issue numbers with links
+3. Report capped-PR recovery decisions (granted / kept parked / close recommended)
+4. Report rejections with reasons
+5. List merged PR numbers and promoted issue numbers with links
 
 **Example report**:
 
@@ -31,11 +32,17 @@ Issue Promotion (2):
 - Issue #445: Add worktree cleanup command
   https://github.com/owner/repo/issues/445
 
+Capped-PR Recovery (2):
+- PR #4543: granted 1 extra Doctor cycle (latest rejection is a distinct defect)
+  https://github.com/owner/repo/pull/4543
+- PR #4501: kept parked (same defect re-litigated across both rejections)
+  https://github.com/owner/repo/pull/4501
+
 Rejected:
 - PR #456: Too large (450 lines, limit is 200)
 - Issue #443: Needs specific performance metrics
 
-Next Steps: 2 PRs merged, 2 issues promoted, 2 items await human review
+Next Steps: 2 PRs merged, 2 issues promoted, 1 capped PR returned to Doctor, 3 items await human review
 ```
 
 ---
@@ -62,7 +69,7 @@ Humans can always:
 This role is designed for **autonomous operation** with a recommended interval of **10 minutes**.
 
 **Default interval**: 600000ms (10 minutes)
-**Default prompt**: "Check for safe PRs to auto-merge and quality issues to promote"
+**Default prompt**: "Check for safe PRs to auto-merge, quality issues to promote, and Doctor-cycle-capped PRs to reconsider"
 
 ### Autonomous Behavior
 
@@ -71,7 +78,8 @@ When running autonomously:
 2. Drain the queue — evaluate every qualifying PR (oldest first) and merge safe ones until the queue is empty (see `champion-pr-merge.md` §"PR Auto-Merge Batch Processing"; PR merging has no numeric per-iteration cap)
 3. If no PRs, check for `loom:curated` issues (Priority 2)
 4. Evaluate all qualifying issues (oldest first) and promote them, bounded only by the tier-based promotion limits in `champion-issue-promo.md` (Tier 1 unlimited / Tier 2 up to 2 per iteration / Tier 3 up to 1, gated at 5 backlog)
-5. Report results and stop
+5. If no promotion work remains, run the capped-PR recovery pass over open `loom:blocked` + `loom:changes-requested` PRs (Priority 5) — one grant / keep-parked / recommend-close decision each, with a rationale comment (see `champion-pr-merge.md` §"Capped-PR Recovery Pass")
+6. Report results and stop
 
 ### Quality Over Quantity
 

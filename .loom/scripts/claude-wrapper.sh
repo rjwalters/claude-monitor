@@ -949,63 +949,67 @@ check_api_reachable() {
     return 0  # Don't fail on network check - let Claude CLI handle it
 }
 
-# Detect if error output indicates a transient/retryable error
+# The category `is_transient_error` last derived its verdict from, exported so
+# the caller's log line can name the SAME verdict it acted on (issue #4501).
+# Initialized here so `set -u` is safe even if a caller reads it before the
+# first classification.
+_LAST_ERROR_CLASSIFICATION="UNCLASSIFIED"
+
+# Detect if error output indicates a transient/retryable error.
+#
+# Issue #4501: this predicate USED to carry its own array of transient phrasings,
+# entirely disjoint from `classify-error.sh`'s pattern tables. That made the
+# retry decision and the printed classification two independent verdict systems,
+# which produced this self-contradicting permanent-death block on a live host:
+#
+#   [ERROR] Non-transient error detected - not retrying
+#   [ERROR] exit_code=1 classification=RECOVERABLE
+#
+# (the CLI had emitted "You've reached your Fable 5 limit …", which matched
+# neither the old exhaustion regex nor the local array, so no rotation happened
+# AND no retry happened, while `log_permanent_death`'s independent
+# `classify_error` call reported the generic RECOVERABLE catch-all.)
+#
+# The verdict is now derived from `classify_error`'s category via the shared
+# `classification_is_transient` deny-list, so the two can never disagree again.
+# Notable consequences, all intentional:
+#   * An UNRECOGNIZED non-zero exit is now retried (the catch-all category is
+#     RECOVERABLE) instead of dying on attempt 1 — bounded by MAX_RETRIES and
+#     exponential backoff. This subsumes both the old `Execution error` special
+#     case (#4255) and the old "empty output with exit code 1" heuristic.
+#   * Genuinely terminal categories (TOKEN_EXPIRED, CWD_DELETED, MODEL_REFUSAL,
+#     FATAL, TIMEOUT) are still NOT retried — see `classification_is_transient`.
 is_transient_error() {
     local output="$1"
     local exit_code="${2:-1}"
 
     # Rate limit abort is NOT transient — the CLI hit a usage/plan limit
     # and showed an interactive prompt.  Retrying will hit the same limit.
+    # Checked before classification because this sentinel is the wrapper's own
+    # (the output/startup monitors emit it), not a CLI phrasing: the account
+    # rotation path above consumes it first, and reaching here means rotation
+    # was already capped or the pool was empty.
     if echo "${output}" | grep -q "RATE_LIMIT_ABORT"; then
+        _LAST_ERROR_CLASSIFICATION="RATE_LIMIT_ABORT"
         return 1
     fi
 
-    # Known transient error patterns
-    local patterns=(
-        "No messages returned"
-        "Rate limit exceeded"
-        "rate_limit"
-        "Connection refused"
-        "ECONNREFUSED"
-        "network error"
-        "NetworkError"
-        "ETIMEDOUT"
-        "ECONNRESET"
-        "ENETUNREACH"
-        "socket hang up"
-        "503 Service"
-        "502 Bad Gateway"
-        "500 Internal Server Error"
-        "overloaded"
-        "temporarily unavailable"
-        "MCP server failed"
-        "MCP.*failed"
-        "plugins failed"
-        "plugin.*failed to install"
-        # Issue #4255: the Claude CLI's bare `Execution error` fatal. This is the
-        # single most common unattended-death signature — 21% of daemon sweep
-        # logs terminated on it — yet it matched NONE of the patterns above, and
-        # because the CLI prints it (non-empty output) the empty-output-with-
-        # exit-1 heuristic below never fired either, so the wrapper died on
-        # attempt 1 without a single retry. Treat it as transient/retryable
-        # (bounded by MAX_RETRIES): it is an opaque transport/harness fault, not
-        # a deterministic build failure, so a retry frequently succeeds.
-        "Execution error"
-    )
-
-    for pattern in "${patterns[@]}"; do
-        if echo "${output}" | grep -qi "${pattern}"; then
-            log_info "Detected transient error pattern: ${pattern}"
-            return 0
-        fi
-    done
-
-    # Exit code 1 with no output often indicates API issues
-    if [[ "${exit_code}" -eq 1 && -z "${output}" ]]; then
-        log_info "Empty output with exit code 1 - treating as transient"
-        return 0
+    # Degraded path: `lib/classify-error.sh` was not sourced (it is optional at
+    # the top of this file). Retry-by-default on any non-zero exit, matching the
+    # deny-list policy's fail-safe direction, still bounded by MAX_RETRIES.
+    if ! declare -F classify_error >/dev/null 2>&1 \
+       || ! declare -F classification_is_transient >/dev/null 2>&1; then
+        _LAST_ERROR_CLASSIFICATION="UNCLASSIFIED"
+        log_warn "classify-error.sh not sourced — treating a non-zero exit as transient (bounded by MAX_RETRIES)"
+        [[ "${exit_code}" -ne 0 ]]
+        return
     fi
 
+    _LAST_ERROR_CLASSIFICATION="$(classify_error "${output}" "${exit_code}")"
+    if classification_is_transient "${_LAST_ERROR_CLASSIFICATION}"; then
+        log_info "Transient error (classification=${_LAST_ERROR_CLASSIFICATION}) - retrying"
+        return 0
+    fi
     return 1
 }
 
@@ -1025,8 +1029,15 @@ log_permanent_death() {
     local output="$2"
     local reason="${3:-permanent failure}"
 
-    local classification="UNCLASSIFIED"
-    if declare -F classify_error >/dev/null 2>&1; then
+    # Prefer the verdict the retry loop ACTED on (#4501). Both call sites reach
+    # here right after `is_transient_error` classified this exact
+    # `(output, exit_code)` pair, so reusing its cached category is equivalent by
+    # construction *and* removes the last way the printed classification could
+    # differ from the one the retry decision used (e.g. the wrapper's own
+    # RATE_LIMIT_ABORT sentinel, which classify_error would report as the generic
+    # RECOVERABLE). Falls back to a fresh classification for a direct caller.
+    local classification="${_LAST_ERROR_CLASSIFICATION:-UNCLASSIFIED}"
+    if [[ "${classification}" == "UNCLASSIFIED" ]] && declare -F classify_error >/dev/null 2>&1; then
         classification="$(classify_error "${output}" "${exit_code}" 2>/dev/null || echo "UNCLASSIFIED")"
     fi
 
@@ -1069,13 +1080,17 @@ is_account_exhaustion() {
     fi
 
     # Otherwise defer to the shared classifier (widened TOKEN_EXHAUSTED set).
-    # Fall back to an inline regex if the classifier lib was not sourced.
+    # This is why the #4501 regex fix in `lib/classify-error.sh` — adding the
+    # per-model "reached your <model> limit" ceiling — reaches the rotation path
+    # here with no change needed in this function.
+    # Fall back to an inline regex if the classifier lib was not sourced (kept
+    # in lockstep with the classifier's pattern, including the #4501 addition).
     if declare -F classify_error >/dev/null 2>&1; then
         [[ "$(classify_error "${output}" "${exit_code}")" == "TOKEN_EXHAUSTED" ]]
         return
     fi
     [[ "${exit_code}" -ne 0 ]] && echo "${output}" \
-        | grep -qiE "hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage"
+        | grep -qiE "hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage|reached your ([^[:space:]]+[[:space:]]+){0,3}limit"
 }
 
 # Return 0 if the captured output indicates a concurrent-session-limit fault
@@ -1145,7 +1160,11 @@ _exhaustion_phrase() {
         return
     fi
     local m
-    m="$(echo "${output}" | grep -ioE "hit your (limit|session limit|weekly limit)|monthly usage limit|out of extra usage|used 100% of your weekly limit" | head -1)"
+    # Kept in lockstep with the classifier's TOKEN_EXHAUSTED regex so the
+    # rotation log line quotes the phrase that actually fired — including the
+    # per-model "reached your <model> limit" ceiling added in #4501 (which
+    # names the constrained model, e.g. "reached your Fable 5 limit").
+    m="$(echo "${output}" | grep -ioE "hit your (limit|session limit|weekly limit)|monthly usage limit|out of extra usage|used 100% of your weekly limit|reached your ([^[:space:]]+[[:space:]]+){0,3}limit" | head -1)"
     echo "${m:-usage limit}"
 }
 
@@ -1776,6 +1795,7 @@ run_with_retry() {
         # distinguish wrapper pre-flight output from actual Claude CLI output.
         # The "# " prefix means it is also filtered as a header line.
         echo "# CLAUDE_CLI_START" >&2
+        echo "# LOOM_CLI_START runtime=claude" >&2
         set +e  # Temporarily disable errexit to capture exit code
         unset CLAUDECODE  # Prevent nested session guard from blocking subprocess
         # Export per-agent config dir if set (for session isolation)
@@ -1947,7 +1967,10 @@ run_with_retry() {
                 continue
             fi
             log_error "Whole account pool exhausted — every account is marked bad or rate-limited."
-            log_error "Retry after the soonest account reset, or run 'loom-tokens unblock <name>'."
+            # `loom-daemon tokens unblock`, not the retired Python `loom-tokens`
+            # console script: epic #4081 Phase 4 (#4557) deleted the package that
+            # provided it, so naming it here would be dead-end recovery advice.
+            log_error "Retry after the soonest account reset, or run 'loom-daemon tokens unblock <name>'."
             echo "# ACCOUNT_POOL_EXHAUSTED" >&2
             clear_retry_state
             return 1
@@ -1955,7 +1978,10 @@ run_with_retry() {
 
         # Check if this is a transient error worth retrying
         if ! is_transient_error "${output}" "${exit_code}"; then
-            log_error "Non-transient error detected - not retrying"
+            # Name the classification the decision was derived from (#4501) so
+            # this line and log_permanent_death's `classification=` below always
+            # agree — they now come from the same `classify_error` call.
+            log_error "Non-transient error detected (classification=${_LAST_ERROR_CLASSIFICATION:-UNCLASSIFIED}) - not retrying"
             # Issue #4255: structured permanent-death diagnostics (exit code +
             # classification + stderr tail) in place of a bare `Output: ...`.
             log_permanent_death "${exit_code}" "${output}" "non-transient error"

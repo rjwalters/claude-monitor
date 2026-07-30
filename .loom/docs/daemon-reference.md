@@ -105,7 +105,7 @@ issue** — the v0.10.0 set is intentionally frozen.
 |-------|-----------|---------|
 | `sweep.issue.{N}.phase`   | Sweep child via `publish_event` | `{phase, pr_number?, repo?}` |
 | `sweep.issue.{N}.blocker` | Sweep child                     | `{reason, label_added, repo?}` |
-| `sweep.issue.{N}.exited`  | Daemon reaper (or `cancel_sweep`) | `{exit_code, duration_sec, repo?}` |
+| `sweep.issue.{N}.exited`  | Daemon reaper (or `cancel_sweep`) | `{exit_code, duration_sec, no_progress, repo?}` |
 | `sweep.issue.{N}.crashed` | Daemon reaper                   | `{checkpoint_phase, repo?}` |
 | `sweep.issue.{N}.resume_dispatched` | Daemon reaper (#4256) | `{pr, checkpoint_phase?, dispatched, repo?}` |
 | `sweep.global.dispatch`   | Daemon                          | `{sweep_id, kind}` |
@@ -149,6 +149,22 @@ field. The daemon stamps `repo` centrally when it emits each event; a sweep
 child that already knows its repo (via `publish_event`) may supply it and will
 not be overwritten. `sweep.global.*` events are unchanged — they already carry a
 unique `sweep_id`.
+
+`sweep.issue.{N}.exited` gained an additive **`no_progress`** boolean field in
+**#4366**. It classifies a checkpoint-less clean exit (`exit_code == Some(0)`)
+as a genuine no-lifecycle-progress death (`true`) vs. an ordinary/benign exit
+(`false`) — `true` requires ALL of: clean exit, no open PR linked to the issue,
+and the issue still open. The reaper counts a `true` verdict toward the
+insta-crash quarantine tally (via the same `record_terminal_outcome` path the
+#3939 insta-crash arm uses) instead of resetting it, closing the gap where a
+headless sweep that ends its turn parked on a monitored background task (e.g.
+"cache download is running in the background... I'll pick this back up") exits
+0 with zero checkpoint/PR progress and previously reset the tally forever,
+letting the dispatch queue churn on it indefinitely. `#[serde(default)]` keeps
+pre-#4366 wire data compatible (deserializes to `false`, matching prior
+behavior). Gated on `!skip_label_flip` like the reaper's other real-forge
+probes — under `skip_label_flip` the field is always `false` and no `gh` call
+is made.
 
 In addition, the bus internally emits:
 
@@ -494,8 +510,9 @@ the plan/ordering/checklist; the per-phase shell is rendered in
    as the **#4292** token-pool-cwd workaround — the rendered unit carries a
    `#4292` marker so it is removed when that lands.
 9. **idle-shutdown** (optional, `--idle-shutdown-minutes N`) — a cron guard that
-   powers the host off after N idle minutes, skipping while claude / loom-daemon
-   are working.
+   powers the host off after N idle minutes. This is stage 2:
+   `autonomous.idleExit` is stage 1. On daemon-managed hosts use a short guard
+   window (typically 15–30 minutes); the running-daemon veto remains.
 10. **safehouse** (optional, `--safehouse`) — **skip-with-notice** until #3998
     (the safehoused provisioning fragment) lands.
 11. **verify** — `loom-daemon status` sane from the workspace cwd, ranking
@@ -562,6 +579,95 @@ format was needed.
   a consumed interface (the #4329 dashboard's multi-host phase reads it over
   the tailnet).
 
+### `fleet drain <ssh-host> [--timeout N] [--force-after-timeout] [--json]` (#4343)
+
+Retires a worker without losing in-flight work, forge claims, or (when a real
+flush seam lands — see below) E2E room keys — the SSH-orchestration layer over
+the drain engine that already exists (`restart --drain`, #4090; `SweepRegistry::
+cancel`'s SIGTERM→grace→SIGKILL), plus the three deltas teardown needs:
+
+1. **Drain-then-*exit*, not drain-then-restart.** `restart --drain --then-exit`
+   (this issue's addition to `Restart`/`DrainAndRestartDaemon`) tells the remote
+   daemon to end the process and **stay down** (`EXIT_SHUTDOWN`, no supervisor
+   relaunch) instead of restarting once drained — a relaunched daemon could pick
+   up new dispatch before the box powers off, defeating the whole point of
+   draining. Because a `then-exit` drain never wants a relaunch, the
+   supervisor-detection refusal gate (`restart --drain`'s AC5) does not apply to
+   it.
+
+   **`then_exit` is escalated one-way, and the ack reports reality (#4521).**
+   A drain request that lands while a drain is *already* in progress is
+   idempotent — it never stacks a supervisor and never moves the active
+   deadline — but `then_exit` is not simply ignored: `--then-exit` **escalates**
+   an in-progress relaunch-drain (e.g. the auto-update roll, which drains with
+   `then_exit=false`) to stay-down, and the already-running supervisor observes
+   the change because it re-reads the terminal action from the drain descriptor
+   on every poll. The reverse never happens: a plain `--drain` against an active
+   teardown drain does **not** downgrade it back to a relaunch. Escalation was
+   chosen over "refuse and tell the operator to `--abort-drain` + re-issue"
+   because that two-command path races the very window it exists for — the roll
+   can complete between the abort and the re-issue and relaunch the daemon on a
+   host that is about to be powered off. When a roll is escalated this way, the
+   daemon logs that the rebuilt binary will not be picked up until it is started
+   again.
+
+   Consequently the `DaemonDrain` reply's `then_exit` reports the **active**
+   drain's terminal action, never an echo of the request, and
+   `loom-daemon restart` renders "will stop" vs "will RESTART" from the reply.
+   When the reply disagrees with what was asked, the CLI prints a loud warning —
+   this is also the version-skew detector: a daemon older than `--then-exit`
+   support silently drops the unknown wire field and replies `then_exit: false`,
+   so `--drain --then-exit` against a stale incumbent now says so instead of
+   promising a teardown that never happens (roll the daemon, then re-issue).
+2. **Immediate, targeted claim reset.** The startup-only `claim_reconciliation`
+   pass is too late for a drain (the anvil#758 pilot evidence: a crashed VM
+   sweep stranded `loom:building` for the full staleness window). `fleet drain`
+   captures the worker's in-flight issue numbers (`status --json`) *before*
+   triggering the remote drain, then — once the remote daemon has exited —
+   flips any of them still `loom:building` back to `loom:issue` via `gh`,
+   **locally, never over SSH** (the forge is global). An issue that finished
+   normally in the meantime (no longer `loom:building`) is left alone.
+3. **Safehoused flush verification is a documented stub pending #3998.** No
+   invocable key-backup steady-state check exists in this repo yet (only the
+   narration-sink/peer-claim client seams in `safehouse.rs`) — rather than block
+   every drain on #3998, this phase degrades honestly: `safehouse.enabled ==
+   false` skips cleanly (no room keys in play); `safehouse.enabled == true`
+   still lets the drain complete (workspace/roster cleanup proceed — loom never
+   *refuses* to retire a box over this) but withholds "safe to power off" and
+   exits `3`. TODO(#3998): replace the stub with a real check once a seam lands.
+
+**Phase state machine** (`loom-daemon/src/fleet/drain.rs`), idempotent +
+resumable (an interrupted drain re-runs from its last completed phase, persisted
+on the registry entry as `drain_phase`):
+
+`mark-draining` (roster `state: "draining"`, first — crash-safety) →
+`capture-claims` → `trigger-remote-drain` → `wait-remote-exit` →
+`reset-claims` → `flush-safehouse` → `deregister-workspace` →
+`remove-from-roster` (last — an interrupted drain stays visible, never
+silently gone).
+
+**What `wait-remote-exit` counts as "exited"**: the normal end state of a
+`then_exit` drain is **host up, daemon gone**, in which the remote
+`loom-daemon status --json` still answers — with the #4069 unreachable payload
+(`{"error": "could not reach loom-daemon at …", "install_state": …}` on stdout,
+non-zero exit). That payload, and an SSH-level failure (host itself gone), both
+mean "exited". Only a *live* status payload reporting `drain.draining: false`
+means the remote refused the drain and is still dispatching — the fail-loud
+exit-`2` case. A transient SSH blip mid-wait is indistinguishable from "host
+gone" and reads as a successful exit; the following phases are
+orchestrator-side and a still-running remote daemon shows up in the next
+`fleet status`.
+
+**Exit codes**: `0` fully verified (safe to power off); `1` a phase failed
+outright (SSH/launch failure, remote refusal — re-run to retry, resuming from
+the persisted phase); `2` the remote drain timed out **without**
+`--force-after-timeout` (fail-safe refusal, remote daemon still up); `3` every
+phase completed but the safehoused flush is unverified (#3998).
+
+**Boundary (epic #4340)**: loom never calls a cloud CLI. The final report
+prints the exact `repo:remote --down <ssh-host>` teardown command for the
+operator to run — this command hands the box back, it does not execute it.
+
 ## Token pool provisioning for managed repos (#3938)
 
 The multi-workspace work finder measures the token pool **once per tick from the
@@ -572,7 +678,7 @@ its `current_dir` set to **its own** repo root, and `spawn-claude.sh` resolves t
 token pool from that repo. A freshly-installed **consumer repo has no
 `.loom/tokens/` of its own** — only the primary workspace was bootstrapped — so
 every cross-repo dispatch used to hard-fail instantly with `EX_CONFIG`
-("Run `loom-tokens bootstrap` …"), burning a dispatch slot per tick on children
+("Run `loom-daemon tokens bootstrap` …"), burning a dispatch slot per tick on children
 that died in ~2s.
 
 **Fix — a shared machine-level pool with a per-repo fallback.** Token selection
@@ -600,25 +706,25 @@ spawn path can actually pick.
 # Preferred on a host running claude-monitor — reads the live credential store
 # (~/.claude-monitor/usage.db -> oauth_credentials, opened mode=ro), so no
 # accounts.env is needed on this machine at all:
-loom-tokens import-from-monitor --shared   # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
-loom-tokens check --ranking                # ranks the effective pool (shared when no per-repo pool)
+loom-daemon tokens import-from-monitor --shared   # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
+loom-daemon tokens check --ranking                # ranks the effective pool (shared when no per-repo pool)
 
 # Without claude-monitor — materialize from the accounts.env snapshot instead:
-loom-tokens bootstrap --shared      # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
-loom-tokens check --ranking         # ranks the effective pool (shared when no per-repo pool)
+loom-daemon tokens bootstrap --shared      # writes ~/.loom/tokens (override LOOM_SHARED_TOKENS_DIR)
+loom-daemon tokens check --ranking         # ranks the effective pool (shared when no per-repo pool)
 ```
 
 Every consumer repo the daemon dispatches into then falls back to that one pool —
-no per-repo `loom-tokens bootstrap` required. A repo that *wants* its own isolated
-pool can still `loom-tokens bootstrap` locally; the per-repo pool always wins.
+no per-repo `loom-daemon tokens bootstrap` required. A repo that *wants* its own isolated
+pool can still `loom-daemon tokens bootstrap` locally; the per-repo pool always wins.
 Selection sources (`~/.claude-monitor/accounts.env`, repo-local `.env`) are
 unchanged for `bootstrap` — `--shared` only redirects the *destination* of the
 materialized pool. `import-from-monitor` bypasses `accounts.env` entirely and
-takes claude-monitor as authoritative for pool membership (use `loom-tokens pin`
+takes claude-monitor as authoritative for pool membership (use `loom-daemon tokens pin`
 to restrict which accounts the selector may pick). If accounts later go
 `blocked` on revoked tokens, `bootstrap --force` cannot recover — the
 `accounts.env` snapshot is itself what went stale — run
-`loom-tokens import-from-monitor --force && loom-tokens check --ranking`
+`loom-daemon tokens import-from-monitor --force && loom-daemon tokens check --ranking`
 instead; without `--force` a rolled token is reported as drift and left alone,
 and the command exits `2`. See "Importing live tokens from claude-monitor" in
 the root `CLAUDE.md` for the full behavior.
@@ -662,7 +768,7 @@ membership, reusing the #4299 check) before applying the per-repo/shared
 straight to the shared machine-level pool instead of a per-repo(`$HOME`) path
 that can coincidentally collide with the shared *default* and mask wherever
 the pool was actually bootstrapped. The operational contract is unchanged:
-always provision a machine-level daemon's pool with `loom-tokens bootstrap
+always provision a machine-level daemon's pool with `loom-daemon tokens bootstrap
 --shared` (or `import-from-monitor --shared`) — which always targets
 `~/.loom/tokens/` regardless of cwd — so the daemon's anchoring and the
 provisioning step agree, whether or not the unit that starts the daemon sets
@@ -1071,7 +1177,7 @@ The reaper (`sweep_registry::spawn_reaper_task`) ticks every 30 seconds
 4. Garbage-collects terminal entries older than the retention window
    (default 1 hour).
 
-## Stale-claim reconciliation & the sweep journal (#3953, fixed #3975)
+## Stale-claim reconciliation & the sweep journal (#3953, fixed #3975, extended to PR-side claims #4367)
 
 Two independent surfaces reclaim abandoned `loom:building` claims when the
 sweep that owned them has died, using the same evidence source and the same
@@ -1079,7 +1185,8 @@ decision rule:
 
 | Surface | Where | When it runs |
 |---------|-------|---------------|
-| Rust startup reconciliation | `claim_reconciliation::forge::reconcile_workspace` (called from `main.rs` at daemon startup, guarded by `LOOM_STALE_CLAIM_RECONCILE`, default on) | Once, on every daemon start, across every `effective_roots()` workspace |
+| Rust issue-side reconciliation (`loom:building`) | `claim_reconciliation::forge::reconcile_workspace` (guarded by `LOOM_STALE_CLAIM_RECONCILE`, default on) | At daemon startup AND every `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` (default 600s) thereafter, via `run_reconciliation_pass` (#4348), across every `effective_roots()` workspace |
+| Rust PR-side reconciliation (`loom:reviewing` / `loom:treating`, #4367) | `claim_reconciliation::forge::reconcile_pr_claims`, called from the same `run_reconciliation_pass` entry point (same `LOOM_STALE_CLAIM_RECONCILE` gate — no separate wiring) | Same cadence as the issue-side pass: at startup and every `LOOM_CLAIM_RECONCILE_INTERVAL_SECS`, across every `effective_roots()` workspace |
 | `loom-recover-orphans` (native, issue #4272) | `worktree_ops::orphan_recovery::check_untracked_building` | On demand (operator/cron invocation of `loom-recover-orphans [--recover]`) |
 
 Both read the same machine-level **sweep journal** (`~/.loom/sweeps.json`,
@@ -1153,6 +1260,94 @@ immediately after a claim is made, before its journal entry has even been
 written) — the short grace period is defense-in-depth against a race the
 once-per-restart Rust pass is much less exposed to.
 
+### PR-side claim labels: `loom:reviewing` / `loom:treating` (#4367)
+
+`loom:reviewing` (Judge) and `loom:treating` (Doctor) are claim *overlays* —
+they coexist with the PR's underlying state label
+(`loom:review-requested` / `loom:changes-requested` / `loom:pr`) while work
+is in progress. Like `loom:building`, they can be left behind forever when
+their holder dies (observed on PR #4303: a `loom:treating` label ~5h stale
+from a Doctor killed on another host). `claim_reconciliation::forge::reconcile_pr_claims`
+extends the same pass to cover both, running from the same
+`run_reconciliation_pass` entry point (startup + periodic, same
+`LOOM_STALE_CLAIM_RECONCILE` gate — no `main.rs` change needed).
+
+The pure decision function, `decide_pr`, mirrors `decide`'s union-probe join
+priority (journal entry, then checkpoint→run-registry) but with two
+deliberate divergences from the issue-side rule, both driven by the PR side's
+weaker evidence:
+
+- **The join is heuristic, not authoritative.** A PR has no `loom:building`
+  issue number of its own — the issue number is recovered only when the PR's
+  `headRefName` matches the `feature/issue-<N>` convention `worktree.sh`
+  establishes (`parse_issue_from_branch`). Any other branch shape has no join
+  key at all and falls straight through to the age rule below.
+- **The age gate applies unconditionally — even to a dead joined pid.**
+  Unlike `decide()`'s `DeadPid`/`DeadRunRegistry` branches (immediate,
+  unconditional reclaim), a dead pid alone is never sufficient proof on the
+  PR side: the branch-name join can be wrong (a Doctor may hold a PR whose
+  sweep record belongs to a different phase), so `decide_pr` only reclaims
+  once the claim's age has *also* aged past the per-label threshold. A
+  **live** joined pid still short-circuits to `Keep` unconditionally — that
+  evidence is trustworthy either way.
+
+**Freshness signal: `claim_labeled_at`, not `updatedAt` (#4618).** The age
+gate above originally used the PR's aggregate `updatedAt` — but GitHub bumps
+that on ANY comment, including a Judge/Doctor "standing down, not stomping"
+comment posted by a later pass that *declined* to reclaim. That made the
+check self-perpetuating: once a claim survived long enough for one stand-down
+comment to post, every subsequent pass saw a "recently updated" PR and never
+reclaimed it (PR #4614 — 3 consecutive stand-down comments, never reclaimed).
+`decide_pr` now prefers `ClaimedPr::claim_labeled_at` — the timestamp of the
+claim label's own most recent `labeled` timeline event, fetched via
+`fetch_claim_labeled_at` alongside `list_prs_with_label` — because posting a
+comment does not re-apply the label, so a stand-down comment cannot bump it.
+`updated_at` is kept only as the fail-open fallback for when the timeline
+fetch itself fails or returns nothing (mirroring the pre-#4618,
+missing/unparseable-`updatedAt`-fails-safe-to-`Keep` posture). See
+`claim_reconciliation.rs`'s `decide_pr` doc comment for the full rationale
+and its `decide_pr_reclaims_via_claim_labeled_at_despite_standdown_inflated_updated_at`
+regression test, which reproduces the PR #4614 shape directly.
+
+Thresholds are minutes-scale, not hours, and env-overridable:
+
+| Claim label | Env var | Default |
+|-------------|---------|---------|
+| `loom:reviewing` | `LOOM_STALE_REVIEWING_MINUTES` | 30 — the SAME env var `.claude/commands/loom/judge.md`'s "Stale `loom:reviewing` Claim Check" already established, so the agent-side fast path and this always-on daemon backstop share one convention |
+| `loom:treating` | `LOOM_STALE_TREATING_MINUTES` | 60 — a Doctor's fix cycle legitimately runs longer than a single Judge review pass; the SAME env var `.claude/commands/loom/doctor.md`'s "Stale `loom:treating` Claim Check" fast path uses (#4527) |
+
+Reclaiming removes only the stale claim label — the PR's state label (still
+present in the normal case) restores discoverability by itself. As a safety
+net, if the PR is left carrying none of `loom:review-requested` /
+`loom:changes-requested` / `loom:pr` after the claim label is removed,
+`forge::reclaim_pr` adds `loom:review-requested` so a fresh Judge pass picks
+it back up. Log lines mirror the issue-side format, e.g. `claim_reconciliation:
+removed stale loom:reviewing from PR #N in <root> (DeadPid { pid: … }, …)`.
+
+**Agent-side fast paths are complementary, not redundant (#4527).** This pass
+is periodic (up to `LOOM_CLAIM_RECONCILE_INTERVAL_SECS`, default 600s, of lag)
+and only ever sees *finished* state, so both role prompts carry a synchronous
+check that fires the moment another agent revisits the same PR: judge.md's
+"Stale `loom:reviewing` Claim Check" and doctor.md's "Stale `loom:treating`
+Claim Check", sharing these exact env vars and defaults. doctor.md additionally
+carries a **pre-push head-SHA recheck** (capture `headRefOid` at claim time,
+re-compare before the final push) — the one race this pass structurally cannot
+cover, since it never hooks into an in-flight Doctor's push.
+
+**Agent-side stand-down marker convention + bounded fallback (#4618).** The
+same self-perpetuating-comment defect fixed on the daemon side above also
+existed in judge.md's and doctor.md's own `COMMENTS_AFTER` heuristic — the
+fast path shared the daemon backstop's blind spot exactly, since both read
+"any comment after the claim" as fresh. Both role prompts now (1) tag every
+stand-down comment they post with `<!-- loom:standdown claim=$CLAIMED_AT -->`
+and exclude marker-tagged comments from `COMMENTS_AFTER`, and (2) count
+marker-tagged comments in a separate `STANDDOWN_COUNT`, force-reclaiming once
+`STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) regardless of
+claim age — a bounded fallback that holds even if the marker-exclusion logic
+above is somehow bypassed. `LOOM_MAX_STANDDOWN_STREAK` is shared by both role
+prompts, mirroring how `LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES`
+are already shared.
+
 ## Stacked-PR dependency — #3729 (v1), #3747 (v2 item 1)
 
 Stacked-PR mode pipelines a genuine dependency: when issue B consumes issue
@@ -1162,12 +1357,15 @@ dispatch surface is opt-in, daemon-`dispatch_sweep`-only, and
 linear-chains-only.**
 
 **Dispatch a chain** — N independent `dispatch_sweep` calls, each naming its
-immediate predecessor via `depends_on` (there is no multi-node planner):
+immediate predecessor via `depends_on` (there is no multi-node planner). Always
+pass `workspace_root` explicitly — omitting it can silently target the wrong
+managed workspace (#4503; see workspace_root note above):
 
 ```text
-dispatch_sweep  kind={"Issue": A}                    # parent (independent)
-dispatch_sweep  kind={"Issue": B}  depends_on=A      # child stacked on A
-dispatch_sweep  kind={"Issue": C}  depends_on=B      # A→B→C linear chain
+WORKSPACE_ROOT=$(git rev-parse --show-toplevel)
+dispatch_sweep  kind={"Issue": A}  workspace_root=$WORKSPACE_ROOT                    # parent (independent)
+dispatch_sweep  kind={"Issue": B}  depends_on=A  workspace_root=$WORKSPACE_ROOT      # child stacked on A
+dispatch_sweep  kind={"Issue": C}  depends_on=B  workspace_root=$WORKSPACE_ROOT      # A→B→C linear chain
 ```
 
 The daemon forwards `depends_on` to the child as `--depends-on <parent>`; the
@@ -1382,44 +1580,100 @@ The concurrency cap is **not** a fixed value resolved once at startup. Every
 tick the finder recomputes
 
 ```
-dynamic_cap = min(healthy-token count × per-token concurrency, disk headroom, cpu/load headroom, configured ceiling)
+dynamic_cap = min(healthy-token count × per-token concurrency, disk headroom, configured maxConcurrent)
 ```
 
-from live inputs, so pool/disk/cpu/backlog changes are honored without a
-daemon restart:
+from live inputs, so pool/disk/backlog changes are honored without a daemon
+restart. A fourth **cpu/load headroom** term sat in this `min(...)` from #3978
+until **#4512 deleted it** — see [Why there is no CPU term in
+admission](#why-there-is-no-cpu-term-in-admission-4512) below.
 
 | Input | Source | Bound it enforces |
 |-------|--------|-------------------|
 | **healthy-token count** | `available` accounts in `.ranking` in the pool directory `tokens_pool::paths::resolve_tokens_dir` resolves for the workspace — per-repo `{workspace}/.loom/tokens/` when it holds `*.token` files, else the shared machine-level pool (#3938) (`capacity::read_ranking` / `token_axis_limit`, unified with the writer in #4344 — pre-#4344 this hardcoded the per-repo path even on a shared-pool host, which could pin the dispatch cap at 0 against an orphaned per-repo `.ranking` indefinitely), falling back to the `*.token` count (`tokens::token_pool_size`) when no ranking exists | the count of accounts safe to dispatch to — never dispatch to an exhausted/blocked one (#3902) |
 | **per-token concurrency** | `LOOM_PER_TOKEN_CONCURRENCY` / `autonomous.perTokenConcurrency`, default **2** (#3947) | how many concurrent sweeps to allow **per healthy account**. A plan limit is a utilization-window token bucket, not a session count, so one healthy account can run several concurrent sessions. Before #3947 the implicit factor was `1` (one sweep per account), which collapsed the whole fleet to cap 1 when 6/7 accounts were at their weekly ceiling even though the single healthy account had ample session-window headroom |
 | **disk headroom** | `floor(free_gb / LOOM_PER_WORKTREE_GB)` on the worktree-root volume (`disk_headroom::disk_headroom_limit`, a Rust port of `disk-headroom.sh` that shells to `df -Pk`) | never provision more worktrees than the scratch volume can hold |
-| **cpu headroom** (#3978, measured-idle signal #4031) | `max(1, floor((logical_cpus × LOOM_CPU_UTILIZATION_TARGET − consumed_cores) / LOOM_EST_CORES_PER_SWEEP))`, where `consumed_cores = logical_cpus × (1 − idle_fraction)` from the measured idle fraction (loadavg fallback) (`cpu_headroom::cpu_headroom_limit`) | never start more concurrent sweeps than the host's CPU headroom can currently absorb |
-| **configured ceiling** | `LOOM_WORK_FINDER_MAX_CONCURRENT` (repurposed from Phase A's fixed target into an operator ceiling) | hard operator upper bound regardless of token/disk/cpu headroom |
+| **configured maxConcurrent** | `LOOM_WORK_FINDER_MAX_CONCURRENT` / `autonomous.workFinder.maxConcurrent` (repurposed from Phase A's fixed target into an operator ceiling) | **the** per-machine admission knob (#4512) — tuned empirically by the operator, the only *policy* term in the `min(...)` (the other two meter exhaustible resources: accounts and bytes) |
 
-**CPU headroom term (#3978, measured-idle signal #4031).** The token and disk
-axes alone let a batch of token accounts resetting from `exhausted` to
-`available` at once raise the cap regardless of how many concurrent `cargo
-build`s were already saturating the host — the incident this term fixes: 2–3
-concurrent Rust builds in sweep worktrees starved `build-gate.sh` of CPU badly
-enough that it hit its own 600s timeout, which the (separately-fixed, #3974)
-gate misreported as a verified-red `main`, halting all dispatch.
-`cpu_headroom_limit()` combines a **static** capacity (`logical_cpus ×
-utilization_target`, default target `0.75` — leaves headroom for the OS, the
-daemon itself, and the gate's own `cargo` invocations) with the cores
-**currently consumed**, subtracted from that capacity, divided by an estimated
-per-sweep core cost (`LOOM_EST_CORES_PER_SWEEP`, default `2.0`).
+#### Why there is no CPU term in admission (#4512)
+
+From #3978 until #4512 the `min(...)` carried a fourth term:
+
+```
+cpu_headroom = max(1, floor((logical_cpus × cpuUtilizationTarget − consumed_cores) / estCoresPerSweep))
+```
+
+It was built for a real incident — 2–3 concurrent Rust builds in sweep
+worktrees starved `build-gate.sh` of CPU badly enough that it hit its own 600s
+timeout, which the (separately-fixed, #3974) gate misreported as a verified-red
+`main`, halting all dispatch — and hardened over #4031/#4234. **#4512 deleted
+it anyway**, because it had become the binding constraint on fleet throughput:
+
+- It priced **every** sweep as a build (`estCoresPerSweep`). Sweep wall-clock is
+  dominated by **API wait** (curator / builder / judge conversations); the
+  sustained-heavy-CPU phases (release builds, full test suites, the build gate)
+  are a small fraction of it. So the term throttled the ~90% low-CPU majority to
+  defend against the minority case.
+- Measured evidence (8-core EC2 worker, 2026-07-29): the host sat **95% idle**
+  while the formula capped concurrency at **2**, and `loom-daemon calibrate`
+  recommended "no change" — the formula could not see past its own estimate.
+
+The replacement is two-part, and the protection moved to **where the load
+actually is**:
+
+1. **Admission is one per-machine knob.** `autonomous.workFinder.maxConcurrent`
+   is the whole policy, tuned empirically by the operator (expect 10+ on an
+   8-core API-bound worker). The two remaining terms — the token axis and disk
+   headroom — stay because they meter genuinely *exhaustible* resources
+   (accounts, bytes), not an estimate.
+2. **The genuinely heavy stages serialize where they occur**, via the
+   [machine-wide build slot](#machine-wide-build-slot-4512). N sweeps run
+   concurrently; at most `LOOM_BUILD_SLOTS` of them hold the slot while running
+   `cargo build`/`test` or the build gate; the rest of a sweep's lifecycle never
+   queues.
+
+The **host-distress circuit breaker** (#4235) is unchanged and is what makes a
+hand-tuned knob safe to raise: a mis-set `maxConcurrent` trips a **measured**
+breaker (load-per-core), instead of melting the host on the strength of a
+mis-estimated constant.
+
+`cpu_headroom.rs` survives as a pure **measurement** module — logical core
+count, load average, measured idle fraction, and the `is_host_saturated`
+predicate — consumed by the host breaker (#4235), the build gate's load-aware
+deferral (#4259), and the `status` / `calibrate` reports. Nothing it produces
+feeds the cap.
+
+**Retired knobs are accepted-but-ignored, never a config error.**
+`autonomous.cpuUtilizationTarget` / `autonomous.estCoresPerSweep` and their env
+twins `LOOM_CPU_UTILIZATION_TARGET` / `LOOM_EST_CORES_PER_SWEEP`
+(`work_finder::DEPRECATED_CPU_CONFIG_KEYS` / `DEPRECATED_CPU_ENV_VARS`) still
+parse — a fleet upgrades the daemon binary before it edits every repo's
+committed `.loom/config.json`, so a stale key must be a *visible no-op*, not a
+parse failure. One message
+(`work_finder::deprecated_cpu_knob_notice`) names exactly which config keys and
+env vars to delete, delivered over the channel the reader is actually watching:
+
+- **daemon** — `work_finder::warn_deprecated_cpu_knobs` logs it **once per
+  process** at startup, into `~/.loom/daemon.log`.
+- **CLI** — `loom-daemon calibrate` prints it to **stderr**. A CLI subcommand
+  returns from `main` *before* `setup_logging()` runs, so a `log::warn!` there
+  would go nowhere; stderr also keeps `--json`'s stdout payload clean.
+
+Deleting the settings silences it; leaving them changes nothing.
 
 *Consumed cores come from a measured idle fraction, not the load average
-(#4031).* The original #3978 term used the 1-minute load average as a stand-in
-for consumed cores. On macOS that overstated consumption by ~1.5× — an observed
-idle-but-loaded host read `load1m ≈ 6–7` alongside 76–86% CPU idle on 28 cores
-(only ~4–7 cores actually consumed). Load average counts threads in the
-runnable **and** uninterruptible-sleep states, and this daemon's workload is
-dominated by `claude` sessions **blocked on network I/O**, which inflate load
-without consuming a core — pointing the feedback loop the wrong way (more
-concurrent sweeps → more blocked `claude` → higher load → *lower* cap, while
-CPU sat idle). The term now derives `consumed_cores = logical_cpus × (1 −
-idle_fraction)` from a measured idle fraction, **per-platform**:
+(#4031).* This detail still governs what `status`/`calibrate` **report** (and
+fed the deleted term while it existed). The original #3978 term used the
+1-minute load average as a stand-in for consumed cores. On macOS that overstated
+consumption by ~1.5× — an observed idle-but-loaded host read `load1m ≈ 6–7`
+alongside 76–86% CPU idle on 28 cores (only ~4–7 cores actually consumed). Load
+average counts threads in the runnable **and** uninterruptible-sleep states, and
+this daemon's workload is dominated by `claude` sessions **blocked on network
+I/O**, which inflate load without consuming a core — pointing the (then)
+feedback loop the wrong way (more concurrent sweeps → more blocked `claude` →
+higher load → *lower* cap, while CPU sat idle). The reported CPU consumption is
+therefore `logical_cpus × (1 − idle_fraction)` from a measured idle fraction,
+**per-platform**:
 
 - **Linux** deltas two reads of the aggregate `cpu` line in `/proc/stat`
   (`idle + iowait` vs total), memoizing the previous cumulative sample and
@@ -1431,29 +1685,18 @@ idle_fraction)` from a measured idle fraction, **per-platform**:
   synchronous `ipc.rs` status path, so a runtime worker is never blocked and a
   status request + a work-finder tick never each pay the full second.
 
-The signal chain is **fail-open**: `measured idle fraction → 1-minute load
-average → static capacity`. An unreadable idle signal (missing `/proc/stat` or
-`iostat`, unsupported platform, or no delta sampled yet) falls back to the load
-average (#3978's behavior); an unreadable load average falls back to the static
-capacity, unadjusted. Like the token axis's "one healthy account is the floor,
-never a halt" policy (#3902), the CPU term is floored at `1` — a read failure or
-a noisy reading must never by itself wedge the whole dynamic cap to zero; disk
-headroom and the token axis remain the only terms allowed to floor to a genuine
-`0`. Tunable with the standard precedence **env (`LOOM_CPU_UTILIZATION_TARGET`
-/ `LOOM_EST_CORES_PER_SWEEP`) > config (`autonomous.cpuUtilizationTarget` /
-`autonomous.estCoresPerSweep`) > default (`0.75` fraction / `2.0` cores)**
-(#4032) — resolved single-root, at startup, from the same
-`WorkFinderConfig`/`read_work_finder_config` that `perTokenConcurrency` uses
-(not per-workspace: the dynamic cap is one global number per tick, computed
-before the workspace registry is even loaded). An out-of-range or
-wrong-JSON-type config value (`cpuUtilizationTarget` outside `(0, 1]`,
-`estCoresPerSweep <= 0`, a string/bool/null where a number is expected) is
-dropped to `None` at the config-read layer, not clamped, so it falls straight
-through to env/default resolution.
+Every read here is **fail-open**: an unreadable idle signal (missing
+`/proc/stat` or `iostat`, unsupported platform, or no delta sampled yet) is
+`None`, and every consumer must fail *safe* on `None` rather than assume "host
+fully loaded" — `is_host_saturated` returns `None` so the build gate runs
+instead of deferring, and the host breaker treats a missing sample as a
+non-observation. This mirrors `capacity::token_axis_limit`'s policy of falling
+back to the optimistic basis when no ranking data exists: the absence of a
+signal is not evidence of unhealthiness.
 
 **`LOOM_PER_WORKTREE_GB` deliberately stays env-only (#4032 decision).**
-Unlike the CPU knobs, `disk_headroom`'s `LOOM_PER_WORKTREE_GB` was *not*
-migrated to the same `autonomous.*` pattern. It has a second, independent
+`disk_headroom`'s `LOOM_PER_WORKTREE_GB` was *not* migrated to the
+`autonomous.*` config pattern. It has a second, independent
 Bash-side reader (`defaults/scripts/lib/disk-headroom.sh`, consumed by
 `/loom:sweep` Stage -1 wave sizing) alongside the Rust
 `disk_headroom::per_worktree_gb`. Migrating only the Rust side would create a
@@ -1463,46 +1706,184 @@ consistent env-only behavior. Wiring the Bash `config-resolver.sh` into
 `disk-headroom.sh` too is a separate, larger change; file a follow-up if that
 cost is judged worth paying.
 
-*Calibrating `LOOM_EST_CORES_PER_SWEEP`.* The host-side half of the term
-(consumed cores) is now measured continuously and needs no tuning. The one
-remaining constant — how many cores one concurrent sweep consumes during its
-build/test step — is a per-repo/host property. Its default (`2.0`) is **not**
-changed here absent a real multi-sweep measurement; a reproducible recipe lives
-at [`docs/measure-est-cores-per-sweep.md`](https://github.com/rjwalters/loom/blob/main/docs/measure-est-cores-per-sweep.md)
-(upstream Loom repo — not shipped to consumer installs)
-so an operator can calibrate it on a live fleet without re-opening the code.
+#### Machine-wide build slot (#4512)
 
-**The release-build fan-out footgun (#4234, decomposed from #4231).** `2.0` is
-calibrated against `cargo check`/`clippy`/debug-build sweep phases (#4031), not
-a **release** build: `cargo build --release` parallelizes codegen units across
-essentially every logical core, so a release-build-heavy repo's real per-sweep
-consumption can run much closer to `logical_cpus` than `2.0`. The #4231 host
-meltdown (a 6-way sweep fan-out that drove load to 118 on a 28-core host) is
-the concrete failure mode: at the shipped default, six concurrent
-release-building sweeps look like `6 × 2 = 12` cores of demand to the cpu
-headroom term when the real demand is far higher. Raise
-`autonomous.estCoresPerSweep` well above `2.0` — plausibly toward
-`logical_cpu_count()` itself — for a repo whose sweeps spend meaningful wall
-clock in a release build. The knob is resolved **once at daemon startup**
-(env > config > default, #4032), the same startup-capture as every other
-dynamic-cap knob; a live re-tune takes effect on the next daemon restart, not
-mid-run. #4234 adds a second, independent backstop for exactly this
-under-estimate — see the next section.
+Deleting the admission-time CPU term would leave nothing between N concurrent
+`cargo test --workspace` runs and the host, so #4512 pairs it with a
+**machine-wide build slot** — the bounded revival of #4003's "agents check out a
+slot only for bound work". N sweeps run concurrently, but at most
+`LOOM_BUILD_SLOTS` of them may be inside a designated high-CPU stage at once.
+
+**Shape.** A slot is a lock **directory** created with `mkdir` (POSIX-atomic,
+works across processes *and* across languages; `flock` is deliberately avoided —
+unavailable on stock macOS). The primitive is `MkdirLock`, the same one the
+token-pool state files and the per-issue claim lock (`.loom/locks/issue-<N>`)
+use. Two implementations share one protocol so they serialize against each
+other:
+
+| Half | File | Used by |
+|------|------|---------|
+| Rust | `loom-daemon/src/build_slot.rs` (`acquire` / `BuildSlotLease`) | the daemon's main-health gate, around its gate command |
+| Bash | `defaults/scripts/lib/build-slot.sh` (`loom_build_slot_acquire` / `_release`) | `build-gate.sh`, i.e. every sweep's post-Builder quality gate in its own worktree |
+
+Slots live **machine-wide** at `~/.loom/locks/build-slot/slot-<i>` —
+deliberately *not* under a repo's `.loom/locks/`. The host's cores are one
+machine-level resource shared by every workspace the daemon manages, and #4512's
+operator note asked explicitly for **one unambiguous home** for machine-tier
+concurrency state rather than the ambiguous per-workspace tier (on a
+multi-workspace host, "which `.loom/config.json` supplied the number" is a real
+question).
+
+**Three hard safety properties**, all load-bearing:
+
+1. **Never deadlocks.** `acquire` waits at most `LOOM_BUILD_SLOT_WAIT_SECS`
+   (default 300s) and then **degrades open** — it returns a lease that holds no
+   slot and lets the caller run unserialized. A slow or crashed holder therefore
+   costs throughput, never liveness.
+2. **Degrades open on any lock-store failure.** An unwritable / missing /
+   permission-denied lock directory yields a degraded-open lease *immediately* —
+   no spinning, no error propagated to the caller. Refusing to build because the
+   lock store is broken would be strictly worse than building unserialized.
+3. **Re-entrant.** A holder exports `LOOM_BUILD_SLOT_HELD=1` into its child
+   environment, so a nested acquire (the daemon's main-health gate holding the
+   slot around `build-gate.sh`, which then tries to take it too) is a logged
+   no-op instead of a self-inflicted wait on its own parent's slot.
+
+Because a slot is held for the *duration of a build* (minutes), the stale-reap
+threshold is deliberately long (`LOOM_BUILD_SLOT_STALE_SECS`, default 1h) —
+`mkdir` locks carry no heartbeat, and a 30s threshold (the token-pool default)
+would let a peer reap a perfectly healthy in-progress build. A crashed holder is
+covered by property 1, not by aggressive reaping.
+
+**Telemetry.** Every state transition is logged once: on acquire (naming the
+slot and the wait), on the first wait of a round (so a queue is visible), on
+release (with the hold duration), and on degrade-open (naming *why*).
+`loom-daemon calibrate` reports the resolved slot count.
+
+**Knobs are env-only**, following the `LOOM_PER_WORKTREE_GB` precedent above for
+exactly the same reason: an independent Bash-side reader must resolve identical
+values, and honoring `.loom/config.json` on one path while silently ignoring it
+on the other is worse than consistent env-only behavior. Export them from the
+daemon's start environment.
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `LOOM_BUILD_SLOTS` | `1` | Concurrent build slots on this machine. `0` **disables** serialization entirely (every acquire degrades open) — exactly the pre-#4512 behavior for an operator who wants it back |
+| `LOOM_BUILD_SLOT_WAIT_SECS` | `300` | Bounded wait before degrading open |
+| `LOOM_BUILD_SLOT_STALE_SECS` | `3600` | Age at which an abandoned slot dir is reaped |
+| `LOOM_BUILD_SLOT_DIR` | `~/.loom/locks/build-slot` | Slot directory override (test seam; also relocates slots onto a chosen filesystem) |
+| `LOOM_BUILD_SLOT_HELD` | *(unset)* | Re-entrancy sentinel, set by a holder for its children — not an operator knob |
+
+Default `1` because the heavy stages (`cargo build`/`test`, the build gate)
+already parallelize across essentially every core on their own; one at a time is
+the point. #4512 allows "at most 1–2".
+
+**The #4231 release-build fan-out under this model.** #4231 was a 6-way sweep
+fan-out that drove load to 118 on a 28-core host, because six concurrent
+release-building sweeps looked like `6 × estCoresPerSweep(2.0) = 12` cores of
+demand to a term whose real demand was closer to `6 × 28`. Under #4512 the same
+fan-out admits 6 sweeps (the knob, not an estimate, decides that) but only **one
+of them compiles at a time** — the other five block in `build-gate.sh`'s slot
+acquire, so peak demand is one build's worth of parallel `cargo`, not six. The
+formula that mis-estimated the fan-out is gone; the thing it was estimating is
+now directly bounded. If the knob is nonetheless set too high for the machine,
+the #4235 host breaker trips on **measured** load-per-core and suppresses
+dispatch — a measurement, not a constant, is the last line of defence.
+
+#### Sizing a host (`loom-daemon calibrate`, #4390; measurement-only since #4512)
+
+Originally (#4390) this subcommand *recommended* — and with `--write` applied —
+new knob values, deriving a `maxConcurrent` ceiling from the CPU headroom term
+(`cpu_headroom + 25% slack`). #4512 deleted that term, so there is nothing left
+to derive a recommendation *from*: `autonomous.workFinder.maxConcurrent` is now
+the one per-machine knob, **tuned empirically by the operator**.
+
+Calibrate is therefore strictly a **measurement report**. It measures the host
+with the **same** primitives dispatch uses (`cpu_headroom::logical_cpu_count` /
+`cached_cpu_idle_fraction` / `read_loadavg_1m`,
+`disk_headroom::disk_headroom_limit`, `capacity::read_ranking` falling back to
+`tokens::token_pool_size`, `build_slot::resolve_slots`), so it can never
+disagree with what dispatch actually does:
+
+```
+loom-daemon calibrate                 # human-readable measurement report
+loom-daemon calibrate --json          # machine-readable
+loom-daemon calibrate --write         # DEPRECATED, ignored (prints a notice)
+```
+
+- **It never writes config.** `--write` is accepted-but-ignored with a
+  deprecation notice so an existing scripted `calibrate --write` does not start
+  failing. The JSON payload keeps a `"write": {"applied": false, "config_path":
+  null}` object for machine consumers that keyed off it.
+- **What it prints**: host measurements (logical cpus, observed idle fraction +
+  1m loadavg, disk headroom, healthy/total accounts, build slots), the currently
+  resolved knobs, the `min(healthy × per-token, disk, maxConcurrent)` breakdown,
+  which term binds (`token` / `disk` / `ceiling`), and one line of advice.
+- **How to read it** (this is the tuning loop that replaces the old
+  recommendation):
+  - binds on `ceiling` **while the host sits idle** ⇒ raise `maxConcurrent`;
+  - binds on `ceiling` **while the host is saturated** (low idle fraction, or
+    the host breaker tripping) ⇒ the knob is already at/above what this machine
+    sustains — leave it or lower it;
+  - binds on `token` / `disk` ⇒ raising `maxConcurrent` changes nothing; add
+    accounts or free scratch space.
+- **Deprecation surface**: `calibrate` also prints the retired-knob notice to
+  **stderr** — an operator running it to size a host is exactly who needs to hear
+  that a stale `estCoresPerSweep` is doing nothing (see the previous
+  subsection for why stderr, not the log, on this path).
+- **Disk has no config key** — `LOOM_PER_WORKTREE_GB` is deliberately env-only
+  (previous subsection) — so calibrate names the env-var alternative instead.
+- **Env overrides win**: when `LOOM_WORK_FINDER_MAX_CONCURRENT` /
+  `LOOM_PER_TOKEN_CONCURRENCY` are set, the report says so explicitly — editing
+  `.loom/config.json` has no effect until the env var is unset or updated
+  (env > config > default).
+- **It names *which file* set the knob** (`set by: …`, JSON
+  `measurements.max_concurrent_source`). Now that one number carries the whole
+  admission policy, "edit the config" has to be unambiguous: the effective config
+  is a deep merge of up to four tiers
+  (`config_resolver::tier_paths_by_precedence`) and the daemon manages several
+  workspaces, so `maxConcurrent = 3` might be a repo's committed value, a
+  host-local override, or the built-in default. `config_resolver::source_of`
+  reports the **highest-precedence tier that actually sets the key**; `null` /
+  `"built-in default"` means no tier does. When an env var shadows a tier the
+  report says that too, so nobody edits a file that cannot take effect. For a
+  genuinely machine-wide setting (one value for every workspace on the host),
+  put it in the machine tier — `~/.local/share/loom/config/defaults.json`, or
+  `LOOM_WORK_FINDER_MAX_CONCURRENT` in the daemon's start environment — rather
+  than in each repo's `.loom/config.json`.
+- **Fleet-safety**: a generous committed `maxConcurrent` is still safe fleet-wide
+  because the two exhaustible-resource terms remain in the `min(...)` (each host
+  binds on its **own** tokens/disk), the build slot bounds concurrent heavy
+  builds per machine, and the host breaker is the measured backstop.
+- **Startup hint**: `loom-daemon-start.sh` prints one advisory line at start
+  time — `"maxConcurrent N binds while the host is M% idle — consider raising
+  autonomous.workFinder.maxConcurrent"` — only when the ceiling is *currently*
+  the binding term **and** the measured idle fraction is at or above 50%
+  (`calibrate::IDLE_HEADROOM_FRACTION`). Never fatal: a missing `jq`, a
+  calibrate error, or an unparseable payload all fall through silently,
+  mirroring the advisory-only safehouse status line.
+- **Restart required**: like every other dynamic-cap knob, `maxConcurrent` is
+  captured once at daemon **startup**, not re-read per tick — a config edit takes
+  effect on the *next* restart
+  (`./.loom/scripts/cli/loom-daemon-stop.sh && ./.loom/scripts/cli/loom-daemon-start.sh`),
+  not live.
 
 #### Per-tick admission (ramp) cap (#4234)
 
 `resolve_dynamic_max_concurrent` is a **live** ceiling, recomputed every tick,
 so it can *jump* tick-to-tick — e.g. several exhausted token accounts resetting
-at once raises the token axis from ~2 to ~14, or a miscalibrated
-`estCoresPerSweep` (previous section) makes the cpu axis look larger than the
-host can actually sustain. Before #4234, a jump like that let a **single tick**
-admit every newly-eligible candidate up to the new, larger cap in one shot.
-Load average / measured idle fraction is a **lagging** signal sampled at
-wave-*start*: a burst admitted together all ramp their builds minutes later,
-well after the tick that "safely" admitted them observed a still-quiet host.
-This is the exact failure mode of the #4231 incident's second wave — the host
-re-spiked at 01:41 after load had already dropped to 8, because the admission
-decision had already been made by the time load caught up.
+at once raises the token axis from ~2 to ~14, or an operator raises
+`maxConcurrent` on a live host. Before #4234, a jump like that let a **single
+tick** admit every newly-eligible candidate up to the new, larger cap in one
+shot. Host load is a **lagging** signal: a burst admitted together all ramp
+their work minutes later, well after the tick that "safely" admitted them
+observed a still-quiet host. This is the exact failure mode of the #4231
+incident's second wave — the host re-spiked at 01:41 after load had already
+dropped to 8, because the admission decision had already been made by the time
+load caught up. (Since #4512 the heavy stages additionally serialize on the
+[build slot](#machine-wide-build-slot-4512), so a burst's *builds* queue even
+when its admissions do not; the ramp cap remains the smoother for everything
+else a burst does.)
 
 `autonomous.workFinder.maxAdmissionsPerTick` (`LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK`,
 default **3**, mirroring `maxConcurrent`'s default) bounds how many **new**
@@ -1516,7 +1897,7 @@ subsequent tick re-samples CPU/disk/token headroom fresh, so a ramp that turns
 out to be too aggressive self-corrects within one interval (default 60s)
 rather than in one uncontrolled burst. Resolved with the standard precedence
 **env > config > default**, single-root, at daemon startup — the same
-startup-capture pattern as `cpuUtilizationTarget`/`estCoresPerSweep`: the ramp
+startup-capture pattern as `maxConcurrent`/`perTokenConcurrency`: the ramp
 cap's whole purpose is to smooth admission *within* the live per-tick
 re-computation of `max_concurrent`, so the knob itself does not need to be
 live; retuning it takes effect on the next daemon restart.
@@ -1537,7 +1918,7 @@ protocol change: `dispatch_sweep` **always dispatches** — an explicit
 operator/MCP request is a deliberate act, and the work finder's own dynamic
 cap remains the hard backstop for *its own* autonomous dispatches — but now
 computes the same `resolve_dynamic_max_concurrent` headroom the work finder
-uses (token/disk/cpu/configured-max, scoped to the target repo) and, on a
+uses (token/disk/configured-max, scoped to the target repo) and, on a
 **state change** into/out of "occupancy at or over that headroom" for that
 repo, logs a warning and publishes a `daemon.dispatch.headroom_advisory`
 event-bus event (state-change-deduped — never a per-call stream, keyed
@@ -1548,15 +1929,16 @@ side channel exactly like the token-capacity advisory. Every `dispatch_sweep`
 call's log line additionally always names the current occupancy/dynamic-cap
 axes (not just on the deduped transition), so `RUST_LOG=loom_daemon=info`
 shows the same headroom picture the work finder's own tick log shows, without
-duplicating the `cpu_headroom_snapshot`/`disk_headroom_limit` plumbing
-`loom-daemon status` (`build_daemon_status`) already exposes.
+duplicating the `disk_headroom_limit` plumbing `loom-daemon status`
+(`build_daemon_status`) already exposes.
 
-The handler never calls the **refreshing** CPU probe
-(`cpu_headroom::cpu_headroom_limit`, which sleeps ~1s on macOS via `iostat`)
-while holding the sweep-registry mutex — doing so would stall every other IPC
-request scoped to the same registry for that second. It uses the
-**non-refreshing** `cpu_headroom::cpu_headroom_snapshot` (the memoized idle
-fraction; never blocks) instead, the same call `build_daemon_status` makes.
+Nothing in this handler may block, because it holds the sweep-registry mutex
+from the assessment through the dispatch call. Since #4512 the headroom is
+`min(token axis, disk, configured max)` — three cheap filesystem/config reads,
+no CPU sampling at all. (Before #4512 this had to carefully avoid the
+**refreshing** CPU probe, whose macOS `iostat` refresh sleeps ~1s and would have
+stalled every other IPC request on the same registry for that second; removing
+the CPU term removed that hazard outright.)
 
 **Per-token concurrency factor (#3947).** The token axis is `healthy × factor`,
 not `healthy × 1`. The factor is resolved with the standard precedence **env
@@ -1569,12 +1951,13 @@ account with session-window headroom — the #3909 rotating selection spread sti
 fills **distinct** accounts first (via the persistent `.rotation_cursor`), only
 stacking multiple sweeps on one account when concurrency demand exceeds the
 healthy-account count. The `loom-daemon status` view spells the arithmetic out,
-e.g. `= min(healthy 1 × per-token 2 = 2, disk headroom 120, cpu headroom 6,
-configured max 3)`, and a separate line reports the live core-count detail
-feeding the cpu headroom term — naming which signal actually fed it, e.g.
-`cpu headroom: 8 concurrent-sweep slot(s) (28 logical cores, 85% idle measured
-(≈4.2 cores consumed))`, or a `1m loadavg …` / `static capacity only` line when
-falling back (#3978 AC4; measured-idle signal #4031).
+e.g. `= min(healthy 1 × per-token 2 = 2, disk headroom 120, configured max 3)`,
+and a separate line reports the live host CPU **observation** — explicitly
+labelled as not a cap term, e.g. `host cpu (observed, not a cap term since
+#4512): 28 logical cores, 85% idle measured (≈4.2 cores consumed), 1m loadavg
+6.10`, degrading to a `1m loadavg … (no idle sample yet)` or `no CPU signal on
+this platform` line when the measurement is unavailable (#3978 AC4;
+measured-idle signal #4031; demoted to observation in #4512).
 
 **"Currently binding" vs "smallest ceiling" (#4031).** The dynamic cap is the
 *minimum* of several ceilings, but a ceiling only *binds* once in-flight
@@ -1590,7 +1973,7 @@ status carries the same `capacity_bound` boolean so scripted consumers aren't
 misled at low occupancy either.
 
 **Honest headline when the daemon's own read disagrees with a fresh probe
-(#4344).** `resolve_capacity` prefers a fresh client-side `loom-tokens check
+(#4344).** `resolve_capacity` prefers a fresh client-side `loom-daemon tokens check
 --json` probe over the daemon's own ranking read when one succeeds — useful for
 showing current numbers, but that probe's cap is **not** what the running
 daemon actually used to gate dispatch this tick. The pretty-printed `Dynamic
@@ -1604,7 +1987,7 @@ real (lower) cap is already saturated. When the daemon's own ranking read
 shows **0 healthy accounts** while the probe (or raw pool) disagrees — the
 #4344 incident: dispatch pinned at a token term of `0 × per-token = 0` for
 ~40 minutes because the ranking directory it read had diverged from the one
-`loom-tokens check --ranking` / the #4080 self-refresher actually wrote — the
+`loom-daemon tokens check --ranking` / the #4080 self-refresher actually wrote — the
 status view promotes this from the old small-print `note: daemon dispatch cap
 still uses a stale .ranking (...)` line to a headline `⚠ DISPATCH IS
 TOKEN-STARVED: …` line and suppresses "the limiter is work availability"
@@ -1626,6 +2009,26 @@ which backs off stacking for the saturated account; a bounded
 `LOOM_MAX_SESSION_LIMIT_RETRIES` (default 10) guards a fully-saturated pool from
 spinning, after which it falls through to normal transient backoff (still without
 marking the token bad).
+
+**Per-model limit handling + one retry verdict (#4501).** The CLI also emits a
+**per-model** ceiling — `You've reached your Fable 5 limit. Run /usage-credits to
+continue or switch models with /model.` — whose model name sits between "your" and
+"limit". That phrasing matched none of the older "hit your … limit" patterns, so
+rotation never fired and every child died instantly; `classify-error.sh` now
+matches the `reached your <model> limit` family as `TOKEN_EXHAUSTED` (ordered
+*after* the `SESSION_LIMIT` branch so "reached your concurrent session limit`"
+keeps its capacity classification). Reusing `TOKEN_EXHAUSTED` is a deliberate safe
+over-approximation: a Fable-only ceiling does not exhaust `sonnet` on the same
+account, so the pool is slightly pessimistic but rotation is correct, and no
+downstream consumer has to learn a new category. Relatedly, `claude-wrapper.sh`'s
+retry decision no longer keeps its own pattern list — `is_transient_error` derives
+it from `classify_error`'s category via the shared `classification_is_transient`
+**deny-list** (terminal: `SUCCESS`, `TIMEOUT`, `TOKEN_EXPIRED`, `CWD_DELETED`,
+`MODEL_REFUSAL`, `FATAL`; everything else retried, bounded by `LOOM_MAX_RETRIES`).
+That makes the observed contradiction — `Non-transient error detected - not
+retrying` printed next to `classification=RECOVERABLE` — structurally impossible,
+and means an *unrecognized* non-zero exit is now retried rather than dying on
+attempt 1.
 
 The **effective** per-tick concurrency is then `min(dynamic_cap, backlog_depth)`:
 `tick()` iterates the ready `loom:issue` rows and stops at the cap, so
@@ -1725,12 +2128,12 @@ alert, recover — all automatic and non-blocking:
    (≤ disk and ≤ ceiling) and work is queued behind it, the finder is
    *token-bound*. On the **state change** into that state it emits an
    add-capacity advisory naming concrete levers — add accounts to
-   `~/.claude-monitor/accounts.env` + `loom-tokens bootstrap`, or buy API
-   credits, then re-probe with `loom-tokens check --ranking` — with the current
+   `~/.claude-monitor/accounts.env` + `loom-daemon tokens bootstrap`, or buy API
+   credits, then re-probe with `loom-daemon tokens check --ranking` — with the current
    numbers (queued count, healthy/total accounts, exhausted count, estimated
    drain time at current capacity). If accounts are `blocked` on revoked tokens,
    `bootstrap --force` cannot recover — the advisory also names
-   `loom-tokens import-from-monitor --force && loom-tokens check --ranking` as
+   `loom-daemon tokens import-from-monitor --force && loom-daemon tokens check --ranking` as
    the recovery lever for that case. The advisory surfaces on **three**
    channels: the daemon log (`warn`), the `daemon.capacity.advisory` event-bus
    topic, and the `capacity` section of `loom-daemon status`. It is
@@ -1745,7 +2148,7 @@ The `estimated_drain_minutes` figure is a coarse `ceil(queued / healthy) ×
 NOMINAL_SWEEP_MINUTES` (30 min nominal) aid, not a precise SLA — the daemon does
 not track live per-sweep durations here. Near-ceiling granularity is limited to
 the `.ranking` discrete status word (`exhausted` is already ≥ 0.95 utilization);
-a finer sub-exhausted (≥ 0.90) bucket would read the richer `loom-tokens check
+a finer sub-exhausted (≥ 0.90) bucket would read the richer `loom-daemon tokens check
 --json` utilization and is a tracked follow-up. Even rotation/staggering of
 dispatches across the available account set (so 5h/7d windows reset in a
 staggered pattern) lives in the spawn-time selector (native `loom-daemon tokens
@@ -1787,8 +2190,6 @@ concurrency ceiling 5" and share it with the team:
   "autonomous": {
     "model": "sonnet",
     "perTokenConcurrency": 2,
-    "cpuUtilizationTarget": 0.75,
-    "estCoresPerSweep": 2.0,
     "workFinder": {
       "enabled": true,
       "intervalSecs": 60,
@@ -1799,6 +2200,11 @@ concurrency ceiling 5" and share it with the team:
         "threshold": 3,
         "ttlSecs": 3600,
         "instaCrashSecs": 60
+      },
+      "dispatchBackoff": {
+        "enabled": true,
+        "baseSecs": 60,
+        "maxSecs": 900
       }
     },
     "hostBreaker": {
@@ -1806,6 +2212,10 @@ concurrency ceiling 5" and share it with the team:
       "loadPerCoreTrip": 2.5,
       "sustainTicks": 3,
       "cooldownSecs": 300
+    },
+    "rateLimitBreaker": {
+      "enabled": true,
+      "fallbackCooldownSecs": 900
     },
     "mainHealthGate": {
       "enabled": true
@@ -1850,26 +2260,35 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.model` | *(per-dispatch `dispatch_sweep` `model` param)* | `sonnet` | Model pinned on **every** daemon-dispatched child (work-finder, epic supervisor, and `dispatch_sweep` when its `model` param is absent). See below (#3944) |
 | `autonomous.workFinder.enabled` | `LOOM_WORK_FINDER` | `false` | Master on/off for the finder loop |
 | `autonomous.workFinder.intervalSecs` | `LOOM_WORK_FINDER_INTERVAL_SECS` | `60` | Zero/invalid → default |
-| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | Operator **ceiling**, not a fixed target |
-| `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the live dynamic cap. Zero/invalid → default; resolved once at startup, mirroring `estCoresPerSweep`. See [Per-tick admission (ramp) cap](#per-tick-admission-ramp-cap-4234) below |
+| `autonomous.workFinder.maxConcurrent` | `LOOM_WORK_FINDER_MAX_CONCURRENT` | `3` | **The** per-machine admission knob since #4512 — an operator ceiling, not a fixed target, tuned empirically from `loom-daemon calibrate` / `status`. Expect well above the shipped default on an API-bound worker (10+ on 8 cores) |
+| `autonomous.workFinder.maxAdmissionsPerTick` | `LOOM_WORK_FINDER_MAX_ADMISSIONS_PER_TICK` | `3` | Per-tick **ramp** cap (#4234) — bounds how many *new* sweeps one tick may admit, independent of `maxConcurrent`/the live dynamic cap. Zero/invalid → default; resolved once at startup, mirroring `maxConcurrent`. See [Per-tick admission (ramp) cap](#per-tick-admission-ramp-cap-4234) below |
 | `autonomous.workFinder.quarantine.enabled` | `LOOM_WORK_FINDER_QUARANTINE` | `true` | Insta-crash quarantine on/off (#3939). A safety backstop — defaults on |
 | `autonomous.workFinder.quarantine.threshold` | `LOOM_WORK_FINDER_QUARANTINE_THRESHOLD` | `3` | Consecutive insta-crashes before an issue is quarantined. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.ttlSecs` | `LOOM_WORK_FINDER_QUARANTINE_TTL_SECS` | `3600` | How long a quarantine entry persists before auto-release. Zero/invalid → default |
 | `autonomous.workFinder.quarantine.instaCrashSecs` | `LOOM_WORK_FINDER_QUARANTINE_INSTA_CRASH_SECS` | `60` | Checkpoint-less death within this window of dispatch counts as an insta-crash. Zero/invalid → default |
+| `autonomous.workFinder.dispatchBackoff.enabled` | `LOOM_DISPATCH_BACKOFF` | `true` | Per-issue dispatch backoff on/off (#4485). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config |
+| `autonomous.workFinder.dispatchBackoff.baseSecs` | `LOOM_DISPATCH_BACKOFF_BASE_SECS` | `60` | Backoff applied after the **first** failed dispatch of an issue; doubles per consecutive failure. Zero/invalid → default |
+| `autonomous.workFinder.dispatchBackoff.maxSecs` | `LOOM_DISPATCH_BACKOFF_MAX_SECS` | `900` | Ceiling on the doubling — also the idle window after which an issue's consecutive-failure tally restarts at zero. Zero/invalid → default; clamped up to `baseSecs` |
 | `autonomous.hostBreaker.enabled` | `LOOM_HOST_BREAKER` | `true` | Host-distress circuit breaker on/off (#4235). A safety backstop — **defaults on**. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. See [Host-distress circuit breaker](#host-distress-circuit-breaker-4235) below |
 | `autonomous.hostBreaker.loadPerCoreTrip` | `LOOM_HOST_BREAKER_LOAD_PER_CORE` | `2.5` | Load-per-core at/over which a tick counts toward tripping. `<= 0`/invalid → default |
 | `autonomous.hostBreaker.sustainTicks` | `LOOM_HOST_BREAKER_SUSTAIN_TICKS` | `3` | Consecutive over-threshold work-finder ticks required to trip (a single spike never trips). Zero/invalid → default |
 | `autonomous.hostBreaker.cooldownSecs` | `LOOM_HOST_BREAKER_COOLDOWN_SECS` | `300` | Cool-down window held after distress subsides before dispatch resumes. Zero/invalid → default |
+| `autonomous.rateLimitBreaker.enabled` | `LOOM_RATE_LIMIT_BREAKER` | `true` | GitHub rate-limit circuit breaker on/off (#4429). A safety backstop — **defaults on**. Env truthy enables, any other value disables; wins over config. See [GitHub rate-limit circuit breaker](#github-rate-limit-circuit-breaker-4429) below |
+| `autonomous.rateLimitBreaker.fallbackCooldownSecs` | `LOOM_RATE_LIMIT_BREAKER_FALLBACK_COOLDOWN_SECS` | `900` | Cooldown length when the `gh api rate_limit` reset probe fails. Zero/invalid → default; every computed cooldown is clamped to `[60, 3600]`s |
 | `autonomous.perTokenConcurrency` | `LOOM_PER_TOKEN_CONCURRENCY` | `2` | Concurrent sweeps **per healthy token** in the cap (#3947). Zero/invalid → default; clamped to a floor of 1 |
-| `autonomous.cpuUtilizationTarget` | `LOOM_CPU_UTILIZATION_TARGET` | `0.75` | Fraction of logical CPUs the CPU headroom term is willing to dedicate to sweep work (#3978, config surface #4032). Outside `(0, 1]` or wrong JSON type → default; single-root, resolved once at startup (not per-workspace) |
-| `autonomous.estCoresPerSweep` | `LOOM_EST_CORES_PER_SWEEP` | `2.0` | Estimated CPU cores one concurrent sweep consumes while building/testing (#3978, config surface #4032). `<= 0` or wrong JSON type → default; integer JSON (`2`) and float JSON (`2.0`) both accepted; single-root, resolved once at startup |
+| `autonomous.cpuUtilizationTarget` | `LOOM_CPU_UTILIZATION_TARGET` | *(none)* | **DEPRECATED — accepted but ignored (#4512).** Fed the deleted CPU-headroom admission term (#3978, config surface #4032). Any value at any type still parses (never a config error); the daemon logs one warning per process naming it and `loom-daemon calibrate` prints it to stderr. Delete it to silence the warning; tune `autonomous.workFinder.maxConcurrent` instead |
+| `autonomous.estCoresPerSweep` | `LOOM_EST_CORES_PER_SWEEP` | *(none)* | **DEPRECATED — accepted but ignored (#4512).** Same story as `cpuUtilizationTarget` above: the CPU term it sized is gone; heavy build/test stages are bounded by the [machine-wide build slot](#machine-wide-build-slot-4512) instead |
 | `autonomous.mainHealthGate.enabled` | `LOOM_MAIN_HEALTH_GATE` | `false` | Gate loop on/off |
 | `autonomous.mainHealthGate.ciWorkflow` | `LOOM_GATE_CI_WORKFLOW` | *(unset)* | Forge workflow that must itself conclude `success` for forge-CI corroboration to vouch for a commit (#3987). Empty/whitespace → unset. Absent → today's unanimity rule, unchanged. See [Optional named verification workflow](#optional-named-verification-workflow-loom_gate_ci_workflow-3987) |
 | `autonomous.mainHealthGate.suppressDispatchDuringGate` | `LOOM_MAIN_HEALTH_GATE_SUPPRESS_DISPATCH` | `true` | Hold new dispatch off a root while its build-gate run is in flight (#4084), per-root so a sibling with no gate in flight keeps dispatching. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. Set `false` to recover the pre-#4084 `is_halted`-only behavior. See [build-gate.md → gate-in-flight dispatch suppressor](build-gate.md) |
-| `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015) |
-| `autonomous.roleRunner.roles` | *(config only)* | all 5 roles | Subset of `champion`/`curator`/`judge`/`auditor`/`guide` to dispatch; explicit empty array runs none |
+| `autonomous.roleRunner.enabled` | `LOOM_ROLE_RUNNER` | `false` | Periodic standalone support-role runner on/off (#4015). **Resolved per registered root** (#4377) — see the callout below the table |
+| `autonomous.roleRunner.roles` | *(config only)* | all 5 roles | Subset of `champion`/`curator`/`judge`/`auditor`/`guide` to dispatch; explicit empty array runs none. Also resolved from each root's own config |
 | `autonomous.roleRunner.intervalSecs` | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | per-role built-in (5–15 min) | Uniform override applied to every enabled role's cadence |
-| `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of the same 5 roles to also fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off) |
+| `autonomous.roleRunner.model` | *(config only)* | `sonnet` | Model every role child is pinned to via `--model` (#4501). Resolved through the same `resolve_dispatch_model` chain as sweep dispatch: this key > `autonomous.model` > shipped default; blanks treated as unset. A role child never inherits the account's interactive CLI default |
+| `autonomous.roleRunner.onIdle` | *(config only)* | `[]` (none) | Subset of the same 5 roles to also fire on the work-finder **idle edge** (#4364) — the non-idle → idle transition (0 in-flight sweeps AND nothing dispatched this tick), in addition to the interval cadence. Absent → none (opposite default from `roles`); unknown names ignored with a warning. Debounced to min 60s per (root, role) and skipped while that role's interval/idle run is in progress. **Requires the work finder enabled** to observe idleness (a startup warning fires if set with the work finder off). **Also gated by that same root's own `enabled`** (#4377) — see below |
+| `autonomous.idleExit.enabled` | `LOOM_AUTONOMOUS_IDLE_EXIT_ENABLED` | `false` | End the daemon cleanly after the idle window so a host guard can take over. Independent of Work Finder; never invokes a power command |
+| `autonomous.idleExit.idleMinutes` | `LOOM_AUTONOMOUS_IDLE_EXIT_MINUTES` | `60` | Continuous idle/starvation window. Zero/invalid → default |
+| `autonomous.idleExit.onTokenStarvation` | `LOOM_AUTONOMOUS_IDLE_EXIT_ON_TOKEN_STARVATION` | `true` | Also exit after zero healthy accounts for the full window with no sweep in flight, even if roles keep cycling |
 | `autonomous.watchMonitor.enabled` | `LOOM_WATCH_MONITOR` | `true` | Durable operator-watch monitor loop (#3971). Default-on; no dispatch side effect, zero forge calls until a watch is registered |
 | `autonomous.watchMonitor.intervalSecs` | `LOOM_WATCH_MONITOR_INTERVAL_SECS` | `120` | Watch poll cadence. Zero/invalid → default |
 | `autonomous.watchMonitor.expirySecs` | `LOOM_WATCH_MONITOR_EXPIRY_SECS` | `86400` | Give-up window for an unresolved watch; `0` disables expiry |
@@ -1881,11 +2300,40 @@ exactly like `main_health_gate::read_build_gate_config`.
 | `autonomous.watchdog.reviewStallTimeoutSecs` | `LOOM_SWEEP_REVIEW_STALL_TIMEOUT_SECS` | `2700` | Log-silence window before a hung Judge/Doctor sweep is re-dispatched |
 | `autonomous.collisionDetection.enabled` | `LOOM_DETECT_COLLISIONS` | `false` | Cross-host dispatch-collision baseline (#4085). Off by default — adds one extra `gh issue view --json labels` round-trip per dispatch. Detection only: a collision is logged/counted, never acted on |
 | `safehouse.enabled` | `LOOM_SAFEHOUSE_ENABLED` | `false` | Enables safehouse fleet-comms (#3997) **and** cross-host soft-claim coordination (#4028). Off by default — a byte-for-byte no-op (no socket, no coordination task) when unset |
-| `safehouse.peerClaimTtlSecs` | `LOOM_PEER_CLAIM_TTL_SECS` | `120` | Peer-claim TTL, in seconds (#4028) — how long a peer's soft claim suppresses local dispatch (measured against local receipt, not the advertiser's clock). Default = 2× the 60s work-finder tick |
+| `safehouse.peerClaimTtlSecs` | `LOOM_PEER_CLAIM_TTL_SECS` | `120` | Peer-claim TTL, in seconds (#4028) — how long a peer's soft claim suppresses local dispatch (measured against local receipt, not the advertiser's clock). Default = 2× the 60s work-finder tick. Since #4431 live claims are re-advertised every reaper tick, so the TTL only bounds how long a **crashed** host's claim lingers |
+| `safehouse.rooms.signal` | `LOOM_SAFEHOUSE_ROOM_SIGNAL` | *(falls back to `safehouse.room`)* | Attention-class routing (#4225): the **signal** room id (`loom-fleet`) — operator conversation, every `handoff`, terminal `ack`/`completion`. Absent **and** no `byRepo` ⇒ single-room mode, byte-identical to pre-#4225 |
+| `safehouse.rooms.byRepo` | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` (`repo=room,…`) | `{}` | Attention-class routing (#4225): per-repo **firehose** room ids keyed by workspace-root basename — `task`/`chat` narration. A repo absent from the map is created lazily as `fleet-<repo>`; a refused creation degrades that repo to the signal room with one `warn!`. The env form replaces the whole map |
+| `safehouse.claimReconcileIntervalSecs` | `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` | `1800` when `safehouse.enabled`, else `600` | Periodic `loom:building`/PR-claim reconciliation cadence (#4431). With safehouse peer-claims carrying the fast in-flight signal (re-advertised each reaper tick), label reconciliation demotes to a slow healing sweep. Env wins on any host; floored at 60s |
 | *(host identity)* | `LOOM_HOST_ID` | `$HOSTNAME` → `hostname` → `unknown-host` | This host's identity string, used in collision log records (#4085) **and** peer-claim self-recognition (#4028); set it where the daemon runs without `$HOSTNAME` exported |
 | `autonomous.autoUpdate.enabled` | `LOOM_AUTO_UPDATE` | `false` | Autonomous self-update loop on/off (#4055). **Opt-in** (it rebuilds + restarts the daemon process). Exactly one loop per daemon, not a per-workspace fan-out. See [Autonomous self-update loop](#autonomous-self-update-loop-4055) below |
 | `autonomous.autoUpdate.intervalSecs` | `LOOM_AUTO_UPDATE_INTERVAL_SECS` | `900` | Cadence between staleness checks. Zero/invalid → default |
 | `autonomous.autoUpdate.settleSecs` | `LOOM_AUTO_UPDATE_SETTLE_SECS` | `600` | Settle window: wait this long after first observing a stale commit — resetting on every further commit — before rolling, so a burst of merges collapses into one roll. Zero/invalid → default |
+
+### Idle exit for remote hosts (#4467)
+
+```json
+{
+  "autonomous": {
+    "idleExit": {
+      "enabled": false,
+      "idleMinutes": 60,
+      "onTokenStarvation": true
+    }
+  }
+}
+```
+
+Ordinary idleness requires zero in-flight sweeps, no active role run, and no
+dispatch/completion event for the full window. Token starvation has a separate
+clock: role sessions do not reset it, but live sweeps and healthy-account
+recovery do. On either trigger the daemon writes
+`<loom-dir>/idle-exit.json`, publishes `daemon.idle_exit`, removes its socket,
+and exits 0. It never calls `shutdown`, `sudo`, or a provider API.
+
+The fleet add-worker systemd unit uses `Restart=on-failure`, so exit 0 stays
+down. macOS launchd uses `KeepAlive:SuccessfulExit`, so exit 0 relaunches the
+daemon; idle exit is meaningful only under on-failure-style supervision. A
+loud warning is logged when it is enabled under launchd.
 
 ### Daemon log path override (`LOOM_DAEMON_LOG`, #4010)
 
@@ -1984,6 +2432,35 @@ the forge** (best-effort, fail-open on a `gh` error) — this covers all three
 watchdogs, since each re-dispatches through the same method, so no self-heal path
 can ever re-claim a closed/merged issue.
 
+**Mid-build-death live-use veto (#4449).** The mid-build-death watchdog (#3895)
+infers "died mid-build" from `(terminal state ∧ no PR ∧ dirty worktree)` and then
+resets the worktree (`git reset --hard` + `git clean -fd`) before re-dispatching.
+That signature is necessary but **not sufficient**: on 2026-07-29 the daemon's
+tracked sweep for issue #4366 had indeed died, but an *untracked* recovery session
+was concurrently editing the same worktree — and the watchdog destroyed its
+tested-but-uncommitted fix mid `git commit`. `git status` cannot tell dead-sweep
+debris from a live session's work in progress, so the watchdog now also requires
+that **nothing live still holds the worktree**. Four signals veto the reset (any
+one is enough):
+
+| Signal | What it means |
+|--------|---------------|
+| `.loom-in-use` marker in the worktree | A session (including a manual, non-daemon one) claims it. This is the one an operator can plant by hand to fence off a worktree. |
+| `.loom/locks/issue-<N>/owner.json` whose `owner_pid` is **alive** | A live claim holder. A dead owner's lock is ignored, so a stale lock never wedges recovery. |
+| `index.lock` in the worktree's gitdir | A git index write (`git add`/`git commit`) is in flight — precisely the #4449 window. |
+| A live process whose cwd is inside the worktree | An operator shell, a manual role session, or an orphaned grandchild still writing files. |
+
+A veto logs one loud `midbuild-watchdog: … REFUSING to git reset --hard …` line
+naming the holder, leaves the worktree untouched, and **does not consume** the
+single recovery retry — so a genuinely-dead sweep is still recovered on a later
+tick once the holder goes away. If the holder is stale, clear it (remove
+`.loom-in-use` / the claim-lock / the `index.lock`, or exit the shell) and the
+next tick recovers normally. Independently, every `clean_worktree` call now logs
+the porcelain status + diffstat of what it is about to destroy, so a wipe can
+never again be silent in the daemon log. The same defense-in-depth guard exists on
+the script side: `worktree.sh remove <N>` refuses a worktree with uncommitted
+changes and requires an explicit `--force` to discard them.
+
 **Review-phase stall watchdog (#3910).** The startup watchdog rescues a sweep
 that shows *no* progress, and the mid-build-death watchdog (#3895) rescues one
 that made progress then *died*. Neither covers a sweep that is **still alive**
@@ -2052,6 +2529,49 @@ only candidates are quarantined never reserves a shared dispatch slot — health
 sibling work in other repos gets it instead. Defaults **on**; disable with
 `LOOM_WORK_FINDER_QUARANTINE=0` or `autonomous.workFinder.quarantine.enabled = false`.
 
+**Per-issue dispatch backoff (#4485, step 2.8).** The quarantine above is a *three-strikes*
+brake, and it has two deliberate carve-outs: a death attributed to account
+exhaustion (#4122) or to a claude-wrapper pre-flight failure (#4386) leaves the
+issue's insta-crash tally **untouched** on purpose — the issue is not at fault.
+Nothing else limited how *often* one issue could be re-dispatched, so an issue
+whose every dispatch died in a carved-out shape flapped
+`loom:issue` ⇄ `loom:building` at the full reap → restore → re-poll cadence. The
+observed incident: ~90 label events on one issue in ~7 minutes (claim, child dead
+~4s later, claim restored, re-dispatched on the next tick), with the quarantine
+not engaging for over 20 cycles. Two further amplifiers: the quarantine tally is
+**per-process, in-memory** (two daemon instances sharing a workspace each need
+their own three strikes), and nothing surfaced the flap in any log — it was found
+by hand-reading the forge timeline.
+
+The dispatch backoff caps the retry *rate* instead of diagnosing the *cause*. A
+terminal outcome that made no progress **and** either died fast (inside
+`instaCrashSecs`) or exited cleanly with zero lifecycle progress — including both
+quarantine carve-outs — arms an exponential per-issue window (`baseSecs`, then ×2
+per consecutive failure, capped at `maxSecs`); `dispatch()` refuses while the
+window is live, **before** the claim lock and the label flip (step 2.8, immediately
+after the #4444 park-label guard at step 2.7 — a deliberate park outranks a
+transient backoff, so a parked *and* backed-off issue is reported as
+`labeled-skip`), so a refusal costs no
+forge write and cannot itself flap anything. A *slow* checkpoint-less death is
+deliberately excluded — that is the mid-build-death (#3895) / review-stall (#3910)
+watchdogs' remit. Any outcome that makes real progress clears
+the window immediately, and a streak whose last failure is older than `maxSecs`
+restarts from zero. The work finder also drops backed-off candidates before the
+capacity gate (reported as `backoff-skip` on the per-tick summary line), so they
+never reserve a shared dispatch slot. Deliberately narrow: in-memory only (a
+daemon restart clears it — it can never permanently strand an issue), never
+touches a forge label, bounded by `maxSecs` (well under the quarantine TTL, so
+quarantine remains the longer, operator-visible brake), cleared by
+`loom-daemon quarantine clear <issue>` alongside the quarantine, and released
+before every **bounded one-shot recovery** dispatch — the reaper-driven resume
+(#4256) and all three watchdogs (#3887/#3895/#3910) — so a refusal can never burn
+a single-attempt recovery those latches already rate-limit.
+Alongside it, the registry counts its **own** `loom:issue`/`loom:building` writes
+per issue and logs a loud `LABEL FLAPPING` warning at 6 writes in 5 minutes
+(a healthy dispatch writes exactly 2), so the pattern shows up in `daemon.log`
+instead of only in the forge timeline. Disable with `LOOM_DISPATCH_BACKOFF=0` or
+`autonomous.workFinder.dispatchBackoff.enabled = false`.
+
 ### Host-distress circuit breaker (#4235)
 
 The insta-crash quarantine above protects the shared **queue** from one broken
@@ -2060,9 +2580,15 @@ overload. It was added after the 2026-07-27→28 meltdown (#4231): a 6-way sweep
 fan-out drove load to 118 on 28 cores, the window server was watchdog-killed five
 times, and the daemon itself crashed — and then a *second* wave re-spiked the host
 two hours later because nothing remembered the first incident. The point-in-time
-admission checks (CPU headroom #3978, the per-tick load-admission ramp cap #4234)
-each make a *fresh* decision every tick, so the instant load dipped they
-re-admitted a full wave.
+admission checks (the CPU headroom term #3978 — since removed in #4512 — and the
+per-tick load-admission ramp cap #4234) each make a *fresh* decision every tick,
+so the instant load dipped they re-admitted a full wave.
+
+Since #4512 removed the CPU estimate from admission, this **measured** breaker is
+also what makes a hand-tuned per-machine `maxConcurrent` safe to raise: a mis-set
+knob trips the breaker — on observed load-per-core, not on a constant — instead
+of melting the host, while the [machine-wide build slot](#machine-wide-build-slot-4512)
+keeps the heavy stages serialized in the first place.
 
 The breaker is the **stateful** layer those checks lack. It samples
 **load-per-core** (`loadavg_1m / logical_cpus`) once per work-finder tick and runs
@@ -2120,6 +2646,45 @@ quarantine). To disable it entirely, set `LOOM_HOST_BREAKER=0` or
 minimal, per #4235): macOS-only trip signals (`.ips` crash reports, `syspolicyd`
 CPU-ratio amplification, daemon self-restart detection) and durable trip/release
 telemetry (coordinate with #4137 rather than building a parallel store).
+
+### GitHub rate-limit circuit breaker (#4429)
+
+The host breaker above protects the **host**; this breaker protects the
+**shared forge API budget**. Every fleet host authenticates as the same
+identity, so the REST/GraphQL rate limits are one fixed pool — and when it
+exhausted on 2026-07-29, every polling loop on every host kept firing its full
+per-tick call pattern for ~25 minutes (all failing), while role sessions were
+spawned straight into the same wall.
+
+The machine is simpler than the host breaker's — **Closed ⇄ Cooldown**, no
+sustain counter, because a rate-limit rejection is unambiguous:
+
+- Any gh polling failure whose stderr carries a rate-limit signature
+  (GraphQL primary, REST 403, secondary-limit phrasings) **trips** the
+  breaker. On trip, one `gh api rate_limit` probe — an endpoint that does
+  *not* count against the quota — learns the real reset epoch; the cooldown
+  runs to the latest exhausted resource's reset, clamped to `[60s, 3600s]`,
+  falling back to `fallbackCooldownSecs` when the probe fails.
+- While cooling, the work-finder, claim/quarantine reconciliation, epic
+  supervisor, and role-runner ticks **skip entirely** — zero gh calls, zero
+  doomed role spawns. Running sweeps are never touched.
+- The breaker **releases itself** on the first tick past the reset. Edges are
+  logged once each way and published as `daemon.rate_limit_breaker.state`
+  events; `loom-daemon status` shows the phase, the tripping loop, the resume
+  deadline, and the last-probed budget.
+
+To disable it entirely, set `LOOM_RATE_LIMIT_BREAKER=0` or
+`autonomous.rateLimitBreaker.enabled = false` (the pre-#4429
+hammer-through-exhaustion behavior).
+
+**Steady-state consumption** is attacked separately (#4428): the hot polls
+(work-finder `loom:issue`, claim reconciliation `loom:building`, epic
+supervisor `loom:epic`/`loom:epic-phase`) go through an ETag-cached REST
+listing (`forge_listing`) instead of GraphQL `gh issue list` — a poll where
+nothing changed answers `304 Not Modified`, which costs **zero** rate limit.
+The cache is in-memory, per (workspace, query), for the daemon's lifetime; a
+restart re-fetches each listing once. PR-side claim listings stay on
+`gh pr list` (they need `headRefName`, which REST issue rows do not carry).
 
 ### Cross-host dispatch-collision baseline (#4085, Phase 0 of #4028)
 
@@ -2179,6 +2744,46 @@ never wedge the daemon. It is GitHub-only (uses the `closedByPullRequestsReferen
 closes-graph, filtered to `state == "OPEN"`); a Gitea workspace fails open and
 keeps today's behavior.
 
+**Park-label dispatch guard (#4444, step 2.7).** The `loom:blocked` /
+`loom:operator-only` **park** labels are the state machine's only "take this out
+of automation" signal, and until #4444 they were enforced *only* in the
+work-finder's candidate query (`SKIP_LABELS`) — one of six dispatch routes. Every
+other route (all three watchdogs, the reaper's checkpoint-resume, the epic
+supervisor, the IPC/CLI `dispatch_sweep`) funnels through
+`SweepRegistry::dispatch()` without re-reading the forge labels, so a park applied
+*after* the original dispatch was invisible to them and the daemon re-claimed
+deliberately parked work (observed on #4366). Step 2.7 — immediately after the
+2.6 open-PR guard, still before the claim lock and label flip — refuses any
+dispatch whose issue currently carries a park label, with a typed
+`ParkedIssueDispatchError` the work finder attributes to `labeled-skip` (never to
+`error(s)`). Four properties are load-bearing:
+
+- **`PARK_LABELS`, not `SKIP_LABELS`.** The guard keys on the
+  `loom:blocked` / `loom:operator-only` subset only. `loom:building` is
+  *legitimately* present on a watchdog re-dispatch or a checkpoint-resume of the
+  daemon's **own** claim, so refusing it would break exactly the recovery paths
+  this guard is meant to constrain. The two constants live side by side in
+  `work_finder.rs` (`SKIP_LABELS` is composed as `BUILDING_LABEL` +
+  `PARK_LABELS`), so they cannot drift.
+- **The #4256 resume bypass does not exempt it.** `resume_bypass_pr` exempts step
+  **2.6** for a sweep's own open PR and nothing else — a park applied after the
+  crash still stops the resume. The refusal stays failure-visible: the reaper
+  logs it and still publishes `sweep.issue.{N}.resume_dispatched` with
+  `dispatched: false`.
+- **REST, not GraphQL.** The probe is `gh api repos/{owner}/{repo}/issues/{N}
+  --jq '.labels[].name'`, a *different* rate-limit bucket from the GraphQL calls
+  steps 2.5/2.6 ride — so a park still holds while the GraphQL quota is
+  exhausted, the condition under which the #4123 guard failed open during the
+  2026-07-29 incident.
+- **Fail-open and fixture-safe.** Any `gh` error, timeout, or unresolvable repo
+  lets dispatch proceed (a forge outage must never wedge the daemon), and the
+  probe is skipped entirely when label flips are disabled (`skip_label_flip`).
+
+Operator note: because this covers the IPC/CLI route too, a manual
+`dispatch_sweep` on a parked issue is refused by design — clear the park label
+first (or use `loom-daemon quarantine clear <N>` when the park came from the
+insta-crash quarantine) rather than expecting a manual dispatch to override it.
+
 **Cost / default.** Enabling detection adds exactly one `gh issue view --json
 labels` round-trip per dispatch (measured ~0.4s against GitHub), bounded by the
 same `LOOM_REAP_GH_TIMEOUT_SECS` ceiling as the other best-effort `gh` calls.
@@ -2207,9 +2812,45 @@ Every other dispatch path still refuses via `OpenPrDispatchError`, so
 a `sweep.issue.{N}.resume_dispatched` event (`{pr, checkpoint_phase?,
 dispatched, repo?}`) is published — with `dispatched: false` on the rare
 case the resume dispatch call itself fails — and narrated over Safehouse
-(when enabled) as a `handoff`. The `restore_label_to_ready` operator-park
-guard (#4206) still applies: an issue carrying `loom:blocked` is never
-resume-dispatched.
+(when enabled) as a `handoff`. Operator parks still win: `restore_label_to_ready`
+preserves a `loom:blocked` label instead of flipping it back to `loom:issue`
+(#4206), and the resume dispatch itself is refused by the **step 2.7 park-label
+guard** (#4444) — which the 2.6 resume bypass deliberately does not exempt — so a
+park applied after the crash surfaces as `dispatched: false` rather than an
+overridden park.
+
+### Completion narration → public fleet feed (#4426)
+
+When a sweep exits, the narration sink additionally asks the forge whether that
+issue's PR actually **merged** (`gh pr list --head feature/issue-N --state
+merged`, in the event's workspace root). If it did, the sink emits a second
+envelope of type **`completion`** carrying a `completion-v1` `meta`
+(`{schema, agent, repo, ref, result, started_at, completed_at, issue,
+tokens?, title?, additions?, deletions?}`) alongside the human `ack`.
+safehoused's egress mirrors well-formed `completion` envelopes out of allowlisted
+rooms to its `sink_url` — that is what fills the public fleet feed. Notes:
+
+- **`repo` is the forge `owner/repo` slug** (`gh repo view --json nameWithOwner`,
+  cached per workspace), not the path-basename narration convention (#4201);
+  `ref` is the PR URL.
+- **Display fields (#4497)** back the feed's
+  `<repo>#<issue>: <title> +A −D · <dur> · <tokens> tok` rows.
+  `title`/`additions`/`deletions` come from the *same* `gh pr list` call that
+  verifies the merge (zero extra round-trips) and degrade per-field; `tokens` is
+  a best-effort input+output total from the in-process activity DB's per-issue
+  rollup, whose attribution is knowingly imperfect (bare issue number, no repo
+  column; only linked samples counted) but consistent enough for a cost trend.
+  All four are optional — absent, the envelope is identical to the pre-#4497 one.
+- **Exit 0 ≠ merged.** No merged PR ⇒ no completion, so `result: "success"` is
+  never claimed for unmerged work. `result: "failure"` is not emitted in v1 —
+  `completion-v1` requires a `ref`, and a sweep with no merged PR has no
+  meaningful one (the wire support exists for a follow-up).
+- **At most one per merge**, deduped on `(workspace, issue)` for the daemon's
+  lifetime; downstream ingest is additionally idempotent on `event_id`.
+- **No new config and no new event-bus topic** — this rides the existing
+  `SweepExited` event and the `safehouse.*` block. Same degradation contract as
+  all narration: a failed/absent/slow `gh`, invalid `meta`, or an unreachable
+  safehoused drops the completion silently and never touches the sweep.
 
 ### Cross-host soft claim over safehouse (#4028, Phase 1 of #4028)
 
@@ -2225,9 +2866,10 @@ for the full design.
   local claim lock and **before** `flip_label_to_building`, the daemon publishes a
   claim advertisement (issue, cross-host-stable repo slug, host identity, PID,
   timestamp) over the room. It rides a **`task`** envelope — the envelope `type`
-  enum is closed and owned by the safehouse repo, so **no fifth type is invented**
-  — with the bare issue number as `task_id` and the structured payload
-  (`loom_claim`-marked JSON) in the `body`.
+  enum is closed and owned by the safehouse repo, so **no type is invented here**
+  (loom only *uses* the members safehoused already defines) — with the bare issue
+  number as `task_id` and the structured payload (`loom_claim`-marked JSON) in
+  the `body`.
 - **Dedicated inbound read task.** A coordination task on its own safehouse
   connection drains the socket continuously (`select!` over read + outbound), so
   an **idle** daemon that emits no narration still sees peer claims promptly — the
@@ -2251,6 +2893,22 @@ for the full design.
   clock skew is not comparable across hosts), so a crashed peer cannot
   permanently starve an issue. A peer also emits a `retract` ad from its reaper on
   a terminal sweep outcome, freeing the issue before the TTL.
+- **Re-advertisement heartbeat (#4431).** The dispatch-time ad is no longer
+  one-shot: the reaper re-advertises every live (`Running`/`Pending`) Issue
+  sweep's claim each tick (default 30s — ~4 refreshes per TTL window), and a
+  repeat ad **restarts** the receiver's TTL clock. A live sweep's claim
+  therefore never expires from peers' views mid-run, while a crashed host's
+  claims still free within one TTL of its last heartbeat. This is what lets
+  the peer claim serve as the **primary fast in-flight signal** on
+  safehouse-enabled hosts, with the `loom:building` label demoted to a slow
+  healing audit trail:
+- **Safehouse-conditional reconciliation cadence (#4431).** On a host with
+  `safehouse.enabled`, `claim_reconciliation`'s periodic pass defaults to
+  **1800s** (30 min, healing-only) instead of 600s. Precedence:
+  `LOOM_CLAIM_RECONCILE_INTERVAL_SECS` env >
+  `safehouse.claimReconcileIntervalSecs` config > 1800s (safehouse) / 600s
+  (no safehouse), floored at 60s. Hosts without safehouse are byte-for-byte
+  unchanged.
 - **Self-claim recognition.** A daemon never backs off on its own advertisement:
   the claim body carries the host identity (`host_identity()`:
   `LOOM_HOST_ID` > `$HOSTNAME` > `hostname` > `unknown-host` — loom's single,
@@ -2292,7 +2950,7 @@ ranking regardless of which refresher is running:
 
 - **A refresher running on a `<10`-min cadence** — the daemon's built-in loop
   (default 10 minutes, comfortably inside the freshness window) or an operator
-  cron. One-shot before a run: `loom-tokens check --ranking`.
+  cron. One-shot before a run: `loom-daemon tokens check --ranking`.
 
 - **Stale-ranking fail-safe (selector-side, #3894).** Even without a fresh
   probe, a stale-but-present `.ranking` is no longer discarded. The selector
@@ -2349,7 +3007,7 @@ knob for a repo that wants it off (e.g. no tokens bootstrapped at all):
 **Never fatal, never double-writes unsafely.** A probe failure (network hiccup,
 `gh`/`python3` missing, every account exhausted, no tokens bootstrapped at all)
 is logged and skipped — it never panics the loop or the daemon. Because
-`loom-tokens check --ranking` writes `.ranking` atomically (temp file +
+`loom-daemon tokens check --ranking` writes `.ranking` atomically (temp file +
 rename), an operator's cron running the identical script concurrently is
 harmless: the two refreshers can race to *schedule* a write but never to a
 *torn* file, so keeping an existing cron alongside the daemon costs nothing but
@@ -2413,6 +3071,19 @@ leaves the daemon's behavior byte-for-byte unchanged:
 | `LOOM_ROLE_RUNNER_INTERVAL_SECS` | `autonomous.roleRunner.intervalSecs` | env > config > default | per-role built-in (see above) |
 | — | `autonomous.roleRunner.roles` | config only | all five roles |
 | — | `autonomous.roleRunner.onIdle` | config only | `[]` (none) |
+| — | `autonomous.roleRunner.model` | config only (`roleRunner.model` > `autonomous.model` > default) | `sonnet` (`DEFAULT_DISPATCH_MODEL`) |
+
+**Role children are model-pinned (#4501).** Every role spawn appends an explicit
+`--model <resolved>` (immediately after the prompt, mirroring sweep dispatch), so
+a scheduled role never inherits the selected account's *interactive* CLI default.
+Before this, a host whose CLI default was `fable` ran every curator/champion/judge
+tick on the most constrained quota tier and then died instantly on "You've reached
+your Fable 5 limit". Resolution reuses `resolve_dispatch_model` — the same chain
+sweeps use, including the #3982 logical-tier aliases (`opus` → `claude-opus-5`) —
+with `autonomous.roleRunner.model` occupying the explicit-request tier. Blank
+values are treated as unset at every tier (`--model ""` is never emitted). The
+resolved model and the tier that supplied it are recorded in the per-role log
+header: `==== loom-daemon role_runner: <ts> role=<role> model=<m> (source=<tier>) ====`.
 
 `roles` restricts the dispatched subset (an explicit empty array runs none;
 unknown names are ignored with a warning). `intervalSecs` — both the env var
@@ -2459,6 +3130,176 @@ re-reads the workspace registry every tick and dispatches into every
 registered repo that has that role enabled in its own config (an empty
 registry reduces to the single daemon workspace). See
 `loom-daemon/src/role_runner.rs` for the implementation.
+
+**`enabled` is resolved per root, not inherited (#4377).** `autonomous.roleRunner.enabled`
+(and `roles` / `onIdle`) is read from **each registered workspace's own**
+`.loom/config.json` — both the interval loops above and the `onIdle` idle-edge
+path call the identical `resolve_enabled(read_role_runner_config(root))` for
+`root`. The daemon workspace's own `autonomous.roleRunner.enabled` only decides
+whether these loops **start at all**; it does not propagate to the other
+workspaces `loom-daemon workspace add` registers. A registered workspace with
+no `autonomous` block of its own is therefore role-runner-disabled by default —
+including for `onIdle` — even when the daemon's own workspace has
+`enabled: true`. Set `autonomous.roleRunner.enabled: true` in **that root's
+own** config to opt it in.
+
+Before #4377 this per-root gate was silent: a disabled root's interval skip
+logged only at `debug!` (invisible at the default `info` level), and the
+`onIdle` bail logged nothing at any level. Now:
+
+- The interval loop logs a one-time `warn!` per root the first tick it sees
+  that root disabled (further identical ticks downgrade to `debug!`, mirroring
+  the `missing_roots_warned` dedup from #4326); the warning clears — and can
+  fire again — once the root re-enables and later disables again.
+- The `onIdle` path logs a one-time `warn!` on the first idle edge it observes
+  for a root that has `onIdle` roles configured but is disabled — the exact
+  silent no-op this issue fixes. A root with no `onIdle` configured stays quiet
+  when disabled: that is its normal, unconfigured state, not a
+  misconfiguration.
+- `loom-daemon status` shows each registered root's resolved role-runner
+  state in the "Managed repos" table's `ROLES` column (`on`/`off`), plus an
+  explicit note when a disabled root has `onIdle` roles configured — so the
+  "N of M registered workspaces are inert" state is diagnosable without
+  reading every root's config file by hand.
+
+#### Bringing a new repo online (runbook, #4498)
+
+`loom-daemon workspace add` registers a repo for *dispatch*. It does **not** give
+that repo a **queue** — no role runner means no Curator, Judge, Champion, Auditor,
+or Guide runs there, so nothing ever reaches `loom:issue` and dispatch has nothing
+to pick up. A newly-registered root therefore shows `ROLES off` in
+`loom-daemon status` and sits inert indefinitely, looking registered-and-healthy.
+The steps below are what turns a registered root into a *self-feeding* one.
+
+**1. Choose a config surface.** `autonomous.roleRunner.enabled` is read from the
+root's own **effective** config, which `config_resolver::resolve_effective_config`
+(`loom-daemon/src/config_resolver.rs:143-153`) deep-merges from four tiers,
+lowest → highest priority:
+
+| # | Tier | Path | Tracked? |
+|---|------|------|----------|
+| 1 | machine-level defaults | `~/.local/share/loom/config/defaults.json` (override: `LOOM_CONFIG_DEFAULTS_FILE`; set it empty to disable the tier) | no — outside every checkout |
+| 2 | legacy per-repo | `<root>/.loom/config.json` | yes |
+| 3 | project | `<root>/.loom-project/project.json` | yes (Epic #3835 Phase 6) |
+| 4 | host-local | `<root>/.loom-local/local.json` | no (git-ignored) |
+
+Two valid ways to flip a root on, with very different blast radii:
+
+- **Machine-level (tier 1)** — one edit per *host* turns on **every** registered
+  root that does not set `roleRunner.enabled` itself. This is the right lever for
+  a fleet of repos you own that should all behave the same way. Because it is the
+  lowest-priority tier, any repo that wants to opt back out can simply set
+  `enabled: false` in its own config and win.
+- **Per-repo (tier 2/3/4)** — one edit per *repo*, in that repo's own checkout.
+  Use this when a root needs a different `roles`/`onIdle` set than the host
+  default, or when the repo's maintainers should see the setting in review.
+
+Either way the JSON block is the same shape as the example above:
+
+```json
+{
+  "autonomous": {
+    "roleRunner": {
+      "enabled": true,
+      "roles": ["champion", "curator", "judge", "auditor", "guide"],
+      "intervalSecs": 300,
+      "onIdle": ["champion"]
+    }
+  }
+}
+```
+
+Remember `onIdle` is **inert unless the work finder is enabled** for that root,
+and that `LOOM_ROLE_RUNNER` (env) outranks all four config tiers.
+
+**2. Sync the repo's labels.** The whole coordination protocol is label-based, so
+a repo with no `loom:*` labels cannot hold a queue — a Curator that tries to apply
+`loom:curated` just fails. Since every GitHub label operation is a `gh label` API
+call, this needs **no checkout of the target repo**: run
+`sync-labels.sh --repo OWNER/NAME` from a workspace that already has an
+authoritative `.github/labels.yml` (labels.yml is read locally; only the target
+moves). Preview first — `--repo` points the default-label *deletions* at a repo
+you are not standing in, so a typo'd NWO is worth catching:
+
+```bash
+# From a checkout whose .github/labels.yml is the source of truth (e.g. loom):
+for r in OWNER/klayout-tools \
+         OWNER/gf180-bandgap OWNER/gf180-ldo OWNER/gf180-temp-por \
+         OWNER/gf180-pll OWNER/gf180-sar-adc OWNER/gf180-trng \
+         OWNER/sky130-bandgap; do
+  ./.loom/scripts/sync-labels.sh --repo "$r" --dry-run   # preview
+done
+# ...then re-run without --dry-run to apply.
+```
+
+`--dry-run` is deliberately forge-free (it reports intent from labels.yml alone
+and makes zero `gh` calls), so it also validates the parse and the NWO offline.
+Because that means a dry run cannot tell a typo'd NWO apart from a repo that
+really exists, the **real** run preflights the named target with `gh repo view`
+before deleting anything and aborts if it is missing or read-only (#4524) —
+nothing is deleted when the preflight fails. `--repo` is GitHub-only — an
+explicitly configured Gitea forge rejects it, whether that comes from
+`LOOM_FORGE_TYPE=gitea` or `forge.type: gitea` in any config tier. For a Gitea
+root, run `sync-labels.sh` from a checkout of that repo so the Gitea helpers can
+resolve a base URL and token.
+
+**3. Refresh a stale install.** A root installed before the machine-level daemon
+model carries a committed file-copy of `.loom/` that **shadows** the machine
+checkout and drifts stale — including the role prompts the role runner invokes.
+Run `loom migrate --dry-run` then `loom migrate` in that root (see
+`defaults/docs/machine-dispatcher.md` → `loom migrate`); for a still-file-copy
+install that is not being migrated yet, `./.loom/scripts/resync-installed.sh`
+refreshes the copies in place.
+
+A repo on the **v0.15 multi-repo canary vintage** predates a cluster of
+multi-repo fixes. Rule these out before blaming a new symptom on config — several
+of them present exactly as "registered, enabled, and still nothing happens":
+
+| Issue | Symptom if the install predates the fix |
+|-------|------------------------------------------|
+| #3936 | `loom-daemon status`'s token-capacity summary contradicts its own per-token table |
+| #3937 | sweep-registry label flips run `gh issue edit` unscoped — cross-repo claims fail, yet dispatch proceeds *unclaimed* |
+| #3938 | dispatched sweeps die in ~2s: no `.loom/tokens/` pool outside the primary workspace (fixed by the shared machine-level pool — see "Token pool provisioning for managed repos" above; bootstrap it once per host) |
+| #3939 | no backoff/quarantine for insta-crashing dispatches — the same few issues are re-dispatched every tick, starving the rest of the queue |
+
+**4. Verify.** In order, because each step's failure looks like the next one's:
+
+1. `loom-daemon status` — the new root appears in "Managed repos" with
+   `ROLES on`. Still `off` means the config edit did not land in a tier that root
+   actually reads (tier 1 is per-*host*: check `LOOM_CONFIG_DEFAULTS_FILE` is not
+   set to something else, and that the daemon process's `$HOME` is the one you
+   edited). A restart is not required — each role task re-reads the registry and
+   per-root config every tick.
+2. Within one Auditor/Curator interval (default 300s), expect **≥1 issue labeled
+   `loom:triage`** in that repo — the Auditor files what it finds, the Curator
+   enriches it. An empty queue after two intervals with `ROLES on` means the role
+   invocation itself is failing; role failures are never fatal and are logged +
+   skipped, so read the daemon log rather than waiting.
+3. Then, and only then, expect dispatch: `loom:issue` → a sweep → a PR.
+
+> **Caveat (#4501).** A dispatched child that dies immediately — e.g. on a
+> `Fable 5 limit` classified as non-retryable, where dispatch inherited the
+> interactive model default instead of pinning a work model — is
+> indistinguishable at the forge from "the role runner is still off": both look
+> like a repo with no activity. Confirm step 1's `ROLES on` and step 2's
+> `loom:triage` issue *before* concluding anything about dispatch, and treat an
+> insta-dying child as #4501 rather than a config problem.
+
+**Which steps an agent cannot do for you.** Steps 1, 3, and 4 are operator steps,
+run by hand on **each daemon host** — repeat them per host, since tier 1 is
+per-machine and a multi-host fleet has one copy of it per machine:
+
+- **Step 1 (config edit)** and **step 3 (install refresh)** are host-local
+  filesystem writes: a file in the operator's home directory, or another repo's
+  own checkout. Neither is reachable from a Builder worktree — the
+  worktree-isolation guard confines Edit/Write to the current worktree, and the
+  machine-level defaults file lives outside every git checkout entirely.
+- **Step 4 (verification)** needs `loom-daemon status` against the *running*
+  daemon on that host, plus a real Auditor/Curator cycle to elapse. An agent can
+  read the forge state but cannot observe another host's daemon.
+- **Step 2 (label sync)** is the exception: `--repo` makes it pure forge API, so
+  it runs from any checkout with `gh` auth for the targets — one loop covers the
+  whole target set at once.
 
 ### Durable operator watches (#3971)
 
@@ -2553,6 +3394,11 @@ process:
 # Enable strictly per .loom/config.json → autonomous (no env forcing):
 ./.loom/scripts/cli/loom-daemon-start.sh --from-config
 
+# --from-config COMPOSES with an explicit flag (#4353): the named loop is
+# forced, the other is left for config to drive:
+./.loom/scripts/cli/loom-daemon-start.sh --from-config --work-finder      # force finder ON, gate config-driven
+./.loom/scripts/cli/loom-daemon-start.sh --from-config --no-health-gate   # force gate OFF, finder config-driven
+
 # Explicit-off / foreground variants:
 ./.loom/scripts/cli/loom-daemon-start.sh --no-work-finder   # force finder off (explicit; same as default)
 ./.loom/scripts/cli/loom-daemon-start.sh --no-health-gate   # force gate off (explicit; same as default)
@@ -2568,9 +3414,13 @@ process:
   and `LOOM_MAIN_HEALTH_GATE=0`, so a plain start is a **reliability daemon** that
   does **not** auto-dispatch sweeps — consistent with the ecosystem-wide opt-in /
   default-off contract. An already-exported env var always wins; `--work-finder`
-  / `--health-gate` force the respective loop on; `--from-config` leaves both
-  unset so `.loom/config.json → autonomous` drives (precedence env > config >
-  default),
+  / `--health-gate` force the respective loop on; `--from-config` alone leaves
+  both unset so `.loom/config.json → autonomous` drives (precedence env >
+  config > default). **`--from-config` composes with an explicit flag rather
+  than ignoring it (#4353)**: `--from-config --work-finder` (or
+  `--no-work-finder`/`--health-gate`/`--no-health-gate`) still FORCES that one
+  var while leaving the other loop unset for config to drive — a
+  pre-exported env var still wins over the forced flag,
 - locates the `loom-daemon` binary (`LOOM_DAEMON_BIN` → `PATH` → `target/{release,debug}`),
 - runs the **advisory** host-sleep check (`check-host-sleep.sh`, #3350) — never blocks the start,
 - **on macOS, backgrounds the daemon as a launchd LaunchAgent** in the resolved
@@ -2684,6 +3534,11 @@ loop is not reusable as the reporter). It has three cooperating parts:
 | watchdog interval | `LOOM_WATCHDOG_INTERVAL_SECS` | — | `300` (launchd `StartInterval` / systemd `OnUnitActiveSec`+`OnBootSec`) |
 | watchdog job/unit basename override | `LOOM_WATCHDOG_LABEL` | — | `<daemon label/unit>-watchdog` |
 | staleness threshold | `LOOM_DAEMON_HEARTBEAT_STALE_SECS` | — | `max(5 × cadence, 300)` |
+| IPC probe on/off (#4398) | `LOOM_WATCHDOG_IPC_PROBE` | — | on |
+| IPC probe budget (#4398) | `LOOM_WATCHDOG_STATUS_PROBE_TIMEOUT_SECS` | — | `15` |
+| IPC probe argv (#4398) | `LOOM_WATCHDOG_IPC_PROBE_ARGS` | — | `quarantine list` |
+| confirmed-hang threshold (#4398) | `LOOM_WATCHDOG_IPC_PROBE_FAIL_THRESHOLD` | — | `3` consecutive ticks |
+| IPC probe startup grace (#4398) | `LOOM_WATCHDOG_IPC_PROBE_GRACE_SECS` | — | `LOOM_DAEMON_STARTUP_GRACE_SECS`, else `90` |
 
 **Why an interval timer, not a resident process or `KeepAlive`/`Restart=`.** The
 reporter must itself be supervised, but a long-lived resident watchdog just moves
@@ -2702,14 +3557,62 @@ service's exit code affects the next scheduled run.
 
 | Marker | Reality | Watchdog |
 |--------|---------|----------|
-| present | daemon alive, heartbeat fresh | silent (OK) |
-| present | daemon alive, heartbeat **stale** | **report** — daemon may be wedged |
+| present | daemon alive, heartbeat fresh, IPC round-trip OK | silent (OK) |
+| present | daemon alive, heartbeat fresh, **IPC round-trip fails** (#4398) | **report** — 1 tick: "not yet confirmed"; N consecutive: **IPC UNRESPONSIVE (CONFIRMED)** |
+| present | daemon alive, heartbeat **stale**, written this boot (younger than the process) | **report** — daemon may be wedged |
+| present | daemon alive, heartbeat **older than the process itself** (#4368: a previous-boot/enablement leftover) | silent (liveness-only; not evidence about the current process) |
 | present | daemon alive, no heartbeat file | silent (liveness-only; heartbeat disabled or not yet written) |
 | present | daemon **not loaded/alive** | **report** — the #4011 outage |
 | **absent** | **nothing running** | silent — deliberate stop, no false page |
 | **absent** | **daemon IS running** | **report (WARN)** — state mismatch, crash protection disarmed (#4331) |
 
-The last row is the #4331 fix. Before it, a missing marker short-circuited to a
+**In-band hang detection (#4398).** Rows 1–2 above are the #4398 addition. Both
+pre-existing checks are *out-of-band*: neither ever talks to the daemon over the
+socket it serves work on, and two incidents proved that is not enough. In #4381
+the installed binary was replaced by a stub that answered `--version` and then
+hung forever — a pid-alive check passes against that indefinitely. On 2026-07-29
+the production daemon (pid 1484) was alive **and writing a fresh heartbeat**
+while every `loom-daemon status` round-trip hung: the heartbeat writer
+(`daemon_heartbeat::spawn_heartbeat_task`) and the IPC accept loop are
+independent `tokio::spawn`ed tasks on a multi-threaded runtime, so one keeps
+ticking while the other is wedged. After liveness is confirmed the watchdog now
+also runs a **bounded in-band round-trip** through the resolved `loom-daemon`
+CLI, with these properties:
+
+- **Bounded twice.** The CLI bounds its own connect + round-trip (5s each,
+  `query_daemon_bounded`); the watchdog additionally wraps the invocation in a
+  hard external budget (default 15s), so even a CLI that never returns at all
+  cannot hang the tick. macOS ships no `timeout(1)`, so the no-`timeout` path is
+  a real built-in bounded runner, not a degrade-to-unbounded.
+- **`quarantine list`, not `status --json`.** `status --json` looks like the
+  obvious probe but, *after* a successful round-trip, it also runs a per-account
+  token-pool network check plus a self-update check — measured at **15.3s against
+  a healthy daemon**, which would make the probe budget itself the
+  false-positive generator. `quarantine list` is a pure IPC round-trip with no
+  post-reply work (~5ms). Override with `LOOM_WATCHDOG_IPC_PROBE_ARGS`.
+- **Debounced, pid-keyed.** One failed round-trip can be transient contention
+  (#4279). A single failure is reported loudly but only **N consecutive**
+  failures (default 3), tallied in `<loom_dir>/.watchdog-probe-fail-count` and
+  **keyed to the live pid** so a relaunched daemon never inherits its
+  predecessor's streak, are called a confirmed hang. A successful probe clears
+  the streak.
+- **Startup-grace aware.** A probe against a process younger than the grace
+  window (default 90s, the same `daemon_install_state::DEFAULT_STARTUP_GRACE_SECS`
+  `status` uses) is skipped outright and never counts toward the tally — the
+  post-relaunch socket-bind window is not a wedge.
+- **Gracefully degrading.** No resolvable `loom-daemon` binary, a build whose CLI
+  does not know the probe subcommand, or a daemon-side *application* error (which
+  proves IPC works) all skip the probe rather than invent a divergence. The probe
+  never becomes a new hard dependency that pages on its own absence.
+- **Report-only, deliberately.** Unlike #4232's narrow auto-`kickstart`, there is
+  no provably-safe unattended remediation for a wedged-but-alive process — the
+  only real fix is killing it, which would equally kill a daemon merely under
+  heavy legitimate load. A confirmed hang escalates to a maximally actionable
+  DIVERGENCE report (distinct `IPC UNRESPONSIVE (CONFIRMED)` text, explicit
+  recovery commands, exit `1`) and stops there. Auto-kill remediation, if ever
+  wanted, needs its own narrow provably-safe gate.
+
+The last no-marker row is the #4331 fix. Before it, a missing marker short-circuited to a
 bare `[OK] … nothing to check` **without probing reality at all** — so a
 supervised daemon running with its marker gone (see "Marker ownership" below) was
 reported healthy while the watchdog would in fact never revive it. The no-marker
@@ -2791,7 +3694,27 @@ disagree, and reports one of four states with a distinct exit code:
 | `not-expected` | marker absent (deliberate stop, or never started) | `1` | suggest `loom-daemon-start.sh` |
 | `expected-but-dead` | marker present, no live process — the #4011 divergence | `3` | suggest `loom-daemon-start.sh`; points at `daemon-watchdog.log` |
 | `alive-starting` | marker present, process alive, IPC failed, **process age ≤ startup-grace window** — a normal `bootout`/`bootstrap` restart whose socket has not bound yet (#4213) | `4` | **none** — reports "still starting, not a fault"; NO stop/start remediation |
-| `alive-but-unresponsive` | marker present, process alive, IPC failed, process **older** than the grace window (or age undeterminable) | `4` | does **not** suggest a start (singleton guard refuses); prints the live pid; heartbeat freshness qualifies fresh ⇒ IPC/socket fault, stale ⇒ likely wedged |
+| `alive-but-unresponsive` | marker present, process alive, IPC failed, process **older** than the grace window (or age undeterminable) | `4` | does **not** suggest a start (singleton guard refuses); prints the live pid; heartbeat freshness qualifies fresh ⇒ IPC/socket fault, stale ⇒ likely wedged, **prior-boot** ⇒ not evidence about the current process |
+
+The heartbeat freshness qualifier on `alive-but-unresponsive` also gates the
+"do NOT run `loom-daemon-start.sh` … stop && start" remediation (#4368): it is
+only printed for a **current-boot `stale`** verdict — heartbeat age exceeds
+the staleness threshold *and* is younger than the process's own age, i.e. the
+evidence actually points at a wedge. `fresh` / `unknown` / **`prior-boot`**
+print inspect-first guidance (`ps -p <pid> -o pid,etime,command`, `loom-daemon
+status --json`) instead of the imperative restart, since none of those three
+qualifiers indicate a fault. `prior-boot` fires when the heartbeat file's mtime
+is strictly older than the live process's own start time (`heartbeat_age_secs
+> process_age_secs`) — necessarily a leftover from a previous boot or a
+previous enablement of the opt-in heartbeat loop, checked *before* the
+staleness threshold (even a heartbeat that would otherwise look "fresh" by age
+alone is not current-boot evidence if it predates the process). Equal ages are
+deliberately **not** `prior-boot` (current-boot evidence, falls through to the
+ordinary threshold check); an undeterminable process age makes **no**
+prior-boot claim and degrades to the pre-#4368 fresh/stale verdicts.
+`loom-daemon-watchdog.sh` §3 mirrors the same mtime-vs-process-start
+comparison (via `ps -o etime= -p <pid>`) before its own stale WARN, so `status`
+and the watchdog log can never contradict each other on this qualifier either.
 
 The startup-grace window defaults to `90s` (sized above the observed ~40–60s
 socket-bind latency after a `launchctl bootout`/`bootstrap` cycle) and is
@@ -2812,9 +3735,70 @@ compatibility. The probe never fails the command — an
 unreadable/malformed marker, absent `launchctl`, a stale/unowned pid, or an
 unreadable heartbeat mtime all degrade to a less-specific verdict (or, if no
 loom dir can be resolved at all, `install_state` is simply omitted and the
-generic pre-#4069 message is printed). The success path (a reachable, healthy
-daemon) is untouched — this probe only runs after `query_daemon_status` has
-already failed.
+generic pre-#4069 message is printed). `install_state` itself only ever runs
+after `query_daemon_status` has already failed — the reachable path's own
+protection reporting is the separate probe described next.
+
+**Fourth consumer: `status`'s REACHABLE path — watchdog protection state
+(#4354, AC4 of #4331).** `install_state` above answers *"why is the daemon
+unreachable?"*, so it runs only on the `Err` arm. A **reachable** daemon (one
+answering over IPC) needs a different question answered: *"is it actually
+protected?"* Before #4354 it did not surface one, so a healthy-looking daemon
+could be running with crash protection silently disarmed, and an operator would
+only find out by reading `daemon-watchdog.log` or poking
+`launchctl`/`systemctl` by hand. `status` now prints a `Protection:` line (and a
+`protection` object under `--json`) built from a **sibling** classification —
+`ProtectionState` in the same `daemon_install_state.rs` module, deliberately
+*not* new `InstallState` variants, whose exit-code semantics above must not
+change:
+
+| State (`--json` `state`) | Human phrase | Meaning |
+|--------------------------|--------------|---------|
+| `protected` | `protected` | autonomy-desired marker present **and** the watchdog job/timer is provisioned |
+| `no-marker` | `unprotected — no autonomy-desired marker` | no marker: crash protection is DISARMED — the watchdog fires on cadence but logs `[OK] … nothing to check` (the #4331 state) |
+| `watchdog-not-provisioned` | `watchdog job not provisioned` | marker present, but no watchdog launchd job / systemd timer is scheduled — nothing will ever notice a future death |
+| `unknown` | `unknown` | marker present but the provisioning probe could not answer (no `launchctl`/`systemctl`, or an unreachable `systemctl --user` bus) — a degradation, never a false verdict |
+
+Two independent facts feed this, and **both** are always reported: the JSON
+object carries `marker_present` and `watchdog_provisioned` separately (the
+latter `null` when undeterminable) alongside `marker_path`, `watchdog_job`,
+`watchdog_job_kind`, `detail`, and the dominant `state`. When both are bad,
+`state` is `no-marker` — the stronger statement, since even a provisioned
+watchdog is inert without a marker — while `watchdog_provisioned: false` still
+records the second fact for a script.
+
+**How the probe resolves its inputs** (client-side and host-local, so nothing is
+plumbed through the IPC report):
+
+- **Marker** — via the same `LOOM_AUTONOMY_MARKER`-honoring resolver the startup
+  healer uses (`autonomy_marker::resolve_marker_path`, now the single
+  implementation `daemon_install_state` also delegates to), else
+  `<loom_dir>/autonomy-desired`.
+- **Watchdog job** — mirrors `loom-daemon-start.sh` exactly: launchd
+  `${LOOM_WATCHDOG_LABEL:-<daemon-label>-watchdog}` (daemon label from
+  `LOOM_LAUNCHD_LABEL`, else the marker's own `launchd_label`, else
+  `com.rjwalters.loom-daemon`), probed with
+  `launchctl print <domain>/<label>` in the `resolve_launchd_domain` domain
+  (`LOOM_LAUNCHD_DOMAIN` → `gui/<uid>` → `user/<uid>`); systemd
+  `${LOOM_WATCHDOG_LABEL:-<LOOM_SYSTEMD_UNIT%.service>-watchdog}.timer`, probed
+  with `systemctl --user is-enabled <unit>`. A **non-Darwin host always resolves
+  the systemd side** (the same non-Darwin blanket override the unreachable path
+  applies), so `launchctl`'s absence on Linux is never even consulted.
+- **Provisioning verdict** — `enabled`/`enabled-runtime` ⇒ provisioned; any other
+  `is-enabled` verdict (`disabled`, `static`, `masked`, absent, …) ⇒ **not**
+  provisioned, deliberately collapsing "present but disabled" and "absent" into
+  the same operator-relevant answer (neither will fire). A `Failed to connect to
+  bus` / missing-binary / undeterminable-domain outcome ⇒ `unknown`.
+
+Like the `install_state` probe, it is **read-only and never fails the command**:
+at most three query-only subprocess calls, no writes, and the reachable path
+still **exits 0** whatever protection state it reports (only `no-marker` and
+`watchdog-not-provisioned` add remediation lines — `protected` and `unknown`
+print none, since `unknown` is a probe limitation on this host, not evidence of a
+fault). When no loom dir resolves at all the `Protection:` line is omitted and
+`--json`'s `protection` is `null`. The unreachable-path `install_state` output
+and its exit codes are unchanged. `fleet status`'s local-host row carries the
+same `protection` field, since it shares the `status --json` payload builder.
 
 ### macOS session-bootstrap hazard (#3972)
 
@@ -3380,6 +4364,86 @@ dispatch — is validated by the E2E playbook at
 throwaway issue from `loom:triage` → Curator → `loom:issue` → work-finder
 dispatch → PR → merge, with a scripted label-transition assertion, and confirms
 the operator only ever created the issue.
+
+## Fleet dashboard (`loom-daemon serve`)
+
+`loom-daemon serve` (#4329 phases 1-3: #4391 status snapshot, #4392 SSE event
+tail, #4393 page rendering) starts a **separate, opt-in** read-only HTTP
+listener that proxies the running daemon's existing Unix socket for
+browser-based fleet visibility. It is not part of the normal daemon-run path —
+a daemon started without `serve` never opens this port, and `serve` itself
+never mutates daemon state or the sweep registry; every request re-fetches a
+live snapshot over IPC.
+
+### Starting it
+
+```bash
+loom-daemon serve                                   # http://127.0.0.1:7420/
+loom-daemon serve --port 9000                        # non-default port, still loopback-only
+loom-daemon serve --peers http://host2:7420,http://host3:7420   # multihost fleet view
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--port` | `7420` | TCP port for the HTTP listener |
+| `--bind` | `127.0.0.1` | Interface address to bind |
+| `--allow-non-loopback` | off | Required opt-in to bind any non-loopback `--bind` address |
+| `--peers` | `""` (empty) | Comma-separated peer `serve` base URLs, served verbatim at `GET /api/peers` for client-side fan-out |
+
+### Security posture (localhost-only invariant)
+
+- **Off by default**: nothing listens on any port unless `loom-daemon serve`
+  is explicitly invoked — a plain `loom-daemon` run (autonomous or not) never
+  opens this listener.
+- **Binds `127.0.0.1` by default.** A wildcard/unspecified bind (`0.0.0.0` /
+  `::`) is refused **unconditionally**, even with `--allow-non-loopback` —
+  this endpoint can never become reachable from the public internet, only
+  from an explicit interface address.
+- A non-loopback `--bind` (e.g. a tailnet interface address, for cross-host
+  fleet visibility) requires the *separate* explicit `--allow-non-loopback`
+  flag — the bind address alone is never enough to opt in.
+- **Read-only, stateless, no steering endpoints.** Every route is a bare
+  `GET`; any other method gets `405`. The SSE bridge only ever sends the
+  IPC `SubscribeEvents` request — it never publishes an event and never
+  writes to the daemon socket beyond that one subscribe call, so nothing
+  this listener originates can appear on the bus. Nothing is written to
+  disk. There is no dispatch/cancel/restart/steering route of any kind.
+- Every response carries a permissive `Access-Control-Allow-Origin: *`
+  header (required for the dashboard's client-side peer fan-out); this is
+  judged safe specifically because the surface is read-only, carries no
+  credentials, and is loopback-by-default — the bind posture is the
+  access-control layer, not CORS.
+
+### What it serves
+
+| Route | Content |
+|-------|---------|
+| `GET /` | The embedded single-page dashboard (plain HTML/CSS/vanilla JS, no build toolchain, compiled into the binary) |
+| `GET /api/status` | JSON status snapshot: the same `DaemonStatusReport` `loom-daemon status --json` aggregates, flattened with a `hostname` field |
+| `GET /api/events` | `text/event-stream` (SSE) tail of the daemon's event bus |
+| `GET /api/pipeline` | Forge-side queue counts per managed repo (same source `status --pipeline` uses), fronted by a 20s in-process cache |
+| `GET /api/tokens` | Per-account rows (name / status / 5h utilization) read from the resolved token pool's `.ranking` file |
+| `GET /api/peers` | The configured `--peers` list, verbatim — this daemon never fetches a peer itself; the browser fetches each peer's own `/api/status`/`/api/events` directly |
+
+The dashboard page renders: the in-flight sweep registry, the dynamic
+concurrency cap/capacity breakdown, per-token usage bars, the per-repo
+main-health gate state, per-repo pipeline queue counts, configured fleet
+peers, and a live event tail — each panel backed by one of the routes above.
+
+### Event tail topics
+
+`GET /api/events` subscribes to the six frozen `sweep.*` topics from the
+[event taxonomy](#event-taxonomy-frozen-for-v0100) above — `sweep.issue.{N}.phase`,
+`.blocker`, `.exited`, `.crashed`, `sweep.global.dispatch`, and
+`sweep.global.completed` — through the exact same `SubscribeEvents` IPC
+request and `event_bus::topic_matches` prefix filter every other subscriber
+uses. It additionally includes the already-authorized `epic.issue.*`,
+`daemon.capacity.advisory`, `daemon.drain.*`, and
+`daemon.dispatch.headroom_advisory` topics, clearly separable from the
+frozen six because every SSE frame carries its exact source topic in the
+JSON payload (never renamed or re-namespaced). There is no replay buffer:
+a reconnecting client (`EventSource`'s built-in retry) resumes from live,
+never from history.
 
 ## Locks and lifecycle
 

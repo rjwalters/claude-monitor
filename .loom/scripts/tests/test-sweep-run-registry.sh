@@ -136,6 +136,14 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# 6b. Both runs have a RUN_ID-keyed main-clean baseline (as /loom:sweep writes).
+BASELINE_DIR="$TMP_REPO/.loom/sweep-checkpoint"
+mkdir -p "$BASELINE_DIR"
+: > "$BASELINE_DIR/main-clean-baseline-${RID1}.txt"
+: > "$BASELINE_DIR/main-clean-baseline-${RID2}.txt"
+# An unrelated per-issue checkpoint must never be touched by this helper.
+: > "$BASELINE_DIR/issue-999.json"
+
 # 7. Kill peer 2 → it is no longer a live peer AND its entry is pruned.
 kill "$LIVE2" 2>/dev/null
 wait "$LIVE2" 2>/dev/null
@@ -149,6 +157,24 @@ else
     PASS=$((PASS + 1))
 fi
 
+# 7a. The dead peer's baseline is reaped with its registry entry (#4450).
+if [[ -f "$BASELINE_DIR/main-clean-baseline-${RID2}.txt" ]]; then
+    echo "FAIL: dead peer's baseline not pruned by peer scan" >&2
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS: dead peer's baseline pruned by peer scan"
+    PASS=$((PASS + 1))
+fi
+
+# 7b. The LIVE run's own baseline survives a peer scan.
+if [[ -f "$BASELINE_DIR/main-clean-baseline-${RID1}.txt" ]]; then
+    echo "PASS: live run's baseline untouched by peer scan"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: live run's baseline was deleted by peer scan" >&2
+    FAIL=$((FAIL + 1))
+fi
+
 # 8. list shows only the surviving run 1.
 out=$("$REG" list)
 if echo "$out" | grep -q "^$RID1 " && ! echo "$out" | grep -q "$RID2"; then
@@ -159,6 +185,11 @@ else
     FAIL=$((FAIL + 1))
 fi
 
+# 8b. A third, still-live run registers a baseline that `cleanup RID1` must spare.
+LIVE3=$(spawn_live); LIVE_PIDS+=("$LIVE3")
+RID3=$("$REG" new --pid "$LIVE3")
+: > "$BASELINE_DIR/main-clean-baseline-${RID3}.txt"
+
 # 9. cleanup removes the run's own entry.
 "$REG" cleanup "$RID1"
 if [[ -f "$TMP_REPO/.loom/sweep-run/${RID1}.json" ]]; then
@@ -168,6 +199,38 @@ else
     echo "PASS: cleanup removed own entry"
     PASS=$((PASS + 1))
 fi
+
+# 9a. cleanup also removes the run's own RUN_ID-keyed baseline (#4450).
+if [[ -f "$BASELINE_DIR/main-clean-baseline-${RID1}.txt" ]]; then
+    echo "FAIL: cleanup did not remove own main-clean baseline" >&2
+    FAIL=$((FAIL + 1))
+else
+    echo "PASS: cleanup removed own main-clean baseline"
+    PASS=$((PASS + 1))
+fi
+
+# 9b. A live peer's baseline and registry entry survive another run's cleanup.
+if [[ -f "$BASELINE_DIR/main-clean-baseline-${RID3}.txt" && -f "$TMP_REPO/.loom/sweep-run/${RID3}.json" ]]; then
+    echo "PASS: live peer's baseline + entry untouched by another run's cleanup"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: live peer's baseline or entry removed by another run's cleanup" >&2
+    FAIL=$((FAIL + 1))
+fi
+
+# 9c. cleanup never touches per-issue checkpoints (that is the bulk path's job).
+if [[ -f "$BASELINE_DIR/issue-999.json" ]]; then
+    echo "PASS: per-issue checkpoint untouched by cleanup"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: cleanup deleted an unrelated per-issue checkpoint" >&2
+    FAIL=$((FAIL + 1))
+fi
+
+# Restore the empty-registry precondition the remaining cases assume.
+"$REG" cleanup "$RID3"
+kill "$LIVE3" 2>/dev/null
+wait "$LIVE3" 2>/dev/null
 
 # 10. peers on an empty/nonexistent registry is empty, exit 0 (single-sweep case).
 out=$("$REG" peers "sweep-nonexistent")

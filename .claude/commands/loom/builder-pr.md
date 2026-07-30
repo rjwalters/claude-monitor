@@ -578,7 +578,7 @@ Closes #123
 
 ### Why This Matters
 
-GitHub's auto-close feature only works with specific keywords at the start of a line:
+GitHub's auto-close feature only works with specific keywords **immediately followed** by the issue reference:
 - `Closes #X`
 - `Fixes #X`
 - `Resolves #X`
@@ -587,6 +587,14 @@ GitHub's auto-close feature only works with specific keywords at the start of a 
 - `Resolved #X`
 
 **Any other phrasing will NOT trigger auto-close.**
+
+> **The keyword does NOT have to start a line — GitHub scans the ENTIRE body.**
+> `close`/`closes`/`closed`/`fix`/`fixes`/`fixed`/`resolve`/`resolves`/`resolved` creates a
+> real closing reference **wherever** it appears — mid-sentence, inside a numbered list, in a
+> "follow-up" checklist. What breaks the link is a word between the keyword and the reference
+> (`close issue #X`, `Fixes issue #X`), not its position in the body. This cuts both ways: it
+> is why `Fixes issue #123` silently fails to close, and why a stray `then close #123` buried
+> in prose silently *does* close — see "Partial increments" below (#4569).
 
 ### Partial increments (family/epic issues)
 
@@ -600,6 +608,56 @@ Contributes to #123
 `Part of #N` references the issue (keeping the PR discoverable) but does NOT trigger auto-close, so the family/epic issue survives the merge. Only the **final increment** that completes the family uses `Closes #N`.
 
 **Both the PR body and the commit message must carry the same reference.** This repo squash-merges, and GitHub harvests closing keywords from the squash commit message as well as the PR body — a stray `Closes #N` in the commit body will auto-close the family issue even when the PR body says `Part of #N`. When in doubt on a `loom:epic` issue, prefer `Part of #N`.
+
+#### A stray closing keyword ANYWHERE in the body defeats `Part of #N` (#4569)
+
+`Part of #N` / `Contributes to #N` is not a shield. GitHub does not weigh the two references
+against each other — **one** closing keyword adjacent to `#N` anywhere in the body is enough
+to close the issue on merge, no matter how explicitly the rest of the body says otherwise.
+
+This is a real, observed failure, not a hypothetical. A partial-increment PR ended with the
+deliberate trailer `Contributes to #2` and an operator-handoff section that read:
+
+```markdown
+## Operator follow-up (after merge)
+
+3. Verify `npm view censusapi` resolves to `0.0.1`, then close #2.   ← closes #2 on merge!
+```
+
+GitHub honored that `close #2`. The issue was closed on squash-merge and had to be reopened
+by hand. (For the record: the head branch was `feature/issue-2`, but branch naming was *not*
+the cause — Loom's `feature/issue-N` convention does not create a Development-sidebar link.)
+
+**Rules for a partial-increment PR body:**
+
+- **Never** write a closing keyword immediately before the tracked issue's number. Write
+  `then close the issue`, or `then close issue #2` (the intervening word breaks the link).
+- The tracked issue number should appear exactly once with a keyword: the `Part of #N` /
+  `Contributes to #N` reference. Scan the whole body — including checklists, test plans, and
+  operator-handoff sections — before creating the PR:
+
+  ```bash
+  # Must print nothing for the tracked issue N:
+  grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#N\b' <<<"$PR_BODY"
+  ```
+
+- **The same rule applies to every commit message on the branch** (#4595). The squash message
+  GitHub composes from your commits is parsed for closing keywords too, so a stray
+  `close #N` in a commit body closes the issue even when the PR body is spotless. Scan them
+  before pushing — and amend/reword (`git commit --amend`, `git rebase -i`) if one is there:
+
+  ```bash
+  # Must print nothing for the tracked issue N:
+  git log --format=%B origin/main..HEAD \
+    | grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#N\b'
+  ```
+
+**Backstop (not a substitute for the above)**: `merge-pr.sh` detects this contradiction
+before merging — in the PR body, in any commit message of the PR, and in GitHub's
+`closingIssuesReferences` — and warns naming which source is at fault, then reopens the issue
+immediately after the merge if GitHub closed it anyway. That leaves a close/reopen flicker
+plus notification churn on the issue — fix the body or the commit message instead of relying
+on it.
 
 ### PR Creation Checklist
 

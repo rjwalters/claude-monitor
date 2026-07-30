@@ -69,7 +69,6 @@ Each role can have an optional JSON metadata file with default settings:
 - **`defaultIntervalPrompt`** (string): Default prompt sent at each interval
 - **`autonomousRecommended`** (boolean): Whether autonomous mode is recommended
 - **`suggestedWorkerType`** (string): "claude" or "codex"
-- **`gitIdentity`** (object): `name` / `email` used for commits made by this role
 - **`stuckThresholds`** (object): Per-role stuck-detection limits (e.g. `maxNoOutput`, `maxNeedsInput`, in milliseconds)
 
 ## Creating Custom Roles

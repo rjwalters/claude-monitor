@@ -8,7 +8,7 @@
 #   pnpm worktree <issue-number> <branch>              # Create worktree with custom branch name
 #   pnpm worktree <issue-number> --sparse <paths...>   # Cone-mode sparse checkout
 #   pnpm worktree <issue-number> --full                # Convert sparse worktree to full
-#   pnpm worktree remove <issue-number> [--keep-branch]# Remove one managed worktree
+#   pnpm worktree remove <issue-number> [--keep-branch] [--force]  # Remove one managed worktree
 #   pnpm worktree --check                              # Check if currently in a worktree
 #   pnpm worktree --json <issue-number>                # Machine-readable output
 #   pnpm worktree --return-to <dir> <issue-number>     # Store return directory
@@ -316,13 +316,23 @@ cleanup_partial_worktree_state() {
 # discovery fallback — those belong to merge-pr.sh's distinct call-sites):
 #   1. Idempotent no-op if the worktree dir is absent (still prune).
 #   2. Refuse to remove a dir lacking the .loom-managed sentinel (user-owned).
-#   3. Discover the attached branch BEFORE removal (the porcelain entry vanishes
+#   3. Refuse to remove a worktree with uncommitted changes unless --force (#4449).
+#   4. Discover the attached branch BEFORE removal (the porcelain entry vanishes
 #      once the worktree is gone).
-#   4. Hop out of the worktree first if our cwd is inside it (CWD-safety).
-#   5. `git worktree remove --force`; warn (don't hard-fail) on failure.
-#   6. `git branch -d` the attached branch (safe delete, refuses on unmerged
+#   5. Hop out of the worktree first if our cwd is inside it (CWD-safety).
+#   6. `git worktree remove --force`; warn (don't hard-fail) on failure.
+#   7. `git branch -d` the attached branch (safe delete, refuses on unmerged
 #      commits) unless --keep-branch.
-#   7. `git worktree prune`.
+#   8. `git worktree prune`.
+#
+# Guard 3 exists because step 6 is `git worktree remove --force`, which discards
+# the working tree unconditionally — there is no "safe" variant to fall back to
+# once it runs. #4449 is the live precedent for why an unconditional destructive
+# removal is unacceptable: a tested-but-uncommitted fix was destroyed in the
+# window before its `git commit`, with no dirty-check anywhere on the path. The
+# create path already preserves a dirty worktree (see the "Worktree has
+# uncommitted changes - preserving existing work" branch); this makes the removal
+# path consistent with it, and `--force` is the explicit opt-in to the loss.
 #
 # `loom-clean` remains the bulk/stale-cleanup path across all closed issues;
 # this verb targets one specific issue's worktree.
@@ -347,21 +357,51 @@ _worktree_attached_branch() {
         '
 }
 
-# remove_worktree_command [--keep-branch] [--json] <issue-number>
+# Print a worktree's uncommitted-change lines in `git status --porcelain`
+# format, EXCLUDING Loom runtime marker files (#4449).
+#
+# `.loom-managed` / `.loom-in-use` / `.loom-checkpoint` / `.no-changes-needed` are
+# runtime breadcrumbs every managed worktree legitimately carries. A correctly
+# installed repo gitignores them, but a stale / pre-#3838 `.gitignore` does not —
+# and if they counted as "uncommitted work", the dirty guard below would refuse
+# to remove *every* managed worktree, which is worse than no guard at all. They
+# carry no work, so they are filtered out here rather than special-cased at each
+# call site.
+#
+# Empty output ⇒ nothing worth preserving. Never fails (a non-repo path or a
+# missing git prints nothing).
+_worktree_dirty_lines() {
+    local wt="$1"
+    git -C "$wt" status --porcelain --untracked-files=all 2>/dev/null | awk '
+        {
+            # Porcelain v1: 2 status chars + 1 space, then the path. Renames
+            # render as "old -> new" and never match a bare marker name.
+            path = substr($0, 4)
+            gsub(/^"/, "", path); gsub(/"$/, "", path)
+            if (path == ".loom-managed"      || path == ".loom-in-use" ||
+                path == ".loom-checkpoint"   || path == ".no-changes-needed") next
+            print
+        }
+    ' || true
+}
+
+# remove_worktree_command [--keep-branch] [--force] [--json] <issue-number>
 #
 # Invoked from the early arg dispatch below. Returns 0 on success (including the
 # idempotent no-op) and 1 on refusal / usage error / removal failure.
 remove_worktree_command() {
-    local issue_number="" keep_branch=false json=false
+    local issue_number="" keep_branch=false json=false force=false
+    local usage="Usage: pnpm worktree remove <issue-number> [--keep-branch] [--force] [--json]"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --keep-branch) keep_branch=true; shift ;;
             --json)        json=true; shift ;;
+            --force|-f)    force=true; shift ;;
             --*)
                 print_error "Unknown flag for remove: $1"
                 echo ""
-                echo "Usage: pnpm worktree remove <issue-number> [--keep-branch] [--json]"
+                echo "$usage"
                 return 1
                 ;;
             *)
@@ -378,13 +418,13 @@ remove_worktree_command() {
     if [[ -z "$issue_number" ]]; then
         print_error "remove requires an issue number"
         echo ""
-        echo "Usage: pnpm worktree remove <issue-number> [--keep-branch] [--json]"
+        echo "$usage"
         return 1
     fi
     if ! [[ "$issue_number" =~ ^[0-9]+$ ]]; then
         print_error "Issue number must be numeric (got: '$issue_number')"
         echo ""
-        echo "Usage: pnpm worktree remove <issue-number> [--keep-branch] [--json]"
+        echo "$usage"
         return 1
     fi
 
@@ -431,11 +471,39 @@ remove_worktree_command() {
         return 1
     fi
 
-    # 3. Discover the attached branch BEFORE removal (porcelain entry vanishes
+    # 3. Dirty guard (#4449): step 5's `git worktree remove --force` discards the
+    #    working tree unconditionally, so uncommitted work must be surfaced and
+    #    the removal refused unless the caller explicitly opts into the loss.
+    #    Defense in depth alongside the create path, which already preserves a
+    #    dirty worktree rather than resetting it.
+    local dirty_lines dirty_count
+    dirty_lines="$(_worktree_dirty_lines "$worktree_path")"
+    if [[ -n "$dirty_lines" ]]; then
+        dirty_count=$(printf '%s\n' "$dirty_lines" | grep -c . || true)
+        if [[ "$force" != true ]]; then
+            print_error "Refusing to remove $worktree_path — it has $dirty_count uncommitted change(s):"
+            printf '%s\n' "$dirty_lines" | head -20 >&2
+            if [[ "$dirty_count" -gt 20 ]]; then
+                echo "  ... and $((dirty_count - 20)) more" >&2
+            fi
+            echo "" >&2
+            echo "Removing it would destroy that work irreversibly. To proceed, pick one:" >&2
+            echo "  1. Commit it:    git -C $worktree_path add -A && git -C $worktree_path commit -m '...'" >&2
+            echo "  2. Save a patch: git -C $worktree_path diff HEAD > /tmp/issue-$issue_number.patch" >&2
+            echo "  3. Stash it:     git -C $worktree_path stash push -u -m 'issue-$issue_number'" >&2
+            echo "  4. Discard it:   re-run with --force (the uncommitted changes are lost)" >&2
+            _rm_json false false "untouched"
+            return 1
+        fi
+        _rm_warning "Worktree has $dirty_count uncommitted change(s) - discarding them (--force)"
+        printf '%s\n' "$dirty_lines" | head -20 >&2
+    fi
+
+    # 4. Discover the attached branch BEFORE removal (porcelain entry vanishes
     #    once the worktree is gone).
     attached_branch="$(_worktree_attached_branch "$repo_root" "$worktree_path")" || attached_branch=""
 
-    # 4. CWD-safety: if our shell is inside the worktree, hop out first.
+    # 5. CWD-safety: if our shell is inside the worktree, hop out first.
     local worktree_real current_dir in_worktree=false
     worktree_real="$(cd "$worktree_path" 2>/dev/null && pwd -P)" || worktree_real="$worktree_path"
     current_dir="$(pwd -P 2>/dev/null || pwd)"
@@ -444,7 +512,7 @@ remove_worktree_command() {
         cd "$repo_root" 2>/dev/null || true
     fi
 
-    # 5. Remove the worktree.
+    # 6. Remove the worktree.
     _rm_info "Removing worktree: $worktree_path"
     local removed=false
     if git -C "$repo_root" worktree remove "$worktree_path" --force >/dev/null 2>&1; then
@@ -458,7 +526,7 @@ remove_worktree_command() {
         _rm_warning "Could not remove worktree at $worktree_path"
     fi
 
-    # 6. Branch cleanup (unless --keep-branch). Deferred until after removal so
+    # 7. Branch cleanup (unless --keep-branch). Deferred until after removal so
     #    the worktree's checkout lock on the branch is released first.
     local branch_status="none"
     if [[ "$keep_branch" == true ]]; then
@@ -479,7 +547,7 @@ remove_worktree_command() {
         fi
     fi
 
-    # 7. Prune the git worktree registration.
+    # 8. Prune the git worktree registration.
     git -C "$repo_root" worktree prune 2>/dev/null || true
 
     if [[ "$removed" == true ]]; then
@@ -632,7 +700,7 @@ Usage:
   pnpm worktree <issue-number> --base <branch>          Branch off <branch> (stacked PR, #3729)
   pnpm worktree <issue-number> --sparse <paths...>      Cone-mode sparse checkout
   pnpm worktree <issue-number> --full                   Convert sparse worktree to full
-  pnpm worktree remove <issue-number> [--keep-branch]   Remove one managed worktree
+  pnpm worktree remove <N> [--keep-branch] [--force]    Remove one managed worktree
   pnpm worktree --check                                 Check if in a worktree
   pnpm worktree --json <issue-number>                   Machine-readable JSON output
   pnpm worktree --return-to <dir> <issue-number>        Store return directory
@@ -666,12 +734,20 @@ Examples:
     branch (safe delete — refuses on unmerged commits). This is the sanctioned
     single-worktree removal path so you never need 'git worktree remove'
     directly. It honors the .loom-managed sentinel (refuses to remove a
-    user-provisioned worktree), is idempotent (clear no-op if absent), and
-    prunes the git worktree registration. Use 'loom-clean' for bulk/stale
+    user-provisioned worktree), REFUSES when the worktree has uncommitted
+    changes (#4449 — see --force below), is idempotent (clear no-op if absent),
+    and prunes the git worktree registration. Use 'loom-clean' for bulk/stale
     cleanup across all closed issues.
 
   pnpm worktree remove 42 --keep-branch
     Same as above but leaves the local feature branch intact.
+
+  pnpm worktree remove 42 --force
+    Removes the worktree even when it has uncommitted changes, DISCARDING them.
+    Without --force, a dirty worktree makes 'remove' exit non-zero, list what it
+    found, and print how to preserve the work (commit / save a patch / stash).
+    Loom runtime markers (.loom-managed, .loom-in-use, .loom-checkpoint,
+    .no-changes-needed) never count as uncommitted work.
 
   pnpm worktree --check
     Shows current worktree status
@@ -1025,6 +1101,41 @@ if [[ -n "$PRUNE_OUTPUT" ]]; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
             print_warning "Failed to prune worktrees (continuing anyway)"
         fi
+    fi
+fi
+
+# ─── Git identity hygiene check (#4369) ─────────────────────────────────────
+# Worktrees share the parent repo's local git config, so a corrupted local
+# user.email/user.name (stacked values, or a value with a glued-on shell
+# command like "...github.comecho" — Tauri-era residue, see
+# check-git-identity.sh's header) poisons every worktree created from this
+# repo, including this one. Hard-fail on the corruption pattern (it would
+# otherwise ship a garbled commit author silently — see PR #4303); warn (but
+# proceed) on a plain multi-value that doesn't match the corruption pattern,
+# since a pre-existing-but-unambiguous local config shouldn't strand a sweep.
+GIT_IDENTITY_CHECK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/check-git-identity.sh"
+if [[ -x "$GIT_IDENTITY_CHECK" ]]; then
+    # Note: in --json mode fd 1 is already redirected to stderr (see the
+    # stdout-purity block above), so this plain `echo`/print output lands on
+    # stderr in both modes — only the explicit `>&3` JSON document below
+    # reaches the caller's stdout.
+    # `if VAR=$(cmd); then` (rather than a bare assignment) so a non-zero exit
+    # from the check does not trip `set -e` before we can inspect $? below.
+    if GIT_IDENTITY_OUTPUT=$("$GIT_IDENTITY_CHECK" 2>&1); then
+        GIT_IDENTITY_RC=0
+    else
+        GIT_IDENTITY_RC=$?
+    fi
+    if [[ "$GIT_IDENTITY_RC" -eq 3 ]]; then
+        print_error "Corrupted local git identity detected — refusing to create a worktree."
+        echo "$GIT_IDENTITY_OUTPUT"
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"success": false, "error": "corrupted-git-identity", "issueNumber": '"$ISSUE_NUMBER"'}' >&3
+        fi
+        exit 1
+    elif [[ "$GIT_IDENTITY_RC" -eq 1 ]]; then
+        print_warning "Stacked local git identity values detected (non-fatal — see details below)."
+        echo "$GIT_IDENTITY_OUTPUT"
     fi
 fi
 

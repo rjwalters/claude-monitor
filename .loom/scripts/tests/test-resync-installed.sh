@@ -18,8 +18,16 @@
 #   (l) symlinked install target -> skipped, not clobbered
 #   (m) recorded loom_source gone -> clear error, exit 1
 #   (n) metadata re-stamp -> loom_version/loom_commit/last_resync present after apply
+# Canonical-guard-defer (#4041, #4403, #4566):
+#   (o) canonical guard + git-TRACKED vendored guard -> preserved, tree clean, and
+#       reported as an informational note (NOT a WARN) that --quiet suppresses
+#   (p) canonical guard + UNTRACKED vendored guard   -> removed (unchanged behavior)
+# Worktree-isolation refusal (#4563):
+#   (q) invoked from a linked worktree -> non-zero exit, NOTHING written to main
+#   (r) --allow-worktree / LOOM_RESYNC_ALLOW_WORKTREE=1 -> permitted (warns)
+#   (s) main checkout (incl. a subdirectory of it)      -> unaffected, exit 0
 # Plus contract checks:
-#   - --help prints usage, exit 0
+#   - --help prints usage (documenting --allow-worktree), exit 0
 #   - unknown arg exits 1
 #   - not-a-git-repo exits 1
 #
@@ -371,6 +379,68 @@ else
     fail "(n) --dry-run re-stamped metadata (should be preview-only)"
 fi
 
+# --- (#4528) install-metadata.json merge=ours driver wiring -----------------
+echo "Test group 12g: resync wires the install-metadata.json merge=ours driver (#4528)"
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+GA="$REPO/.gitattributes"
+if [[ -f "$GA" ]] && grep -qxF ".loom/install-metadata.json merge=ours" "$GA"; then
+    pass "(q) .gitattributes gets the install-metadata.json merge=ours rule"
+else
+    fail "(q) .gitattributes missing the merge=ours rule"
+fi
+if [[ "$(git -C "$REPO" config --get merge.ours.driver 2>/dev/null)" == "true" ]]; then
+    pass "(q) local git config merge.ours.driver=true is set"
+else
+    fail "(q) local git config merge.ours.driver was not set"
+fi
+# Idempotent rerun: no duplicate marker block.
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+OCCURRENCES="$(grep -cxF ".loom/install-metadata.json merge=ours" "$GA")"
+if [[ "$OCCURRENCES" -eq 1 ]]; then
+    pass "(q) rerun does not duplicate the .gitattributes rule"
+else
+    fail "(q) rerun duplicated the .gitattributes rule (found $OCCURRENCES occurrences)"
+fi
+# --dry-run must NOT write .gitattributes or local git config.
+REPO="$(make_fixture)"
+(cd "$REPO" && bash "$SCRIPT" --dry-run >/dev/null 2>&1)
+if [[ ! -f "$REPO/.gitattributes" ]]; then
+    pass "(q) --dry-run leaves .gitattributes absent (preview-only)"
+else
+    fail "(q) --dry-run wrote .gitattributes (should be preview-only)"
+fi
+if [[ -z "$(git -C "$REPO" config --get merge.ours.driver 2>/dev/null)" ]]; then
+    pass "(q) --dry-run leaves merge.ours.driver unset (preview-only)"
+else
+    fail "(q) --dry-run set merge.ours.driver (should be preview-only)"
+fi
+# End-to-end: a real merge conflict on install-metadata.json between two
+# divergent branches resolves automatically to "ours" once the driver+
+# attribute are wired up, instead of stopping for manual resolution.
+MERGE_REPO="$(make_fixture)"
+(cd "$MERGE_REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+git -C "$MERGE_REPO" add -A >/dev/null 2>&1
+git -C "$MERGE_REPO" commit -qm "wire merge driver" >/dev/null 2>&1
+MERGE_REPO_DEFAULT_BRANCH="$(git -C "$MERGE_REPO" symbolic-ref --short HEAD)"
+git -C "$MERGE_REPO" checkout -qb host-a >/dev/null 2>&1
+printf '{\n  "loom_version": "1.1.1",\n  "loom_commit": "aaa1111",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$MERGE_REPO" > "$MERGE_REPO/.loom/install-metadata.json"
+git -C "$MERGE_REPO" commit -qam "host-a resync stamp" >/dev/null 2>&1
+git -C "$MERGE_REPO" checkout -q "$MERGE_REPO_DEFAULT_BRANCH" >/dev/null 2>&1
+printf '{\n  "loom_version": "2.2.2",\n  "loom_commit": "bbb2222",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$MERGE_REPO" > "$MERGE_REPO/.loom/install-metadata.json"
+git -C "$MERGE_REPO" commit -qam "host-b resync stamp" >/dev/null 2>&1
+if git -C "$MERGE_REPO" merge -q host-a >/dev/null 2>&1; then
+    if grep -q '"loom_version": *"2.2.2"' "$MERGE_REPO/.loom/install-metadata.json"; then
+        pass "(q) two hosts' resync stamps merge cleanly, keeping the local (ours) side"
+    else
+        fail "(q) merge succeeded but did not keep the local side's stamp"
+    fi
+else
+    fail "(q) merge of two divergent resync stamps still conflicts"
+fi
+
 # --- (#4280) .gitignore managed-block refresh + audit ------------------------
 echo "Test group 12b: resync refreshes the Loom-managed .gitignore block (#4280)"
 # Resolve a loom-daemon binary that supports `update-gitignore` (this feature).
@@ -539,6 +609,190 @@ else
     fail "(#4285) pinned package.json not reported skipped"
 fi
 
+# --- (#4403) canonical-guard-defer: git-tracked target must NOT be removed --
+echo "Test group 14: canonical guard present + tracked vendored guard is preserved (#4403)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+git -C "$REPO" add .loom/hooks/guard-destructive-generic.sh >/dev/null 2>&1
+git -C "$REPO" commit -qm "track vendored guard" >/dev/null 2>&1
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4403) apply exits 0 with a tracked vendored guard present"; else fail "(#4403) apply exits 0 (got $RC)"; fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4403) git-tracked hooks/guard-destructive-generic.sh preserved (not removed)"
+else
+    fail "(#4403) git-tracked hooks/guard-destructive-generic.sh was removed"
+fi
+if grep -q "git-tracked vendored fallback kept" <<<"$OUT"; then
+    pass "(#4403) the preserved tracked file is reported explicitly"
+else
+    fail "(#4403) no report explaining the preserved tracked file"
+fi
+# #4566: a committed vendored guard is a deliberate, documented posture, so this
+# is the expected steady state on EVERY run — it must not be reported at
+# alarm level (a WARN here reprinted forever with no way to acknowledge it).
+# (Scoped to this message: an unrelated WARN, e.g. the #4280 missing-daemon
+# .gitignore notice, can legitimately appear in the same run.)
+if grep -qEi "WARN.*(git-tracked|guard-destructive-generic)" <<<"$OUT"; then
+    fail "(#4566) tracked vendored guard must not produce a WARN (got: $(grep -Ei "WARN.*(git-tracked|guard-destructive-generic)" <<<"$OUT" | head -1))"
+else
+    pass "(#4566) no WARN for the deliberately-tracked vendored guard"
+fi
+if [[ -z "$(cd "$REPO" && git status --porcelain -- .loom/hooks/guard-destructive-generic.sh 2>&1)" ]]; then
+    pass "(#4403) tracked guard file stays non-dirty (no local mods/deletions) after the run"
+else
+    fail "(#4403) tracked guard file is dirty after the run"
+fi
+# #4566: routed through note(), so --quiet suppresses it entirely while the
+# file is still preserved (behavior unchanged, only the reporting is quieter).
+OUT_Q="$(cd "$REPO" && bash "$SCRIPT" --quiet 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4566) --quiet rerun exits 0"; else fail "(#4566) --quiet rerun exits 0 (got $RC)"; fi
+if grep -q "git-tracked vendored fallback kept" <<<"$OUT_Q"; then
+    fail "(#4566) --quiet still printed the tracked-guard message (not routed through note())"
+else
+    pass "(#4566) --quiet suppresses the tracked-guard message"
+fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4566) --quiet rerun still preserves the git-tracked vendored guard"
+else
+    fail "(#4566) --quiet rerun removed the git-tracked vendored guard"
+fi
+
+# --- (#4403) canonical-guard-defer: untracked target keeps existing behavior -
+echo "Test group 15: canonical guard present + UNTRACKED vendored guard is still removed (#4403)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+# Note: intentionally NOT git-added, so this is the normal consumer-repo case
+# where .loom/ isn't committed.
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4403) apply exits 0 with an untracked vendored guard present"; else fail "(#4403) apply exits 0 (got $RC)"; fi
+if [[ ! -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4403) untracked hooks/guard-destructive-generic.sh removed (existing behavior unchanged)"
+else
+    fail "(#4403) untracked hooks/guard-destructive-generic.sh was NOT removed"
+fi
+if grep -q "removed.*hooks/guard-destructive-generic.sh" <<<"$OUT"; then
+    pass "(#4403) removal reported as before"
+else
+    fail "(#4403) removal not reported"
+fi
+
+# --- (#4563) refuse to run from a linked worktree ----------------------------
+#
+# The installed .loom/ is always resolved against the PRIMARY worktree, so a run
+# from a linked (issue/PR) worktree writes to the MAIN checkout — the 2026-07-30
+# contamination incident. Assert the refusal, that it wrote NOTHING to main, and
+# that the explicit overrides still permit the write.
+echo "Test group 16: linked-worktree invocation is refused (#4563)"
+REPO="$(make_fixture)"
+LINKED_WT="$WORKDIR/linked-wt"
+rm -rf "$LINKED_WT"
+if ! git -C "$REPO" worktree add -q -b wt-4563 "$LINKED_WT" >/dev/null 2>&1; then
+    skip "(#4563) git worktree add unavailable in this environment"
+else
+    RC=0; OUT="$(cd "$LINKED_WT" && bash "$SCRIPT" 2>&1)" || RC=$?
+    if [[ $RC -ne 0 ]]; then
+        pass "(#4563) run from a linked worktree exits non-zero (got $RC)"
+    else
+        fail "(#4563) run from a linked worktree did NOT refuse (exit 0)"
+    fi
+    if grep -qi "worktree" <<<"$OUT"; then
+        pass "(#4563) refusal explains the worktree context"
+    else
+        fail "(#4563) refusal message does not mention the worktree"
+    fi
+    if grep -q -- "--allow-worktree" <<<"$OUT"; then
+        pass "(#4563) refusal names the --allow-worktree override"
+    else
+        fail "(#4563) refusal does not name the override flag"
+    fi
+    # (b) NOTHING written under the main checkout's .loom/
+    if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "OLD" ]]; then
+        pass "(#4563) main checkout's drifted hooks/guard.sh left UNCHANGED"
+    else
+        fail "(#4563) main checkout's hooks/guard.sh was written from the worktree"
+    fi
+    if [[ ! -f "$REPO/.loom/scripts/lib/bar.sh" ]]; then
+        pass "(#4563) main checkout's missing scripts/lib/bar.sh NOT created"
+    else
+        fail "(#4563) a file was created under the main checkout's .loom/"
+    fi
+    if grep -q '"loom_version": "0.0.0"' "$REPO/.loom/install-metadata.json"; then
+        pass "(#4563) main checkout's install-metadata.json NOT re-stamped"
+    else
+        fail "(#4563) main checkout's install-metadata.json was re-stamped"
+    fi
+    # --dry-run is refused too: it reports on the MAIN checkout, not this worktree.
+    RC=0; (cd "$LINKED_WT" && bash "$SCRIPT" --dry-run >/dev/null 2>&1) || RC=$?
+    if [[ $RC -eq 1 ]]; then
+        pass "(#4563) --dry-run from a linked worktree is also refused (exit 1)"
+    else
+        fail "(#4563) --dry-run from a linked worktree was not refused (got $RC)"
+    fi
+
+    # (c) the override permits the write (still targeting the MAIN checkout).
+    RC=0; OUT="$(cd "$LINKED_WT" && bash "$SCRIPT" --allow-worktree 2>&1)" || RC=$?
+    if [[ $RC -eq 0 ]]; then
+        pass "(#4563) --allow-worktree permits the run (exit 0)"
+    else
+        fail "(#4563) --allow-worktree did not permit the run (got $RC)"
+    fi
+    if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+        pass "(#4563) --allow-worktree wrote the main checkout's installed copy"
+    else
+        fail "(#4563) --allow-worktree did not apply the resync"
+    fi
+    if grep -qi "WARN.*linked worktree" <<<"$OUT"; then
+        pass "(#4563) --allow-worktree still WARNs that writes target the main checkout"
+    else
+        fail "(#4563) --allow-worktree did not warn about the main-checkout target"
+    fi
+
+    # The env override is the non-interactive equivalent of the flag.
+    REPO="$(make_fixture)"
+    rm -rf "$LINKED_WT"
+    git -C "$REPO" worktree add -q -b wt-4563-env "$LINKED_WT" >/dev/null 2>&1
+    RC=0; (cd "$LINKED_WT" && LOOM_RESYNC_ALLOW_WORKTREE=1 bash "$SCRIPT" >/dev/null 2>&1) || RC=$?
+    if [[ $RC -eq 0 && "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+        pass "(#4563) LOOM_RESYNC_ALLOW_WORKTREE=1 is equivalent to --allow-worktree"
+    else
+        fail "(#4563) LOOM_RESYNC_ALLOW_WORKTREE=1 did not permit the run (rc=$RC)"
+    fi
+fi
+
+# --- (#4563) the MAIN checkout is completely unaffected ----------------------
+#
+# Including from a SUBDIRECTORY of it, where `git rev-parse --git-common-dir`
+# returns a RELATIVE path ("../../.git") — a naive string compare against the
+# absolute `--show-toplevel` would refuse this legitimate run.
+echo "Test group 17: main-checkout invocation (incl. subdirectories) still works (#4563)"
+REPO="$(make_fixture)"
+RC=0; (cd "$REPO/defaults/scripts" && bash "$SCRIPT" >/dev/null 2>&1) || RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(#4563) run from a main-checkout subdirectory exits 0"
+else
+    fail "(#4563) run from a main-checkout subdirectory was refused (got $RC)"
+fi
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+    pass "(#4563) run from a main-checkout subdirectory still applies the resync"
+else
+    fail "(#4563) run from a main-checkout subdirectory did not apply the resync"
+fi
+
 # --- contract checks ---------------------------------------------------------
 echo "Test group 13: flag/contract checks"
 if bash "$SCRIPT" --help 2>&1 | grep -q "resync-installed.sh"; then
@@ -547,6 +801,12 @@ else
     fail "--help did not print usage"
 fi
 if bash "$SCRIPT" --help >/dev/null 2>&1; then pass "--help exits 0"; else fail "--help did not exit 0"; fi
+HELP_OUT="$(bash "$SCRIPT" --help 2>&1)"
+if grep -q -- "--allow-worktree" <<<"$HELP_OUT" && grep -qi "linked worktree" <<<"$HELP_OUT"; then
+    pass "(#4563) --help documents --allow-worktree and the refusal behavior"
+else
+    fail "(#4563) --help does not document --allow-worktree / the refusal behavior"
+fi
 
 REPO="$(make_fixture)"
 RC=0; (cd "$REPO" && bash "$SCRIPT" --bogus >/dev/null 2>&1) || RC=$?

@@ -46,8 +46,11 @@ are two delivery paths, tried in order; the same degradation contract from
 
 ## 2. When to post (sparingly)
 
-**The room is a human's phone, not a log file.** A message should be something
-a person watching Element would actually want to see arrive as a notification.
+**The signal room is a human's phone, not a log file.** A message should be
+something a person watching Element would actually want to see arrive as a
+notification. (Since #4225 the fleet spans a signal room and per-repo firehose
+rooms — see §3a — but that is a reason to pick the right `type`, **not** a licence
+to narrate freely into the firehose: the guidance below applies to both.)
 Routine progress narration is already covered by the daemon's own event-bus
 narration (`safehouse.md` phase 1) — a worker posting the same information a
 second time is noise, not signal.
@@ -104,11 +107,38 @@ consuming. `--limit <n>` caps how many messages come back in one call.
   number), so your message threads alongside the daemon's phase narration for
   that issue (see the envelope table in `safehouse.md`).
 - **`to`**: `"*"` (broadcast) — this is a shared room, not a DM.
-- **`type`**:
+- **`type`**: this is also what picks the **room** your message lands in (see
+  §3a) — choose it for what the message *is*, and routing follows.
   - `task` — routine, in-band progress (claim / PR-created lines).
   - `handoff` — a genuine blocker; this is the signal that a human must act.
   - `chat` — free-form conversation (rare for automated posts; mostly for
     replying to an operator's directed message).
+
+## 3a. Which room your post lands in (routing by `type`, #4225)
+
+The fleet is not one room. Messages route by **attention class first, repo
+second**, and **severity routes — never duplicate**: one message, exactly one
+room. You do **not** name a room; the `type` you pick decides it:
+
+| Your `type` | Room | Why |
+|---|---|---|
+| `task`, `chat` | the **per-repo firehose** (`fleet-<repo>`, muted by default) | dispatch/phase/worker chatter — read when someone is actively watching that repo |
+| `handoff` | the **signal room** (`loom-fleet`, notifications **on**) | a human must act; this is the operator's phone |
+
+Practical consequences for a role:
+
+- **Do not post the same thing twice** to "make sure it's seen". A `handoff`
+  already goes to the room with notifications on; re-posting it as a `task` just
+  adds noise to the firehose.
+- **`handoff` is the escalation lever, and it is the only one.** Use it for a
+  genuine blocker (per §2) — not for routine progress you would like to be
+  noticed. Over-using it re-creates exactly the drowned-signal problem this split
+  exists to fix.
+- Keep `task_id` repo-qualified (`<repo>_<issue>`) as below: threading works the
+  same inside whichever room the message lands in.
+- On a host with no `safehouse.rooms` map configured, every type still goes to the
+  single configured room — the behavior is unchanged, and nothing you do differs.
+  The daemon's own narration follows the identical table (see `safehouse.md`).
 
 ## 4. What NOT to do
 

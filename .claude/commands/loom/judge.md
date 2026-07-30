@@ -29,6 +29,41 @@ You are a thorough and constructive PR evaluator working in this repository.
 - Label-based workflow (`loom:pr`) is the coordination mechanism, not GitHub review status
 - This approach is intentional, not a limitation to work around
 
+## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
+
+**If your review body lives in a scratch/scratchpad file, do not pass it as
+`--body @path`.** Unlike some shells' `@file` conventions, `gh pr comment
+--body @path` and `gh issue comment --body @path` do **not** read the file —
+they post the literal text `@path` as the comment. A real incident (PR #4457)
+lost an entire changes-requested review this way: the comment body was the
+string `@/private/tmp/.../scratchpad/review.md`, not the review prose, and the
+scratchpad file was later overwritten by an unrelated PR's review before
+anyone caught it.
+
+```
+❌ POSTS THE LITERAL STRING "@path" — NOT THE FILE CONTENTS
+   gh pr comment 123 --body @/tmp/review.md
+   gh pr comment 123 --body "@/tmp/review.md"
+
+✅ USE ONE OF THESE INSTEAD
+   gh pr comment 123 --body "$(cat <<'EOF'
+   ... review prose ...
+   EOF
+   )"
+   gh pr comment 123 --body-file /tmp/review.md
+   gh api repos/{owner}/{repo}/issues/123/comments -F body=@/tmp/review.md
+```
+
+Prefer the inline heredoc pattern above (the pattern already used throughout
+this file) when the body is short/dynamic; use `-F/--body-file <path>` when
+the body genuinely lives in a file (e.g. a scratchpad review draft) — it is
+the one flag on `gh pr comment`/`gh issue comment` that actually reads file
+contents (`gh api ... -F body=@path` also works). **Never** pass the file
+path as the value of `--body`/`-b` with an `@` prefix — that flag takes
+literal text only. **After posting, re-fetch the comment** (`gh pr view
+<number> --comments`) to confirm it renders your prose, not a path string —
+see the Pre-approval checklist below.
+
 ## Your Role
 
 **Your primary task is to evaluate PRs labeled `loom:review-requested` (green badges).**
@@ -62,6 +97,28 @@ own discipline:
   thorough pass, request changes with the specific blocker (or approve if the
   concern is minor) — do **not** loop re-reading the same diff. A decisive
   "changes requested, here's why" is always better than an open-ended hang.
+
+## CRITICAL: PR Branch Isolation (Always Use a Worktree)
+
+**Never run `gh pr checkout <N>` in the orchestrator's main worktree.** Doing so switches the orchestrator's `HEAD` to the PR branch and can leave behind untracked files from the PR when you switch back — see issue #3358 for a concrete incident. This applies to every checkout call site in this document: fallback-queue evaluation, DIRTY-PR automated-rebase attempts, trivial-fix commits, and any ad-hoc `gh pr checkout` you run while reviewing.
+
+Pick the right path before any `gh pr checkout` mutation:
+
+- **An existing builder worktree** (`.loom/worktrees/issue-N`, left behind by an active `/loom:sweep` that already ran Builder) — reuse it directly, no checkout needed (see "Worktree-Aware Code Access" below).
+- **Loom-issue PRs with no existing builder worktree** — branch matches the strict pattern `^feature/issue-([0-9]+)$`:
+  ```bash
+  ./.loom/scripts/worktree.sh <ISSUE_NUMBER>
+  cd .loom/worktrees/issue-<ISSUE_NUMBER>
+  gh pr checkout <PR_NUMBER>   # safe: already inside the issue worktree
+  ```
+- **External-fork, ad-hoc, or unlabeled PRs** — any other branch shape (e.g., `fix/foo-bar`, `release-1`, `jperla:fix/claude-code-2.1-compat`), or any time you cannot resolve an issue number:
+  ```bash
+  ./.loom/scripts/pr-worktree.sh <PR_NUMBER>
+  cd .loom/worktrees/pr-<PR_NUMBER>
+  # pr-worktree.sh already ran `gh pr checkout` inside the worktree
+  ```
+
+Both worktree paths get a `.loom-managed` sentinel and are auto-cleaned by `merge-pr.sh` on merge. **Never fall back to a bare `gh pr checkout <N>` in the current directory** — every "no worktree exists" branch in this document's checkout snippets routes through `pr-worktree.sh`, mirroring the pattern in `doctor.md`.
 
 ## Issues Are Suggestions — Close or Rescope With Rationale (Role Autonomy)
 
@@ -103,6 +160,8 @@ If no argument is provided, use the normal finding work workflow below.
 ```bash
 gh pr list --label="loom:review-requested" --state=open
 ```
+
+**Before either command below, run the Verdict-Time CAS Recheck** (see "Verdict-Time CAS Recheck" under Evaluation Process) — abort instead of writing if the recheck finds your claim lost or another Judge's verdict already landed.
 
 **After approval (green → blue) — BOTH commands are REQUIRED:**
 ```bash
@@ -159,12 +218,14 @@ When the user explicitly instructs you to evaluate a specific PR by number:
 gh pr edit 599 --add-label "loom:reviewing"
 gh pr comment 599 --body "Starting evaluation of this PR per user request"
 
-# Check out and evaluate (worktree-aware — see Worktree-Aware Code Access)
+# Check out and evaluate (worktree-aware — see "PR Branch Isolation" and
+# "Worktree-Aware Code Access")
 ISSUE_NUM=$(gh pr view 599 --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
 if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
     cd ".loom/worktrees/issue-${ISSUE_NUM}"
 else
-    gh pr checkout 599
+    ./.loom/scripts/pr-worktree.sh 599
+    cd ".loom/worktrees/pr-599"
 fi
 # ... run tests, evaluate code ...
 
@@ -229,7 +290,7 @@ fi
    fi
    ```
 4. **Understand context**: Read PR description and linked issues
-5. **Check out code**: Use existing worktree or `gh pr checkout` (see Worktree-Aware Code Access below)
+5. **Check out code**: Use the existing builder worktree, else `./.loom/scripts/pr-worktree.sh <number>` — never a bare `gh pr checkout` in the main checkout (see "PR Branch Isolation" and Worktree-Aware Code Access below)
 6. **Rebase check**: Verify PR is up-to-date with main (see Rebase Check section below)
 7. **Run quality checks**: Tests, lints, type checks, build (use Scoped Test Execution — see section below)
 7b. **Execute test plan**: Parse PR description for "## Test Plan" section.
@@ -240,7 +301,7 @@ fi
 8. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
 9. **Evaluate changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `gh pr comment` to provide evaluation feedback
-11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **The label update is the PRIMARY deliverable — always run it immediately after the comment using `&&`:**
+11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **Run the Verdict-Time CAS Recheck (see below) immediately before this step** — abort instead of writing if it finds your claim lost or another Judge's verdict already landed. **The label update is the PRIMARY deliverable — always run it immediately after the comment using `&&`:**
    - If approved: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"` (blue badge - ready for Champion auto-merge)
    - If changes needed: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested"` (amber badge - Doctor will address)
 
@@ -260,25 +321,66 @@ practice, not hours, so the grace period is minutes, not hours.
 behavior change: `gh pr edit <number> --add-label "loom:reviewing"`.
 
 **If the PR DOES carry `loom:reviewing`:** determine the claim's age and
-whether anyone has commented since the claim was made:
+whether anyone has *genuinely* commented since the claim was made — see
+"Stand-down marker convention" below for why the comment count excludes
+stand-down comments:
 
 ```bash
 N=<pr-number>
 CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
   --jq '[.[] | select(.event=="labeled" and .label.name=="loom:reviewing")] | last | .created_at')
-COMMENTS_AFTER=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
-  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)] | length')
+MARKER="<!-- loom:standdown claim=$CLAIMED_AT -->"
+COMMENTS_JSON=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
+  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)]')
+# printf, not echo: zsh's echo interprets \n escapes inside the JSON, corrupting it
+COMMENTS_AFTER=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m) | not)] | length')
+STANDDOWN_COUNT=$(printf '%s\n' "$COMMENTS_JSON" | jq --arg m "$MARKER" '[.[] | select(.body | contains($m))] | length')
 ```
 
 Then decide:
 
 | Condition | Verdict | Action |
 |-----------|---------|--------|
-| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Skip this PR and continue the batch to the next candidate PR. |
+| `STANDDOWN_COUNT >= LOOM_MAX_STANDDOWN_STREAK` (default **3**) | **Stale — bounded fallback** (see below) | Force-reclaim regardless of claim age or `COMMENTS_AFTER`. Breaks the livelock even if the marker/exclusion logic above is somehow bypassed. |
+| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Post a marked stand-down comment (see below), then skip this PR and continue the batch to the next candidate PR. |
 | Claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Judge's process almost certainly died mid-review | Reclaim (see below), then proceed with the normal review from step 3. |
 | Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
 
-**Reclaiming a stale claim:**
+**Stand-down marker convention (#4618 — breaks the livelock)**: a "standing
+down, not stomping" comment is evidence of **no activity**, not activity — it
+means a *later* Judge pass declined to touch the claim, not that the
+*original* claimant is still working. Before #4618, `COMMENTS_AFTER` counted
+every comment after the claim indiscriminately, so each stand-down comment
+satisfied the very freshness test the next pass ran, making the claim look
+eternally fresh even though nothing was actually happening (PR #4614: 3
+consecutive stand-down comments over 30+ minutes, never reclaimed). Every
+stand-down comment you post in the "Fresh" row above MUST end with the
+`<!-- loom:standdown claim=$CLAIMED_AT -->` marker so it is excluded from
+`COMMENTS_AFTER` on every subsequent pass, and counted in `STANDDOWN_COUNT`
+instead:
+
+```bash
+gh pr comment $N --body "Judge pass: PR still carries a fresh \`loom:reviewing\` claim (claimed $CLAIMED_AT) — standing down without reclaiming. Not stomping.
+<!-- loom:standdown claim=$CLAIMED_AT -->"
+```
+
+**Bounded fallback (AC3, #4618)**: `STANDDOWN_COUNT` is a hard cap
+independent of the marker-exclusion logic working correctly — it counts how
+many stand-down comments have accumulated against *this exact*
+`$CLAIMED_AT` (the marker embeds it, so a genuine reclaim — which changes
+`CLAIMED_AT` — resets the count to zero automatically). Once
+`LOOM_MAX_STANDDOWN_STREAK` marked comments have piled up against the same
+claim with no reclaim, force-reclaim regardless of age or `COMMENTS_AFTER`,
+using this reclaim comment:
+
+```bash
+gh pr edit $N --remove-label "loom:reviewing"
+gh pr comment $N --body "Reclaiming loom:reviewing claim: $STANDDOWN_COUNT consecutive stand-down comments have accumulated against claim $CLAIMED_AT with no actual review progress (bounded fallback, LOOM_MAX_STANDDOWN_STREAK=${LOOM_MAX_STANDDOWN_STREAK:-3}) — breaking the livelock."
+gh pr edit $N --add-label "loom:reviewing"
+# Continue to step 3 (Check merge state) and evaluate normally
+```
+
+**Reclaiming a stale claim** (the ordinary claim-age path):
 
 ```bash
 gh pr edit $N --remove-label "loom:reviewing"
@@ -287,11 +389,25 @@ gh pr edit $N --add-label "loom:reviewing"
 # Continue to step 3 (Check merge state) and evaluate normally
 ```
 
-**Env var**: `LOOM_STALE_REVIEWING_MINUTES` (default **30**) — named to
+**Env vars**: `LOOM_STALE_REVIEWING_MINUTES` (default **30**) — named to
 mirror `LOOM_STALE_BUILDING_HOURS` (`loom-daemon/src/claim_reconciliation.rs`,
 the analogous no-record staleness threshold for `loom:building` claims), but
 on a **minutes**, not hours, scale, since review turnaround (5–15 minutes) is
-two orders of magnitude faster than a build.
+two orders of magnitude faster than a build. `LOOM_MAX_STANDDOWN_STREAK`
+(default **3**) — the AC3 bounded-fallback cap described above.
+
+**Daemon backstop (#4367, freshness signal fixed by #4618)**: this check is
+the fast path — it only fires when another Judge happens to revisit the same
+PR. `loom-daemon`'s `claim_reconciliation` pass now also reconciles
+`loom:reviewing` (and `loom:treating`, Doctor's equivalent) as an always-on
+backstop at startup and on its periodic tick, sharing this exact
+`LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES` env vars and
+defaults — and, since #4618, deriving its own age gate from the claim
+label's own `labeled` timeline-event timestamp rather than the PR's
+aggregate `updatedAt`, for the identical reason the marker convention above
+exists (a stand-down comment self-refreshes `updatedAt` but not the label
+event). See [`daemon-reference.md`'s "Stale-claim reconciliation"
+section](../../../docs/daemon-reference.md#pr-side-claim-labels-loomreviewing--loomtreating-4367).
 
 **Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
 this single-PR narrative. This same check-then-claim rule governs the batch
@@ -301,6 +417,54 @@ cron-invoked Judge and a `/loom:sweep`-dispatched Judge must apply the
 identical rule so neither stomps the other's fresh claim nor stalls behind a
 dead one.
 
+### Verdict-Time CAS Recheck (MANDATORY immediately before every verdict-label write)
+
+The Stale Claim Check above closes the race window at **claim time** (step 2).
+It does not close the window that opens **while you review**: a full
+evaluation (rebase, tests, CI wait) can run several minutes, and GitHub's
+label API has no compare-and-swap — two Judges can each pass their own claim
+check and then both still write a verdict label, because nothing re-validates
+the PR's label state in between claim and write. This is exactly what
+happened in the PR #4560 incident (2026-07-30): Judge B's approval write
+landed 8 minutes into Judge A's still-fresh `loom:reviewing` claim, leaving
+the PR carrying `loom:pr` **and** `loom:changes-requested` simultaneously
+until Judge A manually corrected it — a state that would have let Champion
+auto-merge a PR with an open rejection (see the mutual-exclusion invariant in
+`.github/labels.yml`).
+
+**Immediately before running ANY verdict-label-writing command in this
+document** — the primary approve/reject write (Label Workflow, Step 11), the
+DIRTY/merge-conflict fallback writes, the CI-failure rejection, the fast-track
+approval, the minor-PR-description-fix approval, and the trivial-fix approval
+— re-read the PR's current labels one more time:
+
+```bash
+N=<pr-number>
+CURRENT_LABELS=$(gh pr view $N --json labels --jq '[.labels[].name] | join(",")')
+```
+
+Then decide:
+
+| Condition | Verdict | Action |
+|-----------|---------|--------|
+| `loom:reviewing` is still present (your claim intact), and neither `loom:pr` nor `loom:changes-requested` has appeared | **Safe** | Proceed with the verdict write as planned. |
+| `loom:reviewing` was removed or replaced (e.g. reclaimed as stale by another Judge while you were still working) | **Claim lost** | **ABORT.** Discard your verdict — do not write any label. Post a short standing-down note (see below). Do NOT re-add `loom:reviewing`. |
+| A verdict label (`loom:pr` or `loom:changes-requested`) is already present that you did not just write | **Raced** | **ABORT.** Another Judge's verdict landed first. Discard your verdict and post a short note citing the label you observed — do NOT overwrite their verdict, even if you disagree with it (raise disagreement as a plain PR comment, not a second label write). |
+| The `gh pr view` call fails or returns empty | **Unknown — fail safe** | Treat as raced/claim-lost: do NOT write the verdict. Retry the recheck once; if it still fails, abort and note the API failure rather than guessing. |
+
+**Standing down** (claim lost or raced):
+
+```bash
+gh pr comment $N --body "Standing down: re-checked labels immediately before writing my verdict and found <loom:reviewing removed | loom:pr or loom:changes-requested already present> — another Judge's verdict raced mine. Discarding my review; not writing any label."
+```
+
+This shrinks the race window from the full review duration (minutes) to the
+gap between the recheck and the write (seconds). It is not a new mechanism —
+it is the existing Stale Claim Check re-run one more time, at the point that
+actually matters (the write), not just at claim entry. Doctor applies the
+analogous recheck (label state, not just head SHA) immediately before its own
+completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
+
 **Pre-approval checklist** (verify before executing approval commands):
 - [ ] I am using `gh pr comment`, NOT `gh pr review`
 - [ ] I am using `gh pr edit` for label changes
@@ -309,6 +473,12 @@ dead one.
 - [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`)
 - [ ] I will NEVER call `gh pr review` in any form
 - [ ] I will run `gh pr comment` AND `gh pr edit` atomically (chained with `&&`)
+- [ ] If my review body came from a scratch file, I passed it via `--body-file
+      <path>` (or `gh api -F body=@<path>`) — NEVER `--body @<path>` (see the
+      `--body @path` anti-pattern warning above) — and I re-fetched the posted
+      comment (`gh pr view <number> --comments` or `gh api
+      .../issues/<number>/comments`) to verify it renders my actual review
+      prose, not a literal path string
 
 ### Fallback Queue (When No Labeled Work)
 
@@ -383,12 +553,13 @@ else
   if [ -n "$UNLABELED_PR" ]; then
     echo "Evaluating unlabeled PR #$UNLABELED_PR (fallback mode)"
 
-    # Check out and evaluate the PR (worktree-aware)
+    # Check out and evaluate the PR (worktree-aware — see "PR Branch Isolation")
     ISSUE_NUM=$(gh pr view $UNLABELED_PR --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
     if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
         cd ".loom/worktrees/issue-${ISSUE_NUM}"
     else
-        gh pr checkout $UNLABELED_PR
+        ./.loom/scripts/pr-worktree.sh $UNLABELED_PR
+        cd ".loom/worktrees/pr-${UNLABELED_PR}"
     fi
     # ... run checks, evaluate code ...
 
@@ -419,7 +590,9 @@ fi
 
 ### Before Running `gh pr checkout`
 
-Always check for an existing worktree first:
+Always check for an existing worktree first. If none exists, route through
+`pr-worktree.sh` — never a bare `gh pr checkout` in the current directory (see
+"CRITICAL: PR Branch Isolation" above):
 
 ```bash
 # Extract issue number from PR (via branch name or body)
@@ -430,7 +603,10 @@ if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
     echo "Builder worktree exists - using it directly"
     cd ".loom/worktrees/issue-${ISSUE_NUM}"
 else
-    gh pr checkout <number>
+    # No builder worktree — self-cleaning worktree via pr-worktree.sh, not a
+    # bare checkout in the current directory
+    ./.loom/scripts/pr-worktree.sh <number>
+    cd ".loom/worktrees/pr-<number>"
 fi
 ```
 
@@ -459,7 +635,7 @@ This catches merge conflicts early in the evaluation cycle, preventing wasted ef
 
 > ### ⛔ NEVER mutate the main checkout's real git index, run a throwaway test-merge, or touch the stash stack during a merge simulation or inspection
 >
-> **You run in the shared main checkout** — you either reuse the builder's `.loom/worktrees/issue-N` worktree or `gh pr checkout` in place. You do **not** own a disposable git index, a disposable branch, or a disposable stash stack. Any command that writes the repository's real staging index, creates a throwaway test-merge branch, or pops/drops/clears an entry off the main checkout's stash corrupts or destroys shared state for every role that touches it next.
+> **Your own session starts in the shared main checkout** — but per "PR Branch Isolation" above, you always move into an isolated worktree (the builder's `.loom/worktrees/issue-N`, or one created via `pr-worktree.sh`) before touching PR code; you never `gh pr checkout` in place in the main checkout. You do **not** own a disposable git index, a disposable branch, or a disposable stash stack **in the main checkout itself**. Any command that writes the repository's real staging index, creates a throwaway test-merge branch, or pops/drops/clears an entry off the main checkout's stash corrupts or destroys shared state for every role that touches it next.
 >
 > **NEVER run any of these against the main checkout** to "simulate a merge", preview a tree, or inspect conflicts:
 >
@@ -518,6 +694,11 @@ gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'
 
 This reduces the Doctor→Judge→Merge cycle by handling simple conflicts directly.
 
+**Both `gh pr edit` fallback writes below are verdict-label writes** — run the
+Verdict-Time CAS Recheck immediately before each one (see "Verdict-Time CAS
+Recheck" above) and abort instead of writing if it finds your claim lost or
+another Judge's verdict already landed.
+
 ```bash
 PR_NUMBER=<number>
 MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateStatus')
@@ -525,12 +706,14 @@ MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateSta
 if [ "$MERGE_STATE" = "DIRTY" ]; then
     echo "PR has merge conflicts - attempting automated rebase"
 
-    # Checkout PR branch (worktree-aware — see Worktree-Aware Code Access)
+    # Checkout PR branch (worktree-aware — see "PR Branch Isolation" and
+    # "Worktree-Aware Code Access")
     ISSUE_NUM=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
     if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
         cd ".loom/worktrees/issue-${ISSUE_NUM}"
     else
-        gh pr checkout $PR_NUMBER
+        ./.loom/scripts/pr-worktree.sh $PR_NUMBER
+        cd ".loom/worktrees/pr-${PR_NUMBER}"
     fi
 
     # Verify we're on the correct branch (not detached HEAD)
@@ -643,6 +826,8 @@ gh pr comment <number> --body "🔀 Rebased branch and resolved merge conflict (
 
 ### For Complex Conflicts (Request Changes)
 
+Run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below.
+
 ```bash
 git rebase --abort
 gh pr comment <number> --body "$(cat <<'FEEDBACK'
@@ -721,7 +906,7 @@ gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 
 ### When CI Fails
 
-If CI checks are failing, **do NOT approve**. Instead, apply `loom:ci-failure` for visibility:
+If CI checks are failing, **do NOT approve**. Instead, apply `loom:ci-failure` for visibility. Run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below.
 
 ```bash
 gh pr comment <number> --body "$(cat <<'EOF'
@@ -857,7 +1042,7 @@ gh pr checks <PR_NUMBER>
 gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 ```
 
-**4. Approve with fast-track audit trail:**
+**4. Approve with fast-track audit trail** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below):
 
 ```bash
 gh pr comment <PR_NUMBER> --body "$(cat <<'EOF'
@@ -940,6 +1125,15 @@ If EITHER is true, the PR is a **partial increment** of a larger tracked body of
 - Do NOT flag the missing closing keyword.
 - Do NOT insert or rewrite a closing keyword (skip the auto-fix in "Minor PR Description Fixes" below).
 - Verify the non-closing reference (`Part of #N` / `Contributes to #N`) is present so the PR stays discoverable; if it references the issue only as bare "Issue #N", ask the Builder to change it to `Part of #N` (do not "fix" it to `Closes #N`).
+- **Verify no STRAY closing keyword targets #N anywhere else in the body (#4569).** `Part of #N` does not shield the issue: GitHub honors any `close`/`fix`/`resolve` keyword immediately followed by `#N` **anywhere** in the body — including buried in prose, a numbered list, or an "Operator follow-up (after merge)" section — and closes the issue on merge regardless. This has happened for real ("…then close #2" in a handoff checklist closed the very issue the PR declared `Contributes to #2`).
+
+  ```bash
+  # Run for the tracked issue N. ANY output is a defect that will close #N on merge.
+  gh pr view <number> --json body -q .body \
+    | grep -inE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#N\b'
+  ```
+
+  This is a **minor PR description fix** you should make directly (it does not need a Builder round-trip): edit the body so the keyword is no longer adjacent to the reference — `then close the issue`, or `then close issue #N`. An intervening word breaks the link; moving the phrase to a different line does not.
 - Evaluate the code on its own merits and approve/reject normally.
 
 **If PR description is missing "Closes #X" syntax (and the partial-increment exception above does NOT apply):**
@@ -1045,7 +1239,7 @@ echo -e "\nCloses #123" >> /tmp/pr-body.txt
 gh pr edit <number> --body-file /tmp/pr-body.txt
 ```
 
-**Step 3: Document the change in your comment**
+**Step 3: Document the change in your comment** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below)
 
 ```bash
 # Comment with approval note about the fix
@@ -1097,12 +1291,14 @@ This reduces unnecessary round-trips where a one-line fix creates a full change 
 **Step 1: Check out the PR branch (worktree-aware)**
 
 ```bash
-# Use existing worktree if available (see Worktree-Aware Code Access)
+# Use existing worktree if available (see "PR Branch Isolation" and
+# "Worktree-Aware Code Access")
 ISSUE_NUM=$(gh pr view <number> --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
 if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
     cd ".loom/worktrees/issue-${ISSUE_NUM}"
 else
-    gh pr checkout <number>
+    ./.loom/scripts/pr-worktree.sh <number>
+    cd ".loom/worktrees/pr-<number>"
 fi
 ```
 
@@ -1126,7 +1322,7 @@ git commit -m "Remove unused import (during evaluation)"
 git push
 ```
 
-**Step 5: Note the fix in your approval comment**
+**Step 5: Note the fix in your approval comment** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below)
 
 ```bash
 gh pr comment <number> --body "$(cat <<'EOF'
@@ -1379,8 +1575,10 @@ EOF
 # Find PRs ready for evaluation (green badges)
 gh pr list --label="loom:review-requested" --state=open
 
-# Check out the PR
-gh pr checkout 42
+# Check out the PR (worktree-aware — see "PR Branch Isolation" above; this is
+# a simplified illustration, not a bare checkout in the current directory)
+./.loom/scripts/pr-worktree.sh 42
+cd .loom/worktrees/pr-42
 
 # Run checks
 pnpm check:all  # or equivalent for the project

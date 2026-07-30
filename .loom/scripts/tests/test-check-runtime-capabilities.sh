@@ -198,6 +198,57 @@ else
     fail "defaults/runtimes/claude.json not found -- cannot verify real fixtures"
 fi
 
+# --- Test 7: --json machine-readable decision output (#4494) ---
+# The daemon's native admission path compares its unmet-capability SET against
+# this checker's, so the JSON shape (and specifically the `unmet` array) is a
+# contract, not a convenience. Exit codes and the human-readable stderr lines
+# must stay unchanged when --json is passed.
+echo "Test 7: --json emits a stable decision object without changing exit codes (#4494)"
+dir=$(new_fixture_dir)
+cat > "$dir/roles/jsonrole.json" <<'JSON'
+{"name": "JSON Role", "runtimeRequirements": ["mcp", "worktreeIsolation"]}
+JSON
+cat > "$dir/roles/freerole.json" <<'JSON'
+{"name": "Free Role"}
+JSON
+cat > "$dir/runtimes/jsonrt.json" <<'JSON'
+{"runtime": "jsonrt", "capabilities": {"mcp": "yes", "worktreeIsolation": "partial"}}
+JSON
+
+set +e
+json_out="$("$CHECK_SCRIPT" --role jsonrole --runtime jsonrt --dir "$dir" --json 2>/dev/null)"
+json_code=$?
+set -e
+assert_eq "$json_code" "78" "--json preserves the EX_CONFIG(78) mismatch exit code"
+assert_eq "$(jq -r '.decision' <<<"$json_out")" "reject" "--json reports decision=reject on a mismatch"
+assert_eq "$(jq -rc '.unmet' <<<"$json_out")" '["worktreeIsolation"]' \
+    "--json names the exact unmet-capability set (not just pass/fail)"
+assert_eq "$(jq -r '.role + "/" + .runtime' <<<"$json_out")" "jsonrole/jsonrt" \
+    "--json echoes the role and runtime under test"
+
+set +e
+json_out="$("$CHECK_SCRIPT" --role freerole --runtime jsonrt --dir "$dir" --json 2>/dev/null)"
+json_code=$?
+set -e
+assert_eq "$json_code" "0" "--json preserves the exit-0 admit path"
+assert_eq "$(jq -r '.decision' <<<"$json_out")" "admit" "--json reports decision=admit with no requirements"
+assert_eq "$(jq -rc '.unmet' <<<"$json_out")" '[]' "--json reports an empty unmet set on admit"
+
+set +e
+json_out="$("$CHECK_SCRIPT" --role nosuchrole --runtime jsonrt --dir "$dir" --json 2>/dev/null)"
+json_code=$?
+set -e
+assert_eq "$json_code" "1" "--json preserves the exit-1 configuration-error path"
+assert_eq "$(jq -r '.decision' <<<"$json_out")" "error" \
+    "--json distinguishes a configuration error from a capability mismatch"
+
+# Without --json, stdout stays empty (the default contract is unchanged).
+set +e
+plain_out="$("$CHECK_SCRIPT" --role jsonrole --runtime jsonrt --dir "$dir" 2>/dev/null)"
+set -e
+assert_eq "$plain_out" "" "omitting --json leaves stdout byte-for-byte unchanged (empty)"
+rm -rf "$dir"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"

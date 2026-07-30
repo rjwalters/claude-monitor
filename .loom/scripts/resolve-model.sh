@@ -1,6 +1,9 @@
 #!/bin/bash
 
-# resolve-model.sh - Thin stub delegating to loom_tools.model_tiers (#3982)
+# resolve-model.sh - Thin stub delegating to `loom-daemon resolve-model` (#3982)
+#
+# Ported from Python to native Rust in issue #4275 (epic #4081 Phase 3 family
+# 5); flag names, stdout shape and exit codes are unchanged.
 #
 # The /loom:sweep skill shells out to this to resolve a *logical* model tier
 # (`opus`, `sonnet`, `sonnet@xhigh`) to the concrete model ID it should dispatch
@@ -39,8 +42,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Source shared loom-tools helper
-source "$SCRIPT_DIR/lib/loom-tools.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/lib/script-helper.sh"
 
-# Run the command with proper fallback chain
-run_loom_tool "resolve-model" "model_tiers" "$@"
+# `exec`s the native subcommand, so exit 3 ("no mapping — caller falls through")
+# reaches the caller unmodified. See lib/script-helper.sh.
+loom_exec_script_helper resolve-model "$@"

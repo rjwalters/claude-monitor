@@ -193,7 +193,7 @@ else
         "env-over-config resolution logs source=env"
 
     # A config with no runtimes block falls through to the built-in default.
-    printf '{ "champion": { "auto_merge_max_lines": 500 } }\n' > "$WS/.loom/config.json"
+    printf '{ "commit": { "signoff": true } }\n' > "$WS/.loom/config.json"
     output="$(run_worker "$WS" -- -p ping)"
     assert_contains "runtime=claude (from default)" "$output" \
         "config present but no runtimes block resolves to default claude"
@@ -249,6 +249,8 @@ echo "Testing spawn-worker.sh arg + exit-code passthrough..."
 
 # Args with embedded spaces survive as single arguments.
 output="$(run_worker "$WS" -- -p "hello world" --flag --model=x)"
+assert_contains "# LOOM_RUNTIME_RESOLVED runtime=claude" "$output" \
+    "dispatcher emits the runtime-neutral resolution marker"
 assert_contains "stub-claude arg=[hello world]" "$output" \
     "an arg containing a space is forwarded as ONE argument"
 assert_contains "stub-claude arg=[--flag]" "$output" "bare flag forwarded verbatim"

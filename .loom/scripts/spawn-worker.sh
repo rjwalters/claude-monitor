@@ -140,4 +140,5 @@ if [[ ! -f "$RUNNER" ]]; then
 fi
 
 log_info "spawn-worker: runtime=$RUNTIME (from $RUNTIME_SOURCE) -> $(basename "$RUNNER")"
+echo "# LOOM_RUNTIME_RESOLVED runtime=$RUNTIME" >&2
 exec "$RUNNER" "$@"

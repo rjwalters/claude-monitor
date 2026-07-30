@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
 # test-probe-tokens-fallback.sh - Regression guard for #4079, re-scoped in
-# #4228 (epic #4081 Phase 2).
+# #4228 (epic #4081 Phase 2) and again in #4557 (Phase 4).
 #
 # probe-tokens.sh delegates to the native `loom-daemon tokens check`
-# subcommand (issue #4080) and falls back to the `loom-tokens` console
-# script on PATH only when the resolved daemon binary predates the `tokens`
-# subcommand (a host mid-roll). The bare `python3 -m loom_tools.tokens.cli`
-# fallback tier that #4079 originally regression-tested no longer exists at
-# all — it was removed by #4080, well before this file's own cutover phase
-# (#4228). This test now asserts:
+# subcommand (issue #4080) and has NO fallback tier left at all:
+#   - the bare `python3 -m loom_tools.tokens.cli` tier that #4079 originally
+#     regression-tested went in #4080;
+#   - the `loom-tokens`-console-script-on-PATH tier went in #4557, which
+#     deleted the Python package that provided it. A `loom-tokens` binary
+#     surviving on PATH after that deletion is by definition a stale
+#     editable-install leftover — the #4079 shadowing failure mode — so
+#     dispatching to it would be a bug, not a graceful degradation.
+#
+# This test asserts:
 #   1. probe-tokens.sh no longer references the stale module path (#4079).
 #   2. probe-tokens.sh contains NO python3/loom_tools reference whatsoever —
 #      the bare interpreter fallback tier is gone, not just fixed (#4228).
-#   3. With no capable `loom-daemon` binary resolvable and no `loom-tokens`
-#      on PATH, probe-tokens.sh fails loudly (exit 1, actionable message)
-#      rather than silently degrading — there is nothing left to fall back
-#      to.
-#   4. With `loom-tokens` on PATH but no capable daemon binary, probe-tokens.sh
-#      --json exits 0 and emits JSON via that fallback (exercises the real
-#      fallback codepath end-to-end).
+#   3. probe-tokens.sh's executable code contains NO `loom-tokens` reference
+#      whatsoever — the console-script fallback tier is gone (#4557).
+#   4. With no capable `loom-daemon` binary resolvable, probe-tokens.sh fails
+#      loudly (exit 1, actionable message) rather than silently degrading.
+#   5. It fails loudly EVEN WITH a `loom-tokens` on PATH — the presence of a
+#      stale console script must not resurrect the removed fallback (#4557).
 #
 # Usage:
 #   ./.loom/scripts/tests/test-probe-tokens-fallback.sh
@@ -80,6 +83,20 @@ else
     pass "probe-tokens.sh's executable code contains no python3/loom_tools reference"
 fi
 
+# -------- Test 3b: NO `loom-tokens` console-script reference in CODE (#4557) --
+# Epic #4081 Phase 4 deleted the Python package that shipped the `loom-tokens`
+# console script, so `loom-daemon tokens` is the only implementation left. A
+# `loom-tokens` surviving on PATH is a stale editable-install leftover (#4079);
+# dispatching to it would run frozen token logic. Comments recording that
+# history are allowed — only non-comment lines count.
+echo "Test 3b: no loom-tokens console-script fallback in probe-tokens.sh's executable code"
+tokens_hits="$(grep -vE '^\s*#' "$PROBE_SCRIPT" | grep -nE "loom-tokens" || true)"
+if [[ -n "$tokens_hits" ]]; then
+    fail "probe-tokens.sh's executable code still references the retired loom-tokens binary: $tokens_hits"
+else
+    pass "probe-tokens.sh's executable code contains no loom-tokens reference"
+fi
+
 # A hermetic "nothing resolves" workspace: no .git/.loom markers (so
 # probe-tokens.sh's own find_repo_root() falls back to $PWD) and no
 # target/{release,debug}/loom-daemon build-output-relative candidate
@@ -89,16 +106,16 @@ NO_DAEMON_WS="$(mktemp -d)"
 trap 'rm -rf "$NO_DAEMON_WS"' EXIT
 STRIPPED_PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
-# -------- Test 4: neither a capable daemon binary nor loom-tokens on PATH
-#                   fails loudly (exit 1, actionable message) --------
-echo "Test 4: no capable daemon binary and no loom-tokens on PATH -> exit 1"
+# -------- Test 4: no capable daemon binary fails loudly (exit 1,
+#                   actionable message) --------
+echo "Test 4: no capable daemon binary -> exit 1"
 out="$(cd "$NO_DAEMON_WS" && LOOM_DAEMON_BIN="/nonexistent/loom-daemon" \
     PATH="$STRIPPED_PATH" "$PROBE_SCRIPT" --json 2>&1)"
 rc=$?
 if [[ "$rc" -eq 1 ]]; then
-    pass "no daemon binary + no loom-tokens on PATH exits 1"
+    pass "no resolvable daemon binary exits 1"
 else
-    fail "expected exit 1 with no daemon binary + no loom-tokens on PATH, got $rc"
+    fail "expected exit 1 with no resolvable daemon binary, got $rc"
 fi
 if [[ "$out" == *"no loom-daemon binary"* ]]; then
     pass "failure message is actionable (names the missing daemon binary)"
@@ -106,27 +123,31 @@ else
     fail "failure message did not mention the missing daemon binary. Got: $out"
 fi
 
-# -------- Test 5: with loom-tokens on PATH (but no capable daemon binary),
-#                   --json exits 0 and emits JSON via that fallback --------
-echo "Test 5: --json fallback exits 0 and emits JSON via loom-tokens on PATH"
-if command -v loom-tokens >/dev/null 2>&1; then
-    loom_tokens_dir="$(dirname "$(command -v loom-tokens)")"
-    json_out="$(cd "$NO_DAEMON_WS" && LOOM_DAEMON_BIN="/nonexistent/loom-daemon" \
-        PATH="$loom_tokens_dir:$STRIPPED_PATH" "$PROBE_SCRIPT" --json 2>/dev/null)"
-    rc=$?
-    if [[ "$rc" -eq 0 ]]; then
-        pass "fallback --json exit code is 0"
-    else
-        fail "fallback --json expected exit 0, got $rc"
-    fi
-    if printf '%s' "$json_out" | python3 -c "import json,sys; json.load(sys.stdin)" 2>/dev/null; then
-        pass "fallback --json emits parseable JSON"
-    else
-        fail "fallback --json did not emit parseable JSON. Got: $json_out"
-    fi
+# -------- Test 5: a stale `loom-tokens` on PATH does NOT resurrect the removed
+#                   fallback — probe-tokens.sh must still fail loudly (#4557) --
+echo "Test 5: a stale loom-tokens on PATH does not resurrect the removed fallback"
+STALE_BIN_DIR="$(mktemp -d)"
+cat > "$STALE_BIN_DIR/loom-tokens" <<'STALE_EOF'
+#!/usr/bin/env bash
+# Fixture standing in for a stale editable-install console script (#4079).
+echo '{"stale":"this must never run"}'
+exit 0
+STALE_EOF
+chmod +x "$STALE_BIN_DIR/loom-tokens"
+
+stale_out="$(cd "$NO_DAEMON_WS" && LOOM_DAEMON_BIN="/nonexistent/loom-daemon" \
+    PATH="$STALE_BIN_DIR:$STRIPPED_PATH" "$PROBE_SCRIPT" --json 2>&1)"
+rc=$?
+rm -rf "$STALE_BIN_DIR"
+if [[ "$rc" -eq 1 ]]; then
+    pass "stale loom-tokens on PATH still exits 1 (fallback tier is gone)"
 else
-    echo "  (skipping: loom-tokens is not on PATH in this environment — cannot exercise the fallback codepath)"
-    pass "skipped (loom-tokens absent; not a failure)"
+    fail "expected exit 1 with a stale loom-tokens on PATH, got $rc"
+fi
+if [[ "$stale_out" != *"this must never run"* ]]; then
+    pass "stale loom-tokens on PATH was never invoked"
+else
+    fail "probe-tokens.sh invoked the stale loom-tokens fixture. Got: $stale_out"
 fi
 
 # -------- Summary --------

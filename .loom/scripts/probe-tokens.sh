@@ -9,17 +9,22 @@
 # Exit codes:
 #   0 - At least one account was probed (results may be mixed)
 #   1 - Every probe failed, or the tokens directory is missing, or no daemon
-#       binary/loom-tokens fallback could be resolved
+#       binary supporting `tokens check` could be resolved
 #
 # Cron example (every 10 minutes):
 #   */10 * * * * cd /path/to/repo && ./.loom/scripts/probe-tokens.sh --ranking >> .loom/logs/probe-tokens.log 2>&1
 #
 # Delegates to the native `loom-daemon tokens check` subcommand (issue #4080,
 # epic #4081 Phase 2 — a byte-compatible Rust port of the historical Python
-# `loom-tokens check` CLI). Falls back to `loom-tokens` on PATH when the
-# resolved daemon binary predates the `tokens` subcommand (a host mid-roll —
-# #4108 landed in commit 51389917). The bare `python3 -m` fallback tier has
-# been removed entirely.
+# `loom-tokens check` CLI). `loom-daemon tokens` is now the ONLY tier: the two
+# historical fallbacks are both gone. The bare `python3 -m loom_tools.tokens.cli`
+# tier went in #4080; the `loom-tokens`-console-script-on-PATH tier went in epic
+# #4081 Phase 4 (#4557), which deleted the Python package that provided it. A
+# `loom-tokens` still on PATH after that deletion is by definition a STALE
+# editable-install leftover — the #4079 shadowing incident — so falling back to
+# it would run frozen, months-old token logic against the current pool. Failing
+# loudly is the correct behavior; `loom-daemon-update.sh` warns about such
+# leftovers.
 
 set -uo pipefail
 
@@ -55,16 +60,12 @@ if [[ -n "$DAEMON_BIN" ]] && "$DAEMON_BIN" tokens check --help >/dev/null 2>&1; 
 fi
 
 if [[ -n "$DAEMON_BIN" ]]; then
-    echo "WARNING probe-tokens.sh: $DAEMON_BIN does not support 'tokens check' (stale build); falling back to loom-tokens on PATH" >&2
+    echo "ERROR probe-tokens.sh: $DAEMON_BIN does not support 'tokens check' (stale build)." >&2
+else
+    echo "ERROR probe-tokens.sh: no loom-daemon binary could be resolved." >&2
 fi
-
-if command -v loom-tokens &>/dev/null; then
-    loom-tokens check "$@"
-    exit $?
-fi
-
-echo "ERROR probe-tokens.sh: no loom-daemon binary supporting 'tokens check' and no loom-tokens on PATH." >&2
-echo "  Build or start a daemon binary, then retry:" >&2
+echo "  'loom-daemon tokens' is the only implementation — update or rebuild it, then retry:" >&2
+echo "    ./.loom/scripts/cli/loom-daemon-update.sh" >&2
 echo "    ./.loom/scripts/cli/loom-daemon-start.sh" >&2
 echo "    cargo build --release -p loom-daemon" >&2
 exit 1

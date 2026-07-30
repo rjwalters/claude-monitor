@@ -59,6 +59,12 @@ MANIFEST_VERSION=2
 LOOM_SECTION_START='<!-- BEGIN LOOM ORCHESTRATION -->'
 LOOM_SECTION_END='<!-- END LOOM ORCHESTRATION -->'
 
+# Loom section markers in the top-level AGENTS.md (mirrors
+# loom-daemon/src/init/scaffolding.rs AGENTS_SECTION_START / AGENTS_SECTION_END).
+# A separate marker pair so CLAUDE.md and AGENTS.md regions never collide (#4479).
+AGENTS_SECTION_START='<!-- BEGIN LOOM ORCHESTRATION (AGENTS) -->'
+AGENTS_SECTION_END='<!-- END LOOM ORCHESTRATION (AGENTS) -->'
+
 # Find the repository root (works from worktrees and subdirectories)
 find_repo_root() {
     local dir="$PWD"
@@ -120,10 +126,10 @@ ${BOLD}TRACKED FILE SET:${NC}
     metadata file is absent (pre-#3450 installs), a legacy directory
     walk is used instead, with a stderr warning.
 
-    The top-level CLAUDE.md is hashed over its
+    The top-level CLAUDE.md and AGENTS.md are hashed over their
     ${LOOM_SECTION_START} ... ${LOOM_SECTION_END}
-    region only, so sibling edits outside the Loom block do not report
-    drift. All other files are hashed whole.
+    (and the AGENTS-specific) marker region only, so sibling edits outside
+    the Loom block do not report drift. All other files are hashed whole.
 
 ${BOLD}NOT TRACKED (runtime/user/merge-target files):${NC}
     .loom/config.json              Local terminal config
@@ -160,12 +166,16 @@ ${BOLD}EXAMPLES:${NC}
 EOF
 }
 
-# Return "loom-block" for the top-level CLAUDE.md (region-scoped hashing),
-# empty string for every other path (whole-file hashing). Only the repo-root
-# CLAUDE.md is a merge target; .loom/CLAUDE.md is fully Loom-owned.
+# Return the region-scoped-hashing tag for merge-target root docs, empty string
+# for every other path (whole-file hashing). Only the repo-root CLAUDE.md and
+# AGENTS.md are merge targets (their Loom-managed marker block is hashed, so
+# consumer edits outside it don't report drift); .loom/CLAUDE.md and
+# .loom/AGENTS.md are fully Loom-owned and hashed whole (#4479).
 region_for_path() {
     if [[ "$1" == "CLAUDE.md" ]]; then
         echo "loom-block"
+    elif [[ "$1" == "AGENTS.md" ]]; then
+        echo "loom-block-agents"
     else
         echo ""
     fi
@@ -276,8 +286,14 @@ collect_tracked_files_walk() {
     if [[ -f "$root/CLAUDE.md" ]]; then
         files+=("CLAUDE.md")
     fi
+    if [[ -f "$root/AGENTS.md" ]]; then
+        files+=("AGENTS.md")
+    fi
     if [[ -f "$root/.loom/CLAUDE.md" ]]; then
         files+=(".loom/CLAUDE.md")
+    fi
+    if [[ -f "$root/.loom/AGENTS.md" ]]; then
+        files+=(".loom/AGENTS.md")
     fi
     if [[ -f "$root/.loom/README.md" ]]; then
         files+=(".loom/README.md")
@@ -473,12 +489,15 @@ cmd_check_links() {
 
 # Emit the hashable bytes for an entry to stdout, honoring region rules.
 # For region "loom-block", emit only the CLAUDE.md Loom marker region
-# (inclusive). For whole-file entries, cat the file verbatim.
+# (inclusive); for "loom-block-agents", the AGENTS.md marker region. For
+# whole-file entries, cat the file verbatim.
 emit_hashable_content() {
     local full_path="$1"
     local region="$2"
     if [[ "$region" == "loom-block" ]]; then
         sed -n "/${LOOM_SECTION_START}/,/${LOOM_SECTION_END}/p" "$full_path"
+    elif [[ "$region" == "loom-block-agents" ]]; then
+        sed -n "/${AGENTS_SECTION_START}/,/${AGENTS_SECTION_END}/p" "$full_path"
     else
         cat "$full_path"
     fi
@@ -492,7 +511,7 @@ compute_entry_digest() {
     local full_path="$1"
     local region="$2"
     local sha size
-    if [[ "$region" == "loom-block" ]]; then
+    if [[ -n "$region" ]]; then
         local block
         block=$(emit_hashable_content "$full_path" "$region")
         sha=$(printf '%s' "$block" | $SHA_CMD | awk '{print $1}')

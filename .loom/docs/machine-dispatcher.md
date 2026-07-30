@@ -406,6 +406,101 @@ orphans an entry that lands in a project-level settings file.
 > or their project-level settings entries — that is Phase 6's `git rm --cached`
 > migration, which this replacement unblocks.
 
+## `loom migrate`: historical consumer install → daemon model (Epic #3835 Phase 6, #4254)
+
+`loom migrate` takes a repo carrying a **historical file-copy install** (a full
+committed copy of the Loom implementation under `.loom/`,
+`.claude/commands/loom/`, `.claude/agents/loom-*.md` plus a legacy
+`.loom/config.json` — the pre-daemon layout every consumer repo on ≤ 0.12 holds)
+to the machine-level daemon model in **one idempotent pass**. It is the final
+phase of Epic #3835: Phases 1–5 stood up the machine checkout, user-scope skills /
+agents / hooks / mcp, and the workspace registry; this phase retires the per-repo
+file copies that would otherwise shadow them and drift stale.
+
+Run it from inside the repo:
+
+```bash
+loom migrate --dry-run          # full file-by-file plan; makes no changes
+loom migrate                    # apply; prints a per-file report, stages the result
+loom migrate --priority 20      # workspace-registry priority (default 3)
+loom migrate --force            # proceed despite an uncommitted working tree
+```
+
+The dispatcher resolves the current repo root and delegates to
+`scripts/install/migrate-consumer.sh` in the machine checkout, exporting
+`LOOM_MACHINE_CHECKOUT` so the migration reads the current `defaults/` ownership
+boundary no matter where it is invoked. What one pass does:
+
+1. **Detect** the historical install from `.loom/install-metadata.json` + its
+   `installed_files` manifest. No metadata/manifest → a clean refusal, zero
+   changes. An uncommitted working tree → refuse unless `--force` (so the
+   migration's staged `git rm --cached` never entangles unrelated edits).
+2. **Extract project config** from the legacy `.loom/config.json` into the
+   **tracked** `.loom-project/project.json` (the Phase 2 resolver's project tier)
+   — **excluding `sweep.modelAliases`**. That key's Rust/Python resolvers diverge;
+   migrating it would freeze the divergence into every consumer repo, so it is
+   left in the (lower-precedence, on-disk) legacy tier and reported as excluded.
+   **Host-local keys** (`worktree.root` — a per-host scratch-disk path) are routed
+   to the **gitignored** `.loom-local/local.json` (the resolver's `LOCAL_CONFIG_REL`
+   tier), *not* the tracked, shared `project.json`: since this same pass
+   `git rm --cached`s the legacy config, `project.json` becomes the highest tier
+   every fresh clone / CI run picks up, so a stray `worktree.root` there would
+   silently propagate one operator's filesystem layout to the whole team. An
+   existing `project.json` is left untouched (idempotency); an existing
+   `local.json` override is preserved (only a missing `worktree.root` is filled in).
+3. **Untrack the committed implementation** per the manifest — `git rm --cached`
+   (files stay on disk, just leave the index) + a gitignore block single-sourced
+   with `install-loom.sh --local`. Only the machine-served namespaces (`/.loom/`,
+   `/.claude/commands/loom/`, `/.claude/agents/loom-*.md`) are untracked; genuinely
+   repo-level manifest entries (`.github/*`, `.codex/*`, `.gitignore`,
+   `package.json`) stay **tracked**. Nothing outside the manifest is ever touched
+   (the #3450 ownership rule).
+4. **Remove deprecated artifacts** — the `loom-iteration.md` / `loom-parent.md`
+   two-tier-daemon tombstones (removed as a subsystem in v0.10.0, #3372) and any
+   manifest entry under a Loom namespace no longer shipped by current `defaults/`
+   (shepherd-era scripts) are deleted from disk **and** index.
+5. **Preserve**: `.loom/resync-ignore` pins stay tracked and are reported;
+   locally-modified files are surfaced (the working copy is never deleted — `git
+   rm --cached` only touches the index); runtime state (`.loom/logs/`,
+   `.loom/sweep-checkpoint/`, `.loom/tokens/`) and the `loom.sh` / `.loom/bin/loom`
+   shims are never touched, so `./loom.sh` and the per-repo pool manager keep
+   working.
+6. **Repair the MCP wiring** (#4386). A historical repo can carry a repo-scoped
+   `.mcp.json` whose `loom` server entry points into a long-dead worktree bundle
+   (e.g. `.loom/worktrees/issue-N/mcp-loom/dist/index.js`). Because Claude Code MCP
+   precedence is **local > project > user**, that repo-scoped entry silently
+   *shadows* the machine-level user-scope server — and when its path is a dead
+   worktree it kills every daemon-dispatched child at the claude-wrapper MCP
+   pre-flight (a fleet-wide spawn outage with no surfaced error). Migration strips
+   any repo-scoped `loom` entry from `.mcp.json` (deleting the file if `loom` was
+   its only server; other servers such as `safehouse` are kept — matching
+   `setup-mcp.sh`'s #4230 migration), then **verifies the user-scope `loom`
+   registration** exists and points at the machine checkout's
+   `mcp-loom/dist/index.js`, `claude mcp add --scope user`-ing it if absent or
+   mis-pointed (skipped with a clear note when the `claude` CLI is not on PATH).
+7. **Register** the repo via `loom-daemon workspace add … --priority N` (skipped
+   with a clear note when `loom-daemon` is not on PATH), **re-stamp**
+   `.loom/install-metadata.json` (`loom_version`, `loom_commit`,
+   `migrated_to_machine_model`, `install_model`), and **refresh** the CLAUDE.md
+   `<!-- BEGIN/END LOOM ORCHESTRATION -->` marker section to the daemon-model
+   surface.
+
+The migration **stages** its result and leaves the commit to the operator —
+review with `git status`, then commit. A second run is a clean no-op (an existing
+tracked `.loom-project/project.json` short-circuits extraction and the manifest
+paths are already untracked). Fixture-based coverage:
+`scripts/test-migrate-consumer.sh`.
+
+> **Skills stay installed, not stripped.** After migration the role skills
+> (`/builder`, `/judge`, `/curator`, `/doctor`, `/loom:sweep`, `/loom`, …) still
+> resolve in consumer sessions — now from the **user-scope** machine checkout
+> (Phase 4), so they track the installed daemon version instead of the stale
+> per-repo copies this pass removes. Migration replaces the copies with the
+> always-current shared skills; it does not remove manual capability. It **does**
+> require user-scope provisioning to have run on the host first (Phases 4/5) —
+> otherwise a migrated repo would lose its now-untracked skills with no
+> replacement.
+
 ## Uninstall semantics
 
 A per-repo `uninstall-loom.sh` removes only the per-repo `./.loom/bin/loom` pool

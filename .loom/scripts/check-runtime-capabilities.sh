@@ -30,7 +30,20 @@
 # Usage:
 #   check-runtime-capabilities.sh --role <name> --runtime <name>
 #   check-runtime-capabilities.sh --role <name> --runtime <name> \
-#       [--role-file <path>] [--runtime-file <path>] [--dir <defaults-root>]
+#       [--role-file <path>] [--runtime-file <path>] [--dir <defaults-root>] \
+#       [--json]
+#
+# --json (issue #4494) adds a stable, machine-readable single-line JSON object
+# on STDOUT at every terminal decision, so a caller (notably the daemon's
+# native-vs-shell conformance test) can compare the exact unmet-capability SET,
+# not just the exit code:
+#
+#   {"role":"builder","runtime":"codex","decision":"reject",
+#    "unmet":["worktreeIsolation"],"reason":"..."}
+#
+# `decision` is one of admit | reject | error, mapping 1:1 onto exit 0 | 78 | 1.
+# The human-readable log lines (stderr) and every exit code are UNCHANGED —
+# --json is purely additive, and semantics are untouched.
 #
 # Resolution (when --role-file / --runtime-file are not given):
 #   <dir>/roles/<role>.json      (default <dir>: repo .loom/ falling back to
@@ -65,6 +78,9 @@ Options:
   --dir <path>           Root directory containing roles/ and runtimes/
                           subdirectories (default: repo .loom/, falling back
                           to defaults/ next to this script)
+  --json                 Also print a stable single-line JSON decision object
+                          on stdout: {role, runtime, decision, unmet, reason}
+                          where decision is admit|reject|error (#4494)
   -h, --help             Show this help
 
 Exit codes:
@@ -79,6 +95,7 @@ RUNTIME=""
 ROLE_FILE=""
 RUNTIME_FILE=""
 DIR_OVERRIDE=""
+JSON_OUTPUT=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -102,6 +119,10 @@ while [[ $# -gt 0 ]]; do
             DIR_OVERRIDE="${2:-}"
             shift 2
             ;;
+        --json)
+            JSON_OUTPUT=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -124,6 +145,31 @@ if ! command -v jq >/dev/null 2>&1; then
     log_error "jq is required but not found on PATH."
     exit 1
 fi
+
+# --- Machine-readable decision output (#4494, opt-in via --json) ------------
+# emit_decision <decision> <reason> [unmet...]
+#
+# Prints ONE line of JSON on stdout when --json is set, and nothing otherwise,
+# so the default output/exit contract is byte-for-byte unchanged. jq builds the
+# object so role/runtime/reason values are escaped correctly.
+emit_decision() {
+    if [[ "$JSON_OUTPUT" != "1" ]]; then
+        return 0
+    fi
+    local decision="$1" reason="$2"
+    shift 2
+    local unmet_json='[]'
+    if [[ $# -gt 0 ]]; then
+        unmet_json="$(printf '%s\n' "$@" | jq -R . | jq -sc .)"
+    fi
+    jq -nc \
+        --arg role "$ROLE" \
+        --arg runtime "$RUNTIME" \
+        --arg decision "$decision" \
+        --arg reason "$reason" \
+        --argjson unmet "$unmet_json" \
+        '{role: $role, runtime: $runtime, decision: $decision, unmet: $unmet, reason: $reason}'
+}
 
 # --- Resolve the roles/runtimes root directory ---
 # Precedence: --dir override > repo .loom/ (if present) > defaults/ next to
@@ -162,19 +208,23 @@ fi
 # --- Load + validate files (distinct exit path from mismatch) ---
 if [[ ! -f "$ROLE_FILE" ]]; then
     log_error "Unknown role: no sidecar file found at '$ROLE_FILE'."
+    emit_decision error "unknown role: no sidecar file found at '$ROLE_FILE'"
     exit 1
 fi
 if ! jq -e . "$ROLE_FILE" >/dev/null 2>&1; then
     log_error "Role sidecar '$ROLE_FILE' is not valid JSON."
+    emit_decision error "role sidecar '$ROLE_FILE' is not valid JSON"
     exit 1
 fi
 
 if [[ ! -f "$RUNTIME_FILE" ]]; then
     log_error "Unknown runtime: no manifest file found at '$RUNTIME_FILE'."
+    emit_decision error "unknown runtime: no manifest file found at '$RUNTIME_FILE'"
     exit 1
 fi
 if ! jq -e . "$RUNTIME_FILE" >/dev/null 2>&1; then
     log_error "Runtime manifest '$RUNTIME_FILE' is not valid JSON."
+    emit_decision error "runtime manifest '$RUNTIME_FILE' is not valid JSON"
     exit 1
 fi
 
@@ -182,24 +232,32 @@ fi
 has_requirements="$(jq -r 'has("runtimeRequirements")' "$ROLE_FILE")"
 if [[ "$has_requirements" != "true" ]]; then
     log_info "Role '$ROLE' declares no runtimeRequirements -- any runtime is compatible."
+    emit_decision admit "role '$ROLE' declares no runtimeRequirements"
     exit 0
 fi
 
 # --- Compute mismatches: required capability not declared exactly "yes" ---
 mismatches=""
+unmet=()
 while IFS= read -r cap; do
     [[ -z "$cap" ]] && continue
     value="$(jq -r --arg cap "$cap" '.capabilities[$cap] // "no"' "$RUNTIME_FILE")"
     if [[ "$value" != "yes" ]]; then
         mismatches+="  - $cap: runtime '$RUNTIME' declares '$value' (requires 'yes')"$'\n'
+        unmet+=("$cap")
     fi
 done < <(jq -r '.runtimeRequirements[]?' "$ROLE_FILE")
 
 if [[ -n "$mismatches" ]]; then
     log_error "Role '$ROLE' is not compatible with runtime '$RUNTIME':"
     printf '%s' "$mismatches" >&2
+    emit_decision reject "unmet capabilities: $(
+        IFS=,
+        echo "${unmet[*]}"
+    )" "${unmet[@]}"
     exit 78
 fi
 
 log_info "Role '$ROLE' is compatible with runtime '$RUNTIME' (all requirements met)."
+emit_decision admit "role '$ROLE' is compatible with runtime '$RUNTIME'"
 exit 0

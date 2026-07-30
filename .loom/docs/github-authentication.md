@@ -159,6 +159,144 @@ consequences of the non-Aqua domain are covered in
 As before, export a `GH_TOKEN` for forge auth in a headless session (the login
 keychain may be locked) — the #4005 credential preflight reports this loudly.
 
+## GitHub App identity (#4430)
+
+Every fleet host authenticating as the same personal account (or the same
+long-lived fine-grained PAT) shares one 5,000/hr REST + 5,000/hr GraphQL
+budget with **every other host and the operator's own interactive use** — a
+busy fleet can exhaust it fleet-wide. A GitHub App gives each **installation**
+(e.g. one per GitHub account/org the fleet operates against) its own
+rate-limit bucket, centralizes repo access in one place (adding a repo to the
+fleet is an installation edit, not a PAT rebuild per host), and mints
+short-lived (~1h) tokens on-host from a private key instead of parking a
+long-lived PAT on a cloud disk. Commits/comments made with a minted token
+attribute to the app's bot identity (e.g. `2am-loom[bot]`), not a personal
+account.
+
+**This is entirely opt-in and fallback-first.** With no app credentials
+configured (the default on every host until an operator does the setup
+below), `loom-daemon` behaves exactly as described above — `GH_TOKEN`/
+`GITHUB_TOKEN` env, then `gh`'s own credential store. Configuring the app
+changes nothing about that fallback; it only adds a mechanism that is tried
+*first*, and that falls back to the same ambient path on any failure
+(unreadable/revoked key, network hiccup, GitHub API error) rather than
+hard-failing.
+
+### Setup (operator, one-time per GitHub account/org)
+
+1. Create a GitHub App (under whichever account/org owns the target repos)
+   with **Contents: Read & write**, **Issues: Read & write**, **Pull
+   requests: Read & write**, **Metadata: Read** permissions.
+2. Generate a private key for the app (downloads a `.pem` file) and copy it to
+   each fleet host that should mint tokens for that account/org — e.g.
+   `~/.config/loom/github-app-key.pem`, readable only by the daemon's user
+   (`chmod 600`).
+3. Install the app on the account/org's repositories (all of them, or just the
+   ones Loom manages).
+4. Provision the app id + private-key path to the host, either as env vars or
+   in `.loom/config.json`:
+
+   ```bash
+   # Env (highest precedence) — export before starting the daemon:
+   export LOOM_GITHUB_APP_ID=123456
+   export LOOM_GITHUB_APP_KEY_PATH=~/.config/loom/github-app-key.pem
+   ./.loom/scripts/cli/loom-daemon-start.sh
+   ```
+
+   ```json
+   // .loom/config.json — config beats nothing but env (env > config):
+   {
+     "forge": {
+       "githubApp": {
+         "appId": "123456",
+         "privateKeyPath": "/home/loom/.config/loom/github-app-key.pem"
+       }
+     }
+   }
+   ```
+
+**Installation selection is derivable, not configured further.** The daemon
+resolves *which* installation covers the workspace it's running in from the
+repo itself (`GET /repos/{owner}/{repo}/installation`, JWT-authed) — a fleet
+spanning multiple accounts/orgs needs only the one app id + key path above;
+each workspace's own git remote picks the right installation automatically.
+
+### What happens once configured
+
+At startup (and on a periodic refresh tick thereafter, well inside the
+token's ~1h lifetime), the daemon mints a JWT from the app id + private key
+(RS256, signed locally via `openssl` — the key never leaves the host) and
+exchanges it for a short-lived installation access token. The token is
+cached on disk (`0600`, keyed by installation) and re-minted whenever fewer
+than 10 minutes of its lifetime remain, so a live daemon never has to wait on
+a fresh mint mid-tick.
+
+**Delivery mechanism (#4458).** Earlier releases exported the minted token as
+this process's own `GH_TOKEN` on every refresh — a `std::env::set_var` from a
+background task that recurred roughly every 5 minutes for the life of the
+process, racing the `environ` reads every concurrently spawned `gh`/`git`
+child performs (undefined behavior on POSIX; the reason `set_var` is
+`unsafe` as of Rust edition 2024). The daemon now instead owns a dedicated
+`GH_CONFIG_DIR` (`<workspace>/.loom/gh-config/`, `0700`) whose `hosts.yml` it
+rewrites **atomically** (write a temp file, then rename into place) on every
+rotation — a pure file operation with no process-env mutation at all. `gh`
+re-reads its config from disk on every invocation, so every one of the
+daemon's own `gh`/`git` children (`Command::new` without `env_clear`) picks
+up a fresh token automatically, without any per-call-site change. The single
+`std::env::set_var("GH_CONFIG_DIR", …)` that points the process at this
+directory (clearing any ambient `GH_TOKEN`/`GITHUB_TOKEN` at the same time,
+so the app token isn't outranked by an operator-exported one) fires at most
+once per process lifetime, before any task that spawns `gh`/`git` exists to
+race it.
+
+`loom-daemon status` and the startup log line report this as mechanism
+`github-app` with a **non-secret fingerprint** — `app <id> installation
+<id>` — never the token, JWT, or key material itself:
+
+```
+Forge credential: OK — github-app (app 123456 installation 789)
+```
+
+### Troubleshooting the app path
+
+- **Unreadable/revoked/rotated key**: the daemon logs the failure by name
+  (`credential_preflight: github-app mint failed (…)`) and falls back to
+  ambient `gh` auth rather than hard-failing — check `LOOM_GITHUB_APP_KEY_PATH`
+  / `forge.githubApp.privateKeyPath` points at a file the daemon's user can
+  read.
+- **App not installed on this repo/org**: the installation-resolution call
+  (`GET /repos/{owner}/{repo}/installation`) 404s; install the app on the
+  repo, or verify the workspace's git remote points at the account/org the
+  app is installed on.
+- **Clock skew**: the minted JWT's `iat` is backdated 60 seconds per GitHub's
+  own guidance, tolerating modest host clock drift without a manual fix.
+
+### Long-running sweep children and credential snapshots (#4458)
+
+The daemon's own forge calls (claim reconciliation, the main-health gate, the
+refresh tick, work finder, …) all run inside the one long-lived daemon
+process, so once `GH_CONFIG_DIR`/`hosts.yml` are set up they stay current for
+every one of those calls, for the life of the process — the daemon's own
+forge auth never goes stale between restarts.
+
+**Dispatched sweep children are a different story.** A sweep worker (the
+tmux-hosted Claude session `loom-daemon` spawns per issue/PR, often running
+for an hour or more on a complex issue) inherits whatever forge-credential
+environment is ambient **at the moment it is spawned** — an operator-exported
+`GH_TOKEN`/`GITHUB_TOKEN`, or the daemon's own credential setup, whichever
+resolves. That is a **snapshot**, not a live subscription: env beats the
+ambient keyring/`gh`-config lookup inside that child's own process (the same
+precedence order described throughout this doc), so if the snapshotted
+reference stops being valid partway through a long sweep — a GitHub App
+installation token's ~1h lifetime is the common case — the child does not
+re-resolve credentials on its own. Its own `gh` calls start 401ing with **no
+automatic fallback**, and the daemon rotating its own credential afterwards
+does not reach an already-running child. If you run consistently long sweeps
+against a GitHub-App-only host, prefer a long-lived PAT (`export GH_TOKEN`
+before starting the daemon — see "Headless and SSH-only daemon operation"
+above) for that workload, or expect to restart a sweep that 401s mid-run past
+the ~1h mark.
+
 ## Troubleshooting
 
 ### Token not being picked up

@@ -29,7 +29,23 @@ if [[ -z "$REPO" ]]; then
 fi
 [[ -n "$REPO" ]] || { echo "could not determine repo; pass it explicitly or set LOOM_REPO" >&2; exit 2; }
 
-body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null || true)"
+# Fetch the issue body, distinguishing a fetch FAILURE from a genuinely empty
+# body (#4472). `gh issue view` is a GraphQL call; under quota exhaustion (routine
+# at fleet scale, epic #4432) it fails, and a swallowed failure would parse as an
+# empty tier and print the BLOCKED-missing text — indistinguishable from an
+# unmarked issue, blocking curation while quota is out. So: try GraphQL, fall back
+# to REST (which draws on a separate quota), and only if BOTH fail exit 2
+# ("could not evaluate", already this script's semantics for repo-resolution
+# failures) rather than 1 (missing marker). An empty body from a *successful*
+# fetch remains exit 1.
+if body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null)"; then
+  :
+elif body="$(gh api "repos/$REPO/issues/$ISSUE" --jq .body 2>/dev/null)"; then
+  :
+else
+  echo "BLOCKED: could not fetch issue $REPO#$ISSUE body (both GraphQL and REST failed — likely GitHub API quota exhaustion). Retry or check quota; this is not a curation defect." >&2
+  exit 2
+fi
 tier="$(printf '%s' "$body" | grep -o 'loom:complexity=[a-z]*' | head -1 | cut -d= -f2)"
 
 case "$tier" in

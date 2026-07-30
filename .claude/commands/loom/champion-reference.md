@@ -108,6 +108,39 @@ fi
 
 ---
 
+### Edge Case 5b: Doctor-Cycle-Capped PR (`loom:blocked` + `loom:changes-requested`)
+
+**Scenario**: A PR exhausted `sweep.max_doctor_cycles` and `/loom:sweep` parked it with **both** `loom:blocked` and `loom:changes-requested`. Nothing else in the pipeline reconsiders that state — the work-finder skips blocked items and Mode C pre-flight skips blocked PRs — so it is terminal for automation until Champion looks at it (#4574).
+
+**Handling**:
+```bash
+# Parked set (gh ANDs repeated --label values). Skip any that also carry
+# loom:operator-only — already routed to a human.
+gh pr list --label "loom:blocked" --label "loom:changes-requested" --state open \
+  --json number,title,labels --jq '.[] | "#\(.number) \(.title)"'
+
+# Decide from the FULL history, not the last comment alone.
+gh pr view "$PR_NUMBER" --comments
+```
+
+**Decision**: **Three-way, on the forward-progress test** — never a default grant.
+
+| Finding in the rejection history | Decision | Action |
+|----------------------------------|----------|--------|
+| Latest rejection names defects demonstrably **distinct** from the prior one (prior fix landed, new defects only reachable because of it), fixable in one bounded cycle, chain still converging | **Grant one more Doctor cycle** | Comment with `<!-- champion:capped-pr-grant -->` naming both rejections and the distinction, then remove **`loom:blocked` only** (leave `loom:changes-requested` — it is what routes the PR to Doctor) |
+| Same defect **re-litigated**, comparison **ambiguous**, only one rejection exists, or the chain is no longer converging | **Keep parked** | Comment the *specific* human judgment needed, guarded by a `<!-- champion:capped-pr-parked:<latest-rejection-comment-id> -->` marker so the 10-minute cron does not re-post per tick; change no labels |
+| The **approach** (not the implementation) is the problem — repeated design rejections, superseded premise | **Recommend closing, route to the operator** | Comment with `<!-- champion:capped-pr-close-recommended -->` and add `loom:operator-only` (keeping `loom:blocked`); **do not close the PR** — Champion routes, the human decides |
+
+**Rationale**: This is the *same* forward-progress mechanism as the sweep's in-sweep distinct-defect grace cycle (`sweep.md` → "Doctor-cycle cap"), applied at a different decision point — periodically, post-mortem, with the complete history rather than the dying sweep's local context. There is **no hard grant cap**: repeat grants are allowed as long as each new rejection shows fresh progress, because the anti-thrash guarantee comes from re-applying the test every round, not from a counter. Nor is there a double-grant path: a PR only reaches `loom:blocked` after the sweep-side single-use exception was consumed or was not applicable.
+
+**Entry guards**: the label pair alone is not proof of a cap block. Skip PRs also carrying `loom:operator-only`, keep parked any PR whose history shows no cap block (fewer than two Judge rejections, no `doctor cycle exhausted` line), and never grant over an explicit human hold (`hold until` / `wait until` / `defer` / `not before` / `do not start` phrasing — the sweep's explicit-hold convention).
+
+**Human vs. parked**: `loom:operator-only` means *the approach needs a human ruling and automation should stop touching this PR*; plain `loom:blocked` + a keep-parked comment means *a human should look, but a future rejection could still change the answer* — Champion re-evaluates that PR when a new Judge rejection lands.
+
+**Action** (single authoritative policy — implemented in `champion-pr-merge.md` → "Capped-PR Recovery Pass"): see that section for the exact commands, the full grant/never-grant criteria, and the rationale comment templates.
+
+---
+
 ### Edge Case 6: PR Modifying Only Test Files
 
 **Scenario**: PR changes only test files (e.g., `*.test.ts`, `*.spec.rs`).
@@ -116,7 +149,7 @@ fi
 
 **Decision**: **Allow merge if criteria pass** - test-only changes are safe.
 
-**Rationale**: Size limit (configurable, default 200 lines) and CI checks provide sufficient protection.
+**Rationale**: The merge-risk judgment (criterion #2) and CI checks provide sufficient protection — a test-only diff is green on diff composition and revertability by construction, however many lines it is.
 
 ---
 
@@ -195,21 +228,19 @@ fi
 
 ---
 
-### Edge Case 11: PR Size Exactly at Limit
+### Edge Case 11: Size and Risk Point in Opposite Directions
 
-**Scenario**: PR has exactly the configured limit of lines changed (e.g., if limit is 200: 100 additions + 100 deletions).
+**Scenario A — large but low-risk**: An 886-line PR that is ~700 lines of new tests plus one self-contained new module, approved by a Judge whose review names the module's functions and what it verified.
 
-**Handling**:
-```bash
-SIZE_LIMIT=$(jq -r '.champion.auto_merge_max_lines // 200' .loom/config.json 2>/dev/null || echo 200)
-if [ "$TOTAL" -gt "$SIZE_LIMIT" ]; then  # Strictly greater than
-  echo "FAIL: Too large"
-fi
-```
+**Scenario B — small but high-risk**: A 40-line PR that changes the ordering guard in `.loom/scripts/merge-pr.sh` (or a `.loom/hooks/guard-*.sh` hook), approved with a one-line "LGTM".
 
-**Decision**: **Allow merge** - limit is inclusive (<= configured limit allowed).
+**Handling**: There is no line-count gate. Criterion #2 (Merge-Risk Judgment) scores each PR on diff composition, blast radius, Judge review depth, and revertability.
 
-**Rationale**: PRs exactly at the limit are still considered acceptable for auto-merge purposes. The limit is configurable via `champion.auto_merge_max_lines` in `.loom/config.json` (default: 200). PRs can also bypass the size limit entirely with the `loom:auto-merge-ok` label.
+**Decision**:
+- **Scenario A: allow merge** — green on all four axes (test-heavy composition, single-module blast radius, specific review, plain `git revert`).
+- **Scenario B: hold for a human** — red on blast radius (merge/guard automation the whole fleet depends on) *and* on review depth (a generic approval), with revertability weak because a bad guard can delete a branch before the revert lands. Comment names that concern, `loom:pr` stays, Champion retries next tick.
+
+**Rationale**: Size was never the risk; it was a proxy that inverted in both directions. The `champion.auto_merge_max_lines` knob that produced this edge case is retired — see the migration note in `champion-pr-merge.md` → "Safety Criteria → 2. Merge-Risk Judgment". `loom:auto-merge-ok` still exists, repurposed: it is an explicit human/Judge override of a Champion merge-risk hold (it does not waive the critical-file check).
 
 ---
 
@@ -299,12 +330,15 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 | Force-push after approval | Allow | If criteria still pass |
 | Merge conflicts | Fail | Comment and skip |
 | Stale PR (>24h) | Route to Doctor | Comment once (idempotent marker), swap `loom:pr` → `loom:changes-requested` |
+| Doctor-cycle-capped PR (`loom:blocked` + `loom:changes-requested`) | Three-way on forward progress | Distinct new defects → grant a cycle (remove `loom:blocked` only); same-defect/ambiguous → keep parked with rationale; approach not viable → add `loom:operator-only`, recommend closing (never close it) |
 | Test-only changes | Allow | Standard criteria apply |
 | Human holds PR (removes `loom:pr`) | Skip | Not a merge candidate without `loom:pr` |
 | Multiple linked issues | Allow | Verify all closed |
 | Mixed-state CI | Fail on `fail`/`cancel` | `pending` defers; `skipping` is OK |
 | Unknown critical file | Miss | Needs pattern update |
-| Exactly at size limit | Allow | Limit is inclusive |
+| Large but low-risk PR (e.g. mostly tests) | Allow | Judged on the 4 risk axes, not line count |
+| Small but high-blast-radius PR | Hold for human | Comment names the specific concern, keep `loom:pr`, retry next tick |
+| `loom:auto-merge-ok` present | Allow | Explicit human/Judge override of a merge-risk hold (does not waive critical files) |
 | API rate limit | Error | Comment and continue |
 | Multiple approvals | Allow | Label is source of truth |
 | Follow-on indicators found | Create | If thresholds met |
@@ -317,7 +351,7 @@ gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "
 
 This file previously carried a second, full copy of the end-to-end merge script. That duplicate diverged from `champion-pr-merge.md` over time (it lacked Step 5.5 Follow-on Issue Creation and repeated the same bugs — invalid `gh pr checks --json` fields, etc.), forcing every fix to be applied twice. It has been removed to eliminate the drift (issue #3781).
 
-For the authoritative, end-to-end implementation — the 6 safety criteria, the pre-merge comment, the squash merge via `merge-pr.sh`, linked-issue closure verification, dependent-issue unblocking, and Step 5.5 Follow-on Issue Creation — see **`champion-pr-merge.md`**. The edge cases and decision matrix above remain here as the reference for non-standard situations; they describe *behavior*, and defer to `champion-pr-merge.md` for the *script*.
+For the authoritative, end-to-end implementation — the Verdict-State Janitor (run before all else, resolves a contradictory `loom:pr` + `loom:changes-requested` state fail-safe, #4570), the 6 safety criteria, the pre-merge comment, the squash merge via `merge-pr.sh`, linked-issue closure verification, dependent-issue unblocking, and Step 5.5 Follow-on Issue Creation — see **`champion-pr-merge.md`**. The edge cases and decision matrix above remain here as the reference for non-standard situations; they describe *behavior*, and defer to `champion-pr-merge.md` for the *script*.
 
 ---
 
@@ -336,7 +370,9 @@ For the authoritative, end-to-end implementation — the 6 safety criteria, the 
 - Manual close may be needed for cross-repo references
 
 **Blocked issues not unblocking**
-- Verify dependency format: "Blocked by #123" or "Depends on #123"
+- Verify dependency format: "Blocked by #123" or "Depends on #123" — markdown
+  emphasis and an optional colon before `#N` are also tolerated, e.g.
+  "**Blocked by:** #123 (reason)" or "_Depends on_ #123" (#4508)
 - Check if all dependencies are truly closed
 - Manual unblock may be needed for complex dependency patterns
 

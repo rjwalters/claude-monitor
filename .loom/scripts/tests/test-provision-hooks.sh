@@ -205,6 +205,170 @@ assert_eq "$(count_marker "$S9" guard-destructive.sh)" "0" "deprovision removed 
 assert_eq "$(jq -r '[.hooks.PreToolUse[]? | .hooks[]? | .command | select(. == ".claude/hooks/my-own-guard.sh")] | length' "$S9")" "1" "operator's own hook preserved after deprovision"
 assert_eq "$(jq -r '.permissions.allow[0]' "$S9")" "Bash(x:*)" "operator's permissions preserved after deprovision"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ensure_project_hook_wiring — the project-level fallback (#4401)
+#
+# Guards the exact zero-coverage state reported in #4401: a repo that still
+# carries per-repo `.loom/hooks/` copies (so the user-scope wrapper defers) but
+# whose project-level `.claude/settings.json` entries were stripped (by the
+# 0.16.0 Phase-5 defaults / a --confirm-reinstall's chained uninstall).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Count project-level hook commands referencing a given hook script name.
+count_project_entry() {
+    local file="$1" name="$2"
+    jq --arg m ".loom/hooks/$name" '
+        [ (.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command // ""
+          | select(contains($m)) | select(contains("defaults/hooks/") | not) ] | length
+    ' "$file" 2>/dev/null
+}
+
+# Build a "pre-Phase-6 transition repo" fixture: .loom/hooks/ copies present.
+make_transition_repo() {
+    local root="$1"
+    mkdir -p "$root/.loom/hooks" "$root/.claude"
+    local n
+    for n in guard-destructive.sh guard-loom-workflow.sh guard-worktree-paths.sh \
+             skill-router.sh methodology-inject.sh guard-background-subagents.sh; do
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$root/.loom/hooks/$n"
+        chmod +x "$root/.loom/hooks/$n"
+    done
+}
+
+# ── Test 10: the #4401 repro — copies present, hooks block stripped ──────────
+echo "Test 10: #4401 repro — per-repo copies + stripped project hooks -> entries restored"
+R10=$(mktemp -d)
+make_transition_repo "$R10"
+# The post-uninstall / post-init state: 0.16.0 defaults settings.json, i.e.
+# permissions only and NO `hooks` key at all.
+printf '{"permissions":{"allow":["Bash(gh:*)"]}}\n' > "$R10/.claude/settings.json"
+assert_eq "$(jq -r 'has("hooks")' "$R10/.claude/settings.json")" "false" "precondition: zero guard-hook coverage (no hooks key)"
+# Invoked in the CURRENT shell (not a command substitution) so the verifiable
+# globals it publishes survive for the assertions below.
+ensure_project_hook_wiring "$R10" >/dev/null 2>&1; rc=$?
+assert_eq "$rc" "0" "ensure_project_hook_wiring returns 0 on a transition repo"
+S10="$R10/.claude/settings.json"
+assert_eq "$(count_project_entry "$S10" guard-destructive.sh)" "1" "guard-destructive.sh reachable via a project-level entry"
+assert_eq "$(count_project_entry "$S10" guard-loom-workflow.sh)" "1" "guard-loom-workflow.sh reachable"
+assert_eq "$(count_project_entry "$S10" guard-worktree-paths.sh)" "1" "guard-worktree-paths.sh (Edit|Write) reachable"
+assert_eq "$(count_project_entry "$S10" skill-router.sh)" "1" "skill-router.sh reachable"
+assert_eq "$(count_project_entry "$S10" methodology-inject.sh)" "1" "methodology-inject.sh reachable"
+assert_eq "$(count_project_entry "$S10" guard-background-subagents.sh)" "1" "guard-background-subagents.sh (Stop) reachable"
+assert_eq "$PROJECT_HOOKS_WIRED" "6" "PROJECT_HOOKS_WIRED reports all six copies (#4053 verifiable-globals contract)"
+assert_eq "$PROJECT_HOOKS_SETTINGS" "$S10" "PROJECT_HOOKS_SETTINGS points at the project settings file"
+assert_eq "$(jq -r '.permissions.allow[0]' "$S10")" "Bash(gh:*)" "existing project permissions preserved"
+# Every written command must be resolvable by Claude Code from the project root.
+assert_eq "$(jq -r '[(.hooks // {}) | to_entries[] | .value[]? | .hooks[]? | .command | select(startswith("${CLAUDE_PROJECT_DIR}/.loom/hooks/") | not)] | length' "$S10")" "0" "all written commands use the \${CLAUDE_PROJECT_DIR} prefix (#3277)"
+# The referenced script must exist — a dangling entry is not coverage.
+for n in guard-destructive.sh guard-background-subagents.sh; do
+    [[ -x "$R10/.loom/hooks/$n" ]] && pass "wired entry for $n points at an executable copy" \
+        || fail "wired entry for $n points at a missing/non-executable copy"
+done
+
+# ── Test 11: idempotent — a second install must not duplicate entries ────────
+echo "Test 11: re-running is idempotent (no duplicate project-level entries)"
+ensure_project_hook_wiring "$R10" >/dev/null 2>&1
+assert_eq "$(count_project_entry "$S10" guard-destructive.sh)" "1" "guard-destructive.sh still exactly one entry"
+assert_eq "$(count_project_entry "$S10" skill-router.sh)" "1" "skill-router.sh still exactly one entry"
+
+# ── Test 12: legacy bare-relative entries are recognized, not duplicated ─────
+echo "Test 12: a legacy pre-#3277 bare-relative entry is not duplicated"
+R12=$(mktemp -d)
+make_transition_repo "$R12"
+cat > "$R12/.claude/settings.json" <<'EOF'
+{ "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [
+  { "type": "command", "command": ".loom/hooks/guard-destructive.sh" }
+] } ] } }
+EOF
+ensure_project_hook_wiring "$R12" >/dev/null 2>&1
+assert_eq "$(count_project_entry "$R12/.claude/settings.json" guard-destructive.sh)" "1" "legacy bare-relative entry recognized (no duplicate added)"
+assert_eq "$(count_project_entry "$R12/.claude/settings.json" guard-loom-workflow.sh)" "1" "the missing sibling entry was still added"
+
+# ── Test 13: post-Phase-6 (migrated, copy-free) repo -> no-op ────────────────
+echo "Test 13: a migrated repo with no .loom/hooks/ copies is left alone"
+R13=$(mktemp -d)
+mkdir -p "$R13/.loom" "$R13/.claude"
+printf '{"permissions":{"allow":["Bash(gh:*)"]}}\n' > "$R13/.claude/settings.json"
+BEFORE13=$(cat "$R13/.claude/settings.json")
+LOG13=$(mktemp)
+ensure_project_hook_wiring "$R13" >"$LOG13" 2>&1; rc=$?
+OUT13=$(cat "$LOG13")
+assert_eq "$rc" "0" "copy-free repo returns 0"
+assert_eq "$(cat "$R13/.claude/settings.json")" "$BEFORE13" "copy-free repo settings.json left byte-identical"
+assert_eq "$PROJECT_HOOKS_WIRED" "0" "PROJECT_HOOKS_WIRED is 0 on a copy-free repo"
+assert_contains "$OUT13" "machine checkout" "explains that guards run from the machine checkout"
+
+# ── Test 14: only hooks whose copy exists get an entry (no dangling entries) ──
+echo "Test 14: a hook with no per-repo copy gets no project-level entry"
+R14=$(mktemp -d)
+make_transition_repo "$R14"
+rm -f "$R14/.loom/hooks/skill-router.sh"
+printf '{}\n' > "$R14/.claude/settings.json"
+ensure_project_hook_wiring "$R14" >/dev/null 2>&1
+assert_eq "$(count_project_entry "$R14/.claude/settings.json" skill-router.sh)" "0" "no entry written for the absent skill-router.sh copy"
+assert_eq "$(count_project_entry "$R14/.claude/settings.json" guard-destructive.sh)" "1" "present copies still wired"
+assert_eq "$PROJECT_HOOKS_WIRED" "5" "PROJECT_HOOKS_WIRED counts only present copies"
+
+# ── Test 15: operator's own project hooks are preserved ──────────────────────
+echo "Test 15: an operator's own project-level hooks survive"
+R15=$(mktemp -d)
+make_transition_repo "$R15"
+cat > "$R15/.claude/settings.json" <<'EOF'
+{ "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [
+  { "type": "command", "command": ".claude/hooks/my-own-guard.sh" }
+] } ] }, "permissions": { "allow": ["Bash(x:*)"] } }
+EOF
+ensure_project_hook_wiring "$R15" >/dev/null 2>&1
+assert_eq "$(jq -r '[.hooks.PreToolUse[]? | .hooks[]? | .command | select(. == ".claude/hooks/my-own-guard.sh")] | length' "$R15/.claude/settings.json")" "1" "operator's own project hook preserved"
+assert_eq "$(count_project_entry "$R15/.claude/settings.json" guard-destructive.sh)" "1" "Loom entry added alongside it"
+
+# ── Test 16: invalid existing JSON -> soft-fail, no write ───────────────────
+echo "Test 16: invalid project settings.json is left untouched (soft-fail)"
+R16=$(mktemp -d)
+make_transition_repo "$R16"
+printf '{ this is not json' > "$R16/.claude/settings.json"
+BEFORE16=$(cat "$R16/.claude/settings.json")
+LOG16=$(mktemp)
+ensure_project_hook_wiring "$R16" >"$LOG16" 2>&1; rc=$?
+OUT16=$(cat "$LOG16")
+assert_eq "$rc" "1" "invalid JSON returns 1"
+assert_eq "$(cat "$R16/.claude/settings.json")" "$BEFORE16" "invalid JSON left byte-identical (no write)"
+assert_contains "$OUT16" "not valid JSON" "explains the refusal"
+
+# ── Test 17: a missing .claude/settings.json is created ─────────────────────
+echo "Test 17: a missing project settings.json is created with the entries"
+R17=$(mktemp -d)
+make_transition_repo "$R17"
+rm -rf "$R17/.claude"
+ensure_project_hook_wiring "$R17" >/dev/null 2>&1
+[[ -f "$R17/.claude/settings.json" ]] && pass "settings.json created" || fail "settings.json not created"
+assert_eq "$(count_project_entry "$R17/.claude/settings.json" guard-destructive.sh)" "1" "entry written into the new file"
+
+# ── Test 18: exactly ONE path fires — no double-fire, no zero-coverage ──────
+echo "Test 18: user-scope + project-level compose to exactly one execution path"
+# A transition repo wired BOTH ways (what a --quick install now produces).
+R18=$(mktemp -d); git -C "$R18" init -q
+make_transition_repo "$R18"
+mkdir -p "$R18/.loom"; echo '{}' > "$R18/.loom/config.json"
+printf '{}\n' > "$R18/.claude/settings.json"
+HOME18=$(mktemp -d)
+CHK18=$(mktemp -d); mkdir -p "$CHK18/defaults/hooks"
+printf '#!/usr/bin/env bash\necho MACHINE-RAN\nexit 0\n' > "$CHK18/defaults/hooks/guard-destructive.sh"
+chmod +x "$CHK18/defaults/hooks/guard-destructive.sh"
+provision_loom_hooks "$HOME18/.claude" >/dev/null 2>&1
+ensure_project_hook_wiring "$R18" >/dev/null 2>&1
+# Project-level entry present AND the machine wrapper defers to the copy.
+assert_eq "$(count_project_entry "$R18/.claude/settings.json" guard-destructive.sh)" "1" "project-level entry present (the live path)"
+CMD18=$(jq -r '.hooks.PreToolUse[] | select(.matcher=="Bash") | .hooks[] | .command | select(contains("defaults/hooks/guard-destructive.sh"))' "$HOME18/.claude/settings.json" | head -1)
+OUT18=$(cd "$R18" && LOOM_HOME="$CHK18" bash -c "$CMD18" </dev/null 2>/dev/null); rc18=$?
+[[ -z "$OUT18" && "$rc18" == "0" ]] && pass "user-scope wrapper defers (no double-fire) while the copy exists" \
+    || fail "expected the user-scope wrapper to defer, got out='$OUT18' rc=$rc18"
+# After a Phase-6 migration removes the copies, the machine path takes over —
+# so coverage is never zero in EITHER configuration.
+rm -rf "$R18/.loom/hooks"
+OUT18b=$(cd "$R18" && LOOM_HOME="$CHK18" bash -c "$CMD18" </dev/null 2>/dev/null)
+assert_contains "$OUT18b" "MACHINE-RAN" "once the copies are gone, the machine-checkout hook runs (coverage never zero)"
+
 echo ""
 echo "======================================"
 echo "test-provision-hooks.sh: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"

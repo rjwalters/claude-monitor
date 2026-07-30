@@ -3,10 +3,13 @@
 #
 # Delegates to the native `loom-daemon clean` subcommand (issue #4272, epic
 # #4081 Phase 3 family 2 — a byte-compatible Rust port of the historical
-# Python `loom-clean` CLI). Falls back to the `run_loom_tool` Python fallback
-# chain (source PYTHONPATH -> venv console script -> installed console
-# script) when the resolved daemon binary predates the `clean` subcommand (a
-# host mid-roll), following the `probe-tokens.sh` precedent from Phase 2.
+# Python `loom-clean` CLI). A capability probe still detects a daemon binary
+# that predates the `clean` subcommand (a host mid-roll), but there is NO
+# fallback to fall back to: PR #4301 (commit dba33666) deleted
+# `loom_tools/clean.py` and its `loom-clean` console-script entry in the very
+# same commit that added the probe, so the old `run_loom_tool` branch could
+# only ever produce `No module named loom_tools.clean`. A stale binary now
+# fails loudly with a rebuild remedy instead (#4384).
 #
 # Usage:
 #   clean.sh             # Interactive cleanup
@@ -33,10 +36,19 @@ if [[ -n "$DAEMON_BIN" ]] && "$DAEMON_BIN" clean --help >/dev/null 2>&1; then
     exec "$DAEMON_BIN" clean "$@"
 fi
 
+# No usable path remains. Fail loudly and actionably rather than degrading
+# into a `No module named loom_tools.clean` traceback (#4384).
 if [[ -n "$DAEMON_BIN" ]]; then
-    echo "WARNING clean.sh: $DAEMON_BIN does not support 'clean' (stale build); falling back to loom-clean" >&2
+    DAEMON_VERSION="$("$DAEMON_BIN" --version 2>/dev/null || true)"
+    echo "ERROR clean.sh: $DAEMON_BIN does not support the 'clean' subcommand (stale build)." >&2
+    echo "  Reported version: ${DAEMON_VERSION:-unknown}" >&2
+else
+    echo "ERROR clean.sh: no loom-daemon binary could be resolved." >&2
+    echo "  Searched: \$LOOM_DAEMON_BIN, PATH, then $REPO_ROOT/{loom-daemon/,}target/{release,debug}/loom-daemon" >&2
 fi
-
-# Source shared loom-tools helper (Python fallback chain).
-source "$SCRIPT_DIR/lib/loom-tools.sh"
-run_loom_tool "clean" "clean" "$@"
+echo "  'loom-daemon clean' requires a binary built at or after commit dba33666 (PR #4301)." >&2
+echo "  There is no Python fallback — loom_tools/clean.py was deleted in that same commit." >&2
+echo "  Remedy: rebuild or update loom-daemon, then retry:" >&2
+echo "    cargo build --release -p loom-daemon        # source checkout" >&2
+echo "    ./.loom/scripts/cli/loom-daemon-update.sh   # installed host (self-update)" >&2
+exit 1

@@ -1,6 +1,5 @@
 {
   "name": "loom-workspace",
-  "version": "1.0.0",
   "description": "Loom-managed workspace with AI development orchestration",
   "private": true,
   "scripts": {

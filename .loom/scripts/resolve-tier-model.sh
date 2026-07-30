@@ -18,8 +18,9 @@
 #      `balanced`; env override LOOM_SWEEP_OPTIMIZATION, issue #4238 Phase B).
 #      Either way the resolved logical tier is passed through resolve-model.sh
 #      (logical tier -> current-generation ID). All three steps live in
-#      loom_tools.model_tiers (--tier mode), so they are covered by
-#      test_model_tiers.py rather than duplicated here in inline python.
+#      loom-daemon/src/script_helpers/model_tiers.rs (--tier mode), so they are
+#      covered by its Rust unit tests rather than duplicated here in inline
+#      python.
 #   3. No entry from either source (or a mapping that would resolve to `fable`)
 #      => print nothing, exit 3, so the caller falls through to its normal
 #      precedence chain (the tier-3 role default) instead of guessing a model.
@@ -34,8 +35,6 @@ RUNTIME="${2:-claude}"
 [[ -n "$ISSUE" ]] || { echo "usage: resolve-tier-model.sh <issue> [runtime] [repo]" >&2; exit 2; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=/dev/null
-source "$SCRIPT_DIR/lib/loom-tools.sh"
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "not a git repo" >&2; exit 2; }
 CONFIG="$ROOT/.loom/config.json"
@@ -54,15 +53,42 @@ if [[ -z "$REPO" ]]; then
 fi
 [[ -n "$REPO" ]] || { echo "could not determine repo; pass it explicitly or set LOOM_REPO" >&2; exit 2; }
 
-body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null || true)"
+# Fetch the issue body with a GraphQL->REST fallback (#4472). `gh issue view` is
+# a GraphQL call; under quota exhaustion (routine at fleet scale, epic #4432) it
+# fails and a swallowed failure parses as an empty tier -> `routine`, silently
+# disabling cost/speed routing. REST draws on a separate quota, so try it before
+# giving up. If BOTH fail we still fall through to `routine` (a non-breaking
+# default for this non-blocking resolver — unlike require-complexity-marker.sh
+# this script never blocks curation) but say so, so the degradation shows in logs.
+if body="$(gh issue view "$ISSUE" -R "$REPO" --json body -q .body 2>/dev/null)"; then
+  :
+elif body="$(gh api "repos/$REPO/issues/$ISSUE" --jq .body 2>/dev/null)"; then
+  :
+else
+  echo "$REPO#$ISSUE: could not fetch body (GraphQL+REST failed — likely API quota) -> routine" >&2
+  body=""
+fi
 tier="$(printf '%s' "$body" | grep -o 'loom:complexity=[a-z]*' | head -1 | cut -d= -f2)"
+# Two distinct fall-through cases (#4448): an absent marker is the expected
+# default for issues curated before the marker existed (or before it became
+# mandatory) and stays a quiet info line; an out-of-vocabulary value (a
+# curator paraphrasing the closed enum — `trivial`/`large`/`moderate` etc.)
+# is a drift bug worth naming so it shows up in logs, not just silently
+# routed to routine. Both still resolve to `routine` — no behavior change.
 case "$tier" in
   mechanical|routine|complex) ;;
-  *) echo "$REPO#$ISSUE: no valid complexity marker -> routine" >&2; tier="routine" ;;
+  "")
+    echo "$REPO#$ISSUE: no complexity marker -> routine" >&2
+    tier="routine"
+    ;;
+  *)
+    echo "$REPO#$ISSUE: invalid complexity tier '$tier' -> routine" >&2
+    tier="routine"
+    ;;
 esac
 
 # --tier mode returns "" + exit 3 when the runtime/tier has no mapping.
-if model="$(run_loom_tool "resolve-model" "model_tiers" \
+if model="$("$SCRIPT_DIR/resolve-model.sh" \
               --tier "$tier" --runtime "$RUNTIME" --config "$CONFIG" 2>/dev/null)" \
    && [[ -n "$model" ]]; then
   echo "resolve-tier-model: repo=$REPO issue=$ISSUE runtime=$RUNTIME tier=$tier model=$model" >&2

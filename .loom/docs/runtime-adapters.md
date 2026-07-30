@@ -41,6 +41,14 @@ The contract exists to *generalize* Loom, not to demote Claude Code.
 These are operator policy statements recorded on #4167; the contract encodes
 them but does not decide them.
 
+### Adapter status
+
+| Runtime | Adapter | Tier | Parity doc | CI leg | Notes |
+|---------|---------|------|-----------|--------|-------|
+| Claude Code | `defaults/scripts/spawn-claude.sh` | **1** (default) | n/a — Loom's guards *are* the Claude implementation | the whole existing suite | Zero-regression default; no `LOOM_RUNTIME` needed. |
+| OpenAI Codex CLI | `defaults/scripts/spawn-codex.sh` | **2** | [`guardrail-parity-codex.md`](guardrail-parity-codex.md) | `codex-adapter-smoke` in `.github/workflows/ci.yml` (mocked; no live calls) | **Shipped** by epic #4167 Phase 2 (#4468), ported from the gpeyton fork. Requires Codex CLI ≥ 0.146.0. Capability manifest `defaults/runtimes/codex.json` declares `worktreeIsolation: partial`, so `check-runtime-capabilities.sh` fails Builder+codex closed while Judge+codex passes. |
+| Amp, oh-my-pi (omp), … | — | — | — | — | Not started. |
+
 ## The seven contract points
 
 Every runtime adapter implements the same seven-point contract. Each point below
@@ -80,7 +88,7 @@ Claude-specific internals):
 | **Prompt delivery** | `-p "…"` / `--prompt` is passed through to `claude -p`. | Deliver the prompt to the runtime's own headless/print-mode flag. |
 | **Model tier env** | `LOOM_MODEL` → `claude --model <v>` unless an explicit `--model` is already present (explicit arg wins). See [model mapping](#2-model-mapping). | Map the logical model tier to the runtime's own model-selection flag with the same precedence. |
 | **Effort tier env** | `LOOM_EFFORT` → `claude --effort <v>` unless an explicit `--effort` is present. This is a **session-default** effort; the in-session Task tool exposes no per-rung effort knob. | Map to the runtime's reasoning-effort knob if it has one; otherwise omit (no error). |
-| **Missing-pool failure** | Exits **78** (`EX_CONFIG`) when neither token pool exists / all tokens are bad, with a message pointing at `loom-tokens bootstrap`. It never silently falls back to keychain. | Fail with a distinct, non-generic exit code on a missing/exhausted credential source rather than silently degrading. |
+| **Missing-pool failure** | Exits **78** (`EX_CONFIG`) when neither token pool exists / all tokens are bad, with a message pointing at `loom-daemon tokens bootstrap`. It never silently falls back to keychain. | Fail with a distinct, non-generic exit code on a missing/exhausted credential source rather than silently degrading. |
 | **Runtime-missing failure** | Exits `127` when the `claude` CLI is not on `PATH`. | Fail cleanly when the runtime binary is absent. |
 | **Observability** | Emits exactly one structured `spawn-claude: model=<v>` line (and an effort line when resolved) to stderr on every spawn, changing no behavior. | Emit an equivalent single structured line so log scrapers can attribute the dispatch. |
 
@@ -88,9 +96,11 @@ The daemon dispatch path (`loom-daemon`'s `spawn_child`) sets
 `LOOM_SWEEP_CLAIM_OWNED` and per-sweep log redirection around this script; an
 adapter's spawn entry point is invoked the same way, so it must tolerate that
 env var being present (Claude's script logs `LOOM_SWEEP_CLAIM_OWNED` on every
-spawn for dispatch diagnosability). `LOOM_PACKAGE_PATH` forwarding — the
-bridge that let a dispatched `spawn-claude.sh` locate the Python `loom_tools`
-package — was retired end-to-end in #4228 once token selection went native.
+spawn for dispatch diagnosability). **An adapter has no Python bridge to
+implement:** `LOOM_PACKAGE_PATH` forwarding — the mechanism that let a
+dispatched `spawn-claude.sh` locate a Python package — was retired end-to-end in
+#4228 once token selection went native, and the package itself was deleted in
+epic #4081 Phase 4 (#4557). Nothing on the spawn path reads or sets it.
 
 The runtime-neutral **dispatch seam** that realizes this contract point today —
 `spawn-worker.sh` plus the `runtimes` config block — is specified in
@@ -106,7 +116,8 @@ model-cost experiment all keep naming *logical* tiers; each adapter owns the
 single indirection from logical tier to its own concrete IDs.
 
 **Reference implementation:** `defaults/scripts/resolve-model.sh` (a thin stub
-delegating to `loom_tools.model_tiers`). It is the single indirection point that
+delegating to `loom-daemon resolve-model`, implemented in
+`loom-daemon/src/script_helpers/model_tiers.rs`). It is the single indirection point that
 resolves a logical alias to the concrete ID *before* dispatch. It exists because
 a bare alias is not always current on the wire — the CLI's own `opus` alias
 still resolves to a previous-generation model, so the shipped map pins the stale
@@ -121,13 +132,25 @@ logical `opus` → an OpenAI reasoning-model ID). The fork's "cost of being wron
 tiering is the seed for how a non-Claude runtime should choose which concrete
 model a tier maps to.
 
+**The Codex adapter deliberately does NOT do this yet (#4468).** It ships
+*model-mapping minimalism*: `LOOM_MODEL` is forwarded verbatim to `codex -m`, an
+explicit `-m`/`--model` wins, `LOOM_CODEX_MODEL` supplies an optional static
+adapter default, and with none of those set **no `-m` flag is emitted at all** so
+the Codex CLI/profile default is preserved (exactly `spawn-claude.sh`'s
+no-`--model` behavior). There is no logical-tier→OpenAI-ID table, because Loom's
+tier names (`opus`, `sonnet`, `fable`) are Claude names and inventing an
+OpenAI-side mapping is precisely the reconciliation flagged below. Reasoning
+effort maps to a config override (`-c model_reasoning_effort=<v>`) because
+`codex exec` has no `--effort` flag. Full tier resolution for Codex is Phase 4.
+
 **Complexity tier map (`sweep.tierModels`, issue #4238).** The higher-level
 `sweep.tierModels[<runtime>][<tier>]` map (Curator marker → logical tier →
 model, `mechanical`/`routine`/`complex`) is exactly this per-runtime table. It is
 resolved **entirely orchestrator-side** — the `/loom:sweep` skill runs
 `./.loom/scripts/resolve-tier-model.sh <issue> <runtime>`, which delegates the
-config lookup to `loom_tools.model_tiers` (`resolve_tier_model`, `--tier` mode)
-and then the alias→ID step to `resolve-model.sh`. **The Rust daemon does not
+config lookup to `loom-daemon resolve-model --tier` (`resolve_tier_model` in
+`loom-daemon/src/script_helpers/model_tiers.rs`) and then the alias→ID step to
+`resolve-model.sh`. **The Rust daemon does not
 participate**: it never reads the complexity marker — it dispatches with an
 explicit/inherited `--model` and forwards nothing else — so there is no daemon
 counterpart to keep in lockstep for the tier map, and its `sweep.modelAliases`
@@ -140,8 +163,9 @@ map layers cleanly on top of whichever single-source resolver wins.
 `cost`/`speed`/`balanced` policy switch that selects a preset over the tier map
 above (see `model-selection.md` "Optimization profile switch") is, for the same
 reason, **also orchestrator-side only**: `resolve_optimization_profile` /
-`optimization_preset` live in `loom_tools.model_tiers` alongside
-`resolve_tier_model`, reached through the same `resolve-tier-model.sh` call —
+`optimization_preset` live in `loom-daemon/src/script_helpers/model_tiers.rs`
+alongside `resolve_tier_model`, reached through the same `resolve-tier-model.sh`
+call —
 there is no separate dispatch path to keep in lockstep. It does not touch
 `sweep_registry.rs` for the same reason the tier map does not: the Rust daemon's
 `resolve_dispatch_model` only ever resolves `sweep.modelAliases` for its own
@@ -180,24 +204,48 @@ set:
 | `SESSION_LIMIT` | concurrent-session cap (healthy account) | re-select, retry, do **not** mark bad |
 | `MODEL_REFUSAL` | safety classifier refused the turn | drop one ladder rung, no Doctor cycle consumed |
 | `RECOVERABLE` | rate limit / 5xx / network | retry with backoff |
-| `FATAL` | reserved | non-recoverable |
+| `FATAL` | non-recoverable **configuration** fault — retrying the identical invocation cannot succeed | fail fast; do not retry, do not rotate |
 
-Today this file is a single Claude-only `classify_error()` function — its regexes
-match Claude Code's actual error wording (its 401 phrasing, its quota/weekly-limit
-strings, its concurrent-session message) against the shared category set. It is
-the **Claude reference implementation**, not yet a multi-provider structure.
+This file is now a **shared classification engine plus per-provider pattern
+tables** (the structure #4190 extracted, seeded by the fork's PR #6): the engine
+owns exit-code-first ordering, the category enum, and the generic-transient
+fallthrough; each provider table owns only that runtime's failure-signature
+regexes. Provider selection is `classify_error <output> <exit_code> [provider]`
+with precedence *explicit 3rd arg > `$LOOM_RUNTIME` > `"claude"`*, so two-arg
+legacy callers (e.g. `claude-wrapper.sh`) classify bit-identically to before the
+split. An unknown provider never errors — it matches no table and resolves
+through the generic transients.
 
-The important design point for adapters is the **contract requirement** this file
-must grow into: a **per-provider pattern-table** organization, where each category
-is matched by a *provider-specific* regex over that runtime's error wording, all
-mapping onto the **same** category set. Restructuring `classify-error.sh` into
-per-provider tables is exactly what the fork's PR #6 targets — that is the future
-shape this contract point specifies, not the current upstream state. Once
-restructured, a new adapter contributes its runtime's pattern table (Codex's 401
-wording, its quota-exhaustion phrasing, its concurrent-session message) without
-touching the categories. The category *contract* is shared; the *patterns* are
-per-runtime. Callers such as `claude-wrapper.sh` source this file rather than
-duplicating the patterns, so the category set must stay stable across runtimes.
+Two tables ship today:
+
+- **`claude`** — the reference implementation: `CWD_DELETED` → `MODEL_REFUSAL` →
+  `TOKEN_EXPIRED` → `SESSION_LIMIT` → `TOKEN_EXHAUSTED` → the CLI's
+  "No messages returned" transient. Order is load-bearing (`SESSION_LIMIT`
+  before `TOKEN_EXHAUSTED`, #3947).
+- **`codex`** — added with the Codex adapter (#4468): `FATAL` config faults
+  (trusted-directory refusal, unknown `-c` config field, unconstructable
+  sandbox) → `TOKEN_EXHAUSTED` (plan/quota wording) → `TOKEN_EXPIRED`
+  (401 / `codex login` / refresh-token failures). Every pattern was observed on,
+  or extracted from, codex-cli 0.146.0 — none is guessed.
+
+Adding a runtime therefore means **contributing a table, never touching the
+categories**. Two lessons from the Codex table are worth carrying into the next
+adapter:
+
+- **Leave a category unimplemented rather than guessing.** `codex` deliberately
+  has no `CWD_DELETED` / `SESSION_LIMIT` / `MODEL_REFUSAL` patterns because that
+  runtime has no known wording for them, and reusing Claude's phrasing would
+  produce confident nonsense. An unmatched category simply falls through to
+  `RECOVERABLE`, which is the correct conservative default.
+- **Pick the ordering that makes mis-classification cheap.** `codex` checks
+  quota wording *before* 401 wording because `TOKEN_EXPIRED` marks an account bad
+  with a reason that persists until manual intervention, while
+  `TOKEN_EXHAUSTED`'s TTL-expires on its own.
+
+`FATAL` is no longer purely reserved: the `codex` table is its first producer.
+No `claude` input returns `FATAL`, so every pre-existing caller is unaffected.
+Callers such as `claude-wrapper.sh` source this file rather than duplicating the
+patterns, so the category set must stay stable across runtimes.
 
 ### 4. Usage accounting
 
@@ -235,11 +283,15 @@ them from a single source so role/repo instructions never fork per-runtime.
 - **`CLAUDE.md`** is Claude Code's richer native format. Claude Code also reads
   `AGENTS.md`, but `CLAUDE.md` carries the full operating surface.
 
-Both are generated from one source (the fork's `AGENTS.md` codegen, fork PR #8,
-is the seed) so a new runtime that reads `AGENTS.md` gets correct instructions
-with no per-runtime prompt fork. An adapter declares its instruction-file set
-(e.g. Codex reads `AGENTS.md` + `.codex/` config); it must **not** introduce a
-per-runtime copy of the role prompts.
+Both derive from one source (#4479, seeded by the fork's `AGENTS.md` codegen,
+fork PR #8): `defaults/scripts/generate-agents-md.sh` extracts the
+`agents-md:include` marker ranges from `defaults/.loom/CLAUDE.md` and wraps them
+with dual-runtime framing, writing the checked-in `defaults/.loom/AGENTS.md`
+(CI `scripts/check-agents-md-sync.sh` fails if it is stale). So a new runtime
+that reads `AGENTS.md` gets correct instructions with no per-runtime prompt fork,
+and there is exactly one place a human edits the prose. An adapter declares its
+instruction-file set (e.g. Codex reads `AGENTS.md` + `.codex/` config); it must
+**not** introduce a per-runtime copy of the role prompts.
 
 ### 6. Permission / sandbox mapping
 
@@ -250,6 +302,10 @@ section. Loom's `PreToolUse` guards (`guard-destructive.sh`,
 they are Claude Code hooks. Another runtime has its own sandbox model
 (allow/deny command lists, filesystem confinement, network policy), which will
 not match Loom's guards one-for-one.
+
+**Shipped example:** [`guardrail-parity-codex.md`](guardrail-parity-codex.md) is
+the Codex adapter's parity doc (#4468) and the reference shape for the next one.
+Naming convention: `defaults/docs/guardrail-parity-<runtime>.md`.
 
 **Adapter obligation:** every adapter MUST ship a `GUARDRAIL-PARITY.md`-style map
 of *Loom guard intent → runtime sandbox mechanism* (e.g. "force-push-to-main
@@ -292,8 +348,9 @@ compatibility and refuses to dispatch a role onto a runtime that cannot meet its
 requirements, rather than letting the session fail partway. The declaration is
 per-runtime; the requirements are per-role; the match happens at dispatch time.
 
-**Landed today (#4170):** the declaration and requirement sides of this contract
-exist as data + a standalone checker, ahead of dispatch wiring:
+**Capability contract (#4170, enforced for daemon scheduling by #4494):** the
+declaration and requirement sides exist as data and are interpreted identically
+by the standalone checker and daemon admission:
 
 - **Declaration** — `defaults/runtimes/<name>.json` (e.g.
   `defaults/runtimes/claude.json`), matching the sketch above exactly (tri-state
@@ -310,16 +367,103 @@ exist as data + a standalone checker, ahead of dispatch wiring:
   where a requirement is satisfied only by a declared `"yes"` (`"partial"` fails
   closed). Exit 0 on match or no-requirements, exit 78 (`EX_CONFIG`) on mismatch
   naming each unmet capability, non-zero with a distinct message on an
-  unknown/missing role or runtime file. It is intentionally **standalone** —
-  not yet wired into `spawn-worker.sh` or any dispatch path; that wiring is a
-  follow-up decision.
+  unknown/missing role or runtime file.
+
+**Second manifest (#4468):** `defaults/runtimes/codex.json` declares
+`mcp: "yes"`, `subagents: "no"` (the fork PR #59 prohibition), `hooks: "partial"`
+(Codex 0.146.0 has a `hooks.json` engine with a `pre_tool_use` event, but Loom
+wires nothing into it), `skills: "partial"`, and
+`worktreeIsolation: "partial"` (Codex's `workspace-write` sandbox confines to the
+workspace root, not to one `issue-N` worktree). Because `"partial"` fails closed,
+`check-runtime-capabilities.sh --role builder --runtime codex` exits 78 while
+`--role judge --runtime codex` passes — the manifest mechanically encodes the
+parity doc's residual gap 2, and the CI leg asserts both outcomes. That is the
+intended relationship between points 6 and 7: the parity doc states the gap in
+prose, the manifest makes it enforceable.
+
+### Daemon runtime binding and admission
+
+Standalone periodic roles support per-role bindings:
+
+```json
+{
+  "runtimes": {
+    "default": "claude",
+    "roles": {
+      "curator": "codex",
+      "judge": "codex"
+    }
+  }
+}
+```
+
+The daemon resolves an explicit dispatch value (where the API offers one), then
+`LOOM_RUNTIME_<ROLE>`, `LOOM_RUNTIME`, `runtimes.roles.<role>`,
+`runtimes.default`, and finally `claude`. Empty strings are unset. It
+canonicalizes the role first and validates the selected adapter, role sidecar,
+runtime manifest, and every required capability before starting a child.
+`partial`, `no`, missing, malformed, and unknown values fail closed. The
+admitted runtime is pinned into the child environment so `spawn-worker.sh`
+cannot make a second, divergent choice.
+
+Unknown keys under `runtimes.roles` are a **hard configuration error**, not a
+silently ignored entry: `runtimes.roles.not-a-role` (or a typo such as
+`buidler`) refuses every admission for that workspace with a diagnostic naming
+the offending key, so a misconfigured binding can never leave a role quietly
+running on the default runtime. A known key with an **empty** value keeps its
+established "unset" meaning and falls through to the next precedence tier.
+
+Daemon admission runs before any claim lock, forge mutation, account selection,
+log header, or child spawn. Successful sweep status and
+`sweep.global.dispatch` events include both `runtime` and `runtime_source`.
+Refused work is represented too: the daemon publishes
+`sweep.global.runtime_rejected` carrying `kind`, `role`, `runtime`,
+`runtime_source`, `unmet_capabilities`, and `reason` — emitting it is a pure
+publish that creates no claim, account, or log side effect.
+
+Rejected IPC dispatches return `RuntimeRejected` with structured `role`,
+`runtime`, `source`, `unmet_capabilities`, and `reason` fields, and **both**
+real dispatch clients model it:
+
+- `loom-daemon dispatch <N>` renders the role/runtime/source/unmet diagnostic
+  and exits `78` (`EX_CONFIG`) — the same code the shell checker uses for a
+  mismatch — so a script can tell a capability refusal apart from a daemon
+  error without parsing text.
+- The MCP bridge (`mcp__loom__dispatch_sweep`) returns the parsed rejection as
+  a structured `runtime_rejection` object plus a rendered summary line, instead
+  of an opaque "unexpected response".
+
+These records contain selection metadata only; configuration values,
+environment contents, tokens, and credentials are never serialized.
+
+The native admission path and `check-runtime-capabilities.sh` are held to one
+decision by a shared conformance matrix over **every** shipped role/runtime
+pair, asserting identical decisions *and* identical named unmet-capability
+sets. The checker's `--json` flag (additive; exit codes and stderr are
+unchanged) emits that comparison surface:
+
+```json
+{"role":"builder","runtime":"codex","decision":"reject",
+ "unmet":["worktreeIsolation"],"reason":"unmet capabilities: worktreeIsolation"}
+```
+
+A `/loom:sweep` is different from a standalone role tick: it is one coordinator
+process for the entire Curator → Builder → Judge → Doctor → Merge lifecycle.
+Loom does not switch its CLI runtime between those nested phases. Consequently
+the daemon resolves the sweep runtime once from the global/default tiers and
+admits it against Builder's strongest lifecycle requirements. A per-role
+`curator: codex` binding can route a standalone Curator tick to Codex, but it
+does not make a full sweep partly Codex. With the shipped manifests, standalone
+Curator and Judge can use Codex; Builder and a full sweep cannot, because Codex
+declares `worktreeIsolation: partial`.
 
 ## Phase 1: the `spawn-worker.sh` runtime-dispatch seam
 
 Contract point 1 ([Spawn](#1-spawn)) is realized today by a concrete
 **runtime-dispatch seam** so the underlying runtime is a swappable adapter rather
-than a hardwired path. Claude Code is adapter #1; a future Codex adapter
-(`spawn-codex.sh`) slots in behind the same seam with no caller change. This is
+than a hardwired path. Claude Code is adapter #1; the Codex adapter
+(`spawn-codex.sh`, shipped in Phase 2 / #4468) slots in behind the same seam
+with no caller change — the seam needed no modification to admit it. This is
 **Phase 1** of epic **#4167** and is a **zero-behavior-change** extraction: with
 nothing configured, the seam execs the same `spawn-claude.sh` Loom always ran.
 (This upstreams the dispatch-seam shape the fork's PR #9 built — see the [fork
@@ -340,8 +484,36 @@ LOOM_RUNTIME=claude .loom/scripts/spawn-worker.sh --use-wrapper -p "..."
 ```
 
 Callers migrate from `spawn-claude.sh` to `spawn-worker.sh` to gain runtime
-selection; until they do, `spawn-claude.sh` keeps working unchanged (existing
-daemon/tooling callers are intentionally left on the direct path in Phase 1).
+selection; direct `spawn-claude.sh` callers remain supported. The daemon
+`SweepRegistry` uses this dispatcher and sends generic `--effort`,
+`--dangerously-skip-permissions`, and `--use-wrapper` conventions. Each adapter
+must consume or translate these options and must not pass options unsupported
+by its CLI.
+
+The machine-level `loom sweep <N>` dispatcher (`scripts/loom`'s `loom_cmd_sweep`)
+is one such migrated caller (#4480): it resolves the repo's `spawn-worker.sh` and
+execs `spawn-worker.sh -p "/loom:sweep <N>" --dangerously-skip-permissions`
+instead of `claude` directly, so a Codex-hosted (or any non-Claude) operator can
+dispatch the canonical single-issue lifecycle. With nothing configured this stays
+byte-for-byte the old `claude -p ... --dangerously-skip-permissions` invocation
+(via `spawn-worker.sh` → `spawn-claude.sh`).
+
+### Adapter observability markers
+
+Daemon-compatible runners emit a small, secret-free contract on stderr:
+
+```text
+# LOOM_RUNTIME_RESOLVED runtime=<runtime>
+# LOOM_ACCOUNT name=<account-or-profile>   # optional
+# LOOM_CLI_START runtime=<runtime>
+```
+
+The dispatcher emits runtime resolution, an adapter emits account/profile
+selection when available, and the runner emits CLI-start immediately before
+launching the runtime CLI. Account values are display names only; credential
+values and credential paths must never appear. Parsers anchor these markers
+after the newest daemon dispatch header. Historical `spawn-claude:` preamble
+and `# CLAUDE_CLI_START` records remain supported.
 
 ### Runtime resolution (precedence)
 
@@ -381,6 +553,40 @@ executable). It must satisfy the [Spawn interface](#1-spawn) above — accept th
 same passthrough-args contract and `exec` its underlying CLI. Then select it
 per-run with `LOOM_RUNTIME=<runtime>` or repo-wide with `runtimes.default`.
 
+`spawn-codex.sh` is the worked example. Use it as the shape for a third adapter,
+and note the four things it had to do that the bare Spawn table does not spell
+out — each of which is likely to recur:
+
+1. **Translate Loom's flag conventions, do not forward them.** `-p`/`--prompt`
+   and `--dangerously-skip-permissions` are *Loom* conventions. On `codex exec`,
+   `-p` means `--profile`, so forwarding it would have silently selected a
+   config profile instead of passing a prompt. Consume Loom's flags, re-emit the
+   runtime's.
+2. **Own your own scheduling priority.** `spawn-worker.sh` deliberately applies
+   no `nice`/`taskpolicy` (issue #4233) — it only `exec`s, so a runner-level
+   re-exec covers the whole tree with no double-apply. Copy `spawn-claude.sh`'s
+   `LOOM_SWEEP_NICED` block into the new runner.
+3. **Check which stream your runtime's metadata is on.** Codex writes the agent's
+   final message to stdout and *everything else* — including the `session id:`
+   line that is the transcript join key — to stderr. Reporting it therefore
+   requires running the CLI as a child with stderr tee'd (recovering the exit
+   code from `PIPESTATUS`) rather than a plain `exec`. Verify empirically; do not
+   assume.
+4. **Neutralize stdin.** A dispatched worker's stdin is a pipe nobody writes to.
+   `codex exec` reads non-TTY stdin and appends it to the prompt, so the child
+   would block forever; the adapter redirects `</dev/null`. Any runtime with a
+   "read the prompt from stdin" mode needs the same treatment.
+
+Two contract points gate admission, and neither is optional:
+a **guardrail-parity document** (point 6 — see
+[`guardrail-parity-codex.md`](guardrail-parity-codex.md) for the required shape,
+including an explicit residual-gap section) and a **CI leg** proving the adapter
+spawns correctly against a mocked CLI with no live API calls (the tier-2 gate;
+`codex-adapter-smoke` in `.github/workflows/ci.yml` is the model). Add a
+capability manifest at `defaults/runtimes/<runtime>.json` (point 7) at the same
+time — declaring a capability `"partial"` fails role matching closed, which is
+how Codex is correctly kept out of Builder dispatch.
+
 ### Unknown-runtime failure (exit 78)
 
 If the resolved runtime has no matching `spawn-<runtime>.sh` runner, the
@@ -392,19 +598,25 @@ Spawn contract's *missing-pool* facet uses — with an actionable message naming
 - the `spawn-*.sh` runners actually present on disk.
 
 ```text
-ERROR Unknown runtime 'codex' (resolved from config (runtimes.default)):
-ERROR no runner found at /…/.loom/scripts/spawn-codex.sh.
-ERROR Available runtimes on disk: claude.
+ERROR Unknown runtime 'amp' (resolved from config (runtimes.default)):
+ERROR no runner found at /…/.loom/scripts/spawn-amp.sh.
+ERROR Available runtimes on disk: claude codex.
 ```
+
+(The example named `codex` before Phase 2 shipped `spawn-codex.sh`; `codex` is
+now a *known* runtime. A regression test in
+`defaults/scripts/tests/test-spawn-codex.sh` asserts that `codex` moving from
+unknown to known did not weaken this guard for other names.)
 
 ### Scope (Phase 1)
 
 - No capability-matrix enforcement in the dispatcher
   ([contract point 7](#7-capability-declaration) is a separate issue) — the seam
   only routes; it does not validate a runtime's feature set.
-- `spawn-claude.sh`, `claude-wrapper.sh`, the Rust `loom-daemon`, and the Python
-  `loom-tools` callers are unchanged; migrating callers onto `spawn-worker.sh`
-  is a follow-up once the seam has soaked.
+- `spawn-claude.sh`, `claude-wrapper.sh`, and the Rust `loom-daemon` callers are
+  unchanged; migrating callers onto `spawn-worker.sh` is a follow-up once the
+  seam has soaked. (The Python `loom-tools` callers this list used to name no
+  longer exist — epic #4081 Phase 4, #4557.)
 
 ## Fork mapping table
 
@@ -413,17 +625,17 @@ adapter contract is the interface that work slots into as **upstream PRs from th
 fork** (not cherry-picks). This is the "your work slots in here" map for the
 collaboration:
 
-| Fork PR | What it built | Contract slot |
-|---------|---------------|---------------|
-| #9 | `spawn-worker.sh` spawn dispatcher | **1. Spawn** — the runtime-neutral dispatch entry point |
-| #6 | Restructured `classify-error.sh` into per-provider pattern tables | **3. Error classification** — the per-runtime pattern-table shape |
-| #15 | Codex runner | **1. Spawn** — Codex's `spawn-<runtime>.sh` implementation |
-| #16 | `.codex/` config | **5. Instruction format** — Codex's config/instruction file set |
-| #20, #40 | `GUARDRAIL-PARITY.md` guardrail parity | **6. Permission / sandbox mapping** — the parity-doc requirement |
-| #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation |
-| #12, #17 | Provider-aware account pool (per-account provider, waterfall fill, `CODEX_HOME` rotation) | **4. Usage accounting** — provider-aware selection consuming the pool signals |
-| #14 | Reusable CI role workflow (`loom-role.yml`) parameterized by runtime | Cross-cutting — the tier-2 CI gate every non-Claude adapter must pass |
-| #59 | Finding: native Codex agents prohibited for Loom lifecycles | **6/7. Constraint** — encoded in the parity doc + capability matrix |
+| Fork PR | What it built | Contract slot | Upstream status |
+|---------|---------------|---------------|-----------------|
+| #9 | `spawn-worker.sh` spawn dispatcher | **1. Spawn** — the runtime-neutral dispatch entry point | **landed** (Phase 1) |
+| #6 | Restructured `classify-error.sh` into per-provider pattern tables | **3. Error classification** — the per-runtime pattern-table shape | **landed** (#4190) |
+| #15 | Codex runner | **1. Spawn** — Codex's `spawn-<runtime>.sh` implementation | **landed** as `defaults/scripts/spawn-codex.sh` (#4468). Ported, not cherry-picked: token-pool auth deferred to Phase 4, `--full-auto`/`-a` replaced (absent on `codex exec` 0.146.0), and the skip-permissions → sandbox mapping deliberately diverges (see the parity doc). |
+| #16 | `.codex/` config | **5. Instruction format** — Codex's config/instruction file set | not started (separate issue) |
+| #20, #40 | `GUARDRAIL-PARITY.md` guardrail parity | **6. Permission / sandbox mapping** — the parity-doc requirement | **landed** as [`guardrail-parity-codex.md`](guardrail-parity-codex.md) (#4468), re-verified against 0.146.0 — several fork claims no longer hold and are corrected there |
+| #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation | **landed** (#4479) as a *generator* (`defaults/scripts/generate-agents-md.sh`) that extracts `agents-md:include` ranges from `defaults/.loom/CLAUDE.md` — not the fork's hand-authored static file (that would violate this repo's single-source non-goal). CI `check-agents-md-sync.sh` keeps the checked-in `defaults/.loom/AGENTS.md` in sync; scaffolding installs the root pointer + `.loom/AGENTS.md` full guide. |
+| #12, #17 | Provider-aware account pool (per-account provider, waterfall fill, `CODEX_HOME` rotation) | **4. Usage accounting** — provider-aware selection consuming the pool signals | Phase 4. #4468 ships only single-profile `CODEX_HOME` passthrough — no pool, no rotation, no bad-token marking. |
+| #14 | Reusable CI role workflow (`loom-role.yml`) parameterized by runtime | Cross-cutting — the tier-2 CI gate every non-Claude adapter must pass | partially landed: Codex has its own `codex-adapter-smoke` leg in `ci.yml` (#4468); the parameterized reusable workflow is not adopted |
+| #59 | Finding: native Codex agents prohibited for Loom lifecycles | **6/7. Constraint** — encoded in the parity doc + capability matrix | **landed** — recorded as residual gap 9 in the parity doc; `codex.json` declares `subagents: "no"` |
 
 ## Non-goals
 
@@ -439,5 +651,9 @@ collaboration:
 - Epic **#4167** — first-class multi-runtime worker support (the seven contract
   points' authoritative framing, the phasing, and the fork PR list).
 - **#4165** — fork divergence triage (harvest tracking).
+- [`guardrail-parity-codex.md`](guardrail-parity-codex.md) — the Codex adapter's
+  guardrail-parity doc (contract point 6), including the `CODEX_HOME` profile
+  layout / refresh / security-posture reference absorbed from #4469.
+- **#4468** — Codex adapter port (Phase 2). **#4470** — Codex canary runs.
 - [ADR-0012: Multi-Runtime Worker Support via a Runtime Adapter Contract](../../docs/adr/0012-runtime-adapter-contract.md).
 - Fork: https://github.com/gpeyton/loom · `AGENTS.md` standard: https://agents.md

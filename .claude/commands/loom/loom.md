@@ -150,19 +150,24 @@ When the daemon is running, you coordinate work via MCP tools where available, a
    gh pr list --label="loom:review-requested" --json number,title --limit=20
    ```
 
-3. **Dispatch new sweeps** via MCP or CLI:
+3. **Dispatch new sweeps** via MCP or CLI. Derive the target workspace root once
+   and pass it explicitly — omitting it routes through registry resolution
+   (#4299/PR #4322), which can silently target the daemon's default workspace
+   instead of the repo you meant (#4503):
    ```
+   WORKSPACE_ROOT=$(git rev-parse --show-toplevel)
    For each ready loom:issue not already in the daemon registry:
-     mcp__loom__dispatch_sweep  kind={"Issue": <N>}
+     mcp__loom__dispatch_sweep  kind={"Issue": <N>}  workspace_root=$WORKSPACE_ROOT
    ```
    ```bash
    # CLI equivalent (#3952) — same underlying IPC DispatchSweep request:
-   loom-daemon dispatch <N> [--model M] [--effort E] [--depends-on P]
+   loom-daemon dispatch <N> --workspace "$WORKSPACE_ROOT" [--model M] [--effort E] [--depends-on P]
    ```
    `kind`/`<N>` is the only required input. Optional params on both surfaces:
    `model`, `effort`, `depends_on` (a single parent issue for stacked PRs);
    MCP additionally takes `idempotency_key` (dedup) and CLI additionally takes
-   `--workspace` (target a non-default managed workspace root). The daemon
+   `--workspace` (target a non-default managed workspace root — always pass
+   it explicitly rather than relying on the default). The daemon
    picks an OAuth token from the pool (`spawn-claude.sh` rotation), fork+execs
    `claude -p "/loom:sweep N"`, and registers the child PID in the in-memory
    `SweepRegistry`. Token rotation only happens at this process-spawn
@@ -635,7 +640,7 @@ loom-clean --deep       # Also remove build artifacts
 | `loom:review-requested` | PR ready for review | Builder |
 | `loom:changes-requested` | PR needs fixes | Judge |
 | `loom:pr` | PR approved, ready to merge | Judge |
-| `loom:auto-merge-ok` | Override size limit for merge | Judge/Human |
+| `loom:auto-merge-ok` | Override a Champion merge-risk hold | Judge/Human |
 
 **Proposal labels:**
 

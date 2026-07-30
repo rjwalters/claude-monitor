@@ -501,20 +501,29 @@ gh issue list --label "loom:blocked" --state open --json number,title,body
 
 ### Dependency Parsing
 
-Recognize these patterns in issue bodies:
+Recognize these patterns in issue bodies. The phrase forms tolerate markdown
+emphasis (`*`/`_`) and an optional colon between the phrase and the first
+`#N` — e.g. `**Blocked by:** #1 (reason), #3 (reason)` — and every `#N` on a
+matched line is captured, not just the first (#4508):
 
 | Pattern | Example |
 |---------|---------|
-| Explicit blocker | `Blocked by #123` |
-| Depends on | `Depends on #123` |
+| Explicit blocker | `Blocked by #123`, `**Blocked by:** #123` |
+| Depends on | `Depends on #123`, `_Depends on_ #123` |
 | Requires | `Requires #123` |
 | Task list | `- [ ] #123: Description` |
 
 ```bash
 parse_dependencies() {
   local body="$1"
-  # Match dependency patterns and extract issue numbers
-  echo "$body" | grep -oE '(Blocked by|Depends on|Requires|\- \[.\]) #[0-9]+' | grep -oE '#[0-9]+' | tr -d '#' | sort -u
+  # Two-stage parse (#4508): stage 1 selects lines that declare a dependency
+  # phrase, tolerant of markdown emphasis/colon between the phrase and the
+  # first #N (e.g. "**Blocked by:** #1"); stage 2 extracts every #N on those
+  # lines, so comma-separated lists ("#1 (reason), #3 (reason)") capture all
+  # refs, not just the first.
+  echo "$body" \
+    | grep -E '(Blocked by|Depends on|Requires|\- \[.\])[*_:[:space:]]*#[0-9]+' \
+    | grep -oE '#[0-9]+' | tr -d '#' | sort -u
 }
 ```
 

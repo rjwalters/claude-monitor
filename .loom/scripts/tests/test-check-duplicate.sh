@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # test-check-duplicate.sh - Unit tests for check-duplicate.sh's --issue
-# cross-reference probe (issue #4162).
+# cross-reference probe (issue #4162) and its keyword-similarity scoring
+# (issue #4409).
 #
 # check-duplicate.sh's existing keyword-similarity check answers "has this
 # been reported before?" -- it is structurally blind to an OPEN issue that
@@ -16,6 +17,17 @@
 # black-box test: check-duplicate.sh is a full CLI script (main "$@" at
 # EOF, not sourced functions), so we stub `gh` and `loom-daemon` on PATH and
 # invoke the real script as a subprocess, asserting on stdout/exit code.
+#
+# Issue #4409 fixed two compounding bugs in calculate_similarity(): (1) `read
+# -ra arr <<< "$multiline_str"` only ever consumes ONE line, so a multi-keyword
+# (i.e. any realistically-worded) title/body collapsed to a single-element
+# array -- comparisons became a coin flip on one token instead of a real set
+# comparison; (2) even with arrays populated correctly, normalizing by the
+# SMALLER set saturated near 100% whenever a large query keyword set was
+# compared against a small candidate set. The tests below use small,
+# hand-built keyword sets (plain English words, no stopwords) run through the
+# real CLI against a stubbed candidate pool, so the resulting percentages are
+# exact and checkable by hand (see comments at each candidate).
 #
 # Usage:
 #   ./.loom/scripts/tests/test-check-duplicate.sh
@@ -284,6 +296,175 @@ run_cds --issue 80 --title "Some issue title"
 assert_eq "0" "$RC" "(g) repo view failure -> exit code driven by similarity check alone"
 assert_not_contains "$OUT" "RELATED_OPEN_WORK" "(g) repo view failure -> probe result skipped"
 assert_contains "$ERR" "Failed to resolve repository" "(g) repo view failure -> stderr warning emitted"
+
+echo ""
+echo "Testing check-duplicate.sh keyword-similarity scoring (issue #4409)..."
+
+# All fixtures below use NATO-alphabet words (alpha, bravo, ...) as keywords:
+# real English words, none of them in extract_keywords' stopword list, all
+# >= 3 chars, so every keyword survives extraction and the resulting Jaccard
+# percentages (matches * 100 / (|A| + |B| - matches)) are exact and easy to
+# verify by hand.
+
+# (h) Identical keyword sets -> 100% similarity (union == intersection).
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 501, "title": "Alpha Bravo Charlie Delta", "body": ""}]
+EOF
+run_cds --threshold 50 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(h) Identical keyword sets -> exit 1 (duplicate found)"
+assert_contains "$OUT" "#501: Alpha Bravo Charlie Delta (similarity: 100%)" \
+  "(h) Identical keyword sets score exactly 100%"
+
+# (i) Disjoint keyword sets -> 0% similarity, never flagged even at a
+# near-zero threshold.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 502, "title": "Yankee Zulu Xray Whiskey", "body": ""}]
+EOF
+run_cds --threshold 1 --title "Alpha Bravo Charlie Delta"
+assert_eq "0" "$RC" "(i) Disjoint keyword sets -> exit 0 (no duplicate)"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(i) Disjoint keyword sets never flagged"
+
+# (j) Partial overlap -> exact Jaccard percentage, not the old
+# matches/min(|A|,|B|) normalization. Query {alpha,bravo,charlie,delta} (4)
+# vs candidate {alpha,bravo,echo,foxtrot,golf} (5): matches=2 (alpha,bravo),
+# union=4+5-2=7, percent=2*100/7=28 (integer division). The pre-#4409
+# min-set normalization would have scored this matches/min(4,5)=2/4=50% --
+# a materially different (and saturating) number.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 503, "title": "Alpha Bravo Echo Foxtrot Golf", "body": ""}]
+EOF
+run_cds --threshold 28 --title "Alpha Bravo Charlie Delta"
+assert_eq "1" "$RC" "(j) Partial overlap at threshold==percent -> exit 1"
+assert_contains "$OUT" "#503: Alpha Bravo Echo Foxtrot Golf (similarity: 28%)" \
+  "(j) Partial overlap scores exact true-Jaccard percentage (28%, not 50%)"
+run_cds --threshold 29 --title "Alpha Bravo Charlie Delta"
+assert_eq "0" "$RC" "(j) Partial overlap just below threshold -> exit 0"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(j) 28% does not clear a 29% threshold"
+
+# (k) Empty keyword set on the CANDIDATE side (all stopwords) -> the existing
+# early-return in calculate_similarity (arr2 has 0 elements) must still yield
+# 0%, not a crash or division by zero.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 504, "title": "The Is Are", "body": ""}]
+EOF
+run_cds --threshold 1 --title "Alpha Bravo Charlie Delta"
+assert_eq "0" "$RC" "(k) All-stopword candidate -> empty keyword set -> exit 0, no crash"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(k) Empty candidate keyword set never matches"
+
+# (k2) Empty keyword set on the QUERY side (title is entirely stopwords) --
+# search_similar_issues' own early return (before ever calling
+# calculate_similarity), with a warning on stderr and no forge calls.
+reset_state
+run_cds --title "Is Are Was"
+assert_eq "0" "$RC" "(k2) All-stopword query title -> exit 0, no crash"
+assert_contains "$ERR" "No significant keywords" "(k2) All-stopword query title warns on stderr"
+
+# (l) One-word title on both sides: identical single-keyword sets -> 100%,
+# disjoint single-keyword sets -> 0%.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[
+  {"number": 505, "title": "Alpha", "body": ""},
+  {"number": 506, "title": "Bravo", "body": ""}
+]
+EOF
+run_cds --threshold 50 --title "Alpha"
+assert_eq "1" "$RC" "(l) One-word query matches its identical one-word candidate"
+assert_contains "$OUT" "#505: Alpha (similarity: 100%)" "(l) Identical one-word sets score 100%"
+assert_not_contains "$OUT" "#506" "(l) Disjoint one-word candidate (Bravo) not matched"
+
+# (m) Degenerate-result self-detection: when more than half of the scanned
+# candidates score >= threshold, the search must self-announce
+# NON_DISCRIMINATIVE instead of dumping a DUPLICATE_FOUND wall. Query has 7
+# keywords; of 4 open-issue candidates, 3 share enough keywords to clear the
+# default --threshold (18) and 1 is unrelated:
+#   #601 "Quantum flux widget"              -> matches=2/union=8  -> 25%
+#   #602 "Capacitor reactor system"         -> matches=2/union=8  -> 25%
+#   #603 "Completely unrelated banana fruit basket" -> matches=0  ->  0%
+#   #604 "Core module driver suite"         -> matches=3/union=8  -> 37%
+# matched=3 of scanned=4 -> 3*2=6 > 4 -> degenerate.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[
+  {"number": 601, "title": "Quantum flux widget", "body": ""},
+  {"number": 602, "title": "Capacitor reactor system", "body": ""},
+  {"number": 603, "title": "Completely unrelated banana fruit basket", "body": ""},
+  {"number": 604, "title": "Core module driver suite", "body": ""}
+]
+EOF
+run_cds --title "Quantum Flux Capacitor Reactor Core Module Driver"
+assert_eq "1" "$RC" "(m) Degenerate result set -> still exit 1 (caller should not treat as safe)"
+assert_contains "$OUT" "NON_DISCRIMINATIVE" "(m) Degenerate result set -> NON_DISCRIMINATIVE warning emitted"
+assert_contains "$OUT" "3 of 4 candidates" "(m) NON_DISCRIMINATIVE reports matched/scanned counts"
+assert_not_contains "$OUT" "DUPLICATE_FOUND" "(m) Degenerate result set -> no DUPLICATE_FOUND wall"
+
+# (m2) Same fixture, --json: degenerate flag set, duplicate_found false,
+# empty matches (a degenerate result is noise, not a real match list).
+run_cds --title "Quantum Flux Capacitor Reactor Core Module Driver" --json
+assert_eq "1" "$RC" "(m2) --json degenerate result -> exit 1"
+degenerate_flag="$(echo "$OUT" | jq -r '.degenerate')"
+assert_eq "true" "$degenerate_flag" "(m2) --json degenerate flag is true"
+duplicate_found_flag="$(echo "$OUT" | jq -r '.duplicate_found')"
+assert_eq "false" "$duplicate_found_flag" "(m2) --json duplicate_found is false for a degenerate (noise) result"
+matches_len="$(echo "$OUT" | jq -r '.matches | length')"
+assert_eq "0" "$matches_len" "(m2) --json matches is empty for a degenerate result"
+
+# (n) Mixed real-match + degenerate-result header regression test: when
+# --include-merged-prs turns up a REAL match in one pool (merged PRs) and a
+# DEGENERATE result in the other (closed issues), the real match must still
+# get a "DUPLICATE_FOUND" header -- an earlier draft of this fix required
+# BOTH pools to be non-degenerate before adding the header, which silently
+# swallowed a real duplicate whenever the other pool happened to be noisy.
+reset_state
+echo "[]" > "$STUB_DIR/issues-open.json"
+cat > "$STUB_DIR/prs-merged.json" <<'EOF'
+[
+  {"number": 701, "title": "Quantum flux widget", "body": ""},
+  {"number": 702, "title": "Zulu Yankee Xray", "body": ""},
+  {"number": 703, "title": "Whiskey Tango Foxtrot", "body": ""}
+]
+EOF
+cat > "$STUB_DIR/issues-closed.json" <<'EOF'
+[
+  {"number": 601, "title": "Quantum flux widget", "body": ""},
+  {"number": 602, "title": "Capacitor reactor system", "body": ""},
+  {"number": 603, "title": "Completely unrelated banana fruit basket", "body": ""},
+  {"number": 604, "title": "Core module driver suite", "body": ""}
+]
+EOF
+run_cds --include-merged-prs --title "Quantum Flux Capacitor Reactor Core Module Driver"
+assert_eq "1" "$RC" "(n) Mixed real+degenerate -> exit 1"
+assert_contains "$OUT" "DUPLICATE_FOUND" \
+  "(n) A real match in one pool still gets a DUPLICATE_FOUND header even when the other pool is degenerate"
+assert_contains "$OUT" "PR #701: Quantum flux widget (similarity: 25%)" \
+  "(n) Real merged-PR match is listed under the header"
+assert_contains "$OUT" "NON_DISCRIMINATIVE (closed issues)" \
+  "(n) Degenerate closed-issues pool still self-announces alongside the real match"
+
+# (o) Real historical duplicate pair, threshold calibration (#4409): #3551
+# ("guard-destructive.sh emits PreToolUse decisions without hookEventName ->
+# guard is a silent no-op") was closed with "Closing as already fixed. This
+# is a duplicate of #3550" -- an actual confirmed duplicate from this repo's
+# history, not a synthetic fixture. Titles only (both are real, verbatim):
+# keyword sets {decisions,destructive,emits,guard,hookeventname,pretooluse,
+# silent,without} (8) vs {ask,decisions,deny,destructive,discarded,guard,
+# hookeventname,hookspecificoutput,missing,required,silently} (11); 4 shared
+# words (decisions, destructive, guard, hookeventname); union=8+11-4=15;
+# true Jaccard = 4*100/15 = 26% -- clears the calibrated default threshold
+# (18, no --threshold flag passed here) even though the two titles share no
+# common phrasing beyond individual keywords.
+reset_state
+cat > "$STUB_DIR/issues-open.json" <<'EOF'
+[{"number": 3550, "title": "guard-destructive.sh: hookSpecificOutput missing required hookEventName -- deny/ask decisions silently discarded", "body": ""}]
+EOF
+run_cds --title "guard-destructive.sh emits PreToolUse decisions without hookEventName -> guard is a silent no-op"
+assert_eq "1" "$RC" "(o) Real historical duplicate pair (#3550/#3551) -> exit 1 at the calibrated default threshold"
+assert_contains "$OUT" "#3550" "(o) Real historical duplicate pair (#3550/#3551) -> flagged as a candidate"
+assert_contains "$OUT" "(similarity: 26%)" "(o) Real historical duplicate pair scores the expected 26% true-Jaccard"
 
 # --- Summary ---
 echo ""
