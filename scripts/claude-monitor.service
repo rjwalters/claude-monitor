@@ -11,8 +11,10 @@
 
 [Unit]
 Description=Claude Monitor headless usage poller
-After=network-online.target
-Wants=network-online.target
+# No network-online ordering: this is a *user* unit (systemctl --user), and
+# network-online.target only has a provider in the system manager — the
+# ordering would be a silent no-op here. The poller retries transient network
+# errors itself, and Restart=on-failure covers startup before network is up.
 
 [Service]
 ExecStart=/usr/local/bin/claude-monitor
