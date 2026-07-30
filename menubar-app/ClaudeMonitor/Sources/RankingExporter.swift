@@ -24,6 +24,7 @@ import Foundation
 ///   "accounts": [
 ///     {
 ///       "email": "user@example.com",
+///       "provider": "anthropic",
 ///       "plan": "max_20x",
 ///       "status": "available",
 ///       "utilization": { "5h": 0.12, "7d": 0.44 },
@@ -34,18 +35,32 @@ import Foundation
 ///   ]
 /// }
 /// ```
+///
+/// ### `provider` (added in epic #25 phase 3)
+///
+/// `provider` is `"anthropic"` or `"openai"` and is **additive within schema 1**:
+/// the version number tracks *breaking* changes, and adding an optional key
+/// breaks nobody. A consumer that ignores it behaves exactly as before (every
+/// account predating multi-provider support reports `"anthropic"`); a consumer
+/// that reads it can route work to the right upstream. Unknown future values
+/// should be treated as "some other provider", never rejected.
+///
+/// **A `provider: "openai"` account may legitimately omit `utilization["5h"]`**
+/// — the live-verified Codex usage endpoint can report a weekly window and no
+/// session window at all. Consumers must treat a missing key as *unknown*, not
+/// as 0.0 (which would read as "full session capacity available").
 enum RankingExporter {
     static let schemaVersion = 1
 
     /// Serializes exports so overlapping poll cycles never race on the write.
     private static let queue = DispatchQueue(label: "com.claude-monitor.ranking-exporter")
 
-    private static var dbPath: String {
+    static var defaultDBPath: String {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude-monitor/usage.db").path
     }
 
-    private static var outputPath: String {
+    static var defaultOutputPath: String {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude-monitor/ranking.json").path
     }
@@ -60,6 +75,14 @@ enum RankingExporter {
     /// --once run can't exit before ranking.json lands on disk.
     static func exportNow() {
         queue.sync { exportSync() }
+    }
+
+    /// Export a specific database to a specific path, synchronously. Both paths
+    /// are **explicit** — the self-test uses this against a scratch directory
+    /// rather than a `HOME` override, which `homeDirectoryForCurrentUser`
+    /// ignores on macOS (issue #16).
+    static func exportNow(dbPath: String, outputPath: String) {
+        queue.sync { exportSync(dbPath: dbPath, outputPath: outputPath) }
     }
 
     // MARK: - Status mapping
@@ -91,7 +114,10 @@ enum RankingExporter {
 
     // MARK: - Export implementation
 
-    private static func exportSync() {
+    private static func exportSync(
+        dbPath: String = defaultDBPath,
+        outputPath: String = defaultOutputPath
+    ) {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
 
         do {
@@ -100,9 +126,14 @@ enum RankingExporter {
             var accountObjects: [[String: Any]] = []
 
             // Only non-secret columns are read. `accounts` carries no tokens.
-            let accountStmt = try db.prepare(
-                "SELECT id, email, plan FROM accounts ORDER BY sort_order ASC, last_updated DESC"
-            )
+            // `provider` is selected only when the column exists, so an
+            // unmigrated database still exports (every row then resolves to the
+            // Anthropic fallback).
+            let hasProvider = tableColumns(db, "accounts").contains("provider")
+            let accountStmt = try db.prepare("""
+                SELECT id, email, plan\(hasProvider ? ", provider" : "")
+                FROM accounts ORDER BY sort_order ASC, last_updated DESC
+            """)
 
             for row in accountStmt {
                 guard let accountId = row[0] as? String else { continue }
@@ -110,8 +141,10 @@ enum RankingExporter {
                 // (email is the sole join key — a null key is useless to consumers).
                 guard let email = row[1] as? String, !email.isEmpty else { continue }
                 let plan = row[2] as? String
+                let provider = AccountProvider(stored: hasProvider ? row[3] as? String : nil)
 
-                if let obj = buildAccount(db: db, accountId: accountId, email: email, plan: plan) {
+                if let obj = buildAccount(db: db, accountId: accountId, email: email,
+                                          plan: plan, provider: provider) {
                     accountObjects.append(obj)
                 }
             }
@@ -144,9 +177,13 @@ enum RankingExporter {
         db: Connection,
         accountId: String,
         email: String,
-        plan: String?
+        plan: String?,
+        provider: AccountProvider
     ) -> [String: Any]? {
-        var obj: [String: Any] = ["email": email]
+        // `provider` is emitted unconditionally (never omitted) so a consumer
+        // can rely on its presence rather than defaulting per-account; rows that
+        // predate multi-provider support resolve to "anthropic".
+        var obj: [String: Any] = ["email": email, "provider": provider.rawValue]
         if let plan = plan { obj["plan"] = plan }
 
         // Latest real (non-synthetic) usage reading for this account.

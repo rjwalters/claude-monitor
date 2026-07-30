@@ -38,6 +38,9 @@ OAuth tokens you provide, and renders the data locally on your Mac.
 - **Multi-account.** Add accounts one-by-one via a token from
   `claude setup-token`, or bulk-import from a `.env` file with
   `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` pairs.
+- **Multi-provider.** Anthropic and OpenAI/ChatGPT (Codex) accounts sit side by
+  side in the same table, each row tagged with a provider badge. See
+  [Adding an OpenAI (Codex) Account](#adding-an-openai-codex-account).
 - **Roll Token wizard.** Guided revoke-all + re-mint for an account's
   long-lived token (right-click its row → "Roll Token…"). A temporary stopgap
   until Anthropic ships a token-management API — see
@@ -114,6 +117,52 @@ and **appends** any new emails), then imports the result. Loading is
 **additive**: accounts in the lists are added or have their token refreshed, but
 accounts already in the app that aren't listed are left untouched — nothing is
 removed. Store these files with `chmod 600`; they contain live tokens.
+
+### Adding an OpenAI (Codex) Account
+
+ChatGPT subscription accounts (Plus/Pro, the ones Codex CLI uses) are polled
+too. Their usage comes from a dedicated read-only endpoint —
+`GET https://chatgpt.com/backend-api/wham/usage`, the same one Codex CLI's own
+`/usage` command calls — so no inference request is burned to read it.
+
+A ChatGPT credential is not a single pasteable string (it's an access token +
+refresh token + expiry), so it's **imported** from Codex CLI's own credential
+store rather than typed in:
+
+```bash
+codex login                    # once, if you haven't already
+claude-monitor codex import    # or: Add Account → "Import Codex Account"
+```
+
+The importer reads `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise
+`~/.codex/auth.json`. Pass `--auth <path>` to read a different file. The
+credential is validated against the live usage endpoint before it's stored, and
+the account's email, plan, and OpenAI account id all come back in that same
+response — there's no separate profile call.
+
+What differs from an Anthropic row once it's added:
+
+- **Session % may be blank.** OpenAI reports its windows as
+  `primary_window` / `secondary_window`, each carrying its own length, and a
+  ChatGPT Pro account can legitimately report only a **weekly** window. When
+  there's no session window, the Session cells show `—`. That is a real
+  "unknown", not 0% — the headroom score and sorting use whichever windows
+  actually exist.
+- **Fable Left / Extra are always `—`.** Those columns track Anthropic premium
+  tiers; the Fable probe is skipped for OpenAI accounts entirely.
+- **Tokens expire, and are renewed for you.** An OpenAI access token lives
+  about 10 days. The poller renews it from the stored refresh token
+  *proactively* — 6 hours ahead of expiry, never waiting for a 401 — and the
+  Token dot reports the outcome: green (healthy), **yellow** (renewal is
+  failing but the current token still works; hover for the reason), **red**
+  (expired and unrenewable — re-run `claude-monitor codex import`). A stale
+  OpenAI account never fails silently.
+
+> **Note on refresh-token rotation.** If OpenAI issues a new refresh token
+> during renewal, this app stores it in its own database; it does **not** write
+> back to `~/.codex/auth.json`. Should Codex CLI ever start reporting a bad
+> credential after this app has been running a while, re-run `codex login` and
+> then `claude-monitor codex import`.
 
 ### Rolling a Token (revoke + re-mint)
 
@@ -226,22 +275,28 @@ against `/v1/messages`.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  OAuth tokens                                                            │
-│    - `claude setup-token` (single, paste-in)                             │
-│    - `.env` bulk import (ACCOUNT_EMAIL_N / ACCOUNT_KEY_N)                │
+│  OAuth credentials                                                       │
+│    - `claude setup-token` (single, paste-in)            [anthropic]      │
+│    - `.env` bulk import (ACCOUNT_EMAIL_N / ACCOUNT_KEY_N) [anthropic]    │
+│    - `claude-monitor codex import` (~/.codex/auth.json)   [openai]       │
 └────────────────────────────────┬─────────────────────────────────────────┘
                                  │ stored in
                                  ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  SQLite — ~/.claude-monitor/usage.db                                     │
 │    accounts │ oauth_credentials │ usage_history │ settings               │
+│    (accounts.provider / oauth_credentials.provider tag the upstream)     │
 └────────────────────────────────┬─────────────────────────────────────────┘
                                  │ read by
                                  ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  OAuthPoller → Anthropic API                                             │
-│    - Each account pinged once per 10 min (staggered)                     │
-│    - Tokens are long-lived (1 yr); no refresh dance needed               │
+│  OAuthPoller — one client per provider, one shared window model          │
+│    anthropic: POST /v1/messages (1-token ping) → rate-limit headers      │
+│               tokens are long-lived (~1 yr); no refresh dance needed     │
+│    openai:    GET /backend-api/wham/usage → rate_limit.{primary,         │
+│               secondary}_window; access tokens live ~10 days and are     │
+│               refreshed proactively via auth.openai.com/oauth/token      │
+│    - Each account polled once per 10 min (staggered)                     │
 └────────────────────────────────┬─────────────────────────────────────────┘
                                  │ data drives
                                  ▼
@@ -364,6 +419,59 @@ claude-monitor accounts import accounts.json
   build: `ClaudeMonitor accounts export ...`.
 
 Run `claude-monitor accounts --help` for the full flag list.
+
+## Ranking Export (`ranking.json`)
+
+After every poll cycle the app writes a small, **non-secret**, email-keyed
+snapshot to `~/.claude-monitor/ranking.json` for external multi-account load
+balancers (notably `loom-daemon`, which uses it to pick a token). It's written
+atomically, so a reader never sees a partial document.
+
+```jsonc
+{
+  "schema": 1,
+  "generated_at": "2026-07-30T18:00:00Z",
+  "accounts": [
+    {
+      "email":       "you@example.com",   // the join key
+      "provider":    "anthropic",         // "anthropic" | "openai"
+      "plan":        "max_20x",
+      "status":      "available",         // available | rate_limited | exhausted | blocked
+      "utilization": { "5h": 0.12, "7d": 0.44 },   // 0.0–1.0
+      "resets":      { "5h": "…Z", "7d": "…Z" },
+      "models":      { "fable": { "utilization": 0.30 } },   // optional
+      "updated_at":  "2026-07-30T17:58:00Z"
+    },
+    {
+      "email":       "you@example.com",
+      "provider":    "openai",
+      "plan":        "pro",
+      "status":      "available",
+      "utilization": { "7d": 0.14 },      // note: no "5h" key — see below
+      "resets":      { "7d": "…Z" },
+      "updated_at":  "2026-07-30T17:58:00Z"
+    }
+  ]
+}
+```
+
+**Schema change for consumers (added with OpenAI support):**
+
+- **`provider` is new and additive.** It is emitted for *every* account and is
+  `"anthropic"` or `"openai"`; accounts that predate multi-provider support
+  report `"anthropic"`. `schema` stays **1** on purpose — the version number
+  tracks breaking changes, and adding an optional key breaks nobody. A consumer
+  that ignores `provider` behaves exactly as it did before. Treat an unrecognized
+  future value as "some other provider" rather than rejecting the document.
+- **`utilization["5h"]` can be absent on an `openai` account.** The ChatGPT
+  usage endpoint may report a weekly window and no session window at all.
+  A missing key means **unknown**, not `0.0` — reading it as zero would make an
+  account look like it has full session capacity. The same applies to
+  `resets["5h"]`. (Anthropic accounts always report both windows.)
+- Accounts with a `NULL` email are still excluded entirely; `email` remains the
+  sole join key, and it is not unique across providers — one person's Anthropic
+  and OpenAI accounts can share an address, distinguished by `provider`.
+- No credential material ever appears in this file.
 
 ## Auto-Start on Login (Optional)
 
@@ -496,8 +604,13 @@ claude-monitor/
 │       ├── SQLiteDB.swift          # Minimal system-libsqlite3 wrapper (zero deps)
 │       ├── UsagePopoverView.swift  # Summary table, sortable headers, add-account dialog
 │       ├── UsageChartView.swift    # Per-account chart window
-│       ├── OAuthPoller.swift       # API pings, token add/import, token rolling
-│       ├── AnthropicAPI.swift      # API client
+│       ├── OAuthPoller.swift       # Per-provider polling, token add/import/refresh
+│       ├── AnthropicAPI.swift      # Anthropic client (ping + rate-limit headers)
+│       ├── OpenAIAPI.swift         # OpenAI/Codex client (wham/usage + token refresh)
+│       ├── CodexCLI.swift          # `claude-monitor codex import` CLI surface
+│       ├── RateLimitWindow.swift   # Provider-agnostic window/snapshot model
+│       ├── UsageProviderClient.swift # UsageProviderClient protocol + credentials
+│       ├── SelfTest.swift          # `claude-monitor selftest` portable-core assertions
 │       ├── RollTokenView.swift     # Roll Token wizard window (rotate long-lived tokens)
 │       ├── TokenRoller.swift       # Revoke-all browser-console script generator
 │       ├── RankingExporter.swift   # Emits ~/.claude-monitor/ranking.json for load balancers

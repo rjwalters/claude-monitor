@@ -18,7 +18,7 @@ enum SelfTest {
 
         if arguments.contains("--help") || arguments.contains("-h") {
             print("""
-                Usage: ClaudeMonitor selftest [--db <path>]
+                Usage: ClaudeMonitor selftest [--db <path>] [--wire <path>]
 
                 Runs assertions over the portable core (rate-limit window model,
                 schema migration). No network access and no credentials needed.
@@ -26,6 +26,13 @@ enum SelfTest {
                   --db <path>   Additionally migrate an existing database *copy*
                                 and verify its accounts still load. Point this at
                                 a COPY of ~/.claude-monitor/usage.db — it writes.
+
+                  --wire <path> Additionally decode a captured OpenAI
+                                `GET /backend-api/wham/usage` body and report the
+                                windows it maps to — the offline way to re-check
+                                the wire contract after OpenAI changes it. Only
+                                derived numbers are printed; identity fields are
+                                never echoed.
 
                 Exits 0 when every check passes, 1 otherwise.
                 """)
@@ -36,10 +43,19 @@ enum SelfTest {
         testSnapshotFromPositionalWindows()
         testMissingSessionWindow()
         testProviderParsing()
+        testOpenAIUsageResponseMapping()
+        testOpenAIRawFieldRedaction()
+        testOpenAITokenExpiryParsing()
+        testCodexAuthParsing()
         testSchemaMigrationFromPreMigrationDatabase()
+        testRankingExportCarriesProvider()
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
             testMigrationOfExistingDatabase(at: arguments[idx + 1])
+        }
+
+        if let idx = arguments.firstIndex(of: "--wire"), idx + 1 < arguments.count {
+            testCapturedOpenAIWireBody(at: arguments[idx + 1])
         }
 
         if failures.isEmpty {
@@ -154,6 +170,267 @@ enum SelfTest {
         expectEqual(AccountProvider(stored: "  OpenAI "), .openai, "provider parse is trimmed + case-insensitive")
         expectEqual(AccountProvider(stored: "martian"), .anthropic, "unknown provider → anthropic fallback")
         expectEqual(AccountProvider(stored: "openai").rawValue, "openai", "round-trips through rawValue")
+    }
+
+    // MARK: - OpenAI / Codex
+
+    /// A recorded `GET /backend-api/wham/usage` body in the exact shape the
+    /// live probe returned (spike #26 § "Live verification"), with every
+    /// identity value replaced by a fixture string. Deliberately includes the
+    /// two findings that broke the static-analysis hypothesis: a **weekly**
+    /// `primary_window` and a **null** `secondary_window`.
+    private static let openAIUsageFixture = """
+    {
+      "user_id": "user-fixture",
+      "account_id": "acct-fixture",
+      "email": "fixture@example.com",
+      "plan_type": "pro",
+      "rate_limit": {
+        "allowed": true,
+        "limit_reached": false,
+        "primary_window": {
+          "used_percent": 14,
+          "limit_window_seconds": 604800,
+          "reset_after_seconds": 524971,
+          "reset_at": 1785967226
+        },
+        "secondary_window": null
+      },
+      "code_review_rate_limit": null,
+      "additional_rate_limits": [
+        {
+          "limit_name": "GPT-5.3-Codex-Spark",
+          "metered_feature": "codex_bengalfox",
+          "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {
+              "used_percent": 62,
+              "limit_window_seconds": 604800,
+              "reset_after_seconds": 100,
+              "reset_at": 1785967226
+            },
+            "secondary_window": null
+          }
+        }
+      ]
+    }
+    """
+
+    /// The wire contract, mapped onto the shared model: windows filed by
+    /// duration, a null secondary window left nil, identity picked up from the
+    /// same response, and per-model sub-limits landing in `named`.
+    private static func testOpenAIUsageResponseMapping() {
+        do {
+            let snapshot = try OpenAIAPIClient.snapshot(
+                from: Data(openAIUsageFixture.utf8), httpStatus: 200
+            )
+
+            expectEqual(snapshot.provider, .openai, "snapshot provider")
+            expectEqual(snapshot.accountKey, "acct-fixture", "account key from account_id")
+            expectEqual(snapshot.email, "fixture@example.com", "identity arrives with usage")
+            expectEqual(snapshot.plan, "pro", "plan_type arrives with usage")
+
+            let windows = snapshot.rateLimit
+            expect(windows.session == nil,
+                   "a null secondary_window must leave session nil, never a fabricated 0%")
+            expectEqual(windows.weekly?.usedPercent, 14, "weekly used_percent")
+            expectEqual(windows.weekly?.kind, .weekly,
+                        "a weekly primary_window is filed by duration, not by slot")
+            expectEqual(windows.weekly?.durationSeconds, 604800, "limit_window_seconds is seconds")
+            expectEqual(windows.weekly?.resetAt, Date(timeIntervalSince1970: 1785967226),
+                        "reset_at is unix epoch seconds")
+            expectEqual(windows.headroomScore, 86, "headroom from a weekly-only OpenAI snapshot")
+            expectEqual(windows.overallStatus, "allowed", "allowed:true maps to the shared 'allowed'")
+            expectEqual(windows.named["GPT-5.3-Codex-Spark"]?.usedPercent, 62,
+                        "additional_rate_limits land in the named sub-limit map")
+
+            // `limit_reached` is the direct "you are cut off" signal.
+            let capped = openAIUsageFixture
+                .replacingOccurrences(of: "\"limit_reached\": false", with: "\"limit_reached\": true")
+                .replacingOccurrences(of: "\"allowed\": true", with: "\"allowed\": false")
+            let cappedSnapshot = try OpenAIAPIClient.snapshot(from: Data(capped.utf8), httpStatus: 200)
+            expectEqual(cappedSnapshot.rateLimit.overallStatus, "rejected",
+                        "limit_reached maps to the shared 'rejected' status")
+            expect(cappedSnapshot.rateLimit.weekly?.isExhausted == true,
+                   "a rejected window reads as exhausted regardless of percent")
+
+            // A response with no account_id is unusable — fail rather than
+            // inventing a key that would collide across accounts.
+            let anonymous = openAIUsageFixture
+                .replacingOccurrences(of: "\"account_id\": \"acct-fixture\"", with: "\"account_id\": null")
+            var threw = false
+            do {
+                _ = try OpenAIAPIClient.snapshot(from: Data(anonymous.utf8), httpStatus: 200)
+            } catch {
+                threw = true
+            }
+            expect(threw, "a response without account_id must throw, not fabricate a key")
+
+            // A session window arriving in either slot still files as session.
+            let withSession = openAIUsageFixture.replacingOccurrences(
+                of: "\"secondary_window\": null",
+                with: """
+                "secondary_window": {"used_percent": 30, "limit_window_seconds": 18000, "reset_at": 1785900000}
+                """
+            )
+            let paired = try OpenAIAPIClient.snapshot(from: Data(withSession.utf8), httpStatus: 200)
+            expectEqual(paired.rateLimit.session?.usedPercent, 30, "session filed from the secondary slot")
+            expectEqual(paired.rateLimit.weekly?.usedPercent, 14, "weekly stays in weekly")
+            expectEqual(paired.rateLimit.headroomScore, 70, "headroom uses the most-consumed window")
+        } catch {
+            checks += 1
+            failures.append("OpenAI usage mapping threw: \(error)")
+        }
+    }
+
+    /// The archive must capture the response's *shape* without its secrets. The
+    /// #26 near-miss was a **nested** identity claim surviving a top-level-only
+    /// redaction pass, so this asserts on nesting explicitly.
+    private static func testOpenAIRawFieldRedaction() {
+        do {
+            let snapshot = try OpenAIAPIClient.snapshot(
+                from: Data(openAIUsageFixture.utf8), httpStatus: 200
+            )
+            let archived = snapshot.rawFields
+            let serialized = archived.map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
+
+            expect(!serialized.contains("fixture@example.com"), "email must never reach the archive")
+            expect(!serialized.contains("acct-fixture"), "account_id must never reach the archive")
+            expect(!serialized.contains("user-fixture"), "user_id must never reach the archive")
+            expectEqual(archived["email"], "[redacted]", "redacted keys are recorded as present")
+
+            // Nested PII: a profile object buried two levels down must be
+            // redacted just like a top-level key.
+            let nested = """
+            {"account_id":"acct-fixture","rate_limit":{"allowed":true,"primary_window":
+             {"used_percent":1,"limit_window_seconds":604800}},
+             "profile":{"organization":{"email":"nested@example.com","name":"Nested Person"}}}
+            """
+            let nestedSnapshot = try OpenAIAPIClient.snapshot(from: Data(nested.utf8), httpStatus: 200)
+            let nestedSerialized = nestedSnapshot.rawFields
+                .map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
+            expect(!nestedSerialized.contains("nested@example.com"),
+                   "a nested email claim must be redacted (the #26 near-miss)")
+            expect(!nestedSerialized.contains("Nested Person"),
+                   "a nested name claim must be redacted")
+            expectEqual(nestedSnapshot.rawFields["profile.organization.email"], "[redacted]",
+                        "nested redaction records the path")
+
+            // Non-PII fields are still archived verbatim, so a field OpenAI adds
+            // later is captured before we interpret it.
+            expectEqual(archived["rate_limit.primary_window.limit_window_seconds"], "604800",
+                        "verbatim wire fields are archived")
+            expectEqual(archived["overall_status"], "allowed",
+                        "normalized status keys are archived for RankingExporter")
+        } catch {
+            checks += 1
+            failures.append("OpenAI redaction test threw: \(error)")
+        }
+    }
+
+    /// OpenAI access tokens expire (~10 days) and `auth.json` states no expiry,
+    /// so the token's own `exp` claim is the only source. Only `exp` is read.
+    private static func testOpenAITokenExpiryParsing() {
+        func b64url(_ json: String) -> String {
+            Data(json.utf8).base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: "")
+        }
+        // A structurally-valid but entirely synthetic JWT — no real credential.
+        let token = "\(b64url("{\"alg\":\"RS256\"}")).\(b64url("{\"exp\":1785967226,\"sub\":\"fixture\"}")).sig"
+        expectEqual(OpenAIAPIClient.accessTokenExpiry(token),
+                    Date(timeIntervalSince1970: 1785967226), "exp claim decodes to a Date")
+        expect(OpenAIAPIClient.accessTokenExpiry("not-a-jwt") == nil, "a non-JWT yields nil, not a crash")
+        expect(OpenAIAPIClient.accessTokenExpiry("") == nil, "an empty token yields nil")
+        expect(OpenAIAPIClient.accessTokenExpiry("\(b64url("{}")).\(b64url("{\"sub\":\"x\"}")).sig") == nil,
+               "a JWT without exp yields nil")
+
+        // Expiry drives proactive renewal, and an Anthropic credential (no
+        // stated expiry) must never report as expiring.
+        let expiring = ProviderCredentials(accessToken: "x", refreshToken: "rt",
+                                           expiresAt: Date().addingTimeInterval(600))
+        expect(expiring.isExpiring(within: 3600), "a token expiring in 10 min is expiring")
+        expect(expiring.isRefreshable, "a stored refresh token makes it refreshable")
+        let anthropic = ProviderCredentials(accessToken: "sk-ant-oat01-x")
+        expect(!anthropic.isExpiring(within: 3600), "no stated expiry never reports as expiring")
+        expect(!anthropic.isRefreshable, "no refresh token means not refreshable")
+
+        // OAuth error bodies surface only their machine-readable code. Both the
+        // flat RFC 6749 form and the nested form `auth.openai.com` actually
+        // returns (verified live with a deliberately-invalid refresh token)
+        // are handled.
+        expectEqual(OpenAIAPIClient.oauthErrorCode(Data("{\"error\":\"invalid_grant\"}".utf8)),
+                    "invalid_grant", "flat OAuth error code is extracted")
+        expectEqual(
+            OpenAIAPIClient.oauthErrorCode(Data("""
+            {"error":{"message":"Invalid refresh token.","type":"invalid_request_error",
+                      "param":null,"code":"invalid_refresh_token"}}
+            """.utf8)),
+            "invalid_refresh_token",
+            "the nested error shape auth.openai.com returns is extracted"
+        )
+        expect(OpenAIAPIClient.oauthErrorCode(Data("not json".utf8)) == nil,
+               "a non-JSON error body yields nil")
+    }
+
+    /// Codex CLI's `auth.json`, parsed from an explicit scratch path — never a
+    /// `$HOME`-relative default, which `homeDirectoryForCurrentUser` would
+    /// resolve to the real credential store regardless of a `HOME` override
+    /// (issue #16).
+    private static func testCodexAuthParsing() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-codex-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let authPath = dir.appendingPathComponent("auth.json").path
+
+            func b64url(_ json: String) -> String {
+                Data(json.utf8).base64EncodedString()
+                    .replacingOccurrences(of: "+", with: "-")
+                    .replacingOccurrences(of: "/", with: "_")
+                    .replacingOccurrences(of: "=", with: "")
+            }
+            let fakeAccess = "\(b64url("{\"alg\":\"none\"}")).\(b64url("{\"exp\":1785967226}")).sig"
+            let fixture = """
+            {"OPENAI_API_KEY": null,
+             "tokens": {"id_token": "fixture-id", "access_token": "\(fakeAccess)",
+                        "refresh_token": "rt.fixture", "account_id": "acct-fixture"},
+             "last_refresh": "2026-07-30T00:00:00Z"}
+            """
+            try Data(fixture.utf8).write(to: URL(fileURLWithPath: authPath))
+
+            let credential = try CodexAuth.load(path: authPath)
+            expectEqual(credential.accessToken, fakeAccess, "access_token read from tokens{}")
+            expectEqual(credential.refreshToken, "rt.fixture", "refresh_token read from tokens{}")
+            expectEqual(credential.accountId, "acct-fixture", "account_id read from tokens{}")
+            expectEqual(credential.expiresAt, Date(timeIntervalSince1970: 1785967226),
+                        "expiry derived from the access token's exp claim")
+
+            // A file that isn't a Codex credential fails cleanly.
+            let bogusPath = dir.appendingPathComponent("bogus.json").path
+            try Data("{\"hello\":\"world\"}".utf8).write(to: URL(fileURLWithPath: bogusPath))
+            var threw = false
+            do { _ = try CodexAuth.load(path: bogusPath) } catch { threw = true }
+            expect(threw, "a file with no tokens{} object is rejected")
+
+            // A missing file reports the path rather than crashing.
+            threw = false
+            do {
+                _ = try CodexAuth.load(path: dir.appendingPathComponent("absent.json").path)
+            } catch { threw = true }
+            expect(threw, "a missing auth.json is an error, not a crash")
+
+            // $CODEX_HOME resolution is pure string work — assert the shape
+            // without mutating this process's environment.
+            expect(CodexAuth.defaultAuthPath.hasSuffix("auth.json"),
+                   "default Codex credential path ends in auth.json")
+        } catch {
+            checks += 1
+            failures.append("Codex auth parsing test threw: \(error)")
+        }
     }
 
     // MARK: - Schema migration
@@ -280,6 +557,150 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("schema migration test threw: \(error)")
+        }
+    }
+
+    /// Decode a captured `/backend-api/wham/usage` body and report what the
+    /// shared model made of it. This is the offline half of live verification:
+    /// capture the body once (`curl -H "Authorization: Bearer …"`), then re-run
+    /// this whenever the client changes, with no credential in the loop.
+    ///
+    /// **Only derived numbers are printed.** The account key is truncated and
+    /// the email is reported as present/absent, never echoed — the same
+    /// discipline `OpenAIUsageResponse.flatten` applies to the archive.
+    private static func testCapturedOpenAIWireBody(at path: String) {
+        guard let data = FileManager.default.contents(atPath: path) else {
+            checks += 1
+            failures.append("--wire: could not read \(path)")
+            return
+        }
+        do {
+            let snapshot = try OpenAIAPIClient.snapshot(from: data, httpStatus: 200)
+            let windows = snapshot.rateLimit
+
+            expect(!snapshot.accountKey.isEmpty, "--wire: response carried an account key")
+            expect(!windows.isEmpty, "--wire: response carried at least one rate-limit window")
+            expect(windows.session == nil || windows.session?.kind == .session,
+                   "--wire: the session slot holds a session-length window")
+            expect(windows.weekly == nil || windows.weekly?.kind == .weekly,
+                   "--wire: the weekly slot holds a weekly-length window")
+            let serialized = snapshot.rawFields.map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
+            if let email = snapshot.email, !email.isEmpty {
+                expect(!serialized.contains(email), "--wire: the live email never reaches the archive")
+            }
+
+            func describe(_ window: RateLimitWindow?) -> String {
+                guard let window = window else { return "none" }
+                let reset = window.resetAt.map { ISO8601DateFormatter().string(from: $0) } ?? "unknown"
+                return String(format: "%.0f%% used, %.0fs window, resets %@",
+                              window.usedPercent, window.durationSeconds ?? 0, reset)
+            }
+            print("""
+                selftest --wire: \(path)
+                  account:  \(snapshot.accountKey.prefix(8))… (email \(snapshot.email?.isEmpty == false ? "present" : "absent"))
+                  plan:     \(snapshot.plan ?? "unknown")
+                  status:   \(windows.overallStatus ?? "unknown")
+                  session:  \(describe(windows.session))
+                  weekly:   \(describe(windows.weekly))
+                  headroom: \(windows.headroomScore.map { String(format: "%.0f", $0) } ?? "—")
+                  named:    \(windows.named.keys.sorted().joined(separator: ", "))
+                  archived: \(snapshot.rawFields.count) field(s), PII redacted
+                """)
+        } catch {
+            checks += 1
+            failures.append("--wire: could not map \(path) onto the shared model: \(error)")
+        }
+    }
+
+    // MARK: - ranking.json
+
+    /// `ranking.json` must carry `provider` for every account, and an OpenAI
+    /// account with no session window must omit `utilization["5h"]` rather than
+    /// report 0.0 (which a consumer would read as "full session capacity").
+    ///
+    /// Runs against an explicit scratch database *and* an explicit scratch
+    /// output path — never the `$HOME`-relative defaults.
+    private static func testRankingExportCarriesProvider() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-ranking-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            let outPath = dir.appendingPathComponent("ranking.json").path
+
+            UsageStore(dbPath: dbPath).ensureDatabase()
+            let db = try openDatabase(dbPath)
+            let now = ISO8601DateFormatter().string(from: Date())
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('org-anthropic', 'a@example.com', 'a@example.com', 'Max', ?, 0, 'anthropic')
+            """, now)
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('acct-openai', 'o@example.com', 'o@example.com', 'pro', ?, 1, 'openai')
+            """, now)
+            try db.run("""
+                INSERT INTO usage_history
+                    (account_id, timestamp, primary_percent, session_percent,
+                     weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                VALUES ('org-anthropic', ?, 40, 40, 12, 0,
+                        '{"overall_status":"allowed","session_status":"allowed","weekly_status":"allowed"}', 0)
+            """, now)
+            // The OpenAI shape: NULL session_percent, because the provider
+            // reported no session window at all.
+            try db.run("""
+                INSERT INTO usage_history
+                    (account_id, timestamp, primary_percent, session_percent,
+                     weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                VALUES ('acct-openai', ?, 14, NULL, 14, 0,
+                        '{"overall_status":"allowed","weekly_status":"allowed"}', 0)
+            """, now)
+
+            RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+
+            guard let data = FileManager.default.contents(atPath: outPath),
+                  let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let accounts = root["accounts"] as? [[String: Any]] else {
+                checks += 1
+                failures.append("ranking export produced no readable accounts array")
+                return
+            }
+
+            expectEqual(root["schema"] as? Int, RankingExporter.schemaVersion,
+                        "provider is additive — the schema version does not change")
+            expectEqual(accounts.count, 2, "both accounts exported")
+
+            let byEmail = Dictionary(uniqueKeysWithValues: accounts.compactMap { obj -> (String, [String: Any])? in
+                guard let email = obj["email"] as? String else { return nil }
+                return (email, obj)
+            })
+
+            expectEqual(byEmail["a@example.com"]?["provider"] as? String, "anthropic",
+                        "Anthropic account carries provider")
+            expectEqual(byEmail["o@example.com"]?["provider"] as? String, "openai",
+                        "OpenAI account carries provider")
+
+            // Every field an existing consumer already reads is unchanged.
+            expectEqual(byEmail["a@example.com"]?["status"] as? String, "available",
+                        "existing status field unaffected")
+            let anthropicUtil = byEmail["a@example.com"]?["utilization"] as? [String: Any]
+            expectEqual(anthropicUtil?["5h"] as? Double, 0.4, "Anthropic 5h utilization unchanged")
+            expectEqual(anthropicUtil?["7d"] as? Double, 0.12, "Anthropic 7d utilization unchanged")
+
+            let openaiUtil = byEmail["o@example.com"]?["utilization"] as? [String: Any]
+            expect(openaiUtil?["5h"] == nil,
+                   "a provider with no session window omits 5h rather than reporting 0.0")
+            expectEqual(openaiUtil?["7d"] as? Double, 0.14, "OpenAI weekly utilization exported")
+
+            // No secret ever reaches ranking.json.
+            let text = String(data: data, encoding: .utf8) ?? ""
+            expect(!text.contains("access_token") && !text.contains("refresh_token"),
+                   "ranking.json never carries credential material")
+        } catch {
+            checks += 1
+            failures.append("ranking export test threw: \(error)")
         }
     }
 
