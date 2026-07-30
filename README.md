@@ -403,6 +403,19 @@ sqlite3 ~/.claude-monitor/usage.db \
   "SELECT timestamp, primary_percent FROM usage_history ORDER BY timestamp DESC LIMIT 10;"
 ```
 
+**`accounts` table contract for external consumers:** `email` is the stable
+join key external tooling should key off of — notably `loom-daemon tokens
+import-from-monitor`, which matches accounts by `email` to build its token
+pool. `account_name` is a free-text, user-editable display label/alias and is
+**not** guaranteed to be an address (though it often is, since renaming an
+account to its own email is a common way to tell accounts apart in the UI).
+The app backfills `email` from `account_name` whenever the profile-derived
+email is unavailable but the label is itself a well-formed address — both at
+add/rename time and via a one-time healing migration on launch — so no account
+with valid credentials should persist indefinitely with `email = NULL`. If you
+ever see one, it means `account_name` isn't address-shaped either; there's no
+address for external tooling to recover.
+
 ## Uninstall
 
 ```bash

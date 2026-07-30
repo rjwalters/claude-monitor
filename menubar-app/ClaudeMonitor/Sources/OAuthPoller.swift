@@ -3,6 +3,25 @@ import Foundation
 private let flog = FileLogger.shared
 private let fcat = "OAuth"
 
+/// A conservative "well-formed enough" email check — not full RFC 5322
+/// validation, just enough to distinguish a real address (e.g. one a user
+/// typed as an account label/alias) from an opaque account ID (a UUID/org ID,
+/// which never contains '@'). Used to backfill the `accounts.email` column —
+/// the join key `loom-daemon tokens import-from-monitor` uses to find
+/// accounts (#15) — whenever a profile-fetch-derived email is unavailable but
+/// the label plainly carries the address.
+func looksLikeEmailAddress(_ s: String) -> Bool {
+    guard !s.isEmpty, !s.contains(where: { $0.isWhitespace }) else { return false }
+    let parts = s.split(separator: "@", omittingEmptySubsequences: false)
+    guard parts.count == 2 else { return false }  // exactly one '@'
+    let local = parts[0]
+    let domain = parts[1]
+    guard !local.isEmpty, domain.contains("."), !domain.hasPrefix("."), !domain.hasSuffix(".") else {
+        return false
+    }
+    return true
+}
+
 // MARK: - Token Status
 
 enum TokenStatus: String {
@@ -275,6 +294,13 @@ class OAuthPoller: ObservableObject {
             let now = ISO8601DateFormatter().string(from: Date())
             let label = orgName ?? email ?? accountId
 
+            // When the profile/caller-supplied email is unavailable, fall back to
+            // the label itself if it's a well-formed address — an account must
+            // never persist indefinitely with email = NULL just because its
+            // profile fetch failed (or was never attempted) while the label
+            // plainly carries the address (#15).
+            let resolvedEmail = email ?? (looksLikeEmailAddress(label) ? label : nil)
+
             // Upsert account — never overwrite account_name (user may have renamed)
             try db.run("""
                 INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order)
@@ -283,7 +309,7 @@ class OAuthPoller: ObservableObject {
                     email = COALESCE(excluded.email, accounts.email),
                     plan = COALESCE(excluded.plan, accounts.plan),
                     last_updated = excluded.last_updated
-            """, accountId, label, email, plan, now)
+            """, accountId, label, resolvedEmail, plan, now)
 
             // Look for existing credential for THIS account
             let existingCred = try db.scalar(
