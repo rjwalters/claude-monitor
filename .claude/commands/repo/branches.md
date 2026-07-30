@@ -154,6 +154,7 @@ already merged. Decide with **content containment**, not SHA ancestry:
 
 ```bash
 # Would merging the branch into <default> change anything at all?
+# `--write-tree` requires git >= 2.38; on older git this errors and you take the fallback below.
 [ "$(git merge-tree --write-tree <default> <branch>)" = "$(git rev-parse '<default>^{tree}')" ]
 ```
 
