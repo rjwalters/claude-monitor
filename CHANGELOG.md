@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Healing migration merges duplicate provider accounts sharing an email.**
+  `10660f3` only stopped a *fresh* `codex import` from forking a second row for
+  an OpenAI account whose original row predated the native-id era (keyed by a
+  locally generated UUID); a database where the duplicate already existed kept
+  both rows polling the same account independently. At launch, account pairs
+  sharing `(email, provider)` are now merged automatically: history moves onto
+  the surviving row (preferring the provider-native id), exactly one
+  credential survives (the more recently renewed of the two), and the sibling
+  row is removed. Idempotent, and covered by a selftest over a scratch DB
+  (#45, PR #50)
+- **macOS `--version` never launches the GUI.** The flag is dispatched at top
+  level in `main.swift` (previously it worked only behind `--headless`, so the
+  natural invocation started a second menubar instance), and bare
+  `--once`/`--interval` fail fast with a stderr message pointing at
+  `--headless` (#46, PR #48)
+- **Premium/Extra column titles are provider-aware.** An all-Anthropic table
+  keeps the specific "Fable Left" heading; a mixed or OpenAI-only table shows
+  the neutral "Premium Left", with the per-provider meaning in the tooltip —
+  an Anthropic-only concept no longer titles a column over OpenAI rows
+  (#47, PR #49)
+
 ## [1.18.1] - 2026-07-31
 
 ### Summary
@@ -22,15 +47,6 @@ credential when an OpenAI account shares its email address.
   recover the history by reassigning non-wham-shaped `usage_history` rows (and
   `fable`/`haiku` `probe_snapshots`) back to the Anthropic org id and
   re-importing a valid token
-- **Healing migration merges duplicate provider accounts sharing an email.**
-  `10660f3` only stopped a *fresh* `codex import` from forking a second row for
-  an OpenAI account whose original row predated the native-id era (keyed by a
-  locally generated UUID); a database where the duplicate already existed kept
-  both rows polling the same account independently. At launch, account pairs
-  sharing `(email, provider)` are now merged automatically: history moves onto
-  the surviving row (preferring the provider-native id), exactly one
-  credential survives (the more recently renewed of the two), and the sibling
-  row is removed. Idempotent, and covered by a selftest over a scratch DB (#45)
 
 ## [1.18.0] - 2026-07-30
 

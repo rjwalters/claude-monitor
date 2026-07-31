@@ -153,8 +153,11 @@ What differs from an Anthropic row once it's added:
   there's no session window, the Session cells show `—`. That is a real
   "unknown", not 0% — the headroom score and sorting use whichever windows
   actually exist.
-- **Fable Left / Extra are always `—`.** Those columns track Anthropic premium
-  tiers; the Fable probe is skipped for OpenAI accounts entirely.
+- **Premium Left / Extra are always `—`.** Those columns track Anthropic
+  premium tiers; the Fable probe is skipped for OpenAI accounts entirely. (The
+  premium column is titled "Fable Left" only when every account in the table
+  is Anthropic; with any OpenAI row present it shows the neutral
+  "Premium Left".)
 - **Tokens expire, and are renewed for you.** An OpenAI access token lives
   about 10 days. The poller renews it from the stored refresh token
   *proactively* — 6 hours ahead of expiry, never waiting for a 401 — and the
