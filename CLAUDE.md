@@ -17,7 +17,7 @@
 
 - The same package builds on Linux (`swift build` with `libsqlite3-dev` installed) as a headless daemon for Loom hosts — no UI, same poll loop, same `usage.db`/`ranking.json` outputs. See README "Headless Mode / Linux".
 - UI sources are fenced with `#if os(macOS)`; portable core must stay free of AppKit/SwiftUI/Combine/os.Logger. On Linux, `LinuxCompat.swift` shims `ObservableObject`/`@Published`, and `CSQLite/` maps the system libsqlite3 (macOS uses the SDK's `SQLite3` module).
-- Entry points: `main.swift` (macOS, dispatches to `HeadlessRunner` on `--headless`) and `HeadlessMain.swift` (Linux, always headless). Flags: `--once`, `--interval <sec>`, `--version`. Subcommands: `accounts`, `codex`, `selftest`.
+- Entry points: `main.swift` (macOS, dispatches to `HeadlessRunner` on `--headless`) and `HeadlessMain.swift` (Linux, always headless). Flags: `--once`, `--interval <sec>`, `--version`. Subcommands: `accounts`, `codex`, `selftest`. On macOS, `--version` is dispatched top-level in `main.swift` (works with or without `--headless`, never launches the GUI); bare `--once`/`--interval` (without `--headless`) fail fast with a stderr message instead of falling through to the GUI branch.
 - Run the test suite with `swift build && .build/debug/ClaudeMonitor selftest` (exits non-zero on failure). CI runs it on macOS and Linux.
 - To verify a schema migration against real data, copy the live DB first — `cp ~/.claude-monitor/usage.db /tmp/ && .build/debug/ClaudeMonitor selftest --db /tmp/usage.db`. `--db` **writes** to the path it is given; never point it at `~/.claude-monitor/usage.db`.
 - Parse response headers via `extractAnthropicHeaders` (lowercased map), never `allHeaderFields` subscripts — those are case-sensitive on Linux.
