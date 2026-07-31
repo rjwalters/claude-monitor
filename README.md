@@ -163,11 +163,21 @@ What differs from an Anthropic row once it's added:
   (expired and unrenewable — re-run `claude-monitor codex import`). A stale
   OpenAI account never fails silently.
 
-> **Note on refresh-token rotation.** If OpenAI issues a new refresh token
-> during renewal, this app stores it in its own database; it does **not** write
-> back to `~/.codex/auth.json`. Should Codex CLI ever start reporting a bad
-> credential after this app has been running a while, re-run `codex login` and
-> then `claude-monitor codex import`.
+> **Note on refresh-token rotation.** OpenAI **does** rotate the refresh token
+> on renewal (verified 2026-07-31). This app stores the new pair in its own
+> database and does **not** write back to `~/.codex/auth.json`, so two
+> consequences follow:
+>
+> - **Codex CLI will eventually need a re-login.** Its stored refresh token is
+>   invalidated by the rotation. Its *access* token keeps working until it
+>   expires, so nothing breaks immediately — but once it does, run
+>   `codex login` and then `claude-monitor codex import`.
+> - **Other machines running this app need re-syncing.** A second host that
+>   imported the same credential still holds the pre-rotation token and will
+>   fail its own renewal. Push the refreshed credential to it with
+>   `accounts export` → `accounts import` (see
+>   [Multi-host sync](#multi-host-sync)),
+>   or just re-run `codex import` there after a fresh `codex login`.
 
 ### Rolling a Token (revoke + re-mint)
 
