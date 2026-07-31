@@ -126,7 +126,7 @@ UI-less daemon for Loom worker fleets — same poll loop, same `usage.db` and
 - **Docs.** README now documents the Roll Token workflow — wizard steps, the
   undocumented cookie-authenticated `claude.ai/api/oauth` endpoint dependency,
   upstream tracking issues, and the ping-based revocation verification (#11) —
-  and gains an "Upgrading from pre-2.0" note in Uninstall about stale Node CLI
+  and gains an "Upgrading from pre-1.8" note in Uninstall about stale Node CLI
   artifacts (#10). Both README screenshots retaken against the 1.15 UI (#12).
 
 ## [1.15.0] - 2026-07-26
