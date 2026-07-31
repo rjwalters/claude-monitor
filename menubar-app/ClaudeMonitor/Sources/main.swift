@@ -60,8 +60,20 @@ enum ClaudeMonitorEntry {
             CodexCLI.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.dropFirst().first == "selftest" {
             SelfTest.main(Array(CommandLine.arguments.dropFirst(2)))
+        } else if CommandLine.arguments.contains("--version") {
+            // Dispatched at top level (not just inside HeadlessRunner) so
+            // `ClaudeMonitor --version` never falls through to the GUI branch
+            // below — see #46.
+            print("claude-monitor \(AppVersion.current)")
+            exit(0)
         } else if CommandLine.arguments.contains("--headless") {
             HeadlessRunner.main()
+        } else if CommandLine.arguments.contains("--once") || CommandLine.arguments.contains("--interval") {
+            // These are headless-loop flags handled inside HeadlessRunner; bare
+            // (without --headless) they must fail fast rather than silently
+            // launching a duplicate GUI instance — see #46.
+            FileHandle.standardError.write(Data("--once/--interval require --headless on macOS, e.g. `ClaudeMonitor --headless --once`\n".utf8))
+            exit(2)
         } else {
             ClaudeMonitorApp.main()
         }

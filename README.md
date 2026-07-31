@@ -400,6 +400,11 @@ while the daemon runs. A sample systemd user unit is provided at
 
 On macOS the same headless loop is available as `ClaudeMonitor --headless`
 (the bare binary or the app bundle's `Contents/MacOS/ClaudeMonitor`).
+`ClaudeMonitor --version` prints the version and exits on macOS with or
+without `--headless` — it never launches the GUI. `--once` and `--interval`
+are headless-loop flags: bare (without `--headless`) they print an error to
+stderr and exit non-zero rather than launching a duplicate GUI instance, e.g.
+`ClaudeMonitor --headless --once`.
 
 ## Multi-Host Sync
 
