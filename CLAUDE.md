@@ -22,6 +22,7 @@
 - To verify a schema migration against real data, copy the live DB first — `cp ~/.claude-monitor/usage.db /tmp/ && .build/debug/ClaudeMonitor selftest --db /tmp/usage.db`. `--db` **writes** to the path it is given; never point it at `~/.claude-monitor/usage.db`.
 - Parse response headers via `extractAnthropicHeaders` (lowercased map), never `allHeaderFields` subscripts — those are case-sensitive on Linux.
 - Verify Linux builds from macOS with the `swift:6.1` Docker image (`apt-get install libsqlite3-dev`, then `swift build`).
+- **A clean local `swift build` is weak evidence for Swift strict-concurrency errors** (e.g. "mutation of captured var in concurrently-executing code") — a newer local toolchain (6.3.3+) can downgrade these to warnings under region-based isolation while CI's pinned `macos-14` Xcode still hard-errors on them. CI is authoritative for this bug class. Before pushing, run the stronger local proxy `swift build -Xswiftc -swift-version -Xswiftc 6` (forces Swift 6 language mode, surfacing the same diagnostics CI's toolchain flags). Adopting Swift 6 language mode package-wide would make local and CI agree by construction, but that's a bigger change than this note and hasn't been done yet.
 
 ## Project Structure
 
