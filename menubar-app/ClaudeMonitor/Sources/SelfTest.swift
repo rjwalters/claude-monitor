@@ -52,6 +52,7 @@ enum SelfTest {
         testSchemaMigrationFromPreMigrationDatabase()
         testRankingExportCarriesProvider()
         testNamedLimitsRoundTrip()
+        testOpenAIImportResolvesExistingAccountByEmail()
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
             testMigrationOfExistingDatabase(at: arguments[idx + 1])
@@ -533,6 +534,62 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("named limits round-trip test threw: \(error)")
+        }
+    }
+
+    // MARK: - OpenAI import account resolution
+
+    /// A fresh `codex import` must land on the account row that already tracks
+    /// the same email, not create a sibling keyed by OpenAI's native id —
+    /// rows created before the native-id era carry a locally generated UUID.
+    private static func testOpenAIImportResolvesExistingAccountByEmail() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES ('legacy-uuid-row', 'me@example.com', 'me@example.com', 'pro',
+                        '2026-01-01T00:00:00Z', 'openai')
+            """)
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES ('anthropic-row', 'me@example.com', 'me@example.com', 'Max',
+                        '2026-01-01T00:00:00Z', 'anthropic')
+            """)
+
+            expectEqual(
+                OAuthPoller.resolveOpenAIAccountId(
+                    email: "me@example.com", nativeId: "user-native", db: db),
+                "legacy-uuid-row",
+                "an existing openai row with the same email wins over the native id")
+            expectEqual(
+                OAuthPoller.resolveOpenAIAccountId(
+                    email: "someone-else@example.com", nativeId: "user-native", db: db),
+                "user-native",
+                "an unknown email falls through to the native id")
+            expectEqual(
+                OAuthPoller.resolveOpenAIAccountId(
+                    email: nil, nativeId: "user-native", db: db),
+                "user-native",
+                "a missing email falls through to the native id")
+
+            // The anthropic row shares the email; matching is provider-scoped
+            // so a Claude and a ChatGPT account under one address never merge.
+            expect(
+                OAuthPoller.resolveOpenAIAccountId(
+                    email: "me@example.com", nativeId: "user-native", db: db) != "anthropic-row",
+                "resolution never lands on an anthropic row")
+        } catch {
+            checks += 1
+            failures.append("openai import account resolution test threw: \(error)")
         }
     }
 

@@ -235,8 +235,16 @@ class OAuthPoller: ObservableObject {
             return (nil, "Invalid OpenAI credential: \(error.localizedDescription)")
         }
 
+        var accountId = snapshot.accountKey
+        if FileManager.default.fileExists(atPath: dbPath),
+           let db = try? openDatabase(dbPath, readonly: true) {
+            accountId = Self.resolveOpenAIAccountId(
+                email: snapshot.email, nativeId: snapshot.accountKey, db: db
+            )
+        }
+
         saveCredentialForAccount(
-            accountId: snapshot.accountKey,
+            accountId: accountId,
             email: snapshot.email,
             orgName: nil,
             plan: snapshot.plan ?? "ChatGPT",
@@ -247,10 +255,34 @@ class OAuthPoller: ObservableObject {
             tokenExpiresAt: credentials.expiresAt
         )
 
-        writeSnapshotToDB(accountId: snapshot.accountKey, snapshot: snapshot)
+        writeSnapshotToDB(accountId: accountId, snapshot: snapshot)
 
-        flog.info("addOpenAIAccount: account \(snapshot.accountKey.prefix(8))... plan \(snapshot.plan ?? "?")", category: fcat)
-        return (snapshot.accountKey, nil)
+        flog.info("addOpenAIAccount: account \(accountId.prefix(8))... plan \(snapshot.plan ?? "?")", category: fcat)
+        return (accountId, nil)
+    }
+
+    /// The account row a fresh OpenAI import must land on. Rows created before
+    /// the native-id era are keyed by a locally generated UUID rather than
+    /// OpenAI's `user-…` account id, so upserting on the native id alone would
+    /// create a duplicate sibling for the same account. Match by email within
+    /// the provider first — the same guard `AccountSync.importAccount` applies
+    /// on multi-host import.
+    static func resolveOpenAIAccountId(email: String?, nativeId: String, db: Connection) -> String {
+        guard let email, !email.isEmpty else { return nativeId }
+        do {
+            let stmt = try db.prepare("""
+                SELECT id FROM accounts
+                WHERE email = ? AND COALESCE(provider, 'anthropic') = 'openai'
+                ORDER BY last_updated DESC
+                LIMIT 1
+            """)
+            for row in stmt.bind(email) {
+                if let id = row[0] as? String, !id.isEmpty { return id }
+            }
+        } catch {
+            flog.error("resolveOpenAIAccountId: \(error.localizedDescription)", category: fcat)
+        }
+        return nativeId
     }
 
     /// Import the credential Codex CLI stores at `~/.codex/auth.json` (or

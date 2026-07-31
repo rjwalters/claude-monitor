@@ -41,6 +41,11 @@ alongside Claude accounts, sharing the same table, headroom score, and
 
 ### Fixed
 
+- **`codex import` no longer duplicates an existing OpenAI account.** The
+  import now matches an existing row by email within the provider before
+  keying a new one by OpenAI's native account id — rows created before the
+  native-id era are keyed by a locally generated UUID, and upserting on id
+  alone created a second row for the same account on re-import
 - **Account names sort naturally.** `agent-10` now follows `agent-9` instead of
   sorting between `agent-1` and `agent-2`; equal-usage accounts tie-break on
   display name rather than account id (#40, PRs #34/#43)
