@@ -478,7 +478,15 @@ class UsageStore: ObservableObject {
             let aEffective = max(aWindows?.session?.usedPercent ?? 0, aWindows?.weekly?.usedPercent ?? 0)
             let bEffective = max(bWindows?.session?.usedPercent ?? 0, bWindows?.weekly?.usedPercent ?? 0)
             if aEffective != bEffective { return aEffective < bEffective }
-            return UsageStore.resetSeconds(a.usage) < UsageStore.resetSeconds(b.usage)
+            let aReset = UsageStore.resetSeconds(a.usage)
+            let bReset = UsageStore.resetSeconds(b.usage)
+            if aReset != bReset { return aReset < bReset }
+            // Usage and reset both tie (common for freshly-added or idle
+            // accounts that all read 0%): order by natural display name
+            // instead of falling through to arbitrary insertion/UUID order.
+            let cmp = NaturalSort.compare(a.account.displayName, b.account.displayName)
+            if cmp != .orderedSame { return cmp == .orderedAscending }
+            return a.account.id < b.account.id
         }
         return sorted.map { $0.account }
     }

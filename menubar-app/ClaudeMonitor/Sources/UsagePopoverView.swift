@@ -280,6 +280,18 @@ struct UsagePopoverView: View {
         return map
     }
 
+    /// Final tiebreak when a column's primary comparison is exactly equal
+    /// (common for freshly-added or idle accounts that all read 0%): order by
+    /// natural display name instead of falling through to arbitrary
+    /// insertion/UUID order, and only fall back to account id when even the
+    /// display names are indistinguishable, so the order stays total and
+    /// stable.
+    private func stableTiebreak(_ a: Account, _ b: Account) -> Bool {
+        let cmp = NaturalSort.compare(a.displayName, b.displayName)
+        if cmp != .orderedSame { return cmp == .orderedAscending }
+        return a.id < b.id
+    }
+
     /// Sort comparator for two rows under the current column/direction.
     /// Rows without data sort to the bottom regardless of direction.
     private func compareRows(_ a: (Account, UsageRecord?), _ b: (Account, UsageRecord?)) -> Bool {
@@ -287,7 +299,7 @@ struct UsagePopoverView: View {
         // agent-10 follows agent-9 instead of landing next to agent-1.
         if case .account = sortBy {
             let cmp = NaturalSort.compare(a.0.displayName, b.0.displayName)
-            if cmp == .orderedSame { return a.0.id < b.0.id }
+            if cmp == .orderedSame { return stableTiebreak(a.0, b.0) }
             return sortDir == .asc
                 ? (cmp == .orderedAscending)
                 : (cmp == .orderedDescending)
@@ -295,11 +307,11 @@ struct UsagePopoverView: View {
 
         let (av, bv) = sortValues(a, b, for: sortBy)
         switch (av, bv) {
-        case (nil, nil): return a.0.id < b.0.id
+        case (nil, nil): return stableTiebreak(a.0, b.0)
         case (nil, _):   return false          // nil rows go last
         case (_, nil):   return true
         case let (.some(x), .some(y)):
-            if x == y { return a.0.id < b.0.id }
+            if x == y { return stableTiebreak(a.0, b.0) }
             return sortDir == .asc ? (x < y) : (x > y)
         }
     }
