@@ -52,6 +52,90 @@ enum SummaryColumns {
     static let horizontalPadding: CGFloat = 12
 }
 
+// MARK: - Provider column vocabulary
+
+/// A column whose *meaning* is provider-specific — today "Fable Left" and
+/// "Extra" are both Anthropic-premium concepts that mean nothing for an
+/// OpenAI row. Adding a provider that has something to say for a slot means
+/// adding one case to `AccountProvider.columnEntry(for:)`; no conditionals
+/// scattered through the header/row views.
+enum ProviderColumnSlot {
+    /// Anthropic: "Fable Left" — remaining premium-model weekly allowance.
+    case premium
+    /// Anthropic: "Extra" — overage/extra-usage balance beyond that allowance.
+    case extra
+}
+
+/// One provider's declared title (and whether the slot applies to it at all)
+/// for a `ProviderColumnSlot`.
+struct ProviderColumnEntry {
+    let title: String
+    let isApplicable: Bool
+    /// This provider's meaning for the slot, folded into the neutral-title
+    /// tooltip whenever a mixed (or not-applicable) table falls back to it.
+    let meaning: String
+}
+
+extension AccountProvider {
+    /// This provider's vocabulary entry for a given column slot. The single
+    /// mapping every provider (including a future Gemini client) needs to
+    /// touch to make the summary table's headers make sense for its rows.
+    func columnEntry(for slot: ProviderColumnSlot) -> ProviderColumnEntry {
+        switch (self, slot) {
+        case (.anthropic, .premium):
+            return ProviderColumnEntry(
+                title: "Fable Left",
+                isApplicable: true,
+                meaning: "Anthropic: Fable/premium weekly allowance remaining. At 0% the account switches to extra usage."
+            )
+        case (.anthropic, .extra):
+            return ProviderColumnEntry(
+                title: "Extra",
+                isApplicable: true,
+                meaning: "Anthropic: extra usage (overage) balance beyond the premium allowance."
+            )
+        case (.openai, .premium):
+            return ProviderColumnEntry(
+                title: "Premium",
+                isApplicable: false,
+                meaning: "OpenAI/Codex: no premium-allowance concept — not applicable."
+            )
+        case (.openai, .extra):
+            return ProviderColumnEntry(
+                title: "Extra",
+                isApplicable: false,
+                meaning: "OpenAI/Codex: no extra-usage concept — not applicable."
+            )
+        }
+    }
+}
+
+/// Header title + tooltip for a provider-specific slot, given the providers
+/// actually visible in the table right now. When exactly one provider is
+/// visible *and* it declares the slot applicable, its own vocabulary wins
+/// (unchanged behavior for an Anthropic-only or OpenAI-only table); anything
+/// else — a mixed table, or a lone provider with nothing to say — falls back
+/// to a neutral title whose tooltip spells out every provider's meaning, so
+/// the mixed-table case never presents one provider's concept as if it
+/// applied to all rows.
+func columnHeading(
+    for slot: ProviderColumnSlot,
+    neutralTitle: String,
+    visibleProviders: Set<AccountProvider>
+) -> (title: String, tooltip: String) {
+    if visibleProviders.count == 1,
+       let only = visibleProviders.first {
+        let entry = only.columnEntry(for: slot)
+        if entry.isApplicable {
+            return (entry.title, entry.meaning)
+        }
+    }
+    let tooltip = AccountProvider.allCases
+        .map { $0.columnEntry(for: slot).meaning }
+        .joined(separator: " ")
+    return (neutralTitle, tooltip)
+}
+
 // MARK: - Sorting
 
 enum SummarySort: String {
@@ -263,6 +347,13 @@ struct UsagePopoverView: View {
         (store.error != nil || store.accounts.isEmpty) ? 0 : store.accounts.count
     }
 
+    /// Providers represented among the currently-configured accounts. Drives
+    /// whether the premium/extra column headers show a provider-specific
+    /// title or fall back to a neutral one — see `columnHeading`.
+    private var visibleProviders: Set<AccountProvider> {
+        Set(store.accounts.map(\.provider))
+    }
+
     /// Accounts paired with latest usage, sorted by the user-selected column.
     /// Recomputed every render so the table sorts live as usage updates.
     private var sortedRows: [(account: Account, usage: UsageRecord?)] {
@@ -419,7 +510,7 @@ struct UsagePopoverView: View {
             } else if store.accounts.isEmpty {
                 SetupGuideView(oauthPoller: oauthPoller, store: store, error: nil, onAddAccount: onAddAccount)
             } else {
-                SummaryHeaderRow(sortBy: $sortBy, sortDir: $sortDir)
+                SummaryHeaderRow(sortBy: $sortBy, sortDir: $sortDir, visibleProviders: visibleProviders)
                 Divider()
 
                 ScrollView {
@@ -601,6 +692,17 @@ struct UsagePopoverView: View {
 struct SummaryHeaderRow: View {
     @Binding var sortBy: SummarySort
     @Binding var sortDir: SortDirection
+    /// Providers represented among the rows currently in the table — see
+    /// `columnHeading` for how this picks the premium/extra titles below.
+    let visibleProviders: Set<AccountProvider>
+
+    private var premiumHeading: (title: String, tooltip: String) {
+        columnHeading(for: .premium, neutralTitle: "Premium Left", visibleProviders: visibleProviders)
+    }
+
+    private var extraHeading: (title: String, tooltip: String) {
+        columnHeading(for: .extra, neutralTitle: "Extra", visibleProviders: visibleProviders)
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -625,12 +727,14 @@ struct SummaryHeaderRow: View {
             SortableHeader(title: "Wk Reset", column: .weeklyReset,
                            width: SummaryColumns.reset, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir)
-            SortableHeader(title: "Fable Left", column: .fablePercent,
+            SortableHeader(title: premiumHeading.title, column: .fablePercent,
                            width: SummaryColumns.fable, alignment: .trailing,
-                           sortBy: $sortBy, sortDir: $sortDir)
-            SortableHeader(title: "Extra", column: .extraUsage,
+                           sortBy: $sortBy, sortDir: $sortDir,
+                           tooltip: premiumHeading.tooltip)
+            SortableHeader(title: extraHeading.title, column: .extraUsage,
                            width: SummaryColumns.extra, alignment: .trailing,
-                           sortBy: $sortBy, sortDir: $sortDir)
+                           sortBy: $sortBy, sortDir: $sortDir,
+                           tooltip: extraHeading.tooltip)
             SortableHeader(title: "Fresh", column: .fresh,
                            width: SummaryColumns.dot, alignment: .center,
                            sortBy: $sortBy, sortDir: $sortDir)
@@ -656,6 +760,10 @@ struct SortableHeader: View {
     let alignment: Alignment
     @Binding var sortBy: SummarySort
     @Binding var sortDir: SortDirection
+    /// Overrides the default "Sort by <title>" tooltip. Used by columns whose
+    /// title is a neutral stand-in (see `columnHeading`) so the tooltip can
+    /// still explain what each provider means by it.
+    var tooltip: String? = nil
 
     private var isActive: Bool { sortBy == column }
 
@@ -672,7 +780,7 @@ struct SortableHeader: View {
         }
         .buttonStyle(.plain)
         .frame(width: width, alignment: alignment)
-        .help("Sort by \(title)")
+        .help(tooltip ?? "Sort by \(title)")
         .onHover { hovering in
             if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
         }
