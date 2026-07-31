@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.18.0] - 2026-07-30
 
 ### Summary
 
@@ -49,9 +49,11 @@ alongside Claude accounts, sharing the same table, headroom score, and
 - **Account names sort naturally.** `agent-10` now follows `agent-9` instead of
   sorting between `agent-1` and `agent-2`; equal-usage accounts tie-break on
   display name rather than account id (#40, PRs #34/#43)
-- **Build no longer ships a stale User-Agent silently.** Version detection falls
-  back to `claude --version` when the npm lookup finds nothing (a Homebrew
-  install), and hard-fails when no version is detectable at all (#39, PR #44)
+- **Build no longer ships a stale User-Agent silently.** Version detection
+  prefers `claude --version` (the binary actually on PATH, current under the
+  native installer's self-update) over the npm global listing — a vestigial npm
+  install would otherwise patch the User-Agent backwards — and hard-fails when
+  no version is detectable at all (#39, PR #44)
 
 ### Documentation
 
