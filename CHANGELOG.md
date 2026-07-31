@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.1] - 2026-07-31
+
+### Summary
+
+Emergency patch: multi-host `accounts import` could destroy a Claude account's
+credential when an OpenAI account shares its email address.
+
+### Fixed
+
+- **`accounts import` email matching is provider-scoped.** A Claude and a
+  ChatGPT account legitimately share one address; the unscoped match landed an
+  imported OpenAI account on the local Anthropic row, flipping its provider and
+  overwriting its credential in place — destroying the Claude token. The match
+  is now scoped to the incoming account's provider, mirroring the guard `codex
+  import` gained in 1.18.0. Hosts that already lost an account this way can
+  recover the history by reassigning non-wham-shaped `usage_history` rows (and
+  `fable`/`haiku` `probe_snapshots`) back to the Anthropic org id and
+  re-importing a valid token
+
 ## [1.18.0] - 2026-07-30
 
 ### Summary
