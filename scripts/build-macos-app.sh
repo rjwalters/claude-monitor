@@ -14,13 +14,19 @@ echo "Building macOS app..."
 cd "$APP_DIR"
 
 # Auto-detect installed claude-code version for User-Agent header.
-# Primary source: the npm global install. This misses Homebrew/other installs
-# (npm list finds nothing), so fall back to `claude --version` in that case.
-CLAUDE_CODE_VERSION=$(npm list -g @anthropic-ai/claude-code --depth=0 2>/dev/null | grep claude-code | sed 's/.*@//')
-
-if [ -z "$CLAUDE_CODE_VERSION" ] && command -v claude >/dev/null 2>&1; then
+# Primary source: `claude --version` — it reports the binary actually on PATH,
+# which stays current under the native installer's self-update. The npm global
+# listing is only a fallback: a vestigial npm install left behind after
+# switching to the native installer keeps reporting its frozen version, and
+# preferring it would silently patch the User-Agent *backwards*.
+CLAUDE_CODE_VERSION=""
+if command -v claude >/dev/null 2>&1; then
     # e.g. "2.1.220 (Claude Code)" -> "2.1.220"
     CLAUDE_CODE_VERSION=$(claude --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+fi
+
+if [ -z "$CLAUDE_CODE_VERSION" ]; then
+    CLAUDE_CODE_VERSION=$(npm list -g @anthropic-ai/claude-code --depth=0 2>/dev/null | grep claude-code | sed 's/.*@//')
 fi
 
 if [ -n "$CLAUDE_CODE_VERSION" ]; then
@@ -72,9 +78,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
     <key>CFBundleDisplayName</key>
     <string>Claude Monitor</string>
     <key>CFBundleVersion</key>
-    <string>1.17.0</string>
+    <string>1.18.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.17.0</string>
+    <string>1.18.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleIconFile</key>
