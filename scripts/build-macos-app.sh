@@ -13,14 +13,33 @@ echo "Building macOS app..."
 
 cd "$APP_DIR"
 
-# Auto-detect installed claude-code version for User-Agent header
+# Auto-detect installed claude-code version for User-Agent header.
+# Primary source: the npm global install. This misses Homebrew/other installs
+# (npm list finds nothing), so fall back to `claude --version` in that case.
 CLAUDE_CODE_VERSION=$(npm list -g @anthropic-ai/claude-code --depth=0 2>/dev/null | grep claude-code | sed 's/.*@//')
+
+if [ -z "$CLAUDE_CODE_VERSION" ] && command -v claude >/dev/null 2>&1; then
+    # e.g. "2.1.220 (Claude Code)" -> "2.1.220"
+    CLAUDE_CODE_VERSION=$(claude --version 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+fi
+
 if [ -n "$CLAUDE_CODE_VERSION" ]; then
     echo "Detected claude-code version: $CLAUDE_CODE_VERSION"
     sed -i '' "s|claude-code/[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*|claude-code/${CLAUDE_CODE_VERSION}|g" \
         Sources/AnthropicAPI.swift
 else
-    echo "Warning: could not detect claude-code version, using existing value"
+    # Shipping a stale User-Agent is a silent correctness bug (it already
+    # happened once at v1.17.0), so this is a hard failure rather than a
+    # warning that's easy to lose in build output. Set
+    # ALLOW_STALE_USER_AGENT=1 to explicitly opt into building anyway with
+    # whatever User-Agent is already committed in AnthropicAPI.swift.
+    echo "ERROR: could not detect claude-code version via 'npm list -g @anthropic-ai/claude-code' or 'claude --version'." >&2
+    echo "       Install claude-code (npm or Homebrew) so it's on PATH before building," >&2
+    echo "       or set ALLOW_STALE_USER_AGENT=1 to build anyway with the existing User-Agent." >&2
+    if [ "${ALLOW_STALE_USER_AGENT:-}" != "1" ]; then
+        exit 1
+    fi
+    echo "ALLOW_STALE_USER_AGENT=1 set — proceeding with the existing (possibly stale) User-Agent." >&2
 fi
 
 # Build release version
