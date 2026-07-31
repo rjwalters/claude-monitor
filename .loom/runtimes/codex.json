@@ -1,0 +1,10 @@
+{
+  "runtime": "codex",
+  "capabilities": {
+    "mcp": "yes",
+    "subagents": "no",
+    "hooks": "partial",
+    "skills": "partial",
+    "worktreeIsolation": "partial"
+  }
+}
