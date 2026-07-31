@@ -40,6 +40,7 @@ enum SelfTest {
         }
 
         testNaturalSort()
+        testSortedAccountsForPopoverTieBreak()
         testWindowKindDerivation()
         testSnapshotFromPositionalWindows()
         testMissingSessionWindow()
@@ -95,6 +96,40 @@ enum SelfTest {
         let result = NaturalSort.selfCheck()
         checks += result.checks
         failures.append(contentsOf: result.failures.map { "naturalSort: \($0)" })
+    }
+
+    /// Two accounts with identical usage and reset must not fall through to
+    /// arbitrary insertion/UUID order (#40): the account id here is chosen to
+    /// *disagree* with natural name order, so a fix that still tiebreaks on
+    /// id would sort these the wrong way.
+    private static func testSortedAccountsForPopoverTieBreak() {
+        let store = UsageStore(dbPath: ":memory:selftest-tiebreak")
+
+        let agentNine = Account(
+            id: "zzz-later-id", accountName: "agent-9", email: nil, plan: "Max",
+            lastUpdated: nil, latestPercent: nil
+        )
+        let agentTen = Account(
+            id: "aaa-earlier-id", accountName: "agent-10", email: nil, plan: "Max",
+            lastUpdated: nil, latestPercent: nil
+        )
+        store.accounts = [agentTen, agentNine]
+
+        func identicalUsage(_ accountId: String, _ recordId: Int64) -> UsageRecord {
+            UsageRecord(
+                id: recordId, accountId: accountId, timestamp: Date(),
+                primaryPercent: 50, sessionPercent: 50, weeklyAllPercent: 20,
+                weeklySONnetPercent: nil, sessionReset: nil, weeklyReset: nil
+            )
+        }
+        store.latestUsage = [
+            agentNine.id: identicalUsage(agentNine.id, 1),
+            agentTen.id: identicalUsage(agentTen.id, 2),
+        ]
+
+        let ordered = store.sortedAccountsForPopover.map { $0.displayName }
+        expectEqual(ordered, ["agent-9", "agent-10"],
+                    "equal usage/reset falls back to natural name order, not account id")
     }
 
     // MARK: - Window model
