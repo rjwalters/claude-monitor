@@ -388,6 +388,16 @@ class UsageStore: ObservableObject {
         // loom-daemon's `tokens import-from-monitor`) key accounts on, so an
         // account must never persist indefinitely without one (#15).
         backfillMissingEmailsFromAccountName(db)
+
+        // Migration: merge account rows left duplicated by pre-1.18.1
+        // databases. `10660f3` stops a fresh `codex import` from creating a
+        // second row for an OpenAI account whose original row predated the
+        // native-id era (keyed by a locally generated UUID rather than
+        // OpenAI's `user-…` id) — that fix is prevention only, so any
+        // database where the duplicate already exists still has two active
+        // rows polling the same account independently (#45). Must run after
+        // the email backfill above so a row healed there is eligible too.
+        mergeDuplicateAccountsSharingEmail(db)
     }
 
     /// Adds a column only when it isn't already there. `ALTER TABLE ... ADD
@@ -430,6 +440,116 @@ class UsageStore: ObservableObject {
             }
         } catch {
             FileLogger.shared.error("backfillMissingEmailsFromAccountName failed: \(error)", category: "DB")
+        }
+    }
+
+    /// One-time-per-launch healing pass (#45): merges account rows that
+    /// share the same `(email, provider)` pair. Matching is provider-scoped
+    /// so a Claude and a ChatGPT account under one address never merge —
+    /// same guard `resolveOpenAIAccountId` and `AccountSync.importAccount`
+    /// already apply. Idempotent: once only one row remains per (email,
+    /// provider), the grouping query below finds nothing to merge.
+    private static func mergeDuplicateAccountsSharingEmail(_ db: Connection) {
+        struct Candidate {
+            let id: String
+            let provider: String
+            let email: String
+            let lastUpdated: String?
+        }
+        do {
+            let stmt = try db.prepare("""
+                SELECT id, COALESCE(provider, 'anthropic'), email, last_updated
+                FROM accounts
+                WHERE email IS NOT NULL AND TRIM(email) != ''
+            """)
+            var candidates: [Candidate] = []
+            for row in stmt {
+                guard let id = row[0] as? String,
+                      let provider = row[1] as? String,
+                      let email = row[2] as? String else { continue }
+                candidates.append(Candidate(id: id, provider: provider, email: email, lastUpdated: row[3] as? String))
+            }
+
+            // Group key uses a separator that cannot appear in either field
+            // (both come from the accounts table, never user-typed free
+            // text) so an email/provider pair can't collide with another.
+            let groups = Dictionary(grouping: candidates) { "\($0.email)\u{0}\($0.provider)" }
+            for (_, group) in groups where group.count > 1 {
+                let survivorId = pickMergeSurvivor(group.map { (id: $0.id, lastUpdated: $0.lastUpdated) })
+                for candidate in group where candidate.id != survivorId {
+                    mergeAccountRow(db, from: candidate.id, into: survivorId)
+                }
+            }
+        } catch {
+            FileLogger.shared.error("mergeDuplicateAccountsSharingEmail failed: \(error)", category: "DB")
+        }
+    }
+
+    /// Picks which of a set of duplicate `(email, provider)` rows survives a
+    /// merge. Prefers a provider-native id (one that doesn't parse as a
+    /// canonical UUID — the shape Swift's `UUID()` produces for a locally
+    /// generated id, and the shape the pre-native-id-era duplicate is keyed
+    /// by) over a generated one; ties — including when every candidate looks
+    /// native, or none does — break on the most-recently-updated row.
+    private static func pickMergeSurvivor(_ candidates: [(id: String, lastUpdated: String?)]) -> String {
+        let native = candidates.filter { UUID(uuidString: $0.id) == nil }
+        let pool = native.isEmpty ? candidates : native
+        return pool.max { ($0.lastUpdated ?? "") < ($1.lastUpdated ?? "") }?.id ?? candidates[0].id
+    }
+
+    /// Merges `loserId`'s history, credential, and settings pin onto
+    /// `survivorId`, then removes the now-empty `loserId` row. Runs inside a
+    /// transaction so a mid-merge failure never leaves history split across
+    /// two rows with neither id complete.
+    private static func mergeAccountRow(_ db: Connection, from loserId: String, into survivorId: String) {
+        do {
+            try db.execute("BEGIN")
+            try db.run("UPDATE usage_history SET account_id = ? WHERE account_id = ?", survivorId, loserId)
+            try db.run("UPDATE probe_snapshots SET account_id = ? WHERE account_id = ?", survivorId, loserId)
+            try db.run("UPDATE named_limits SET account_id = ? WHERE account_id = ?", survivorId, loserId)
+
+            // Exactly one credential survives: the most recently renewed
+            // between the two rows (falling back to updated_at for a
+            // credential that has never been rolled). Any other credential
+            // row for either id is discarded rather than merged — a stale
+            // token for an account that already has a fresher one is not
+            // useful to keep around.
+            var winnerCredentialId: Int64?
+            let credStmt = try db.prepare("""
+                SELECT id FROM oauth_credentials
+                WHERE account_id IN (?, ?)
+                ORDER BY COALESCE(token_rolled_at, updated_at) DESC
+                LIMIT 1
+            """)
+            for row in credStmt.bind(survivorId, loserId) {
+                winnerCredentialId = row[0] as? Int64
+            }
+            if let winnerCredentialId {
+                try db.run("UPDATE oauth_credentials SET account_id = ? WHERE id = ?",
+                           survivorId, winnerCredentialId)
+                try db.run("DELETE FROM oauth_credentials WHERE account_id IN (?, ?) AND id != ?",
+                           survivorId, loserId, winnerCredentialId)
+            } else {
+                try db.run("DELETE FROM oauth_credentials WHERE account_id = ?", loserId)
+            }
+
+            // The user's pinned "primary" account (if it was the row being
+            // removed) must keep pointing at a live account after the merge.
+            try db.run("UPDATE settings SET value = ? WHERE key = ? AND value = ?",
+                       survivorId, primaryAccountSettingKey, loserId)
+
+            try db.run("DELETE FROM accounts WHERE id = ?", loserId)
+            try db.execute("COMMIT")
+            FileLogger.shared.info(
+                "mergeDuplicateAccountsSharingEmail: merged \(loserId) into \(survivorId)",
+                category: "DB"
+            )
+        } catch {
+            try? db.execute("ROLLBACK")
+            FileLogger.shared.error(
+                "mergeDuplicateAccountsSharingEmail: merge of \(loserId) into \(survivorId) failed: \(error)",
+                category: "DB"
+            )
         }
     }
 
