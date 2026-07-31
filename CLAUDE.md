@@ -17,7 +17,7 @@
 
 - The same package builds on Linux (`swift build` with `libsqlite3-dev` installed) as a headless daemon for Loom hosts — no UI, same poll loop, same `usage.db`/`ranking.json` outputs. See README "Headless Mode / Linux".
 - UI sources are fenced with `#if os(macOS)`; portable core must stay free of AppKit/SwiftUI/Combine/os.Logger. On Linux, `LinuxCompat.swift` shims `ObservableObject`/`@Published`, and `CSQLite/` maps the system libsqlite3 (macOS uses the SDK's `SQLite3` module).
-- Entry points: `main.swift` (macOS, dispatches to `HeadlessRunner` on `--headless`) and `HeadlessMain.swift` (Linux, always headless). Flags: `--once`, `--interval <sec>`, `--version`. Subcommands: `accounts`, `selftest`.
+- Entry points: `main.swift` (macOS, dispatches to `HeadlessRunner` on `--headless`) and `HeadlessMain.swift` (Linux, always headless). Flags: `--once`, `--interval <sec>`, `--version`. Subcommands: `accounts`, `codex`, `selftest`.
 - Run the test suite with `swift build && .build/debug/ClaudeMonitor selftest` (exits non-zero on failure). CI runs it on macOS and Linux.
 - To verify a schema migration against real data, copy the live DB first — `cp ~/.claude-monitor/usage.db /tmp/ && .build/debug/ClaudeMonitor selftest --db /tmp/usage.db`. `--db` **writes** to the path it is given; never point it at `~/.claude-monitor/usage.db`.
 - Parse response headers via `extractAnthropicHeaders` (lowercased map), never `allHeaderFields` subscripts — those are case-sensitive on Linux.
@@ -46,6 +46,8 @@
   - `Sources/UsageStore.swift` - SQLite-backed data store, account/usage models
   - `Sources/SQLiteDB.swift` - Minimal wrapper over system libsqlite3 (zero package deps)
   - `Sources/FileLogger.swift` - Debug log at `~/.claude-monitor/debug.log`
+  - `Sources/AccountSync.swift` / `Sources/AccountSyncCLI.swift` - `claude-monitor accounts export|import`: multi-host sync of account records + credentials. Exports carry plaintext tokens — `--output` writes `0600` and warns either way. Imports match by email, preserve local ids, and skip records older than the local row.
+  - `Sources/NaturalSort.swift` - Hybrid lexical/numeric ordering so `agent-10` sorts after `agent-9`. Digit runs compare by value without parsing to `Int` (significant-digit count, then lexically), so a run past `Int.max` can't overflow. Used for the Account column and as the tiebreak when usage figures are equal.
   - `Assets/` - App icon (`AppIcon.icns` + 1024px master PNG + `icon-master.source.json` generation recipe)
 - `scripts/build-macos-app.sh` - Build script that compiles and creates the .app bundle (bundles the icon)
 - `scripts/claude-monitor.service` - Sample systemd user unit for Linux headless mode

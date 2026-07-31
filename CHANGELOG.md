@@ -4,6 +4,58 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Summary
+
+Multi-provider support: ChatGPT/Codex subscription accounts are now monitored
+alongside Claude accounts, sharing the same table, headroom score, and
+`ranking.json` export.
+
+### Added
+
+- **OpenAI/Codex account monitoring.** `claude-monitor codex import` registers a
+  Codex CLI credential (`~/.codex/auth.json`, honoring `$CODEX_HOME`); usage is
+  polled from `chatgpt.com/backend-api/wham/usage` and shown beside Anthropic
+  accounts (#25, #29, PR #31)
+- **Provider-agnostic rate-limit model.** A shared window type both providers
+  populate, with window kind derived from its duration rather than its position
+  in the response. `Account` gains `provider`, `refresh_token` and
+  `token_expires_at`, migrated in place (#28, PR #30)
+- **Proactive token refresh.** OpenAI access tokens live ~10 days (not ~1 year
+  like Anthropic's), so they are renewed before expiry from the stored refresh
+  token; a failing renewal surfaces a visible token-health state rather than
+  silently stale data (#29, PR #31)
+- **`ranking.json` carries `provider`.** Additive — `schema` stays 1. A
+  `provider: openai` account may omit `utilization["5h"]`; consumers must read a
+  missing key as *unknown*, never 0 (#29, PR #31)
+- **Per-model sub-limits.** OpenAI's `additional_rate_limits[]` is persisted to a
+  `named_limits` table and overlaid on the per-account history chart, hidden for
+  accounts that have none (#32, PR #33)
+- **Pixel-art provider badges.** Each row is tagged with its upstream's mark,
+  drawn from bitmaps so the package still ships no image resources (#35, #36,
+  #37, PRs #35/#36/#37)
+- **`selftest` subcommand.** Portable-core assertions runnable on macOS and
+  Linux with no network or credentials, wired into CI. `--wire <path>` decodes a
+  captured usage body offline to re-check the OpenAI contract (PR #30)
+
+### Fixed
+
+- **Account names sort naturally.** `agent-10` now follows `agent-9` instead of
+  sorting between `agent-1` and `agent-2`; equal-usage accounts tie-break on
+  display name rather than account id (#40, PRs #34/#43)
+- **Build no longer ships a stale User-Agent silently.** Version detection falls
+  back to `claude --version` when the npm lookup finds nothing (a Homebrew
+  install), and hard-fails when no version is detectable at all (#39, PR #44)
+
+### Documentation
+
+- The OpenAI wire contract is recorded in `docs/spikes/`, live-verified against a
+  real account (#26, PR #27, corrected in 517c1f5)
+- CI is documented as authoritative for Swift strict-concurrency diagnostics — a
+  clean local `swift build` is not sufficient evidence, since toolchain versions
+  disagree on that class (#41, PR #42)
+
 ## [1.17.0] - 2026-07-30
 
 ### Summary

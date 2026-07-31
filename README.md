@@ -39,8 +39,13 @@ OAuth tokens you provide, and renders the data locally on your Mac.
   `claude setup-token`, or bulk-import from a `.env` file with
   `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` pairs.
 - **Multi-provider.** Anthropic and OpenAI/ChatGPT (Codex) accounts sit side by
-  side in the same table, each row tagged with a provider badge. See
+  side in the same table, each row tagged with a pixel-art provider badge. See
   [Adding an OpenAI (Codex) Account](#adding-an-openai-codex-account).
+  A provider that reports no session window (ChatGPT often reports only a
+  weekly one) shows "—" rather than a fabricated 0%.
+- **Per-model sub-limits.** OpenAI accounts report per-model limits alongside
+  the account-level window; these are stored and overlaid on the per-account
+  history chart. The overlay is hidden for accounts that have none.
 - **Roll Token wizard.** Guided revoke-all + re-mint for an account's
   long-lived token (right-click its row → "Roll Token…"). A temporary stopgap
   until Anthropic ships a token-management API — see
@@ -369,8 +374,15 @@ import — see [Multiple Accounts](#multiple-accounts)), then:
 claude-monitor                  # poll loop, logs to stdout + ~/.claude-monitor/debug.log
 claude-monitor --once           # one poll cycle, write ranking.json, exit
 claude-monitor --interval 300   # override per-account poll interval (seconds, min 60)
+claude-monitor --version        # print the version and exit
 claude-monitor selftest         # self-check (no network/credentials); non-zero exit on failure
 ```
+
+`selftest` also takes `--db <path>` (migrate and verify a **copy** of a real
+database — it writes, so never point it at the live `usage.db`) and
+`--wire <path>` (decode a captured `/wham/usage` body offline to re-check the
+OpenAI wire contract; prints only derived numbers, never identity fields).
+Run `claude-monitor selftest --help` for details.
 
 Edits to `accounts.env` / `accounts.local.env` are picked up automatically
 while the daemon runs. A sample systemd user unit is provided at
@@ -615,10 +627,12 @@ claude-monitor/
 │       ├── TokenRoller.swift       # Revoke-all browser-console script generator
 │       ├── RankingExporter.swift   # Emits ~/.claude-monitor/ranking.json for load balancers
 │       ├── FileLogger.swift        # Debug logging
+│       ├── NaturalSort.swift       # Hybrid lexical/numeric ordering (agent-10 after agent-9)
 │       └── LinuxCompat.swift       # ObservableObject/@Published stand-ins for Linux
 ├── scripts/
 │   ├── build-macos-app.sh          # macOS release build script
 │   └── claude-monitor.service      # Sample systemd user unit for Linux headless mode
+├── docs/spikes/                 # Investigation write-ups (e.g. the OpenAI usage-endpoint probe)
 ├── .github/workflows/build.yml  # CI: swift build on push
 ├── build/                       # Build output (gitignored): ClaudeMonitor.app + .zip
 ├── CHANGELOG.md
