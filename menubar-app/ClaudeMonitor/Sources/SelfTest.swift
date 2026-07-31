@@ -53,6 +53,7 @@ enum SelfTest {
         testRankingExportCarriesProvider()
         testNamedLimitsRoundTrip()
         testOpenAIImportResolvesExistingAccountByEmail()
+        testAccountSyncImportIsProviderScoped()
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
             testMigrationOfExistingDatabase(at: arguments[idx + 1])
@@ -590,6 +591,89 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("openai import account resolution test threw: \(error)")
+        }
+    }
+
+    // MARK: - AccountSync provider scoping
+
+    /// A multi-host `accounts import` whose bundle carries an OpenAI account
+    /// must never land on an Anthropic row that shares the email. An unscoped
+    /// email match flips the Claude row's provider and overwrites its
+    /// credential in place — destroying the Claude token (this happened).
+    private static func testAccountSyncImportIsProviderScoped() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES ('claude-org-uuid', 'me@example.com', 'me@example.com', 'Max',
+                        '2026-01-01T00:00:00Z', 'anthropic')
+            """)
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, is_active,
+                     created_at, updated_at)
+                VALUES ('claude-org-uuid', 'me@example.com', 'token', 'anthropic',
+                        'sk-ant-claude-token', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            """)
+
+            let bundle = AccountSync.ExportBundle(
+                formatVersion: AccountSync.formatVersion,
+                exportedAt: "2026-07-01T00:00:00Z",
+                sourceHost: "selftest",
+                accounts: [AccountSync.ExportedAccount(
+                    id: "user-native-openai",
+                    provider: "openai",
+                    accountName: "me@example.com",
+                    email: "me@example.com",
+                    plan: "pro",
+                    lastUpdated: "2026-07-01T00:00:00Z",
+                    sortOrder: 0,
+                    credentials: [AccountSync.ExportedCredential(
+                        label: "me@example.com", source: "codex", provider: "openai",
+                        accessToken: "openai-access-token", refreshToken: "openai-refresh",
+                        expiresAt: nil, tokenExpiresAt: "2026-08-01T00:00:00Z",
+                        scopes: nil, subscriptionType: nil, rateLimitTier: nil,
+                        isActive: true, createdAt: nil, updatedAt: nil, tokenRolledAt: nil
+                    )]
+                )]
+            )
+            let summary = try AccountSync.importBundle(bundle, dbPath: dbPath)
+            expectEqual(summary.created, 1, "the OpenAI account is created as its own row")
+
+            let claudeProvider = try db.scalar(
+                "SELECT provider FROM accounts WHERE id = 'claude-org-uuid'") as? String
+            expectEqual(claudeProvider, "anthropic",
+                        "the Anthropic row sharing the email keeps its provider")
+            let claudeToken = try db.scalar(
+                "SELECT access_token FROM oauth_credentials WHERE account_id = 'claude-org-uuid'") as? String
+            expectEqual(claudeToken, "sk-ant-claude-token",
+                        "the Claude credential is not overwritten by the OpenAI import")
+            let openaiRow = try db.scalar(
+                "SELECT id FROM accounts WHERE email = 'me@example.com' AND provider = 'openai'") as? String
+            expectEqual(openaiRow, "user-native-openai",
+                        "the OpenAI account lands under its own id")
+
+            // Same-provider re-import must still match by email and update in
+            // place (the multi-host convergence contract), not fork a row.
+            var again = bundle
+            again.accounts[0].id = "user-native-openai-renamed"
+            again.accounts[0].lastUpdated = "2026-07-02T00:00:00Z"
+            let summary2 = try AccountSync.importBundle(again, dbPath: dbPath)
+            expectEqual(summary2.updated, 1, "same-provider re-import updates the existing row")
+            let openaiCount = try db.scalar(
+                "SELECT COUNT(*) FROM accounts WHERE email = 'me@example.com' AND provider = 'openai'") as? Int64
+            expectEqual(openaiCount, 1, "same-provider re-import does not fork a second row")
+        } catch {
+            checks += 1
+            failures.append("account sync provider scoping test threw: \(error)")
         }
     }
 

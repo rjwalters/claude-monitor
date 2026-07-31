@@ -210,9 +210,21 @@ enum AccountSync {
         var existingId: String?
         var existingLastUpdated: String?
 
+        // A bundle exported before multi-provider support carries no provider;
+        // it resolves to Anthropic, which is what those hosts were polling.
+        let provider = AccountProvider(stored: account.provider).rawValue
+
+        // The email match MUST be scoped to the incoming account's provider: a
+        // Claude and a ChatGPT account legitimately share one address, and an
+        // unscoped match lands the OpenAI import on the Anthropic row —
+        // flipping its provider and overwriting its credential in place, which
+        // destroys the Claude token.
         if let email = account.email, !email.isEmpty {
-            let stmt = try db.prepare("SELECT id, last_updated FROM accounts WHERE email = ? LIMIT 1")
-            for r in stmt.bind(email) {
+            let stmt = try db.prepare("""
+                SELECT id, last_updated FROM accounts
+                WHERE email = ? AND COALESCE(provider, 'anthropic') = ? LIMIT 1
+            """)
+            for r in stmt.bind(email, provider) {
                 existingId = r[0] as? String
                 existingLastUpdated = r[1] as? String
             }
@@ -234,10 +246,6 @@ enum AccountSync {
 
         let now = ISO8601DateFormatter().string(from: Date())
         let lastUpdated = account.lastUpdated ?? now
-
-        // A bundle exported before multi-provider support carries no provider;
-        // it resolves to Anthropic, which is what those hosts were polling.
-        let provider = AccountProvider(stored: account.provider).rawValue
 
         try db.run("""
             INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
