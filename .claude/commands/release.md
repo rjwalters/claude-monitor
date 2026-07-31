@@ -159,11 +159,16 @@ The build is local — there is no release workflow that produces the `.zip`. Th
    ```bash
    ./scripts/build-macos-app.sh
    ```
-   This produces `build/ClaudeMonitor.app` and `build/ClaudeMonitor.zip`. The script auto-detects the installed `claude-code` version (via npm) and patches the User-Agent in `AnthropicAPI.swift` before compiling — confirm with the user that the local `claude-code` is on the version they want to ship with.
+   This produces `build/ClaudeMonitor.app` and `build/ClaudeMonitor.zip`. The script auto-detects the installed `claude-code` version (via `npm list -g`, falling back to `claude --version` for Homebrew/other installs) and patches the User-Agent in `AnthropicAPI.swift` before compiling — confirm with the user that the local `claude-code` is on the version they want to ship with. If neither detection method finds a version, the script now fails outright rather than silently shipping a stale User-Agent (set `ALLOW_STALE_USER_AGENT=1` to override deliberately).
 
-2. **Verify the `.zip` exists** at `build/ClaudeMonitor.zip` and is non-trivially sized.
+2. **Verify the patched User-Agent** matches the version the script reported (and the `claude-code` version you intend to ship with):
+   ```bash
+   grep claudeCodeUserAgent menubar-app/ClaudeMonitor/Sources/AnthropicAPI.swift
+   ```
 
-3. **Create the GitHub Release** using the CHANGELOG entry as the body:
+3. **Verify the `.zip` exists** at `build/ClaudeMonitor.zip` and is non-trivially sized.
+
+4. **Create the GitHub Release** using the CHANGELOG entry as the body:
    ```bash
    gh release create vX.Y.Z \
      --title "vX.Y.Z" \
@@ -172,7 +177,7 @@ The build is local — there is no release workflow that produces the `.zip`. Th
    ```
    (Manually extract the new entry from CHANGELOG.md if the awk doesn't pick up cleanly — past releases have the body matching the `### Summary` + section bullets, without the `## [X.Y.Z] - DATE` header.)
 
-4. **Verify the release page** shows the `.zip` asset and that the notes render correctly:
+5. **Verify the release page** shows the `.zip` asset and that the notes render correctly:
    ```bash
    gh release view vX.Y.Z --json name,assets,url --jq '.'
    ```
@@ -197,6 +202,6 @@ Present:
 - **Two version-bearing files:** `menubar-app/ClaudeMonitor/Sources/UsageStore.swift` (`AppVersion.current`) and `scripts/build-macos-app.sh` (CFBundleVersion + CFBundleShortVersionString). Keep them in lockstep — `UpdateChecker` compares `AppVersion.current` to GitHub's latest tag, while macOS surfaces the `CFBundleShortVersionString` in About.
 - **Tag format:** `vX.Y.Z` (annotated, with a one-line message).
 - **Build is local.** `.github/workflows/build.yml` only runs `swift build` on push/PR; it does not produce or attach release artifacts.
-- **`build-macos-app.sh` rewrites `AnthropicAPI.swift`** with the locally-installed `claude-code` User-Agent. Confirm that version is what you want to ship.
+- **`build-macos-app.sh` rewrites `AnthropicAPI.swift`** with the locally-installed `claude-code` User-Agent (npm, falling back to `claude --version`). Confirm that version is what you want to ship — if detection fails entirely the script exits non-zero instead of building silently.
 - **Installing the new build** (for sanity check): see CLAUDE.md — you must `rm -rf /Applications/ClaudeMonitor.app` first because `cp -R` doesn't replace a running app.
 - **Do not push or create the release without explicit user confirmation** at each phase.
