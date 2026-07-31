@@ -54,6 +54,7 @@ enum SelfTest {
         testNamedLimitsRoundTrip()
         testOpenAIImportResolvesExistingAccountByEmail()
         testAccountSyncImportIsProviderScoped()
+        testMergeDuplicateAccountsSharingEmail()
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
             testMigrationOfExistingDatabase(at: arguments[idx + 1])
@@ -674,6 +675,144 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("account sync provider scoping test threw: \(error)")
+        }
+    }
+
+    // MARK: - Duplicate account merge (#45)
+
+    /// A database created before `10660f3` (v1.18.0) can carry two active
+    /// rows for the same account — one keyed by a locally generated UUID
+    /// from the pre-native-id era, one by the provider's native id — each
+    /// polled independently. The healing migration must merge them: history
+    /// moves onto the surviving (native-id) row, exactly one credential
+    /// survives (the more recently renewed of the two), the settings pin
+    /// follows if it pointed at the row being removed, an Anthropic row
+    /// sharing the same email is left untouched (provider-scoped), and a
+    /// second run over the healed database is a no-op.
+    private static func testMergeDuplicateAccountsSharingEmail() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            let legacyId = "BFA6C1F0-8C2A-4CB0-9A5E-000000000001" // canonical UUID shape
+            let nativeId = "user-native-oai"
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES (?, 'me@example.com', 'me@example.com', 'pro', '2026-01-01T00:00:00Z', 'openai')
+            """, legacyId)
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES (?, 'me@example.com', 'me@example.com', 'pro', '2026-06-01T00:00:00Z', 'openai')
+            """, nativeId)
+            // Shares the email but a different provider — must survive untouched.
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES ('anthropic-row', 'me@example.com', 'me@example.com', 'Max',
+                        '2026-01-01T00:00:00Z', 'anthropic')
+            """)
+
+            try db.run("""
+                INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
+                VALUES (?, '2026-01-01T00:00:00Z', 10, 0)
+            """, legacyId)
+            try db.run("""
+                INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
+                VALUES (?, '2026-06-01T00:00:00Z', 20, 0)
+            """, nativeId)
+            try db.run("""
+                INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                VALUES (?, '2026-01-01T00:00:00Z', 'haiku', 200, '{}')
+            """, legacyId)
+            // named_limits only exists for the legacy row — merge must carry it
+            // over even though the native row never had any.
+            try db.run("""
+                INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                VALUES (?, '2026-01-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 42)
+            """, legacyId)
+
+            // The legacy row's credential was renewed more recently than the
+            // native row's — the merge must keep the legacy credential's
+            // token even though the *native* row is the id that survives.
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, is_active,
+                     created_at, updated_at, token_rolled_at)
+                VALUES (?, 'me@example.com', 'codex', 'openai', 'legacy-fresher-token', 1,
+                        '2026-01-01T00:00:00Z', '2026-06-20T00:00:00Z', '2026-06-20T00:00:00Z')
+            """, legacyId)
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, is_active,
+                     created_at, updated_at, token_rolled_at)
+                VALUES (?, 'me@example.com', 'codex', 'openai', 'native-stale-token', 1,
+                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', '2026-01-05T00:00:00Z')
+            """, nativeId)
+
+            // The user had pinned the legacy row as their primary account.
+            try db.run("INSERT INTO settings (key, value) VALUES ('primary_account_id', ?)", legacyId)
+
+            // --- What the next launch does. ---
+            store.ensureDatabase()
+
+            let openaiRows = try db.prepare(
+                "SELECT id FROM accounts WHERE email = 'me@example.com' AND provider = 'openai'"
+            ).map { $0[0] as? String }
+            expectEqual(openaiRows.count, 1, "the openai duplicate pair merges into one row")
+            expectEqual(openaiRows.first.flatMap { $0 } ?? "", nativeId,
+                        "the provider-native id survives over the locally generated UUID")
+
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", legacyId) as? Int64, 0,
+                "the losing row is removed")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM accounts WHERE email = 'me@example.com'") as? Int64, 2,
+                "the anthropic row sharing the email is untouched (provider-scoped)")
+            expectEqual(
+                try db.scalar("SELECT provider FROM accounts WHERE id = 'anthropic-row'") as? String,
+                "anthropic", "the anthropic row keeps its provider")
+
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", nativeId) as? Int64, 2,
+                "usage_history rows from both accounts land on the survivor")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = ?", nativeId) as? Int64, 1,
+                "probe_snapshots rows move onto the survivor")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = ?", nativeId) as? Int64, 1,
+                "named_limits rows move onto the survivor even though the survivor never had any")
+
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IN (?, ?)",
+                              nativeId, legacyId) as? Int64,
+                1, "exactly one credential survives the merge")
+            expectEqual(
+                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?", nativeId) as? String,
+                "legacy-fresher-token",
+                "the more recently renewed credential wins, reassigned to the survivor")
+
+            expectEqual(
+                try db.scalar("SELECT value FROM settings WHERE key = 'primary_account_id'") as? String,
+                nativeId, "the primary-account pin follows the merge to the survivor")
+
+            // Idempotent: re-running over an already-healed database changes nothing.
+            store.ensureDatabase()
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 2,
+                        "re-running the healed database doesn't merge or remove anything further")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IN (?, ?)",
+                              nativeId, legacyId) as? Int64,
+                1, "re-running doesn't touch the surviving credential")
+        } catch {
+            checks += 1
+            failures.append("duplicate account merge test threw: \(error)")
         }
     }
 

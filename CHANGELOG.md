@@ -22,6 +22,15 @@ credential when an OpenAI account shares its email address.
   recover the history by reassigning non-wham-shaped `usage_history` rows (and
   `fable`/`haiku` `probe_snapshots`) back to the Anthropic org id and
   re-importing a valid token
+- **Healing migration merges duplicate provider accounts sharing an email.**
+  `10660f3` only stopped a *fresh* `codex import` from forking a second row for
+  an OpenAI account whose original row predated the native-id era (keyed by a
+  locally generated UUID); a database where the duplicate already existed kept
+  both rows polling the same account independently. At launch, account pairs
+  sharing `(email, provider)` are now merged automatically: history moves onto
+  the surviving row (preferring the provider-native id), exactly one
+  credential survives (the more recently renewed of the two), and the sibling
+  row is removed. Idempotent, and covered by a selftest over a scratch DB (#45)
 
 ## [1.18.0] - 2026-07-30
 
