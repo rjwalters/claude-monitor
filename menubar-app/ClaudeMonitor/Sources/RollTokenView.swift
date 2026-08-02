@@ -244,6 +244,10 @@ struct RollTokenView: View {
 
 // MARK: - Window Controller
 
+// Window-controller cache: only ever touched from AppKit callbacks (button
+// actions, notification handlers), which always run on the main thread —
+// @MainActor isolation matches actual usage rather than papering over it.
+@MainActor
 final class RollTokenWindowController {
     static var windows: [String: NSWindow] = [:]
 
@@ -287,8 +291,13 @@ final class RollTokenWindowController {
         windows[account.id] = window
 
         // Drop our retained reference when the window closes so a later roll reopens fresh.
+        // The observer is registered with `queue: .main`, so the block always runs on
+        // the main thread; `MainActor.assumeIsolated` lets it touch the `@MainActor`
+        // `windows` cache without an async hop under Swift 6's `@Sendable`-closure checking.
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { _ in
-            windows.removeValue(forKey: account.id)
+            MainActor.assumeIsolated {
+                _ = windows.removeValue(forKey: account.id)
+            }
         }
 
         window.makeKeyAndOrderFront(nil)

@@ -2,7 +2,13 @@ import Foundation
 
 /// Writes timestamped debug lines to ~/.claude-monitor/debug.log
 /// Automatically rotates when the file exceeds 1 MB.
-final class FileLogger {
+///
+/// `@unchecked Sendable`: all mutable file/rotation state (`fileHandle`, and
+/// the byte-count check in `rotateIfNeeded`) is only ever touched from the
+/// private serial `queue`, which is the sole writer. `echoToStdout` is set
+/// once at process startup (see `HeadlessRunner`) before any concurrent
+/// logging begins, and after that is read-only from `log(_:category:level:)`.
+final class FileLogger: @unchecked Sendable {
     static let shared = FileLogger()
 
     /// When true (headless mode), every line is also printed to stdout so
@@ -33,7 +39,13 @@ final class FileLogger {
         let line = "\(ts) [\(level.rawValue)] [\(category)] \(message)\n"
         if echoToStdout {
             print(line, terminator: "")
-            fflush(stdout)
+            // Flush every open output stream rather than naming `stdout`
+            // directly: Linux's Glibc overlay (unlike Darwin's) doesn't mark
+            // that C global Sendable, so referencing it at all is flagged
+            // under Swift 6 mode. `fflush(nil)` is the portable equivalent
+            // for the "make sure this just-printed line reaches
+            // journald/docker logs immediately" intent here.
+            fflush(nil)
         }
         queue.async { [weak self] in
             self?.writeLine(line)

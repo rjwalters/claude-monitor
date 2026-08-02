@@ -122,7 +122,10 @@ enum ProviderAPIError: Error, LocalizedError {
 // MARK: - Protocol
 
 /// A client that can read one provider's subscription usage.
-protocol UsageProviderClient: AnyObject {
+/// `Sendable`: every conformer is a stateless (or immutable-state) API client
+/// safe to call from any isolation domain — see `AnthropicAPIClient` /
+/// `OpenAIAPIClient`.
+protocol UsageProviderClient: AnyObject, Sendable {
     /// Which provider this client speaks to.
     var provider: AccountProvider { get }
 

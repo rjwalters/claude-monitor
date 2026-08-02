@@ -13,6 +13,12 @@ extension CGFloat {
 /// of account rows so there is no empty space below the table. Height is
 /// clamped to [minHeight, maxHeight]; when rows would exceed maxHeight the row
 /// list scrolls. There is no manual resize — the fit is automatic.
+///
+/// `@MainActor`: it holds an `NSPopover` and mutates its `contentSize` (an
+/// AppKit main-actor API) and is only ever driven from the app's main-thread
+/// UI path (`AppDelegate`, SwiftUI view bodies), matching the isolation of the
+/// other UI-state classes (`UsageStore`, `OAuthPoller`).
+@MainActor
 class PopoverHeightManager: ObservableObject {
     static let popoverWidth: CGFloat = 818
     static let minHeight: CGFloat = 200
@@ -50,6 +56,7 @@ class PopoverHeightManager: ObservableObject {
 
 @main
 enum ClaudeMonitorEntry {
+    @MainActor
     static func main() {
         // `accounts export|import` is a one-shot CLI operation, not a launch
         // mode — route it before the --headless/GUI dispatch so it works
@@ -90,6 +97,7 @@ struct ClaudeMonitorApp: App {
     }
 }
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set at launch so windows opened deep in the SwiftUI view tree can reach the
     /// popover to dismiss it. `NSApp.delegate as? AppDelegate` is unreliable under
@@ -155,9 +163,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         heightManager.popover = popover
         flog.info("Popover ready, starting poll timer", category: "App")
 
-        // Tick every 30s; each account is polled once per 10 min (staggered)
+        // Tick every 30s; each account is polled once per 10 min (staggered).
+        // The timer is scheduled on the main run loop, so its `@Sendable` block
+        // always fires on the main thread; `MainActor.assumeIsolated` lets it call
+        // the `@MainActor`-isolated `refreshDue()` without an async hop.
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            self?.refreshDue()
+            MainActor.assumeIsolated {
+                self?.refreshDue()
+            }
         }
 
         // Initial load — sync accounts from the master + local list files, then

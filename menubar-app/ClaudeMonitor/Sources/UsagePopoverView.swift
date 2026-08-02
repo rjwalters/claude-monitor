@@ -480,8 +480,13 @@ struct UsagePopoverView: View {
                         .foregroundColor(.primary)
                         .onHover { hovering in
                             if hovering {
+                                // Scheduled on the main run loop, so the `@Sendable`
+                                // block fires on the main thread; assume the isolation
+                                // to mutate the `@MainActor` `showGitHubLink` state.
                                 titleHoverTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { _ in
-                                    showGitHubLink = true
+                                    MainActor.assumeIsolated {
+                                        showGitHubLink = true
+                                    }
                                 }
                             } else {
                                 titleHoverTimer?.invalidate()
@@ -798,6 +803,13 @@ struct SortableHeader: View {
 
 // MARK: - Summary Table — Row
 
+// SwiftUI already isolates `body` to the main actor, but this row's computed
+// properties (`tokenStatus`, `isMenubarSelected`, …) and button actions
+// (`openChart`, `togglePrimary`, `saveRename`, …) reach into `@MainActor`
+// state on `UsageStore`/`OAuthPoller` and the window-controller caches. Marking
+// the whole view `@MainActor` isolates those members too, so the call sites
+// match the isolation of what they touch under Swift 6 language mode.
+@MainActor
 struct SummaryRow: View {
     let account: Account
     let usage: UsageRecord?

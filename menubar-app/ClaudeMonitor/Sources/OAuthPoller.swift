@@ -116,6 +116,12 @@ struct EnvImportResult {
     let error: String?
 }
 
+// `@Published`-driven state is only ever read/written from the main thread
+// today (SwiftUI views on macOS; a single Task-driven headless loop that
+// pumps via `dispatchMain()` on Linux) — @MainActor isolation matches actual
+// usage and lets Swift 6 verify it, rather than sprinkling per-call
+// `Task { @MainActor in ... }` hops that only *assert* the same invariant.
+@MainActor
 class OAuthPoller: ObservableObject {
     private let apiClient = AnthropicAPIClient()
     private let openAIClient = OpenAIAPIClient()
@@ -267,7 +273,9 @@ class OAuthPoller: ObservableObject {
     /// create a duplicate sibling for the same account. Match by email within
     /// the provider first — the same guard `AccountSync.importAccount` applies
     /// on multi-host import.
-    static func resolveOpenAIAccountId(email: String?, nativeId: String, db: Connection) -> String {
+    // Pure function of its arguments (plus the module-level `flog`) — touches
+    // no instance/class main-actor state.
+    nonisolated static func resolveOpenAIAccountId(email: String?, nativeId: String, db: Connection) -> String {
         guard let email, !email.isEmpty else { return nativeId }
         do {
             let stmt = try db.prepare("""

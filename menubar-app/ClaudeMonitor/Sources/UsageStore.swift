@@ -216,6 +216,12 @@ struct DailyTokenSummary: Identifiable {
     }
 }
 
+// `@Published`-driven state is only ever read/written from the main thread
+// today (SwiftUI views on macOS; a single Task-driven headless loop that
+// pumps via `dispatchMain()` on Linux) — @MainActor isolation matches actual
+// usage and lets Swift 6 verify it, rather than sprinkling per-call
+// `DispatchQueue.main.async` hops that only *assert* the same invariant.
+@MainActor
 class UsageStore: ObservableObject {
     @Published var accounts: [Account] = []
     @Published var latestUsage: [String: UsageRecord] = [:]
@@ -227,7 +233,9 @@ class UsageStore: ObservableObject {
     /// Called when accounts change (e.g., reordering, primary selection) so the menubar can update
     var onAccountsChanged: (() -> Void)?
 
-    private static let primaryAccountSettingKey = "primary_account_id"
+    // Immutable String constant — safe to read from the nonisolated merge
+    // helpers above as well as main-actor instance methods.
+    private nonisolated static let primaryAccountSettingKey = "primary_account_id"
 
     private let dbPath: String
 
@@ -260,7 +268,10 @@ class UsageStore: ObservableObject {
     /// read-write connection. Safe to run on every launch — that is the
     /// established pattern here (#15, #23): heal in place rather than make the
     /// user re-add accounts.
-    static func applySchema(_ db: Connection) throws {
+    // Pure function of its `db` argument — touches no instance/class
+    // main-actor state, so it stays callable from non-UI contexts (CLI
+    // import/export, headless startup) without forcing them onto MainActor.
+    nonisolated static func applySchema(_ db: Connection) throws {
         try db.execute("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id TEXT PRIMARY KEY,
@@ -399,7 +410,9 @@ class UsageStore: ObservableObject {
     /// COLUMN` throws on a duplicate; checking first keeps the (expected)
     /// already-migrated path free of spurious errors and lets us log the one
     /// launch where a real migration happens.
-    private static func addColumnIfMissing(
+    // Pure function of its arguments (plus the free `tableColumns` helper and
+    // `FileLogger.shared`) — touches no instance/class main-actor state.
+    private nonisolated static func addColumnIfMissing(
         _ db: Connection, table: String, column: String, definition: String
     ) {
         let existing = tableColumns(db, table)
@@ -417,7 +430,9 @@ class UsageStore: ObservableObject {
     /// copied into `email`. Idempotent and side-effect-free once every row is
     /// backfilled — cheap enough to run unconditionally on every launch rather
     /// than tracking a schema version for it.
-    private static func backfillMissingEmailsFromAccountName(_ db: Connection) {
+    // Pure function of its argument — touches no instance/class main-actor
+    // state.
+    private nonisolated static func backfillMissingEmailsFromAccountName(_ db: Connection) {
         do {
             let stmt = try db.prepare("SELECT id, account_name FROM accounts WHERE email IS NULL AND account_name IS NOT NULL")
             var candidates: [(id: String, name: String)] = []
@@ -444,7 +459,9 @@ class UsageStore: ObservableObject {
     /// same guard `resolveOpenAIAccountId` and `AccountSync.importAccount`
     /// already apply. Idempotent: once only one row remains per (email,
     /// provider), the grouping query below finds nothing to merge.
-    private static func mergeDuplicateAccountsSharingEmail(_ db: Connection) {
+    // Pure function of its argument — touches no instance/class main-actor
+    // state.
+    private nonisolated static func mergeDuplicateAccountsSharingEmail(_ db: Connection) {
         struct Candidate {
             let id: String
             let provider: String
@@ -486,7 +503,9 @@ class UsageStore: ObservableObject {
     /// generated id, and the shape the pre-native-id-era duplicate is keyed
     /// by) over a generated one; ties — including when every candidate looks
     /// native, or none does — break on the most-recently-updated row.
-    private static func pickMergeSurvivor(_ candidates: [(id: String, lastUpdated: String?)]) -> String {
+    // Pure function of its argument — touches no instance/class main-actor
+    // state.
+    private nonisolated static func pickMergeSurvivor(_ candidates: [(id: String, lastUpdated: String?)]) -> String {
         let native = candidates.filter { UUID(uuidString: $0.id) == nil }
         let pool = native.isEmpty ? candidates : native
         return pool.max { ($0.lastUpdated ?? "") < ($1.lastUpdated ?? "") }?.id ?? candidates[0].id
@@ -496,7 +515,9 @@ class UsageStore: ObservableObject {
     /// `survivorId`, then removes the now-empty `loserId` row. Runs inside a
     /// transaction so a mid-merge failure never leaves history split across
     /// two rows with neither id complete.
-    private static func mergeAccountRow(_ db: Connection, from loserId: String, into survivorId: String) {
+    // Pure function of its arguments — touches no instance/class main-actor
+    // state.
+    private nonisolated static func mergeAccountRow(_ db: Connection, from loserId: String, into survivorId: String) {
         do {
             try db.execute("BEGIN")
             try db.run("UPDATE usage_history SET account_id = ? WHERE account_id = ?", survivorId, loserId)
@@ -550,7 +571,9 @@ class UsageStore: ObservableObject {
 
     /// Seconds until reset (session first, then weekly). Returns large value if
     /// unknown — including when the provider reports no window at all.
-    static func resetSeconds(_ usage: UsageRecord?) -> TimeInterval {
+    // Pure function of its argument — touches no instance/class main-actor
+    // state.
+    nonisolated static func resetSeconds(_ usage: UsageRecord?) -> TimeInterval {
         guard let usage = usage else { return .greatestFiniteMagnitude }
         let snapshot = usage.rateLimit
         for date in [snapshot.session?.resetAt, snapshot.weekly?.resetAt].compactMap({ $0 }) {
@@ -620,7 +643,9 @@ class UsageStore: ObservableObject {
     /// never populates `RateLimitSnapshot.named`), so this is a silent no-op
     /// for those accounts — exactly the "zero named_limits rows" behavior the
     /// chart overlay depends on to stay hidden.
-    static func insertNamedLimits(
+    // Pure function of its arguments — touches no instance/class main-actor
+    // state.
+    nonisolated static func insertNamedLimits(
         _ db: Connection,
         accountId: String,
         timestamp: String,
@@ -900,7 +925,10 @@ class UsageStore: ObservableObject {
     /// with no named limits (every Anthropic account today), which is what
     /// lets `UsageChartView` hide the overlay entirely rather than rendering
     /// an empty series.
-    func loadNamedLimitHistory(for accountId: String, daysBack: Int = 7) -> [String: [NamedLimitDataPoint]] {
+    // Reads only the immutable `dbPath` and calls `parseDate` (also
+    // `nonisolated`) — touches no @Published main-actor state, so it stays
+    // callable from the (synchronous, non-UI) selftest suite.
+    nonisolated func loadNamedLimitHistory(for accountId: String, daysBack: Int = 7) -> [String: [NamedLimitDataPoint]] {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
                 return [:]
@@ -1165,7 +1193,8 @@ class UsageStore: ObservableObject {
         }
     }
 
-    private func parseDate(_ string: String?) -> Date? {
+    // Pure function of its argument — touches no @Published main-actor state.
+    private nonisolated func parseDate(_ string: String?) -> Date? {
         guard let string = string else { return nil }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1220,6 +1249,10 @@ struct UpdateInfo {
     let releaseURL: String
 }
 
+// Only ever instantiated from a SwiftUI `@StateObject` in the macOS-only
+// chart window (UsageChartView.swift), so @MainActor isolation matches the
+// only actual caller rather than papering over the diagnostic.
+@MainActor
 class UpdateChecker: ObservableObject {
     @Published var updateAvailable: UpdateInfo?
     @Published var isChecking = false

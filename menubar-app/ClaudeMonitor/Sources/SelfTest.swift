@@ -8,9 +8,20 @@ import Foundation
 /// Everything here operates on throwaway databases under a temporary
 /// directory; the real `~/.claude-monitor/usage.db` is never opened.
 /// Exits 0 when every check passes, 1 otherwise, so CI can gate on it.
+///
+/// @MainActor: several checks exercise `UsageStore` (a main-actor-isolated
+/// class — see its definition) directly against throwaway databases; `main()`
+/// runs synchronously to completion on the process's initial thread before
+/// calling `exit()`, so this matches the real caller rather than forcing a
+/// `Task` hop purely to satisfy the type-checker.
+@MainActor
 enum SelfTest {
-    private static var failures: [String] = []
-    private static var checks = 0
+    // `main()` runs every test function sequentially on a single thread to
+    // completion before exiting the process — there is no concurrent access,
+    // so a global accumulator is genuinely safe here (narrower than adding an
+    // actor or threading state through every one of the ~40 call sites below).
+    private nonisolated(unsafe) static var failures: [String] = []
+    private nonisolated(unsafe) static var checks = 0
 
     static func main(_ arguments: [String] = []) -> Never {
         failures = []

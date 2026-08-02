@@ -1126,6 +1126,10 @@ struct UsageConsumedBox: View {
     }
 }
 
+// Window-controller cache: only ever touched from AppKit/SwiftUI button
+// actions and view bodies, which always run on the main thread — @MainActor
+// isolation matches actual usage rather than papering over it.
+@MainActor
 class ChartWindowController {
     static var windows: [String: NSWindow] = [:]
 

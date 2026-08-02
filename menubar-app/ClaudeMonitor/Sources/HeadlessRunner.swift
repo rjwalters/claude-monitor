@@ -8,6 +8,11 @@ import Foundation
 /// round of polls. Additionally re-imports the account list files whenever
 /// their mtime changes, since a daemon has no "relaunch to pick up new
 /// accounts" moment.
+// `main()` bridges its synchronous entry to `dispatchMain()` pumping the
+// process's initial thread, and every call into `UsageStore`/`OAuthPoller`
+// happens either directly there or from the single `Task` it spawns — the
+// same main-thread caller those two classes are isolated to.
+@MainActor
 enum HeadlessRunner {
     private static let flog = FileLogger.shared
     private static let tickSeconds: UInt64 = 30
