@@ -244,6 +244,10 @@ struct RollTokenView: View {
 
 // MARK: - Window Controller
 
+// Window-controller cache: only ever touched from AppKit callbacks (button
+// actions, notification handlers), which always run on the main thread —
+// @MainActor isolation matches actual usage rather than papering over it.
+@MainActor
 final class RollTokenWindowController {
     static var windows: [String: NSWindow] = [:]
 

@@ -4,6 +4,7 @@
 // when launched with --headless.)
 @main
 enum ClaudeMonitorEntry {
+    @MainActor
     static func main() {
         // `accounts export|import` is a one-shot CLI operation, distinct from
         // the always-on poll loop below.

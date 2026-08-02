@@ -50,6 +50,7 @@ class PopoverHeightManager: ObservableObject {
 
 @main
 enum ClaudeMonitorEntry {
+    @MainActor
     static func main() {
         // `accounts export|import` is a one-shot CLI operation, not a launch
         // mode — route it before the --headless/GUI dispatch so it works
@@ -90,6 +91,7 @@ struct ClaudeMonitorApp: App {
     }
 }
 
+@MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set at launch so windows opened deep in the SwiftUI view tree can reach the
     /// popover to dismiss it. `NSApp.delegate as? AppDelegate` is unreliable under

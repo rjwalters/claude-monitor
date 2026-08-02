@@ -9,6 +9,12 @@ import Foundation
 ///
 /// Nothing here ever prints a token or an email address; the account is
 /// identified in output by the first 8 characters of its OpenAI `account_id`.
+// The whole CLI runs synchronously to completion on the process's initial
+// thread (see `runImport`'s `dispatchMain()` bridge below) before it ever
+// calls `exit()`, so it is the actual main-thread caller `UsageStore` /
+// `OAuthPoller` are isolated to — @MainActor makes that explicit rather than
+// implicit.
+@MainActor
 enum CodexCLI {
     /// `args` is everything after the `codex` subcommand itself.
     static func main(_ args: [String]) -> Never {

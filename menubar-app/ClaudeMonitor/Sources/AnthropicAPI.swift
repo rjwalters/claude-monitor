@@ -86,7 +86,10 @@ typealias AnthropicAPIError = ProviderAPIError
 
 // MARK: - API Client
 
-class AnthropicAPIClient {
+// Genuinely Sendable: the only stored property is `URLSession` (itself
+// Sendable), every method is a pure function of its arguments plus that
+// session, and there is no other instance-level mutable state.
+final class AnthropicAPIClient: Sendable {
     private let session = URLSession.shared
 
     /// Ping a token with a minimal Haiku inference call.
@@ -203,7 +206,10 @@ class AnthropicAPIClient {
         "anthropic-ratelimit-unified-overage-in-use",
         "anthropic-ratelimit-unified-upgrade-paths",
     ]
-    private static var loggedUnknownKeys: Set<String> = []
+    // Log-dedup only (never read for correctness); OAuthPoller processes
+    // credentials sequentially in an `await`-ed for loop, never concurrently,
+    // so this is genuinely single-threaded in practice.
+    private nonisolated(unsafe) static var loggedUnknownKeys: Set<String> = []
 
     private static func logUnknownHeaderKeys<S: Sequence>(_ keys: S) where S.Element == String {
         for key in keys where !knownHeaderKeys.contains(key) && !loggedUnknownKeys.contains(key) {

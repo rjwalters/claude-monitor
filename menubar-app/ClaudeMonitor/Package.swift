@@ -24,7 +24,16 @@ let package = Package(
             ],
             path: "Sources",
             swiftSettings: [
-                .unsafeFlags(["-parse-as-library"])
+                // `-swift-version 6` (rather than bumping this manifest's
+                // `swift-tools-version` to 6.0 and using the
+                // `.swiftLanguageMode(.v6)` API) keeps the manifest itself
+                // parseable by any 5.9+ SwiftPM/toolchain — including
+                // whatever exact Xcode CI's `macos-14` runner happens to
+                // pin — while still forcing full Swift 6 language-mode
+                // checking on every `swift build`, matching the local
+                // `-Xswiftc -swift-version -Xswiftc 6` proxy this setting
+                // retires (see CLAUDE.md).
+                .unsafeFlags(["-parse-as-library", "-swift-version", "6"])
             ]
         )
     ]

@@ -282,7 +282,10 @@ struct OpenAITokenRefreshResponse: Decodable {
 
 // MARK: - API client
 
-final class OpenAIAPIClient {
+// Genuinely Sendable: the only stored property is `URLSession` (itself
+// Sendable), every method is a pure function of its arguments plus that
+// session, and there is no other instance-level mutable state.
+final class OpenAIAPIClient: Sendable {
     /// The live-verified usage endpoint. The `/backend-api/codex/usage` variant
     /// is Cloudflare-challenged (403) and must not be used.
     static let usageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
