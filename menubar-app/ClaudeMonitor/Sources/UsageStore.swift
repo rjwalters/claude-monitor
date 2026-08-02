@@ -83,11 +83,6 @@ struct UsageRecord: Identifiable {
     /// Whether the account is currently drawing on extra usage.
     var overageInUse: Bool? = nil
 
-    /// Remaining Fable allocation 0–100, or nil if unknown.
-    var fableRemaining: Double? {
-        fablePercent.map { max(0, 100 - $0) }
-    }
-
     /// This stored reading expressed in the shared, provider-agnostic window
     /// model. The `usage_history` columns are already kind-keyed (a session
     /// column and a weekly column), so each window's kind is explicit and its

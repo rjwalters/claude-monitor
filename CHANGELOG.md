@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Premium column counts up and sits before "Wk Reset".** The summary
+  table's premium column now shows allowance *used*, counting up to 100% to
+  mirror Session % / Weekly % (titled "Fable %" for an Anthropic-only table,
+  neutral "Premium %" otherwise; previously "Fable Left"/"Premium Left"
+  counting down), and swaps places with the "Wk Reset" column so the three
+  percentage columns read together.
+
 ## [1.18.2] - 2026-07-31
 
 ### Summary

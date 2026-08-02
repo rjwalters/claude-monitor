@@ -54,13 +54,13 @@ enum SummaryColumns {
 
 // MARK: - Provider column vocabulary
 
-/// A column whose *meaning* is provider-specific — today "Fable Left" and
+/// A column whose *meaning* is provider-specific — today "Fable %" and
 /// "Extra" are both Anthropic-premium concepts that mean nothing for an
 /// OpenAI row. Adding a provider that has something to say for a slot means
 /// adding one case to `AccountProvider.columnEntry(for:)`; no conditionals
 /// scattered through the header/row views.
 enum ProviderColumnSlot {
-    /// Anthropic: "Fable Left" — remaining premium-model weekly allowance.
+    /// Anthropic: "Fable %" — premium-model weekly allowance used.
     case premium
     /// Anthropic: "Extra" — overage/extra-usage balance beyond that allowance.
     case extra
@@ -84,9 +84,9 @@ extension AccountProvider {
         switch (self, slot) {
         case (.anthropic, .premium):
             return ProviderColumnEntry(
-                title: "Fable Left",
+                title: "Fable %",
                 isApplicable: true,
-                meaning: "Anthropic: Fable/premium weekly allowance remaining. At 0% the account switches to extra usage."
+                meaning: "Anthropic: Fable/premium weekly allowance used. At 100% the account switches to extra usage."
             )
         case (.anthropic, .extra):
             return ProviderColumnEntry(
@@ -697,7 +697,7 @@ struct SummaryHeaderRow: View {
     let visibleProviders: Set<AccountProvider>
 
     private var premiumHeading: (title: String, tooltip: String) {
-        columnHeading(for: .premium, neutralTitle: "Premium Left", visibleProviders: visibleProviders)
+        columnHeading(for: .premium, neutralTitle: "Premium %", visibleProviders: visibleProviders)
     }
 
     private var extraHeading: (title: String, tooltip: String) {
@@ -724,13 +724,13 @@ struct SummaryHeaderRow: View {
             SortableHeader(title: "Weekly %", column: .weeklyPercent,
                            width: SummaryColumns.percent, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir)
-            SortableHeader(title: "Wk Reset", column: .weeklyReset,
-                           width: SummaryColumns.reset, alignment: .trailing,
-                           sortBy: $sortBy, sortDir: $sortDir)
             SortableHeader(title: premiumHeading.title, column: .fablePercent,
                            width: SummaryColumns.fable, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir,
                            tooltip: premiumHeading.tooltip)
+            SortableHeader(title: "Wk Reset", column: .weeklyReset,
+                           width: SummaryColumns.reset, alignment: .trailing,
+                           sortBy: $sortBy, sortDir: $sortDir)
             SortableHeader(title: extraHeading.title, column: .extraUsage,
                            width: SummaryColumns.extra, alignment: .trailing,
                            sortBy: $sortBy, sortDir: $sortDir,
@@ -946,14 +946,14 @@ struct SummaryRow: View {
             percentText(usage?.rateLimit.weekly?.usedPercent)
                 .frame(width: SummaryColumns.percent, alignment: .trailing)
 
+            fableCell
+                .frame(width: SummaryColumns.fable, alignment: .trailing)
+
             Text(resetLabel(usage?.rateLimit.weekly?.resetAt))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .lineLimit(1)
                 .frame(width: SummaryColumns.reset, alignment: .trailing)
-
-            fableCell
-                .frame(width: SummaryColumns.fable, alignment: .trailing)
 
             extraCell
                 .frame(width: SummaryColumns.extra, alignment: .trailing)
@@ -1093,24 +1093,19 @@ struct SummaryRow: View {
         return .primary
     }
 
-    /// Fable/premium weekly allowance remaining, colored by how much is left.
+    /// Fable/premium weekly allowance used, counting up to 100% like the
+    /// Session % / Weekly % columns.
     @ViewBuilder
     private var fableCell: some View {
-        if let remaining = usage?.fableRemaining {
-            Text("\(Int(remaining.rounded()))%")
-                .foregroundColor(colorForRemaining(remaining))
-                .help("Fable/premium weekly allowance remaining. At 0% the account switches to extra usage.")
+        if let used = usage?.fablePercent {
+            Text("\(Int(used.rounded()))%")
+                .foregroundColor(colorForPercent(used))
+                .help("Fable/premium weekly allowance used. At 100% the account switches to extra usage.")
         } else {
             Text("—")
                 .foregroundColor(.secondary)
                 .help("No premium-model probe yet")
         }
-    }
-
-    private func colorForRemaining(_ remaining: Double) -> Color {
-        if remaining <= 0 { return Color(nsColor: .systemRed) }
-        if remaining < 10 { return Color(nsColor: .systemOrange) }
-        return .primary
     }
 
     /// Extra-usage (overage) balance. The API gives no dollar figure, and an
