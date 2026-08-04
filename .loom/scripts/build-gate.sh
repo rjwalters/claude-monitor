@@ -29,6 +29,11 @@
 #   - bash scripts/test-changelog.sh runs scripts/changelog.sh's unit suite
 #     (#5196) against a disposable scratch repo (CHANGELOG_REPO_ROOT) -- no
 #     network, no dependency on this repo's own history, sub-second.
+#   - bash scripts/test-install-local-mode.sh (#5276) covers install-loom.sh
+#     --local/--gitignore mode -- no daemon build, no network, sub-second.
+#   - bash scripts/test-migrate-consumer.sh (#5276) covers scripts/install/
+#     migrate-consumer.sh (Epic #3835 Phase 6) against throwaway git fixtures
+#     -- no network, no real daemon, sub-second.
 #   - mcp-loom (TypeScript) is intentionally EXCLUDED: it needs npm install/ci
 #     in a fresh worktree (no guaranteed warm node_modules), which adds
 #     unpredictable latency to a gate that also runs once per PR. CI still
@@ -158,5 +163,11 @@ bash scripts/test-installer.sh
 
 echo "[build-gate] bash changelog generator suite"
 bash scripts/test-changelog.sh
+
+echo "[build-gate] bash install --local/--gitignore mode suite"
+bash scripts/test-install-local-mode.sh
+
+echo "[build-gate] bash migrate-consumer suite"
+bash scripts/test-migrate-consumer.sh
 
 echo "[build-gate] all stages passed"

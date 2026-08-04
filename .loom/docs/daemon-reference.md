@@ -3656,6 +3656,20 @@ pool, gated by that repo's own config (an empty registry reduces to the single
 daemon workspace). See `loom-daemon/src/token_ranking_refresh.rs` for the
 implementation.
 
+**This loop's scope is per-repo; `loom-daemon health`'s tokens section used to
+be single-pool only (#5269).** This refresher keeps every registered repo's
+OWN pool fresh independently — but through v0.18.0, `loom-daemon health`/
+`status` reported staleness for only the daemon's single
+`fallback_root`-anchored pool (its launch CWD, see [Full anchoring precedence,
+and machine-level daemon startup](token-pool.md#full-anchoring-precedence-and-machine-level-daemon-startup-4292)
+in token-pool.md), which on a multi-repo daemon is not necessarily any
+particular *other* registered repo's own pool. `status`'s `per_repo` array now
+carries each repo's own `token_pool_dir`/`ranking_present`/
+`ranking_age_secs` (populated with the same unanchored `resolve_tokens_dir`
+this loop uses), and `health --json`'s `tokens.detail.per_repo` surfaces it —
+see [token-pool.md's `loom-daemon health` distinction](token-pool.md#loom-daemon-healths-daemon-cwd-vs-operator-repo-distinction-5269)
+for the full incident writeup and the now-obsolete `$HOME`-refresh workaround.
+
 ### Merged-PR worktree reaper (#4876)
 
 CLAUDE.md states the contract: *"Loom-managed worktrees (with the
@@ -3834,6 +3848,71 @@ routinely run long jobs by hand in a finished issue's worktree, raise
 `minAgeSecs`, drop a `.loom-in-use` file in the worktree, or turn the pass off.
 Linux-only (it needs `/proc`); on other hosts the pass is a no-op. See
 `loom-daemon/src/orphan_process_reaper.rs`.
+
+### Primary-checkout reaper (#5268)
+
+**The problem.** The merged-PR worktree reaper above and `loom-daemon clean`
+both operate on `.loom/worktrees/<n>` entries — never on the **primary
+checkout's own `HEAD`**. Nothing returns that checkout to the default branch,
+so a primary clone left checked out on a feature branch (no PR ever opened) or
+on a PR branch whose PR was closed without merging stays there indefinitely.
+Every primary-clone agent — role ticks, the work finder, anything not running
+inside a `.loom/worktrees/` worktree — then reads stale files off that branch,
+and any repo-level `git` operation run from the primary checkout lands on the
+dead branch by default. Observed during loom#5184 (2026-08-04): two of eight
+managed-repo primary checkouts were parked exactly this way.
+
+**What it does.** Rides the same per-registered-root tick as the worktree and
+orphaned-process reapers above. For each root's primary checkout: resolves the
+current branch and the repo's default branch (`origin/HEAD`); if the two
+already match, does nothing. Otherwise, in order: skips a dirty tree (checked
+via `git status --porcelain` **plus** a scan for `.git/{rebase-merge,
+rebase-apply,MERGE_HEAD,CHERRY_PICK_HEAD,BISECT_LOG,REVERT_HEAD}`, so a rebase
+paused between conflict-free steps still counts as dirty even though porcelain
+status alone would read clean); probes the branch's PR state via the forge API
+(REST-first, GraphQL fallback — the same `check_pr_status_for_branch[_rest]`
+helpers the merged-PR worktree reaper's `check_pr_merged[_rest]` are built on,
+never `git branch -d` reachability classification, which loom#4889 already
+showed is unsafe under squash-merge); and — regardless of PR state — skips if
+the branch carries any commit not yet safe to discard (ahead of its own
+`@{u}` remote upstream when one is configured, or ahead of
+`origin/<default>` for a branch that was never pushed at all). Only when every
+gate passes does it `git checkout` the default branch, logging what it did.
+
+**Why the unpushed-commits gate exists independent of PR state.** A `Merged`
+verdict from the forge alone is not sufficient: a local branch can carry
+commits made *after* what the PR merged that were never pushed, and comparing
+`HEAD` against the default branch directly (instead of against the branch's
+own upstream) would misclassify a squash-merged branch's already-merged
+commits as "unpushed" — the same #4889 trap. Comparing against `@{u}` instead
+answers "is there anything on this branch that isn't already on some remote
+copy of it?", which is the actual question that matters for not losing work.
+
+**Default-on**, for the same reason as the two reapers above: it restores a
+tacit contract (agents read the default branch) whose absence is a
+slow-motion outage.
+
+```json
+{
+  "autonomous": {
+    "primaryCheckoutReaper": {
+      "enabled": true,
+      "gracePeriodSecs": 600
+    }
+  }
+}
+```
+
+| Env var | Config key | Precedence | Default |
+|---------|-----------|------------|---------|
+| `LOOM_PRIMARY_CHECKOUT_REAPER` | `autonomous.primaryCheckoutReaper.enabled` | env > config > default | `true` (on) |
+| — | `autonomous.primaryCheckoutReaper.gracePeriodSecs` | config > default | `600` (10 min, same default as `worktreeReaper.gracePeriodSecs`) |
+
+**Fails closed on every ambiguity.** A detached HEAD, no `origin/HEAD`, a
+`git`/forge probe failure, or an indeterminate unpushed-commit count all skip
+rather than act — under-acting here is recoverable on the next tick,
+over-acting is not (this switches an operator's actual working tree, not a
+disposable worktree directory). See `loom-daemon/src/primary_checkout_reaper.rs`.
 
 ### Autonomous periodic support-role runner (#4015)
 

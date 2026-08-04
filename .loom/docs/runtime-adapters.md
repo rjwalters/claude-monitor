@@ -537,6 +537,12 @@ the identical fail-closed rules, so a bad binding is caught any time an
 operator runs the command — not only the next time a role's tick actually hits
 it.
 
+**Bash fallback (#5277)**: `defaults/scripts/validate-roles.sh` runs the same
+role-dependency checks as `loom-daemon validate` without needing the Rust
+binary built — useful on a fresh source checkout or a shell-only CI step. It
+is operator-manual (no in-repo caller invokes it as a dependency); prefer
+`loom-daemon validate` when the binary is available.
+
 **Runtime manifest resolution and the bundled fallback (#5002).** The role and
 runtime manifest directories are resolved independently (#4688): each prefers
 `.loom/roles` / `.loom/runtimes` when the subdirectory exists on disk, and

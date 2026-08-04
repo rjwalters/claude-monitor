@@ -132,3 +132,20 @@ defaults/hooks/tests/test-guard-loom-workspace.sh
 defaults/hooks/tests/test-guard-worktree-paths.sh
 defaults/hooks/tests/test-methodology-inject.sh
 defaults/hooks/tests/test-skill-router.sh
+
+# tests/install/ — installer/uninstaller unit suites, wired since #5275 (were
+# previously orphaned entirely — appeared in ci.yml only as a paths-filter
+# trigger, never as an invoked job step). All confirmed hermetic (no live
+# network/forge calls, fake/stub binaries only) and ubuntu-portable.
+tests/install/test-daemon-build-shortcut.sh
+tests/install/test-forge-detect.sh
+tests/install/test-git-repo-detection.sh
+tests/install/test-hooks-preserve.sh
+tests/install/test-provision-daemon.sh
+tests/install/test-uninstall-labels-block.sh
+tests/install/test-uninstall-preserve-siblings.sh
+
+# tests/hermit/ — the Hermit role's stateless-ceremony heuristic regression
+# guard, wired since #5275 (was previously orphaned, no CI runner at all).
+# Hermetic: python3 AST parsing over local fixtures only, no network.
+tests/hermit/test-stateless-ceremony.sh

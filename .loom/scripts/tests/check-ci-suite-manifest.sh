@@ -14,10 +14,14 @@
 # Since #4769 the invariant also covers tests/hooks/ (repo root) — the
 # Claude-path guard suites. Since #4451 it also covers defaults/hooks/tests/
 # (the Repo Skills' own guard-hook suites — background-subagents,
-# loom-workspace, worktree-paths, methodology-inject, skill-router). Entries
-# for either external directory are qualified with their path relative to the
-# repo root (e.g. `tests/hooks/test-guard-destructive.sh`,
-# `defaults/hooks/tests/test-skill-router.sh`) so they can't collide with a
+# loom-workspace, worktree-paths, methodology-inject, skill-router). Since
+# #5275 it also covers tests/install/ (installer/uninstaller unit suites) and
+# tests/hermit/ (the Hermit role's stateless-ceremony heuristic regression
+# guard) -- both were previously orphaned (no CI runner at all). Entries for
+# any external directory are qualified with their path relative to the repo
+# root (e.g. `tests/hooks/test-guard-destructive.sh`,
+# `defaults/hooks/tests/test-skill-router.sh`,
+# `tests/install/test-forge-detect.sh`) so they can't collide with a
 # same-named suite in this directory.
 #
 # Exit 0 = invariant holds; exit 1 = violation (details printed to stderr).
@@ -29,8 +33,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 WIRED_MANIFEST="$SCRIPT_DIR/ci-wired.txt"
 EXCLUDED_MANIFEST="$SCRIPT_DIR/ci-excluded.txt"
 # Directories of suites outside defaults/scripts/tests/ that this manifest
-# also governs, each relative to the repo root (#4769, #4451).
-EXTERNAL_TEST_DIRS=("tests/hooks" "defaults/hooks/tests")
+# also governs, each relative to the repo root (#4769, #4451, #5275).
+EXTERNAL_TEST_DIRS=("tests/hooks" "defaults/hooks/tests" "tests/install" "tests/hermit")
 
 fail=0
 err() { printf 'ERROR: %s\n' "$1" >&2; fail=1; }

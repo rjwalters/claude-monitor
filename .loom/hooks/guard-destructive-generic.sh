@@ -446,6 +446,91 @@ fastpath_builtin_admits() {
     return 1
 }
 
+# Read-only search-pipe-to-sink admission (#5263). Pure bash builtins, zero forks.
+#
+# The shared fastpath_structural_ok() above disqualifies EVERY pipe, which is
+# correct for the general case but produces a self-defeating false positive for
+# the single most common interactive idiom: piping a read-only search to a pager
+# or counter. `grep 'DROP TABLE' schema.sql | head` is 100% read-only — the DDL
+# phrase lives only inside grep's quoted search argument, and grep never executes
+# what it matches — yet the pipe kicked it to the full path, where SQL_DDL_PATTERN
+# (:~2819) substring-matches the literal phrase in grep's own argument and denies
+# at the catastrophic tier. The bare `grep 'DROP TABLE' schema.sql` (no pipe) was
+# already fast-pathed and allowed; this narrows the gap so the piped form matches.
+#
+# SECURITY: this is a deliberately NARROW carve-out, not a general "pipes are OK"
+# relaxation. It admits ONLY the shape
+#     <search> | <read-only-sink>
+# where:
+#   * exactly ONE pipe, and NO other shell metacharacter (; & < > ` $( newline)
+#     anywhere — so wrapper (`bash -c`), substitution (`$(...)`), and compound
+#     (`&&`/`;`) forms are untouched and keep denying via the full path exactly
+#     as before (satisfying #5263's "obfuscation still caught" requirement);
+#   * the UPSTREAM command word is a non-executing search: grep|egrep|fgrep|rg
+#     (grep/rg are already fully admitted for any args by the built-in allowlist;
+#     egrep/fgrep are the same tool). A real DDL-executing command piped the same
+#     way (`mysql -e '…' | cat`, `psql -c '…' | head`) has a non-search first
+#     token, so it is NOT admitted and still denies;
+#   * the DOWNSTREAM command word is a fixed read-only sink allowlist. head|tail|wc
+#     are already fully allowlisted (any args), so they admit with any args. cat,
+#     less, and more are NOT in the built-in allowlist — cat has a live `.ssh`/
+#     `.aws/credentials` ASK carve-out (:~3764) — so they admit ONLY as pure stdin
+#     consumers (no positional file operand). This keeps `grep x | cat ~/.ssh/id_rsa`
+#     (which would leak a key past the cat ASK) OUT of the fast path: it falls
+#     through to the full path where the cat ASK still fires.
+#
+# False NEGATIVES (declining) are always safe — they just fall through to the
+# existing slower behavior. So anything not matching the exact shape above (a
+# second pipe, an unlisted sink, a non-search upstream, a cat/less/more with a
+# file operand) declines and is handled by the full path unchanged.
+_FASTPATH_PIPE_SINKS_ANYARG=" head tail wc "     # already fully allowlisted → any args
+_FASTPATH_PIPE_SINKS_STDIN=" cat less more "     # stdin-only → no positional operand
+fastpath_grep_pipe_admits() {
+    local cmd="$1"
+    # No shell metacharacter other than a single pipe. Reject substitution,
+    # redirection, chaining, backticks, and newlines outright.
+    case "$cmd" in
+        *';'*|*'&'*|*'<'*|*'>'*|*'`'*|*'$('*) return 1 ;;
+    esac
+    [[ "$cmd" == *$'\n'* ]] && return 1
+    [[ "$cmd" == *'|'* ]] || return 1
+    local left="${cmd%%|*}"
+    local right="${cmd#*|}"
+    # Exactly one pipe: a second one (`grep a | grep b | head`) declines here and
+    # falls through to the full path (conservative — a false negative, not a hole).
+    case "$right" in
+        *'|'*) return 1 ;;
+    esac
+    local -a lt rt
+    read -ra lt <<< "$left"
+    read -ra rt <<< "$right"
+    (( ${#lt[@]} >= 1 && ${#rt[@]} >= 1 )) || return 1
+    # Upstream must be a non-executing search command.
+    case "${lt[0]}" in
+        grep|egrep|fgrep|rg) ;;
+        *) return 1 ;;
+    esac
+    # Downstream must be a read-only sink.
+    local sink="${rt[0]}"
+    if [[ "$_FASTPATH_PIPE_SINKS_ANYARG" == *" $sink "* ]]; then
+        return 0
+    fi
+    if [[ "$_FASTPATH_PIPE_SINKS_STDIN" == *" $sink "* ]]; then
+        # Pure stdin consumer only: reject any positional (non-flag) operand so a
+        # credential-file argument (`| cat ~/.ssh/id_rsa`) is NOT fast-pathed and
+        # the cat `.ssh`/`.aws` ASK carve-out still fires via the full path.
+        local i
+        for (( i = 1; i < ${#rt[@]}; i++ )); do
+            case "${rt[i]}" in
+                -*) ;;          # a flag (e.g. -n, -N) — fine
+                *) return 1 ;;  # a positional file operand — decline
+            esac
+        done
+        return 0
+    fi
+    return 1
+}
+
 # Optional extend-only escape hatch: guards.readOnlyFastPathExtra is an array of
 # literal first-word commands. Read lazily (only when the built-in list did not
 # admit) and cached. Each entry is a full-generality bypass for that word.
@@ -513,6 +598,9 @@ _fastpath_env="${LOOM_GUARD_READONLY_FASTPATH:-}"
 if [[ "$_fastpath_env" != "0" && "$_fastpath_env" != "false" && "$_fastpath_env" != "no" ]]; then
     if fastpath_builtin_admits "$COMMAND"; then
         # Silent allow: no stdout/stderr, no log_hook_error, before REPO_ROOT.
+        fastpath_enabled && exit 0
+    elif fastpath_grep_pipe_admits "$COMMAND"; then
+        # Read-only search piped to a read-only sink (#5263) — same silent allow.
         fastpath_enabled && exit 0
     elif fastpath_extra_admits "$COMMAND"; then
         fastpath_enabled && exit 0
@@ -3710,7 +3798,16 @@ ASK_PATTERNS=(
     # were REMOVED from this array (#3757): they are trivially undone (gh pr
     # reopen / gh issue reopen / recreate the label) and are only asked for when
     # a repo opts IN via guards.reversibleGh (REVERSIBLE_GH_ASK_PATTERNS below).
-    '(^|[;&|[:space:]])gh release delete'
+    #
+    # Right-hand anchored (#5260): the old pattern had no boundary after
+    # `delete`, so it substring-matched `gh release delete-asset` — a distinct,
+    # far-less-destructive subcommand that only removes one uploaded artifact,
+    # not the whole release/tag. Requiring the match to end at a shell
+    # separator/whitespace or end-of-string (mirroring the existing left-hand
+    # `(^|[;&|[:space:]])` anchor) lets `delete-asset`'s immediate hyphen break
+    # the match while the bare/argumented `gh release delete` case (and any
+    # other `gh release delete-*` subcommand) is unaffected.
+    '(^|[;&|[:space:]])gh release delete([;&|[:space:]]|$)'
 
     # Cloud IAM credential deletion — retiered from the catastrophic ALWAYS_BLOCK
     # list to this UNGATED ask tier (#4216). Kept OUT of CLOUD_ASK_PATTERNS on

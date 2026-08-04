@@ -587,6 +587,83 @@ loom-daemon status --json  # machine-readable
 
 The pre-v0.10.0 indicators `missing_milestone:worktree_created` and `extended_work` were retired when the Python daemon brain (`daemon_v2/`) was removed — see [the migration guide § Per-CLI breaking changes](https://github.com/rjwalters/loom/blob/main/docs/migration/v0.10.0-shepherd-deprecation.md#per-cli-breaking-changes) (upstream Loom repo — not shipped to consumer installs) for the field-level diff. The shell-level daemon surface (`./.loom/scripts/daemon.sh`) is preserved but does not write progress files, so milestone-based heuristics no longer apply.
 
+### A killed Task/Agent-tool subagent leaves no teardown signal for external resources it held
+
+**Symptom**: a Task/Agent-tool subagent dispatched mid-conversation (e.g. a
+Builder or Judge subagent under `/loom:sweep`) is killed by a session cap or an
+API error while it holds an external, non-Loom resource — a browser profile
+lock, a hardware device claim, a DB advisory lock, a cloud lease, any arbitrary
+mutex a caller's own tooling manages. The resource stays held indefinitely:
+nothing in Claude Code notifies the parent session or Loom that the subagent
+died, and nothing runs the subagent's own cleanup code.
+
+**Root cause — no kill-time teardown hook exists for Task-tool subagents (as of
+2026-08-04, this repo's Claude Code)**. This repo's `.claude/settings.json`
+wires exactly four hook types: `PreToolUse`, `UserPromptSubmit`, `SessionStart`,
+and `Stop` (the top-level `Stop` hook fires on the **outer** session ending, not
+per-subagent). There is no `SubagentStop`-equivalent hook that fires when an
+individual Task/Agent-tool dispatch is killed — a session-cap or API-error kill
+of a subagent bypasses whatever teardown code that subagent would otherwise
+have run on a graceful exit. **This was evaluated and found infeasible against
+Claude Code's current hook taxonomy** (issue #5262) — if a future Claude Code
+release adds a subagent-lifecycle hook, re-evaluate then; until it does, do not
+re-propose a kill-time teardown hook or a daemon-side termination-signal
+channel for Task-tool subagents without first confirming the taxonomy actually
+changed upstream.
+
+**Guidance for callers building agent-driven scripts against Loom**: because no
+teardown signal is coming, any external lock a subagent might hold must be
+designed so it recovers **without** relying on the holder's liveness or on any
+kill notification:
+
+- **Make locks self-expiring by wall-clock heartbeat, not by holder liveness.**
+  A lock that is only released by its holder's own cleanup code stays held
+  forever once that holder is killed outside its control (a session cap or API
+  error gives it no chance to run cleanup at all). Instead, record a
+  last-heartbeat timestamp and treat the lock as free once that timestamp is
+  older than a bounded TTL — the same shape whether the lock lives in a file's
+  mtime, a directory, a DB row, or a remote lease API.
+- **Reap on a schedule, not only on the next acquire attempt.** A "stale-break
+  on acquire" check (comparing an existing lock's age against a threshold only
+  when something next tries to acquire it) never fires if nothing else ever
+  tries to acquire that resource again — the lock silently stays stale
+  forever. Pair it with a periodic reaper that proactively expires stale
+  entries on its own cadence, independent of acquisition attempts.
+
+**Loom's own internal precedent for this pattern** (worked examples, not a
+reusable shared primitive external callers can import — they solve Loom's own
+coordination problems, not a general-purpose external-mutex library):
+- `heartbeat_claim` (`loom-daemon/src/activity/claims.rs`, wired into the IPC
+  layer at `loom-daemon/src/ipc.rs:2712-2741`) keeps the `issue_claims` table's
+  `last_heartbeat` column current for a live claim holder; `claim_issue` in the
+  same file breaks a claim as stale only when `age_secs > stale_threshold` at
+  the moment of the **next acquire attempt** — the "on next acquire, not
+  scheduled" half of the pattern above, which is exactly why a resource nobody
+  else ever tries to (re-)claim can stay stale-held indefinitely under this
+  model alone.
+- `PeerClaimView` (`loom-daemon/src/peer_claims.rs`) is the scheduled-reaper
+  half: it expires a peer's soft claim once local receipt time exceeds a fixed
+  TTL since the *last* observed heartbeat ad (`is_claimed_at` /
+  `claimed_issues_at`), and a periodic re-advertisement
+  (`sweep_registry::readvertise_peer_claims`) refreshes that clock well inside
+  the TTL for a still-live holder — see the module doc comment's "TTL is
+  measured against LOCAL receipt, never the advertiser's clock" section for why
+  wall-clock skew across hosts rules out comparing timestamps directly.
+
+**Prior art establishing this as Loom's actual mitigation pattern** (both
+resolved without a kill-time hook, because none is available):
+- #3683 — a role subagent killed mid-phase by an account rate limit left
+  lifecycle steps dangling; the fix made the *lifecycle state* self-healing
+  (resumable from a checkpoint) rather than depending on the killed subagent's
+  own cleanup running.
+- #4348 — a detached sweep killed by an external `SIGKILL` was never recovered;
+  the fix was reaper-based detection of a dead PID against the sweep registry,
+  not a termination signal from the kill itself.
+
+**Out of scope**: implementing a `SubagentStop`-style hook, or any daemon-side
+termination-signal channel for Task-tool subagents, is explicitly out of scope
+for this section — see "Root cause" above for why.
+
 ## Sweep Dispatch Troubleshooting
 
 Multi-issue dispatch is driven by the Rust `loom-daemon` binary via `mcp__loom__dispatch_sweep`. The daemon holds the sweep registry, event bus, and reaper in memory — there is no on-disk orchestration state file to inspect. (The v0.9.x `spawn-loop.sh` and its `.loom/spawn-loop-state.json` state file were removed in v0.11.0.)
