@@ -6,7 +6,7 @@
     "worktree:return": "./.loom/scripts/worktree-return.sh",
     "check:ci": "cd menubar-app/ClaudeMonitor && swift build",
     "check:all": "npm run check:ci && npm run test",
-    "test": "echo 'No Swift test target: menubar-app/ClaudeMonitor/Package.swift defines only the ClaudeMonitor executable target, no Tests/ directory. Correctness is verified by check:ci (swift build) plus the .github/workflows/build.yml CI build.' && exit 0",
+    "test": "cd menubar-app/ClaudeMonitor && swift build && .build/debug/ClaudeMonitor selftest",
     "lint": "echo 'No linter configured. Customize this script for your project.' && exit 0"
   }
 }

@@ -260,4 +260,22 @@ struct RateLimitSnapshot {
     var nextReset: Date? {
         [session?.resetAt, weekly?.resetAt].compactMap { $0 }.min()
     }
+
+    /// The window whose reset actually gates this account's next usable moment.
+    ///
+    /// An exhausted weekly window is the gate: the session limit rolling over in
+    /// twenty minutes buys nothing while the week is spent. Otherwise the
+    /// session window is what frees up first, and an account with no session
+    /// window (an OpenAI reading may have none) falls back to its weekly one.
+    var gatingWindow: RateLimitWindow? {
+        if let weekly = weekly, weekly.isExhausted { return weekly }
+        return session ?? weekly
+    }
+
+    /// Seconds until this account is expected to have capacity again, measured
+    /// against `gatingWindow`. Nil when no relevant reset time is known — so
+    /// callers rank it as *unknown* rather than *imminent*.
+    var secondsUntilRecovery: TimeInterval? {
+        gatingWindow?.resetAt?.timeIntervalSinceNow
+    }
 }

@@ -569,17 +569,14 @@ class UsageStore: ObservableObject {
         }
     }
 
-    /// Seconds until reset (session first, then weekly). Returns large value if
-    /// unknown — including when the provider reports no window at all.
+    /// Seconds until the account has capacity again — the reset of whichever
+    /// window is actually gating it (weekly when the week is spent, otherwise
+    /// session). Returns a large value if unknown — including when the provider
+    /// reports no window at all — so unknowns rank last rather than first.
     // Pure function of its argument — touches no instance/class main-actor
     // state.
     nonisolated static func resetSeconds(_ usage: UsageRecord?) -> TimeInterval {
-        guard let usage = usage else { return .greatestFiniteMagnitude }
-        let snapshot = usage.rateLimit
-        for date in [snapshot.session?.resetAt, snapshot.weekly?.resetAt].compactMap({ $0 }) {
-            return date.timeIntervalSinceNow
-        }
-        return .greatestFiniteMagnitude
+        usage?.rateLimit.secondsUntilRecovery ?? .greatestFiniteMagnitude
     }
 
     /// Account ID currently driving the menubar icon. Falls back to the

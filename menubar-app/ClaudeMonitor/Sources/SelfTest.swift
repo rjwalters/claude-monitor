@@ -52,6 +52,7 @@ enum SelfTest {
 
         testNaturalSort()
         testSortedAccountsForPopoverTieBreak()
+        testGatingResetOrdering()
         testWindowKindDerivation()
         testSnapshotFromPositionalWindows()
         testMissingSessionWindow()
@@ -144,6 +145,60 @@ enum SelfTest {
         let ordered = store.sortedAccountsForPopover.map { $0.displayName }
         expectEqual(ordered, ["agent-9", "agent-10"],
                     "equal usage/reset falls back to natural name order, not account id")
+    }
+
+    /// Accounts that are all capped (0 headroom) still have a meaningful order:
+    /// whichever comes back first. The gating reset is the weekly one once the
+    /// week is spent, so an account with a session reset minutes away but no
+    /// weekly capacity must rank *behind* one whose session reset is hours out.
+    private static func testGatingResetOrdering() {
+        func iso(_ seconds: TimeInterval) -> String {
+            ISO8601DateFormatter().string(from: Date().addingTimeInterval(seconds))
+        }
+        func capped(_ accountId: String, weekly: Double, session: TimeInterval, weeklyReset: TimeInterval)
+            -> UsageRecord {
+            UsageRecord(
+                id: 1, accountId: accountId, timestamp: Date(),
+                primaryPercent: 100, sessionPercent: 100, weeklyAllPercent: weekly,
+                weeklySONnetPercent: nil,
+                sessionReset: iso(session), weeklyReset: iso(weeklyReset)
+            )
+        }
+
+        // Session-capped with weekly capacity left → the session reset gates.
+        let sessionGated = capped("a", weekly: 40, session: 7200, weeklyReset: 3 * 86400)
+        expect((sessionGated.rateLimit.secondsUntilRecovery ?? 0) > 7000,
+               "session-capped account recovers at its session reset")
+        expect((sessionGated.rateLimit.secondsUntilRecovery ?? .infinity) < 7300,
+               "session-gated recovery must not read the weekly reset")
+
+        // Weekly spent → the session reset is irrelevant; the week gates.
+        let weeklyGated = capped("b", weekly: 100, session: 600, weeklyReset: 3 * 86400)
+        expect((weeklyGated.rateLimit.secondsUntilRecovery ?? 0) > 2 * 86400,
+               "an exhausted weekly window gates recovery, not the session reset")
+
+        // Nothing known → unknown, never "available now".
+        let empty = UsageRecord(
+            id: 2, accountId: "c", timestamp: Date(),
+            primaryPercent: nil, sessionPercent: nil, weeklyAllPercent: nil,
+            weeklySONnetPercent: nil, sessionReset: nil, weeklyReset: nil
+        )
+        expect(empty.rateLimit.secondsUntilRecovery == nil, "no windows → unknown recovery")
+
+        let store = UsageStore(dbPath: ":memory:selftest-gating")
+        func account(_ name: String) -> Account {
+            Account(id: name, accountName: name, email: nil, plan: "Max",
+                    lastUpdated: nil, latestPercent: nil)
+        }
+        store.accounts = ["agent-1", "agent-2", "agent-3"].map(account)
+        store.latestUsage = [
+            "agent-1": capped("agent-1", weekly: 40, session: 7200, weeklyReset: 3 * 86400),
+            "agent-2": capped("agent-2", weekly: 100, session: 600, weeklyReset: 3 * 86400),
+            "agent-3": capped("agent-3", weekly: 10, session: 1800, weeklyReset: 3 * 86400),
+        ]
+        expectEqual(store.sortedAccountsForPopover.map { $0.displayName },
+                    ["agent-3", "agent-1", "agent-2"],
+                    "capped accounts order by time until they are usable again")
     }
 
     // MARK: - Window model

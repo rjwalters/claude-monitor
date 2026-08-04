@@ -402,8 +402,30 @@ struct UsagePopoverView: View {
         case (nil, _):   return false          // nil rows go last
         case (_, nil):   return true
         case let (.some(x), .some(y)):
-            if x == y { return stableTiebreak(a.0, b.0) }
-            return sortDir == .asc ? (x < y) : (x > y)
+            if x != y { return sortDir == .asc ? (x < y) : (x > y) }
+            if case .headroom = sortBy, let ordered = recoveryTiebreak(a.1, b.1) { return ordered }
+            return stableTiebreak(a.0, b.0)
+        }
+    }
+
+    /// Tiebreak for the Headroom column. Equal scores are the norm at the
+    /// bottom of the table, where every capped account reads 0 — so order those
+    /// by how soon they come back. The gating reset is the weekly one once the
+    /// week is spent, and the session one otherwise: a session window rolling
+    /// over in minutes means nothing to an account that is out for the week.
+    ///
+    /// Returns nil when the two rows are indistinguishable (equal or both
+    /// unknown), leaving the caller to fall through to the name tiebreak.
+    private func recoveryTiebreak(_ a: UsageRecord?, _ b: UsageRecord?) -> Bool? {
+        switch (a?.rateLimit.secondsUntilRecovery, b?.rateLimit.secondsUntilRecovery) {
+        case (nil, nil): return nil
+        case (nil, _):   return false          // unknown recovery goes last
+        case (_, nil):   return true
+        case let (.some(x), .some(y)):
+            if x == y { return nil }
+            // Coming back sooner is the better row, so it leads under the
+            // "best first" direction and trails when the sort is flipped.
+            return sortDir == .desc ? (x < y) : (x > y)
         }
     }
 
