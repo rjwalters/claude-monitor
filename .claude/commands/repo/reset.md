@@ -22,6 +22,25 @@ without an explicit opt-in and the permanent-loss check.
 /repo:reset --prune            # Also delete confirmed-safe branches/worktrees (after the loss check)
 ```
 
+## Two halves
+
+The steps below split cleanly in two, and naming the split matters because
+callers can schedule the halves separately:
+
+- **Sync-and-switch** (reversible — steps 1 and 4): the working-tree safety
+  check, `git fetch --all --prune`, and landing on an up-to-date default
+  branch. Nothing is removed.
+- **Pruning** (gated — steps 2 and 3): stash review and branch/worktree
+  review. These can permanently remove work, so they keep the explicit opt-in
+  and the [[branches]] permanent-loss check.
+
+Run standalone, `/repo:reset` always runs all four steps in order, exactly as
+documented — this split changes nothing here. It exists because [[all]] may run
+the **sync-and-switch half early** (before its Docs stage) when the current
+branch is fully pushed and behind the default branch, so that its doc stages
+don't edit a stale checkout; the pruning half still runs last there, with its
+gates intact.
+
 ## Steps
 
 ### 1. Working tree safety check

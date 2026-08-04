@@ -112,12 +112,27 @@ restricts to a single discovered tool.
 ### 3. Dedup against existing open issues
 
 Before proposing to file, check each target repo for issues that already cover
-the candidate so nothing is re-filed:
+the candidate so nothing is re-filed. Query the **REST search** endpoint, not
+`gh issue list --search`:
 
 ```bash
-gh issue list --repo <slug> --state open --search "<key terms>" \
-  --json number,title,url
+gh api "search/issues?q=repo:<slug>+state:open+<key+terms>&per_page=30" \
+  --jq '.items[] | "#\(.number) \(.title) \(.html_url)"'
 ```
+
+Search result items already carry `number`, `title`, and `html_url`, so this is
+a straight replacement for the old `--json number,title,url` output shape — no
+second-pass mapping needed.
+
+Terms go into `q` as `+`-joined tokens; URL-encode anything that isn't
+alphanumeric, and quote the whole URL so the shell leaves it alone.
+
+**Why not `gh issue list --search`:** it goes through GitHub's GraphQL API,
+whose rate-limit bucket is separate from REST's and is routinely exhausted on a
+busy multi-agent host while the `core` budget sits nearly unused. `search/*` is
+a third bucket again (30 requests/minute authenticated), so deduping here costs
+nothing from the pool step 5 needs to actually file. Check live budgets with
+`gh api rate_limit --jq .resources` if either step starts failing.
 
 Classify each candidate against its target repo's open issues:
 
@@ -147,24 +162,57 @@ file. **If `--dry-run` was passed, stop here — file nothing.**
 
 ### 5. File the approved issues
 
-For each approved, non-UNKNOWN candidate:
+For each approved, non-UNKNOWN candidate, write the body to a scratch file and
+POST it through REST:
 
 ```bash
-gh issue create --repo <slug> \
-  --title "<title>" \
-  --body "$(cat <<'EOF'
-## Context
-<where this came up in the session / repro>
+BODY="${TMPDIR:-/tmp}/followup-body.md"
+PAYLOAD="${TMPDIR:-/tmp}/followup-payload.json"
 
-## Suggested acceptance criteria
-- [ ] …
-EOF
-)"
+# 1. Write the issue body to "$BODY" using your own file-write capability —
+#    NOT a shell heredoc (see below). Content is the usual shape:
+#      ## Context
+#      <where this came up in the session / repro>
+#
+#      ## Suggested acceptance criteria
+#      - [ ] …
+
+# 2. Build the create payload, then POST it (REST `core` pool, not GraphQL).
+jq -n --arg t "<title>" --rawfile b "$BODY" \
+  '{title: $t, body: $b, labels: []}' > "$PAYLOAD"
+
+gh api --method POST "repos/<slug>/issues" --input "$PAYLOAD" --jq '.html_url'
 ```
 
+Two reasons this is the documented form rather than
+`gh issue create --body "$(cat <<'EOF' … EOF)"`:
+
+- **Rate-limit pool.** `gh issue create` is GraphQL-backed; `POST
+  repos/…/issues` is REST. GraphQL exhausts first on a busy agent host, and
+  filing is the step you least want to lose — it runs *after* the user has
+  already approved the set.
+- **The body never re-enters the shell.** A heredoc body is still shell input:
+  a line containing `>=`, backticks, or `$(…)` gets tokenized by the shell and
+  by command-matching guards, which can deny the call outright. `jq --rawfile`
+  reads the file as one raw string and JSON-escapes it, so markdown checkboxes,
+  headings, and code fences survive verbatim.
+
+The payload's `labels` array is where labels would go if a variant ever needed
+them — applied atomically with creation, no create-then-label round trip. Leave
+it `[]` here, per the labeling note below.
+
 Print the resulting issue URLs. For near-matches the user chose to comment on
-instead of file, use `gh issue comment --repo <slug> <n>`. Leave UNKNOWN /
-skipped candidates unfiled and list them so nothing is silently lost.
+instead of file, use the same REST shape (`gh issue comment` is GraphQL-backed
+too):
+
+```bash
+jq -n --rawfile b "$BODY" '{body: $b}' > "$PAYLOAD"
+gh api --method POST "repos/<slug>/issues/<n>/comments" --input "$PAYLOAD" \
+  --jq '.html_url'
+```
+
+Leave UNKNOWN / skipped candidates unfiled and list them so nothing is silently
+lost.
 
 Filed issues are triaged like any other afterward — this command does not apply
 `loom:*` or other pipeline labels.
@@ -178,3 +226,8 @@ Filed issues are triaged like any other afterward — this command does not appl
 3. **Never guess a target repo** — unresolved or ambiguous targets are reported
    as UNKNOWN for the user to name, never filed to a guessed slug.
 4. **`--dry-run` files nothing** — pure proposal mode for review.
+5. **Reach the forge over REST** — dedup via `gh api search/issues`, file via
+   `gh api --method POST repos/<slug>/issues --input <payload>`, and pass issue
+   bodies as files (`--rawfile` / `--input`), never as inline heredocs. The
+   `gh issue list` / `gh issue create` forms are GraphQL-backed and fail on
+   exactly the busy multi-agent repos this command is most useful in.

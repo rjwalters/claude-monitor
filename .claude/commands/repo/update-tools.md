@@ -12,6 +12,11 @@ Find every tool package installed into this repo by an Anvil/Loom-style
 installer, compare each against the latest version of its source, and offer
 to update the stale ones.
 
+Scope is *installer-managed tool packages* only. Third-party dependency
+currency — npm/cargo/pip packages and GitHub Actions, i.e. Dependabot setup and
+Dependabot PR triage — is [[deps]], not this command: there is no local source
+clone to diff against, so it needs a different comparison model.
+
 ## Usage
 
 ```

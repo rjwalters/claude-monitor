@@ -50,14 +50,87 @@ report. This surfaces everything before anything is touched.
 Offer to fix gitignore findings here. Leave README, link, and documentation
 fixes for the Docs stage next — don't apply them twice.
 
-### 2. Docs (see [[docs]])
+### 2. Sync early, if and only if nothing can be lost (see [[reset]])
+
+[[reset]] is two separable halves, and only one of them is safe to move:
+
+- **Sync-and-switch** (reversible): `git fetch`, check out the default branch,
+  `git pull --ff-only`. Nothing is removed.
+- **Pruning** (gated): stash review, branch & worktree deletion. Can
+  permanently remove work, so it keeps its gates and stays last (stage 6).
+
+Running the whole of Reset last assumes the working branch is the right place
+for the later stages to be looking — which holds when it carries unpushed work
+those stages should see. When the branch is **fully pushed and behind the
+default branch** that assumption inverts: there is no local-only content to
+protect, and Docs/Tidy either report drift that is already fixed upstream or
+edit a copy that pollutes an open PR's diff and blocks the branch switch Reset
+performs at the end. So check the branch state here, before Docs runs:
+
+```bash
+current=$(git symbolic-ref --short HEAD 2>/dev/null) || current=""
+default=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+git fetch origin --quiet
+
+eligible=no
+if [ -n "$current" ] && [ -n "$default" ] && [ "$current" != "$default" ] \
+   && [ -z "$(git status --porcelain)" ]; then
+  # "Fully pushed" = HEAD has an upstream AND is not ahead of it.
+  if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    ahead_of_upstream=$(git rev-list --count '@{u}..HEAD')
+  else
+    ahead_of_upstream=""   # no upstream at all => never pushed, not eligible
+  fi
+  behind_default=$(git rev-list --count "HEAD..origin/$default" 2>/dev/null || echo 0)
+  if [ "$ahead_of_upstream" = "0" ] && [ "$behind_default" -gt 0 ]; then
+    eligible=yes
+  fi
+fi
+```
+
+Every condition must hold, and each one rules out a distinct way the early
+switch could lose work or fail:
+
+| Condition | Why it is required |
+|---|---|
+| On a branch (not detached), and it isn't already the default | Nothing to switch to; a detached HEAD has no upstream to reason about |
+| `origin/HEAD` resolves to a default branch | Without it there is no defensible switch target — leave the order alone |
+| Working tree clean (`git status --porcelain` empty) | A dirty tree would have to be stashed to switch, and this run ends on the default branch, so there is no natural point to pop it back |
+| Branch **has an upstream** and is **0 commits ahead of it** | This is the literal "no unpushed commits". A branch that was **never pushed** has no upstream and is **not** eligible — treat it exactly like unpushed commits |
+| Branch is behind `origin/<default>` by at least one commit | If it isn't behind, the checkout is already current and switching buys nothing |
+
+Being ahead of the *default branch* is **not** disqualifying — a pushed PR
+branch normally is. The unpushed-work test is against the branch's own
+upstream, which is a different axis; a branch that has diverged from the
+default branch is still eligible as long as everything on it is pushed.
+
+**If `eligible=yes`**, run only the sync-and-switch half now — [[reset]]'s
+step 4: `git fetch --all --prune`, then `git checkout "$default"` and `git pull
+--ff-only` — so Docs, Tidy, and Update tools all operate on a fresh
+default-branch checkout. Report it on one line as it happens:
+
+```
+Reset: synced early — feature/x was fully pushed and 6 commits behind main; switched before Docs
+```
+
+Under `--ask`, report the finding and get a yes before switching, like every
+other stage. If the checkout or the `--ff-only` pull fails (a diverged local
+default branch, say), change nothing, report why, and continue with the stage
+order unchanged — stage 6 will surface it again with [[reset]]'s own handling.
+
+**If `eligible=no`**, this stage is a no-op: say nothing, and run the remaining
+stages exactly as before, with Reset in full at the end. Unpushed work on the
+working branch, a dirty tree, and an already-on-default run all land here, and
+none of them behave any differently than they did before this check existed.
+
+### 3. Docs (see [[docs]])
 
 Bring the documentation back in line with reality: content accuracy (stale
 prose, out-of-date command/feature tables, CHANGELOG drift), README structure,
 and internal cross-references. This is the explicit, named home for the doc
 fixes the audit surfaced — apply the ones the user approves.
 
-### 3. Tidy (see [[tidy]])
+### 4. Tidy (see [[tidy]])
 
 Inventory filesystem clutter — build artifacts, caches, temp files, empty dirs
 — present it grouped with sizes, and delete the SAFE junk (OS droppings, merge
@@ -67,20 +140,31 @@ hygiene pass — deleting them just forces a costly rebuild — so this stage do
 Environments (`node_modules/`, virtualenvs) and other ASK items are never
 auto-removed here regardless.
 
-### 4. Update tools (see [[update-tools]])
+### 5. Update tools (see [[update-tools]])
 
 Check installed tool packages (Loom, Anvil, Repo itself, …) against their
 sources. Report what's behind and offer to update.
 
-### 5. Reset (see [[reset]])
+### 6. Reset (see [[reset]])
 
-Last, because it changes branch state and syncs with the remote. Run the
+Last, because this is where branch state can be permanently removed. Run the
 end-of-task baseline ritual: working-tree safety check, stash review, branch &
 worktree pruning, `git fetch --prune`, and return to the default branch. Pass
 `--prune` and `--ask` through if either was given to `/repo:all`.
 
-Do this stage last so the earlier scans and cleanup happen while you're still on
-the working branch, and you finish on a clean default branch.
+The **pruning half always runs here**, with its existing gates — which
+branches, worktrees, and stashes are safe to remove has nothing to do with
+which branch the earlier stages ran against, so stage 2 never moves it.
+
+If stage 2 already performed the sync-and-switch, run [[reset]] unchanged
+anyway — the checkout is a no-op and the fetch/pull still picks up anything
+the remote gained during the run — but **don't report the switch twice**. It
+was announced when it happened; here just report the resulting branch state
+along with the pruning outcome.
+
+Otherwise this stage behaves exactly as it always has: the earlier scans and
+cleanup happened while you were still on the working branch, and you finish on
+a clean default branch.
 
 ## Final Summary
 
@@ -100,6 +184,44 @@ Skipped:      remote (never part of /repo:all)
 
 List anything intentionally left behind — deferred findings, kept stashes,
 UNKNOWN branches — so the user knows exactly what state the repo is in.
+
+When stage 2's early sync-and-switch ran, the `Reset:` line still carries the
+pruning half's outcome — branches, worktrees, and stashes reviewed — and notes
+the switch **once**, as something already done, so the summary never reads as
+if the branch changed at the end of the run:
+
+```
+Reset:        synced early (feature/x → main, was 6 behind), tree clean, 4 branches deleted, 1 stash kept
+```
+
+Never drop the pruning reporting just because the switch moved earlier, and
+never describe the same switch in both places.
+
+### Re-verify before printing
+
+A fix applied in the Docs stage can be gone by the time this summary prints. A
+concurrent writer — another agent in the same clone, a background `git stash`
+or `git checkout --`, a Loom sweep quarantining the primary clone's working
+tree — reverts the working tree without touching this run, and the stage that
+applied the edit has long since reported success.
+
+So **immediately before printing the consolidated summary, each stage
+re-verifies that the edits it applied are still present on disk** (the same
+unconditional verify-after-write check each command documents — see [[docs]],
+[[readme]], [[gitignore]], [[links]]). A stage's `N fixed` count only ever
+includes edits confirmed still on disk at print time.
+
+Any edit found reverted gets its **own line**, never folded into that stage's
+fixed count — same convention as deferred findings and kept stashes above:
+
+```
+Docs:         1 fixed (README table), 1 reverted after apply — needs re-run: CHANGELOG entry
+```
+
+Only the affected stage's line changes; stages whose edits survived report
+exactly as they otherwise would. In a repo with no concurrent writer the
+re-verification always finds every edit still applied, so the summary is
+byte-for-byte what it was before this check existed.
 
 ## Principles
 

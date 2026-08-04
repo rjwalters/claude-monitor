@@ -72,6 +72,47 @@ failure this mechanism exists to prevent. Offer **[c]** continue anyway (the
 offending section simply won't run) or **[a]** abort to fix the policy. When the
 policy is clean, note which seams are bound and carry that into the phases below.
 
+### Version-source declaration (a source-constant version, not a seam)
+
+Separately from the seams above, a repo whose version lives in an **arbitrary
+source constant** — one no Phase 2 heuristic can discover (a Swift
+`AppVersion.current` assignment, a `CFBundle*` string in a build script, a
+module-level `__version__`) — declares how to read and bump it with a
+`## version-source` section in the same file. This is **data** (a source location
+plus two shell one-liners), **not** a `## seam:` hook: the command *reads* the two
+commands and runs them at Phases 3 and 5, it does not *run the section* as
+procedural steps, and it has no augment/replace semantics. Parse and validate it
+here, alongside the seam check:
+
+```bash
+VS_READ="" ; VS_BUMP=""
+if [ -f "$POLICY_FILE" ] && grep -Eq '^##[[:space:]]+version-source[[:space:]]*$' "$POLICY_FILE"; then
+  # Section body = lines between the '## version-source' header and the next '## ' header.
+  VS_BODY="$(awk '
+    /^##[[:space:]]+version-source[[:space:]]*$/ {f=1; next}
+    /^##[[:space:]]/ {f=0}
+    f' "$POLICY_FILE")"
+  # Each command is the backtick-fenced inline code on its own '- read:' / '- bump:' line.
+  VS_READ="$(printf '%s\n' "$VS_BODY" | sed -nE 's/^-[[:space:]]*read:[[:space:]]*`(.*)`[[:space:]]*$/\1/p' | head -1)"
+  VS_BUMP="$(printf '%s\n' "$VS_BODY" | sed -nE 's/^-[[:space:]]*bump:[[:space:]]*`(.*)`[[:space:]]*$/\1/p' | head -1)"
+  if [ -n "$VS_READ" ] && [ -n "$VS_BUMP" ]; then
+    echo "version-source declared — read + bump both present (Phase 2 will select VERSION_TOOL='declared-policy')"
+  elif [ -n "$VS_READ" ]; then
+    echo "  WARNING: '## version-source' declares 'read:' but no 'bump:' — it can detect the current version but never apply a bump. Add the 'bump:' line or remove the section."
+  elif [ -n "$VS_BUMP" ]; then
+    echo "  WARNING: '## version-source' declares 'bump:' but no 'read:' — it can apply a bump but never detect the current version. Add the 'read:' line or remove the section."
+  else
+    echo "  WARNING: '## version-source' section present but neither a 'read:' nor a 'bump:' line parsed — expected two inline-code lines: '- read: \`…\`' and '- bump: \`…\`'."
+  fi
+fi
+```
+
+An **asymmetric** declaration (one of `read:`/`bump:` missing) is a near-certain
+typo, so it warns exactly like an unknown seam — a `read` with no `bump` can
+detect but never apply; a `bump` with no `read` can apply but never detect.
+Surface any `WARNING:` line to the operator before Phase 1 proceeds, same as the
+seam warnings above, and carry `VS_READ`/`VS_BUMP` into Phases 2, 3, and 5.
+
 ## Phase 1 — Pre-flight
 
 Confirm the repo is safe to cut from. The CI gate degrades gracefully when no
@@ -134,16 +175,20 @@ release tag), **[c]** continue and leave the gap, or **[a]** abort.
 
 ## Phase 2 — Detect the version tool
 
-Detect the host repo's bump mechanism. **First match wins**, in this order. An
-explicit `scripts/version.sh` is honored first; a plain `VERSION` file is the
-most-general fallback. Because `npm` is matched on `package.json` alone — before
-the `VERSION` fallback — the result is **provisional** whenever both files
-coexist: reconcile it against the root `VERSION` file (see *Cross-source
-reconciliation* below) before treating `VERSION_TOOL` as final.
+Detect the host repo's bump mechanism. **First match wins**, in this order. A
+repo-authored `## version-source` declaration (parsed in Phase 0) is
+repo-authored ground truth and is honored **first**, ahead of every heuristic;
+after it, an explicit `scripts/version.sh` is honored, and a plain `VERSION` file
+is the most-general fallback. Because `npm` is matched on any version-bearing
+`package.json` — before the `VERSION` fallback — the result is **provisional**
+whenever both files coexist: reconcile it against the root `VERSION` file (see
+*Cross-source reconciliation* below) before treating `VERSION_TOOL` as final.
 
 ```bash
 VERSION_TOOL="" ; WHY=""
-if [ -x ./scripts/version.sh ]; then
+if [ -n "$VS_READ" ] && [ -n "$VS_BUMP" ]; then
+  VERSION_TOOL="declared-policy"; WHY=".repo/release-policy.md version-source"
+elif [ -x ./scripts/version.sh ]; then
   VERSION_TOOL="version.sh"; WHY="./scripts/version.sh is executable"
 elif command -v cargo-release >/dev/null 2>&1 && [ -f Cargo.toml ]; then
   VERSION_TOOL="cargo-release"; WHY="cargo-release + Cargo.toml"
@@ -157,26 +202,73 @@ elif command -v bump2version >/dev/null 2>&1 && [ -f .bumpversion.cfg ]; then
   VERSION_TOOL="bump2version"; WHY="bump2version + .bumpversion.cfg"
 elif command -v poetry >/dev/null 2>&1 && [ -f pyproject.toml ] && grep -q '\[tool.poetry\]' pyproject.toml; then
   VERSION_TOOL="poetry"; WHY="poetry + [tool.poetry]"
-elif command -v npm >/dev/null 2>&1 && [ -f package.json ]; then
+elif [ -f pyproject.toml ] && grep -qE '^\[project\]' pyproject.toml && \
+     awk '/^\[project\]/{f=1;next} /^\[/{f=0} f' pyproject.toml | grep -qE '^version[[:space:]]*='; then
+  VERSION_TOOL="pyproject"; WHY="pyproject.toml [project].version (PEP 621)"
+elif command -v npm >/dev/null 2>&1 && [ -f package.json ] && grep -q '"version"' package.json; then
   VERSION_TOOL="npm"; WHY="npm + package.json"
 elif [ -f VERSION ]; then
   VERSION_TOOL="version-file"; WHY="plain VERSION file at repo root"
 fi
 echo "${VERSION_TOOL:-<none>} — ${WHY:-no tool detected}"
+if [ "$VERSION_TOOL" = "declared-policy" ] && [ -x ./scripts/version.sh ]; then
+  echo "  WARNING: a '## version-source' declaration AND an executable scripts/version.sh both exist — the declaration wins, but this pairing usually signals a stale/leftover declaration. Confirm the declaration is current before proceeding."
+fi
 ```
+
+Three branch details are load-bearing:
+
+- **A declared `## version-source` outranks every heuristic.** It is
+  repo-authored ground truth, not a guess, so it wins ahead of even
+  `scripts/version.sh`. The one caveat is the combination warning above: a
+  declaration *and* an executable `scripts/version.sh` usually means the
+  declaration is stale, so the branch warns rather than silently shadowing the
+  script.
+- **`poetry` stays ahead of `pyproject`.** Modern poetry projects also carry a
+  `[project]` table, so ordering is what keeps `poetry version` (the correct
+  apply path for those repos) winning over a raw TOML edit.
+- **The PEP 621 check is scoped to the `[project]` table.** The `awk`
+  block-extractor feeds `grep` only the lines *inside* `[project]`, so an
+  unrelated `version = …` in e.g. `[tool.poetry.dependencies]` can't
+  false-positive the branch. Likewise `npm` now requires a `"version"` field
+  rather than the mere presence of `package.json` — a version-less scaffold
+  (`{"private": true}`) cannot be the version source, so it falls through the
+  chain instead of misdirecting the bump.
 
 **Surface the detected tool to the user.** If none is detected, do not proceed
 silently — offer: **[m]** manual (they edit manifests, you commit + tag), or
 **[a]** abort.
 
+On the **[m]** manual path, once the operator identifies **where the version
+actually lives** — often from the repo's CLAUDE.md, as with a source-constant
+version no heuristic could find — **offer to record it** as a `## version-source`
+block in `.repo/release-policy.md`, so the next release detects it automatically
+instead of rediscovering it from scratch. Confirm the two commands with the
+operator (a `read:` that prints the current version, a `bump:` that rewrites it
+in place with the new version arriving as `$1`) and, on a yes, append the block —
+creating `.repo/release-policy.md` if absent:
+
+```bash
+# Run only after the operator confirms the read:/bump: commands for their source.
+mkdir -p .repo
+[ -f .repo/release-policy.md ] || printf '# Release policy\n' > .repo/release-policy.md
+printf '\n## version-source\n\n- read: `%s`\n- bump: `%s`\n' \
+  "$VS_READ_CONFIRMED" "$VS_BUMP_CONFIRMED" >> .repo/release-policy.md
+```
+
+The written block is exactly the shape Phase 0 parses back (a `## version-source`
+header, one `` - read: `…` `` line, one `` - bump: `…` `` line), so the next
+release's Phase 0 picks it up and Phase 2 selects `declared-policy` with no manual
+step — closing the loop the mechanism above opens.
+
 ### Cross-source reconciliation (VERSION vs package.json)
 
-`npm` is matched on the mere presence of `package.json`, so a repo that keeps a
-plain root `VERSION` file **and** a `package.json` detects as `npm` even when
-`VERSION` is the maintained source of truth — a blind `npm version` would then
-bump and tag the wrong line. Whenever the provisional tool is `npm` **and** a
-root `VERSION` file also exists **and** `package.json` carries a `version` field,
-read both and reconcile before finalizing `VERSION_TOOL`:
+`npm` is matched on any `package.json` carrying a `version` field, so a repo that
+keeps a plain root `VERSION` file **and** a versioned `package.json` detects as
+`npm` even when `VERSION` is the maintained source of truth — a blind `npm
+version` would then bump and tag the wrong line. Whenever the provisional tool is
+`npm` **and** a root `VERSION` file also exists, read both and reconcile before
+finalizing `VERSION_TOOL`:
 
 ```bash
 # Runs only when detection landed on npm but a root VERSION file also coexists.
@@ -223,6 +315,12 @@ the drifted one. Before reading the current version, verify agreement:
   a placeholder version). Do **not** treat `npm` or `version-file` as
   unconditionally drift-free: when both files exist, run the *Cross-source
   reconciliation* above before bumping.
+- **A declared `## version-source`** names a single source, so there is no
+  cross-source coexistence to reconcile — the drift gate is intentionally a
+  **no-op** for `declared-policy`. If such a repo *also* keeps a `VERSION` or
+  `package.json`, auto-reconciling that combination is out of scope; treat it as a
+  documented limitation (the declaration remains authoritative), not a silent
+  skip.
 
 ## Phase 3 — Gather changes & decide the bump
 
@@ -232,10 +330,15 @@ git log "${last}..HEAD" --oneline
 git diff "${last}..HEAD" --stat
 ```
 
-Read the current version per tool (`./scripts/version.sh`; `grep -m1 '^version'
-Cargo.toml`; `poetry version -s`; `node -p "require('./package.json').version"`;
-`cat VERSION`; …). If there are **zero** commits since the last tag, stop —
-nothing to release.
+Read the current version per tool. For `declared-policy`, run the `read:` command
+captured in Phase 0 — `sh -c "$VS_READ"`, which prints the current version to
+stdout. Otherwise use the tool-specific command (`./scripts/version.sh`; `grep -m1 '^version'
+Cargo.toml`; `poetry version -s`; `python3 -c "import tomllib;
+print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"` for
+`pyproject` (Python 3.11+; on older Python fall back to the same
+`awk`-scoped-then-`sed` one-liner the Phase 2 branch uses); `node -p
+"require('./package.json').version"`; `cat VERSION`; …). If there are **zero**
+commits since the last tag, stop — nothing to release.
 
 Present a semver analysis (https://semver.org) against whatever public surface
 the repo exposes (API, CLI, protocol, config, file formats):
@@ -320,15 +423,55 @@ Once approved:
      bumpversion)       bumpversion <level> --tag --commit ;;
      bump2version)      bump2version <level> --tag --commit ;;
      poetry)            poetry version <level> ;;  # then commit + tag v$(poetry version -s)
+     pyproject)         python3 -c 'import re,sys;p="pyproject.toml";t=open(p).read();n=re.subn(r"(?ms)(^\[project\][^\n]*\n(?:(?!^\[)[^\n]*\n)*?version[ \t]*=[ \t]*)\"[^\"]*\"",lambda m:m.group(1)+f"\"{sys.argv[1]}\"",t,count=1);sys.exit("ERROR: no [project].version found in pyproject.toml") if n[1]==0 else open(p,"w").write(n[0])' "$NEW" && { [ -f uv.lock ] && command -v uv >/dev/null 2>&1 && uv lock || : ; } ;;  # then commit (with CHANGELOG) + tag v$NEW
      npm)               npm version <level> -m "chore: bump version to %s" ;;
      version-file)      printf '%s\n' "$NEW" > VERSION ;;  # then commit (with CHANGELOG) + tag v$NEW
+     declared-policy)   sh -c "$VS_BUMP" _ "$NEW"; GOT="$(sh -c "$VS_READ")"; [ "$GOT" = "$NEW" ] || { echo "ERROR: declared bump: ran but the source still reads '$GOT', not '$NEW' — the bump: command did not take (regex/path mismatch?). Refusing to commit/tag." >&2; exit 1; } ;;  # declared bump: command, $NEW passed as $1, then post-verified against declared read:; then commit (with CHANGELOG) + tag v$NEW
    esac
    ```
 
    For tools that don't self-commit (`cargo-set-version`, `cargo-workspace`,
-   `poetry`, `version-file`), stage the bumped files **plus `CHANGELOG.md`**,
-   commit, and `git tag -a "v$NEW" -m "v$NEW"` — match the repo's existing
-   commit/tag convention (check `git log` and `git tag`).
+   `poetry`, `pyproject`, `version-file`, `declared-policy`), stage the bumped
+   files **plus `CHANGELOG.md`**, commit, and `git tag -a "v$NEW" -m "v$NEW"` —
+   match the repo's existing commit/tag convention (check `git log` and `git tag`).
+
+   The `pyproject` branch rewrites only the `version` line **inside** the
+   `[project]` table and leaves every other line byte-identical. Three details
+   are load-bearing, each guarding a failure this branch would otherwise cause:
+
+   - **Scoping is line-anchored** (`(?:(?!^\[)[^\n]*\n)*?`), matching lines up
+     to the next table *header*, rather than "any run of non-`[` characters".
+     The looser form silently matches nothing whenever a list-valued key
+     (`classifiers`, `dependencies`, `keywords`) appears before `version` in
+     `[project]` — a no-op bump that would still get committed and tagged.
+   - **A zero-substitution result is fatal**, not a no-op: the branch exits
+     non-zero with `ERROR: no [project].version found` so a mis-shaped
+     `pyproject.toml` fails the apply instead of tagging a stale version.
+   - **`uv.lock` is refreshed when present**, so `uv sync --locked` CI doesn't
+     break on the now-stale locked version. It's gated on both the lock file
+     existing and `uv` being on `PATH` (with a trailing `|| :` so a flit- or
+     setuptools-only PEP 621 repo with no lock file doesn't fail the branch on
+     the gate's own false status). Stage the regenerated `uv.lock` alongside
+     `pyproject.toml` and `CHANGELOG.md` in the version commit.
+
+   The `declared-policy` branch runs the repo's declared `bump:` command with the
+   new version passed as `$1` — `sh -c "$VS_BUMP" _ "$NEW"` sets `$0=_` and
+   `$1=$NEW` — then joins the same stage-plus-`CHANGELOG.md`, commit, and tag path
+   as the other non-self-committing tools. The declaration owns **only** the
+   in-file edit; this command still owns the commit and the tag, so a repo
+   declares just the one-line `sed`/edit, never the git plumbing.
+
+   - **The bump is post-verified against the declared `read:`**, mirroring the
+     `pyproject` branch's zero-substitution guard: after running `bump:`, the
+     branch re-reads the version with `sh -c "$VS_READ"` and **fails loud**
+     (`exit 1`, no commit, no tag) unless it now equals `$NEW`. This closes the
+     one silent-mis-tag footgun unique to this branch — `bump:` runs an arbitrary
+     repo-declared `sed`/edit, so a stale constant name, wrong path, or drifted
+     regex leaves the file untouched while `sh -c` still exits 0. Without the
+     re-read assertion the apply would commit and tag `v$NEW` over a source that
+     still holds the old version; with it, a `bump:` that doesn't take fails the
+     release instead of shipping a stale tag — the same guarantee `pyproject`
+     gives on a zero-substitution rewrite.
 3. **Verify**: re-read the version and confirm the tag exists
    (`git tag --sort=-v:refname | head -1`). For cargo, `cargo check --workspace`.
    Also confirm the `## Unreleased` fold (Phase 4) actually landed: grep the
@@ -440,6 +583,47 @@ meaningful where the boundary has a default action to replace:
 | `post-push` | immediately after the push succeeds | run policy steps | **augment-only** — no default action; a `(replace)` marker is ignored with a warning |
 | `pre-github-release` | before `gh release create` | run policy steps (e.g. wait for publish workflows), then create the Release | policy steps create the Release (or intentionally skip it); skip the default `gh release create` |
 | `post-summary` | after the Phase 7 summary | run policy steps (e.g. deploy a site) | **augment-only** — no default action; a `(replace)` marker is ignored with a warning |
+
+### Declaring a version source (a declaration, not a seam)
+
+Some repos keep their version in a source constant **no Phase 2 heuristic can
+discover** — a Swift `AppVersion.current` assignment, a `CFBundle*` string in a
+build script, a module-level `__version__`. For these, `.repo/release-policy.md`
+carries a `## version-source` section. It lives in the same file as the seams but
+is deliberately **not** a seam: it is *data* the command reads, not procedural
+steps bound to a phase boundary. It takes **no** `(replace)` suffix and has no
+augment/replace mode — there is nothing to augment or replace, only two commands
+to read and run.
+
+```markdown
+## version-source
+
+- read: `sed -n 's/.*AppVersion\.current = "\(.*\)".*/\1/p' Sources/App/Version.swift`
+- bump: `sed -i '' "s/AppVersion\.current = \".*\"/AppVersion.current = \"$1\"/" Sources/App/Version.swift`
+```
+
+- **`read:`** — a shell one-liner (backtick-fenced inline code) that prints the
+  current version to stdout. Phase 3 runs it via `sh -c "$VS_READ"`.
+- **`bump:`** — a shell one-liner that rewrites the version in place, with the new
+  version arriving as `$1`. Phase 5 runs it via `sh -c "$VS_BUMP" _ "$NEW"`. The
+  command owns only the in-file edit; `/repo:release` still stages, commits (with
+  `CHANGELOG.md`), and tags — declare just the edit, not the git plumbing.
+
+When both lines are present, Phase 2 sets `VERSION_TOOL="declared-policy"`, which
+**outranks every heuristic** (even `scripts/version.sh`) because it is
+repo-authored ground truth. Phase 0 validates the block: an **asymmetric**
+declaration (only `read:` or only `bump:`) warns like an unknown seam, since a
+read-only source can detect but never apply and a bump-only source can apply but
+never detect. A `## version-source` declaration *alongside* an executable
+`scripts/version.sh` also warns (the declaration still wins, but the pairing
+usually means a stale leftover). Because it names a single source, the
+multi-source drift gate is a no-op for `declared-policy`.
+
+The first manual (`[m]`) release in a repo with such a source **records** it here:
+after the operator supplies the version by hand, `/repo:release` offers to write
+this block so every subsequent release detects it automatically. This keeps the
+single-file design principle intact — one `.repo/release-policy.md`, holding both
+seams (procedure) and the version-source declaration (data), with no second file.
 
 ### Unknown seams are surfaced, never silently ignored
 

@@ -116,6 +116,29 @@ the default apply mode.
 Never rewrite prose wholesale to "improve" it — the job is accuracy, not a
 style pass. Fix the factual drift and leave the voice alone.
 
+### Verify after write
+
+Applying an edit is not proof it survived. A concurrent writer — another agent
+working in the same clone, a background `git stash` or `git checkout --`, a
+pre-commit hook, a Loom sweep quarantining the primary clone's working tree —
+can revert a file between the moment you fix it and the moment you report it,
+leaving this command claiming a fix that is no longer on disk.
+
+So immediately after applying each fix, and **before counting it as applied**,
+confirm the edit is still there: re-read the changed region of the file, or run
+`git diff -- <path>` / `git status --porcelain -- <path>` and check the change
+is still present.
+
+This check is **unconditional** — run it whether or not you have any reason to
+suspect a concurrent writer. Detecting a daemon first would be racy (one can
+start right after the check), and in a repo with no concurrent writer the check
+always finds the edit still applied, so nothing about the reported output
+changes.
+
+If a fix is gone on re-check, report it on its own line as **reverted after
+apply — needs re-run**. Do not silently re-apply it, and do not count it in the
+fixed total — that total must only ever include edits confirmed still on disk.
+
 ## Principles
 
 Same as every hygiene command: **apply safe fixes, gate destructive ones**

@@ -67,6 +67,7 @@ stashes, untracked files) always need an explicit opt-in.
 | /repo:audit | Monthly sweep, or after a big refactor/import |
 | /repo:host-optimize | Prep/re-check a Mac (or Linux box) for heavy Loom/agent build use — Gatekeeper churn, backup-agent interference, build-tree bloat |
 | /repo:update-tools | Keep Loom/Anvil/Repo Skills installs current |
+| /repo:deps | Keep third-party deps current — verify/scaffold Dependabot (config + security flag), triage open Dependabot PRs |
 
 ### Focused checks
 | /repo:docs | Documentation health — content, README structure, cross-refs |
@@ -93,7 +94,9 @@ their frontmatter descriptions.
   confirmed-safe branches/worktrees (after a permanent-loss check)
 - Full details per command: `/repo:help <command>` or the files in
   `.claude/commands/repo/`
-- Updating: `/repo:update-tools` (source: https://github.com/rjwalters/repo)
+- Updating: `/repo:update-tools` for installed tool packages (source:
+  https://github.com/rjwalters/repo); `/repo:deps` for third-party dependencies
+  (Dependabot setup + bot-PR triage)
 
 ## Steps — with a command argument
 
