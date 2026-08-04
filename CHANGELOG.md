@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spent, the session reset otherwise. The same rule replaces the old
   session-reset-first tiebreak used for popover ordering and the auto-selected
   menubar account.
+- **`npm test` runs the self-test.** The script still claimed there was no test
+  target and exited 0 unconditionally, which predates `selftest` — orchestration
+  gates that shell out to it now actually gate.
 
 ## [1.18.3] - 2026-08-02
 

@@ -342,7 +342,9 @@ swift build
 .build/debug/ClaudeMonitor &
 ```
 
-CI (`.github/workflows/build.yml`) runs the same `swift build` on every push.
+CI (`.github/workflows/build.yml`) runs on pushes to `main` and on pull requests:
+two jobs build the package — macOS and a `swift:6.1` Linux container — and each
+runs `ClaudeMonitor selftest`, with the Linux job also smoke-running `--once`.
 
 ### Build for Distribution
 
@@ -651,13 +653,14 @@ claude-monitor/
 │   ├── build-macos-app.sh          # macOS release build script
 │   └── claude-monitor.service      # Sample systemd user unit for Linux headless mode
 ├── docs/spikes/                 # Investigation write-ups (e.g. the OpenAI usage-endpoint probe)
-├── .github/workflows/build.yml  # CI: swift build on push
+├── .github/workflows/build.yml  # CI: build + selftest on macOS and Linux
 ├── build/                       # Build output (gitignored): ClaudeMonitor.app + .zip
-├── CHANGELOG.md
+├── CHANGELOG.md                 # Release history
+├── CLAUDE.md                    # Development notes (build/install sequence, invariants)
 ├── .env.example                 # Sample accounts.env for bulk import
 ├── window.png, plot_window.png  # README screenshots
 ├── loom.sh, package.json        # Loom orchestration workspace files (not part of the app)
-└── .loom/, .claude/             # Loom + Claude Code tooling installs
+└── .loom/, .claude/, .gitattributes  # Loom + Claude Code tooling installs
 ```
 
 ## Related Projects
