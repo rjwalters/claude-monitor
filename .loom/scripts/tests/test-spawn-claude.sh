@@ -438,6 +438,15 @@ assert_contains "stub-claude args=-p ping" "$output" \
 assert_contains "OAuth account 'alpha'" "$output" \
     "spawn-claude logs the chosen account"
 
+# Test: binary provenance at the selection site (issue #4643). The daemon
+# binary that decides token selection is resolved by spawn-claude.sh itself,
+# so a stale one is invisible unless it is logged. Assert both the resolved
+# path and a version string land in the sweep log.
+assert_contains "spawn-claude: token-selection binary: $DAEMON_BIN" "$output" \
+    "spawn-claude logs the resolved daemon binary path at token selection (#4643)"
+assert_contains "(loom-daemon " "$output" \
+    "spawn-claude logs the daemon binary's --version at token selection (#4643)"
+
 # Test: spawn-claude disables the print-mode background-task wait ceiling
 # (issue #3943) so a daemon-dispatched sweep child's long-running Builder/Judge
 # subagents are not reaped at the 600s ceiling. Default = 0 (no cap).
@@ -516,6 +525,33 @@ assert_contains "tokens bootstrap" "$output" \
 assert_not_contains "loom-tokens bootstrap" "$output" \
     "empty pool error does NOT advise the retired loom-tokens binary (#4557)"
 rm -rf "$EMPTY_WS"
+
+# Test: an all-bad pool reports PER-TOKEN exclusion detail plus the deciding
+# binary (issue #4643). Diagnosing the 2026-07-30 incident required reading
+# Rust source because "All N tokens ... are marked bad or empty" said nothing
+# about why each account was out or which binary decided. The whole point is
+# that this is answerable from the sweep log, so assert it at the spawn layer.
+BAD_WS="$(mktemp -d)"
+mkdir -p "$BAD_WS/.loom/tokens"
+echo -n "fake-token-exh" > "$BAD_WS/.loom/tokens/exh.token"
+echo -n "fake-token-auth" > "$BAD_WS/.loom/tokens/auth.token"
+_now_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+{
+    echo "$_now_ts exh exhausted: hit your session limit"
+    echo "$_now_ts auth 401 unauthorized"
+} > "$BAD_WS/.loom/tokens/.bad_tokens"
+output=$(LOOM_WORKSPACE="$BAD_WS" LOOM_SHARED_TOKENS_DIR="" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
+    "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "exh: bad-marked [exhaustion, TTL]" "$output" \
+    "all-bad pool error names the exhaustion entry's class and TTL (#4643)"
+assert_contains "auth: bad-marked [auth, permanent]" "$output" \
+    "all-bad pool error names the auth entry as permanent (#4643)"
+assert_contains "clears in " "$output" \
+    "all-bad pool error reports the cooldown remaining (#4643)"
+assert_contains "deciding binary: loom-daemon " "$output" \
+    "all-bad pool error names the deciding binary (#4643)"
+rm -rf "$BAD_WS"
 
 # Test that spawn-claude.sh exits 78 on missing tokens (shared fallback off).
 set +e

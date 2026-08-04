@@ -297,6 +297,90 @@ before starting the daemon — see "Headless and SSH-only daemon operation"
 above) for that workload, or expect to restart a sweep that 401s mid-run past
 the ~1h mark.
 
+## Fleet rate-limit protections are `loom-daemon`-internal (#4432)
+
+Epic #4432 ("survive GitHub API rate limits at fleet scale") shipped real
+mitigations for the shared-budget problem stated at the top of the GitHub App
+section — a rate-limit circuit breaker, ETag-cached hot polls, per-installation
+App tokens, and moving claim coordination off label polling. **Every one of them
+lives inside the `loom-daemon` process.** None is wired into the spawn scripts:
+
+```bash
+grep -n 'rate_limit_breaker\|forge_listing\|github-app' \
+  .loom/scripts/spawn-claude.sh .loom/scripts/claude-wrapper.sh
+# → no matches
+```
+
+So an operator running the older hand-rolled per-issue pattern — one
+`claude-wrapper.sh --dangerously-skip-permissions "/loom:sweep <N>"` shell per
+in-flight issue, **with no `loom-daemon` running at all** — gets *zero* benefit
+from any of it. That is not an oversight awaiting a wrapper flag: the breaker's
+state, the ETag cache, and the minted-token refresh tick are all in-process
+state of one long-lived daemon, with no cross-process protocol for independent
+shells to join.
+
+| Mechanism | Implementation | Daemon-dispatched sweeps | Hand-rolled `claude-wrapper.sh` loop |
+|---|---|---|---|
+| Rate-limit circuit breaker (#4429 → #4440) | `loom-daemon/src/rate_limit_breaker.rs` | Governs the **daemon's own** forge polls (work finder, claim/quarantine reconciliation, role runner, epic supervisor) — pauses them until the window resets | **None** |
+| ETag-cached REST listings (#4428 → #4443) | `loom-daemon/src/forge_listing.rs` | Same scope — the daemon's hot polls; an unchanged poll returns 304 and costs no quota | **None** |
+| GitHub App installation tokens (#4430 → #4454, #4578) | daemon credential preflight + daemon-owned `GH_CONFIG_DIR` | Reaches spawned children too: they inherit the daemon's `GH_CONFIG_DIR`, so their `gh` calls draw on the **per-installation** bucket instead of the operator's personal 5,000/hr | **None** — every session uses whatever ambient `gh auth` / `GH_TOKEN` the operator's shell carries, i.e. one shared personal budget |
+| Claim/peer coordination off label polling (#4431) | safehouse ([`safehouse.md`](safehouse.md)) | Removes a whole class of repeated label reads from the poll path | **None** |
+
+**Read the middle column precisely.** The breaker and the ETag cache bound the
+daemon's *own* polling loops; they do **not** govern the `gh` calls a spawned
+Claude session makes while it works an issue. What bounds those is admission
+control — `autonomous.workFinder.maxConcurrent` and the token / disk terms
+folded into the same `min(...)` ceiling (the fourth cpu/load term was deleted in
+#4512 — see [`daemon-reference.md`](daemon-reference.md)) — which caps how many
+sessions exist at once on a host. A hand-rolled loop has no equivalent: N
+shells started by hand are N unbounded `gh` consumers, and nothing
+coordinates them across the other projects sharing the same machine and the
+same `gh auth` login.
+
+### Recommendation: dispatch through the daemon
+
+If you run several repos/projects concurrently on one machine under one GitHub
+login, migrate off the hand-rolled pattern and dispatch via `loom-daemon`
+(`mcp__loom__dispatch_sweep`) — one daemon per workspace, one admission ceiling
+per host, and the table's middle column instead of its right-hand one. This is
+also the already-documented direction of travel: `spawn-loop.sh`, the shipped
+version of that pattern, was **removed in v0.11.0** in favor of
+`mcp__loom__dispatch_sweep` (see `CLAUDE.md` → Migration History). Parallel
+hand-started `claude-wrapper.sh` sweeps are not a supported scaling story; they
+are the configuration reported in #4665 — 15+ concurrent sweep/judge sessions
+for a single project, multiplied across every other project on the box, with
+`loom-daemon status` confirming no daemon was running.
+
+Before scaling out, confirm which regime you are in:
+
+```bash
+loom-daemon status   # "Forge credential: OK — github-app (app … installation …)"
+                     #   ⇒ daemon-managed, per-installation bucket
+                     # no daemon running ⇒ none of the above protections apply
+gh api rate_limit --jq '.resources.core, .resources.graphql'
+```
+
+### Known limitation, even under daemon dispatch
+
+There is **no per-sweep credential re-resolution** in the spawn path. A
+dispatched sweep child works from whatever forge-credential reference was
+ambient at spawn time. Where that reference is the daemon's own `GH_CONFIG_DIR`,
+rotation does reach it (`gh` re-reads `hosts.yml` on every invocation — #4578);
+where it is an inherited `GH_TOKEN`/`GITHUB_TOKEN` env value, env outranks `gh`
+config and the value is **frozen for the life of the sweep**, so a sweep that
+outlives a ~1h App-token lifetime starts 401ing with no automatic fallback. See
+"Long-running sweep children and credential snapshots (#4458)" above for the
+mechanics and the workaround (a long-lived PAT for consistently long workloads).
+
+## Filing issues under GraphQL exhaustion
+
+GitHub's GraphQL quota and REST quota are independent buckets, and `gh issue
+create` is GraphQL-backed with no REST fallback of its own (#5047) — file new
+issues with `./.loom/scripts/create-issue.sh`, never a bare `gh issue create`.
+Full recipe, the atomic create+label requirement, the scripted
+`forge_gh_create_issue_rl_safe` equivalent, and why `loom-daemon forge issue
+create` is NOT a fallback: [`gh-issue-create-rest-fallback.md`](gh-issue-create-rest-fallback.md).
+
 ## Troubleshooting
 
 ### Token not being picked up

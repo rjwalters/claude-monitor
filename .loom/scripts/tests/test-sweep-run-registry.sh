@@ -232,6 +232,77 @@ fi
 kill "$LIVE3" 2>/dev/null
 wait "$LIVE3" 2>/dev/null
 
+# --------------------------------------------------------------------------
+# #4691: the liveness PID must outlive the one-shot shell that ran `new`, and
+# "not signallable" must never be mistaken for "dead".
+# --------------------------------------------------------------------------
+
+# 9d. `new` (no --pid) skips the ephemeral `<shell> -c …` wrapper it was invoked
+#     from. An agent harness spawns one such shell PER TOOL CALL and reaps it
+#     immediately, so recording its PID (the pre-fix bare `$PPID`) made every run
+#     look dead to the very next peer scan. The trailing `:` keeps bash from
+#     exec-optimizing the wrapper away, so the wrapper is a real intermediate.
+EPH_FILE="$TMP_REPO/ephemeral.pid"
+RID_FILE="$TMP_REPO/default.rid"
+bash -c 'echo $$ > "$2"; "$1" new > "$3"; :' _ "$REG" "$EPH_FILE" "$RID_FILE"
+EPH_PID=$(cat "$EPH_FILE")
+RID_D=$(cat "$RID_FILE")
+REG_PID=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    "$TMP_REPO/.loom/sweep-run/${RID_D}.json")
+
+if kill -0 "$EPH_PID" 2>/dev/null; then
+    echo "SKIP: invoking one-shot shell $EPH_PID outlived the call; cannot assert" >&2
+else
+    echo "PASS: the one-shot invoking shell is already dead (the pre-fix handle)"
+    PASS=$((PASS + 1))
+    if [[ "$REG_PID" != "$EPH_PID" ]]; then
+        echo "PASS: default liveness pid is not the ephemeral invoking shell"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: default liveness pid is the ephemeral invoking shell ($EPH_PID)" >&2
+        FAIL=$((FAIL + 1))
+    fi
+    if kill -0 "$REG_PID" 2>/dev/null; then
+        echo "PASS: default liveness pid ($REG_PID) is still alive after the call"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: default liveness pid $REG_PID is already dead after the call" >&2
+        FAIL=$((FAIL + 1))
+    fi
+fi
+"$REG" cleanup "$RID_D"
+
+# 9e. A PID that EXISTS but cannot be signalled by this caller (POSIX EPERM) is
+#     alive, not dead. PID 1 (launchd/init) is root-owned and always present, so
+#     `kill -0 1` fails with EPERM for an unprivileged test run — and simply
+#     succeeds when running as root, so the assertion holds either way.
+LIVE4=$(spawn_live); LIVE_PIDS+=("$LIVE4")
+RID_SELF=$("$REG" new --pid "$LIVE4")
+RID_EPERM=$("$REG" new --pid 1)
+: > "$BASELINE_DIR/main-clean-baseline-${RID_EPERM}.txt"
+out=$("$REG" peers "$RID_SELF")
+if echo "$out" | grep -q "^$RID_EPERM 1 "; then
+    echo "PASS: unsignallable-but-existing pid reported as a live peer"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: unsignallable-but-existing pid treated as dead, got: $out" >&2
+    FAIL=$((FAIL + 1))
+fi
+if [[ -f "$TMP_REPO/.loom/sweep-run/${RID_EPERM}.json" \
+    && -f "$BASELINE_DIR/main-clean-baseline-${RID_EPERM}.txt" ]]; then
+    echo "PASS: unsignallable run's entry + baseline survive a peer scan"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: unsignallable run's entry or baseline was pruned" >&2
+    FAIL=$((FAIL + 1))
+fi
+
+# Restore the empty-registry precondition the remaining cases assume.
+"$REG" cleanup "$RID_EPERM"
+"$REG" cleanup "$RID_SELF"
+kill "$LIVE4" 2>/dev/null
+wait "$LIVE4" 2>/dev/null
+
 # 10. peers on an empty/nonexistent registry is empty, exit 0 (single-sweep case).
 out=$("$REG" peers "sweep-nonexistent")
 assert_eq "peers empty when no registry entries" "" "$out"

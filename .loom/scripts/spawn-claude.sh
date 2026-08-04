@@ -369,6 +369,20 @@ if [[ -z "${LOOM_SPAWN_NO_EXPORT:-}" && -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; th
         exit 78  # EX_CONFIG
     fi
 
+    # --- Binary provenance at the selection site (issue #4643) ---
+    # The binary that decides token selection is resolved HERE, independently
+    # of any running daemon ($LOOM_DAEMON_BIN -> PATH -> build-output
+    # candidates), so a long-running daemon can hand a sweep child a binary
+    # older than the last merged selection fix. That staleness was the leading
+    # hypothesis for the 2026-07-30 incident (13h-old exhaustion entries
+    # appearing to block every spawn); refuting it took out-of-band forensics
+    # on the host's installed binaries, because NOTHING in the sweep log
+    # recorded which binary ran. Log path + version on every spawn so the next
+    # occurrence is answerable straight from `.loom/logs/sweep-issue-<N>.log`.
+    # Best-effort: a binary too old to support `--version` still logs its path.
+    _daemon_version="$("$_daemon_bin" --version 2>/dev/null | head -1)"
+    log_info "spawn-claude: token-selection binary: $_daemon_bin (${_daemon_version:-version unknown})"
+
     _select_args=(tokens select --workspace "$WORKSPACE" --export)
     # Pre-flight: auto-unpin if every allowlisted account has hit the
     # consecutive-failure threshold (default 5). Without this, an

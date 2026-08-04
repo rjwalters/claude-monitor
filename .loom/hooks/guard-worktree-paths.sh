@@ -46,9 +46,24 @@
 # (missing jq, unparseable input, no sentinel anywhere, resolver errors) so a
 # broken guard cannot wedge all agent writes.
 
-# Determine main repo root via git-common-dir (works from worktrees and subdirectories)
-MAIN_ROOT="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd)" || \
-MAIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd 2>/dev/null || echo ".")"
+# Determine main repo root via git-common-dir (works from worktrees and subdirectories).
+# `pwd -P` (physical, symlinks resolved) rather than plain `pwd` (#4495): the
+# target path is canonicalized with symlinks resolved below, so the root it is
+# compared against must be resolved the same way — otherwise a repo reached
+# through a symlinked ancestor (the common case for `/tmp` on macOS, which is a
+# symlink to `/private/tmp`) never string-matches and the deny silently misses.
+MAIN_ROOT="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd -P)" || \
+MAIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd -P 2>/dev/null || echo ".")"
+# ...and the LOGICAL spelling of the same root (symlinks intact). Both are kept
+# because the canonicalization of the TARGET path degrades to lexical
+# normalization on a host without python3/GNU realpath (or an install that
+# predates defaults/scripts/lib/canonical-path.sh). In that degraded mode a
+# target reached through a symlinked ancestor still spells the logical root, and
+# comparing against the physical root alone would silently stop denying. Both
+# prefixes are checked in path_derived_allow(), so neither spelling escapes.
+MAIN_ROOT_LOGICAL="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd)" || \
+MAIN_ROOT_LOGICAL="$MAIN_ROOT"
+[[ -n "$MAIN_ROOT_LOGICAL" ]] || MAIN_ROOT_LOGICAL="$MAIN_ROOT"
 HOOK_ERROR_LOG="${MAIN_ROOT}/.loom/logs/hook-errors.log"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
@@ -66,6 +81,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo "."
 if [[ -f "$SCRIPT_DIR/../scripts/lib/config-resolver.sh" ]]; then
     # shellcheck source=/dev/null
     source "$SCRIPT_DIR/../scripts/lib/config-resolver.sh" 2>/dev/null || true
+fi
+
+# Shared symlink-aware canonicalization (#4495). Replaces this hook's original
+# `python3 os.path.normpath` call, which was purely LEXICAL: it collapsed `.`
+# and `..` but left symlinks intact, so `<worktree>/link-to-main/CLAUDE.md`
+# looked like it was inside the worktree while actually resolving into the main
+# checkout. loom_canonical_path resolves every component that exists and
+# normalizes the tail that does not, so a `Write` to a brand-new file still
+# works. Best-effort source: a missing lib leaves loom_canonical_path undefined
+# and the normalization below falls back to the historical normpath behavior,
+# preserving this hook's fail-open contract.
+if [[ -f "$SCRIPT_DIR/../scripts/lib/canonical-path.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$SCRIPT_DIR/../scripts/lib/canonical-path.sh" 2>/dev/null || true
 fi
 
 log_hook_error() {
@@ -223,10 +252,20 @@ path_derived_allow() {
         return 0
     fi
 
-    # Not under any worktree. If it's also not under the main checkout,
-    # there's nothing this guard protects (e.g. /tmp scratch files) -> allow.
-    local target_slash="${target%/}/" main_slash="${MAIN_ROOT%/}/"
-    if [[ -z "$MAIN_ROOT" || ( "$target_slash" != "$main_slash"* && "$target" != "$MAIN_ROOT" ) ]]; then
+    # Not under any worktree. If it's also not under the main checkout (in
+    # EITHER its physical or its logical spelling — see MAIN_ROOT_LOGICAL
+    # above), there's nothing this guard protects (e.g. /tmp scratch files)
+    # -> allow.
+    local target_slash="${target%/}/"
+    local main_slash="${MAIN_ROOT%/}/" alt_slash="${MAIN_ROOT_LOGICAL%/}/"
+    local under_main=false
+    if [[ -n "$MAIN_ROOT" && ( "$target_slash" == "$main_slash"* || "$target" == "$MAIN_ROOT" ) ]]; then
+        under_main=true
+    fi
+    if [[ -n "$MAIN_ROOT_LOGICAL" && ( "$target_slash" == "$alt_slash"* || "$target" == "$MAIN_ROOT_LOGICAL" ) ]]; then
+        under_main=true
+    fi
+    if [[ "$under_main" != true ]]; then
         return 0
     fi
 
@@ -291,10 +330,19 @@ if [[ "$FILE_PATH" != /* ]]; then
     fi
 fi
 
-# Normalize the path: resolve .. and . components without requiring the file to exist.
-# Use Python's os.path.normpath for reliable path normalization (handles ../ etc.)
-# Falls back to the raw path if Python is unavailable.
-NORM_PATH=$(printf '%s' "$FILE_PATH" | python3 -c "import os,sys; print(os.path.normpath(sys.stdin.read()))" 2>/dev/null) || NORM_PATH="$FILE_PATH"
+# Canonicalize the path: resolve symlinks in every component that EXISTS, and
+# normalize `.`/`..` in the tail that does not (so a Write to a brand-new file
+# still resolves). loom_canonical_path (defaults/scripts/lib/canonical-path.sh,
+# #4495) owns the resolution chain — python3 realpath, GNU `realpath -m`, then a
+# pure-bash lexical fallback that reproduces the pre-#4495 normpath behavior.
+# If the lib could not be sourced, fall back to the original inline normpath so
+# this hook's fail-open contract does not depend on it.
+if declare -F loom_canonical_path >/dev/null 2>&1; then
+    NORM_PATH=$(loom_canonical_path "$FILE_PATH" "${CWD:-}" 2>/dev/null) || NORM_PATH="$FILE_PATH"
+    [[ -n "$NORM_PATH" ]] || NORM_PATH="$FILE_PATH"
+else
+    NORM_PATH=$(printf '%s' "$FILE_PATH" | python3 -c "import os,sys; print(os.path.normpath(sys.stdin.read()))" 2>/dev/null) || NORM_PATH="$FILE_PATH"
+fi
 
 if [[ -n "$WORKTREE_PATH" ]]; then
     # Normalize worktree path (resolve symlinks, remove trailing slash)

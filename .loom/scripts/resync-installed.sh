@@ -21,8 +21,17 @@
 # surface map — note the asymmetric source->target mapping):
 #   .loom/hooks/            <- defaults/hooks/            (top-level *.sh)
 #   .loom/scripts/          <- defaults/scripts/          (recursive)
-#   .loom/roles/            <- defaults/roles/            (recursive)
-#   .loom/docs/             <- defaults/docs/             (recursive; symlinks skipped)
+#   .loom/roles/            <- defaults/roles/            (recursive; SOURCE-side
+#                                                          symlinks resolved to
+#                                                          content, #5222 — all 17
+#                                                          defaults/roles/*.md are
+#                                                          symlinks to
+#                                                          .claude/commands/loom/*.md)
+#   .loom/docs/             <- defaults/docs/             (recursive; DESTINATION-side
+#                                                          symlinks skipped, e.g. this
+#                                                          dogfood repo's own
+#                                                          .loom/docs/*.md)
+#   .loom/runtimes/         <- defaults/runtimes/         (recursive; BACKFILLED if absent, #4688)
 #   .loom/bin/              <- defaults/.loom/bin/        (recursive; live consumer CLI)
 #   .claude/commands/loom/  <- defaults/.claude/commands/loom/ (recursive)
 #
@@ -59,6 +68,25 @@
 # dirty-tree check treats byte-identical installed-surface dirt as ignorable
 # (never a reason to skip the gate) but does not commit on the operator's
 # behalf.
+#
+# ATOMIC WRITES + DEFERRED SELF-UPDATE (#4669): every file is installed by
+# staging a copy NEXT TO its destination and rename(2)-ing it into place, never
+# by truncating and rewriting the destination in place. This matters most for
+# THIS script: resync-installed.sh is itself a file under defaults/scripts/, so
+# a resync copies it over the very path the running bash process is still
+# reading from. The old in-place `cp` let bash resume reading a half-rewritten
+# file at a now-meaningless byte offset — the reported `syntax error near
+# unexpected token` mid-run, which aborted the run and left dozens of surfaces
+# partially refreshed. A rename swaps the directory entry and leaves the
+# already-open inode intact, so the running process keeps reading the exact
+# bytes it started with. Belt-and-suspenders, the self-copy is also DEFERRED:
+# it is applied only after every other surface has settled.
+#
+# A file that cannot be staged or renamed is counted as a FAILURE: the run
+# still finishes the remaining files, then prints an explicit PARTIAL summary
+# naming every failed path and exits 1. No file is ever left half-written
+# (staging happens off to the side), so re-running after fixing the cause
+# completes the refresh — a partial refresh is never silent.
 #
 # EXPLICITLY OUT OF SCOPE (never touched by resync — updated by other mechanisms):
 #   .loom/config.json       - operator-owned; needs merge-semantics design
@@ -114,8 +142,9 @@
 #
 # Exit codes:
 #   0 - Success. Sync applied (or already in sync); or --dry-run found no drift.
-#   1 - Error (not in a git repo, the source tree could not be located, or
-#       invoked from a linked worktree without --allow-worktree).
+#   1 - Error (not in a git repo, the source tree could not be located,
+#       invoked from a linked worktree without --allow-worktree, or one or more
+#       files could not be synced — see the PARTIAL summary block, #4669).
 #   2 - --dry-run only: drift detected (one or more files WOULD be updated).
 #       Lets callers (e.g. the #3770 warning) use --dry-run as a cheap check.
 #
@@ -339,6 +368,69 @@ is_loom_internal() {
 N_UPDATED=0
 N_UNCHANGED=0
 N_SKIPPED=0
+# #4669: files that could not be staged/renamed into place. A non-empty list
+# means the refresh is PARTIAL and must be reported as such (exit 1), never
+# swallowed into a "success" summary.
+N_FAILED=0
+FAILED_RELS=()
+
+record_failure() {
+    N_FAILED=$((N_FAILED + 1))
+    FAILED_RELS+=("$1")
+}
+
+# ---------- atomic staging + self-update deferral (#4669) ----------
+
+# Physical absolute path of a FILE (abs_path above only resolves directories).
+abs_file_path() {
+    local p="$1" d b dir_abs
+    d="$(dirname "$p")"
+    b="$(basename "$p")"
+    dir_abs="$(abs_path "$d")"
+    [[ "$dir_abs" == "/" ]] && dir_abs=""
+    printf '%s/%s' "$dir_abs" "$b"
+}
+
+# Octal permission bits of a path, or "" when unavailable (GNU stat, then BSD).
+# -L (dereference) so a symlinked source (e.g. defaults/roles/*.md -> the
+# .claude/commands/loom/*.md skillification target, #5222) reports the
+# REFERENT's mode rather than the symlink's own (typically 755/lrwxrwxrwx)
+# mode -- both GNU and BSD `stat` report the link's own bits without -L.
+file_mode() {
+    local p="$1" m
+    m="$(stat -L -c '%a' "$p" 2>/dev/null)" || m=""
+    if [[ -z "$m" ]]; then
+        m="$(stat -L -f '%OLp' "$p" 2>/dev/null)" || m=""
+    fi
+    printf '%s' "$m"
+}
+
+# The file this bash process is executing. Its installed counterpart is synced
+# LAST (apply_deferred_self_sync), so nothing rewrites it mid-run.
+SELF_PATH=""
+SELF_BASE=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SELF_PATH="$(abs_file_path "${BASH_SOURCE[0]}")"
+    SELF_BASE="${SELF_PATH##*/}"
+fi
+DEFER_SELF=1
+SELF_SRC=""
+SELF_DST=""
+SELF_REL=""
+
+# The staging file currently in flight, removed on any exit so a killed run
+# never leaves `.resync-stage.*` dirt behind in an installed surface directory.
+STAGED_TMP=""
+# shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
+cleanup_staged_tmp() {
+    [[ -n "$STAGED_TMP" && -e "$STAGED_TMP" ]] && rm -f "$STAGED_TMP" 2>/dev/null
+    STAGED_TMP=""
+    return 0
+}
+trap cleanup_staged_tmp EXIT
+trap 'cleanup_staged_tmp; exit 130' INT
+trap 'cleanup_staged_tmp; exit 143' TERM
+trap 'cleanup_staged_tmp; exit 129' HUP
 
 # ---------- per-file sync ----------
 #
@@ -347,8 +439,24 @@ N_SKIPPED=0
 #   installed file's executable bit expectation. Only files that exist in the
 #   source tree ever reach this function, so repo-specific installed files with
 #   no source counterpart are never touched.
+#
+#   The copy is ALWAYS staged beside the destination and renamed into place
+#   (#4669) — never written in place — so no reader can observe a partial file.
 sync_one() {
     local src="$1" dst="$2" rel="$3"
+
+    # #4669: never rewrite the script this process is executing while the rest
+    # of the run is still in flight. Record it and apply it once every other
+    # surface has settled (apply_deferred_self_sync). The basename test is a
+    # cheap pre-filter so the path resolution (two subshells) runs at most once
+    # per surface walk instead of once per file.
+    if [[ "$DEFER_SELF" -eq 1 && -n "$SELF_PATH" && "${dst##*/}" == "$SELF_BASE" && \
+          "$(abs_file_path "$dst")" == "$SELF_PATH" ]]; then
+        SELF_SRC="$src"
+        SELF_DST="$dst"
+        SELF_REL="$rel"
+        return 0
+    fi
 
     if is_ignored "$rel"; then
         note "  ${YELLOW}skipped${NC}   $rel ${YELLOW}(pinned in .loom/resync-ignore)${NC}"
@@ -373,7 +481,6 @@ sync_one() {
     fi
 
     # src and dst differ (or dst is missing) — this is an update.
-    N_UPDATED=$((N_UPDATED + 1))
     local verb_past="updated" verb_pres="update"
     if [[ ! -f "$dst" ]]; then
         verb_past="created"
@@ -381,21 +488,89 @@ sync_one() {
     fi
 
     if [[ "$DRY_RUN" -eq 1 ]]; then
+        N_UPDATED=$((N_UPDATED + 1))
         printf '%b\n' "  ${BOLD}would ${verb_pres}${NC} $rel"
         return 0
     fi
 
-    mkdir -p "$(dirname "$dst")"
-    if cp "$src" "$dst" 2>/dev/null; then
-        # Match the executable bit of the source (defaults/ scripts/hooks are +x).
-        if [[ -x "$src" ]]; then
-            chmod +x "$dst" 2>/dev/null || true
-        fi
-        printf '%b\n' "  ${GREEN}${verb_past}${NC}   $rel"
-    else
-        err "failed to copy $rel"
+    local dst_dir mode
+    dst_dir="$(dirname "$dst")"
+    mkdir -p "$dst_dir" 2>/dev/null
+
+    # #4669: stage beside the destination, then rename. rename(2) is atomic
+    # within a filesystem and replaces the DIRECTORY ENTRY rather than
+    # truncating the destination's inode, so a process that already has the
+    # destination open (most importantly: this script syncing itself) keeps
+    # reading intact bytes, and an interrupted run can never leave a truncated
+    # installed file behind.
+    STAGED_TMP="$(mktemp "$dst_dir/.resync-stage.XXXXXX" 2>/dev/null)" || STAGED_TMP=""
+    if [[ -z "$STAGED_TMP" ]]; then
+        err "failed to stage $rel (cannot create a temp file in $dst_dir)"
+        record_failure "$rel"
         return 1
     fi
+
+    if ! cp "$src" "$STAGED_TMP" 2>/dev/null; then
+        err "failed to copy $rel"
+        cleanup_staged_tmp
+        record_failure "$rel"
+        return 1
+    fi
+
+    # mktemp creates the staging file 0600, so the rename would otherwise change
+    # the installed file's permissions: restore the destination's current mode
+    # (or the source's, when creating a new file) before swapping it in...
+    mode="$(file_mode "$dst")"
+    [[ -n "$mode" ]] || mode="$(file_mode "$src")"
+    if [[ -n "$mode" ]]; then
+        chmod "$mode" "$STAGED_TMP" 2>/dev/null || true
+    fi
+    # ...then match the executable bit of the source (defaults/ scripts/hooks are +x).
+    if [[ -x "$src" ]]; then
+        chmod +x "$STAGED_TMP" 2>/dev/null || true
+    fi
+
+    if mv -f "$STAGED_TMP" "$dst" 2>/dev/null; then
+        STAGED_TMP=""
+        N_UPDATED=$((N_UPDATED + 1))
+        printf '%b\n' "  ${GREEN}${verb_past}${NC}   $rel"
+        return 0
+    fi
+
+    err "failed to install $rel (could not rename the staged copy into place)"
+    cleanup_staged_tmp
+    record_failure "$rel"
+    return 1
+}
+
+# ---------- deferred self-update (#4669) ----------
+#
+# Applied after every other surface has settled: at this point nothing else in
+# the run needs the old copy, and the atomic rename in sync_one leaves this
+# process's already-open inode untouched, so the remaining steps below
+# (metadata re-stamp, .gitignore refresh, audit, summary) still execute the
+# exact bytes this run started with.
+apply_deferred_self_sync() {
+    [[ -n "$SELF_DST" ]] || return 0
+    local src="$SELF_SRC" dst="$SELF_DST" rel="$SELF_REL" rc=0
+    SELF_SRC=""
+    SELF_DST=""
+    SELF_REL=""
+    DEFER_SELF=0
+
+    if ! is_ignored "$rel" && ! cmp -s "$src" "$dst" 2>/dev/null; then
+        note "  ${BLUE}(deferred to last: $rel is the script running this resync)${NC}"
+    fi
+
+    sync_one "$src" "$dst" "$rel" || rc=$?
+    DEFER_SELF=1
+
+    if [[ $rc -ne 0 ]]; then
+        err "The running resync script could NOT update itself: $rel"
+        err "  Other installed surfaces were refreshed, so this install is now MIXED."
+        err "  Recover with: cp '$src' '$dst'"
+    fi
+    return 0
 }
 
 # ---------- generic recursive surface resync (#4239) ----------
@@ -410,6 +585,22 @@ sync_one() {
 #                       ".claude/commands/loom", ".loom/bin").
 #   A missing src_dir is a silent no-op. Existing sync_one semantics (ignore
 #   list, symlink skip, idempotent copy, --dry-run) apply per file.
+#
+#   SOURCE-SIDE symlinks (#5222): all 17 defaults/roles/*.md files are
+#   symlinks to ../.claude/commands/loom/*.md (the skillification dedup, so
+#   the two copies of each role prompt never drift). Plain `find -type f`
+#   lstats each entry and a symlink never matches `-type f`, so those 17
+#   files silently fell out of the walk entirely -- not updated, not
+#   skipped, not counted -- and a consumer repo's installed .loom/roles/*.md
+#   (real file copies there, not symlinks) went stale forever while resync
+#   reported success. `find -L` dereferences before the type test, so a
+#   symlinked source is walked as the regular file it resolves to; `cp`
+#   (sync_one) and `cmp` both already dereference by default, so the
+#   destination gets the RESOLVED CONTENT, never a copied link. This is a
+#   source-side concern only -- the destination-side symlink guard in
+#   sync_one (`[[ -L "$dst" ]]`, protecting e.g. this dogfood repo's own
+#   .loom/roles/*.md and .loom/docs/*.md, which are themselves symlinks back
+#   into defaults/) is untouched and still runs first.
 resync_tree() {
     local src_dir="$1" dst_dir="$2" report_prefix="$3" defaults_prefix="$4"
     [[ -d "$src_dir" ]] || return 0
@@ -423,17 +614,24 @@ resync_tree() {
             continue
         fi
         sync_one "$src" "$dst_dir/$rel" "$report_prefix/$rel"
-    done < <(find "$src_dir" -type f -print0 2>/dev/null | sort -z)
+    done < <(find -L "$src_dir" -type f -print0 2>/dev/null | sort -z)
 }
 
-# ---------- canonical Repo Skills guard detection (#4041) ----------
+# ---------- canonical Repo Skills guard detection (#4041, #4894) ----------
 #
-# When the canonical generic guard (with the rjwalters/repo#29 fix) is installed
-# in this repo, Loom's vendored generic guard (guard-destructive-generic.sh) is
+# When the canonical generic guard is installed in this repo AND passes BOTH
+# runtime probes the guard-destructive.sh dispatcher requires — the
+# rjwalters/repo#29 VERSION marker and the `worktree-write-confinement`
+# CAPABILITY marker (proving it actually implements the Loom-only Bash-tool
+# write-confinement category, issue #4178, not just the unrelated repo#29 fix)
+# — Loom's vendored generic guard (guard-destructive-generic.sh) is
 # intentionally NOT installed — the guard-destructive.sh dispatcher defers to the
 # canonical guard at runtime. Resync must therefore neither resurrect the vendored
-# copy nor leave a stale one behind. Same marker probe the dispatcher/installer
-# use, so all three agree on which guard wins.
+# copy nor leave a stale one behind. Same two-probe check the dispatcher/installer
+# use, so all three agree on which guard wins (#4894: requiring only the version
+# probe here would strip the vendored fallback out from under the dispatcher the
+# moment a canonical guard picked up repo#29 without write-confinement, leaving
+# zero coverage instead of the intended fallback).
 #
 # Guard against #4403: the canonical Repo Skills guard is a LOCAL, typically
 # gitignored, per-host install (`.claude/skills/repo/`), but the vendored guard
@@ -456,7 +654,8 @@ resync_tree() {
 # firing entirely.
 CANONICAL_GUARD_PRESENT=0
 if [[ -r "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" ]] && \
-   grep -q 'repo#29' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
+   grep -q 'repo#29' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null && \
+   grep -q 'worktree-write-confinement' "$REPO_ROOT/.claude/skills/repo/hooks/guard-destructive.sh" 2>/dev/null; then
     CANONICAL_GUARD_PRESENT=1
 fi
 
@@ -520,12 +719,30 @@ fi
 if [[ -d "$REPO_ROOT/.loom/docs" ]]; then
     resync_tree "$DEFAULTS_DIR/docs" "$REPO_ROOT/.loom/docs" "docs" "docs"
 fi
+# `.loom/runtimes/` is deliberately UNCONDITIONAL, unlike the surfaces above
+# (#4688): every one of the gated blocks only backfills a surface the
+# consumer already opted into (destination pre-exists). `runtimes/` is not
+# an opt-in surface — it is a provisioning gap that both the Rust-native
+# `loom-daemon init` path and this script itself failed to populate before
+# this fix, so a host resynced any number of times has NO other path to ever
+# obtain the directory. `resync_tree`'s per-file `sync_one` already creates
+# `$dst_dir` via `mkdir -p` as it copies (skipped harmlessly under
+# `--dry-run`, which only reports "would create"), so this call alone is
+# sufficient to both create `.loom/runtimes/` on hosts that never had it and
+# keep it fresh on hosts that already do.
+resync_tree "$DEFAULTS_DIR/runtimes" "$REPO_ROOT/.loom/runtimes" "runtimes" "runtimes"
 if [[ -d "$REPO_ROOT/.loom/bin" ]]; then
     resync_tree "$DEFAULTS_DIR/.loom/bin" "$REPO_ROOT/.loom/bin" "bin" ".loom/bin"
 fi
 if [[ -d "$REPO_ROOT/.claude/commands/loom" ]]; then
     resync_tree "$DEFAULTS_DIR/.claude/commands/loom" "$REPO_ROOT/.claude/commands/loom" "commands/loom" ".claude/commands/loom"
 fi
+
+# ---------- install the deferred self-copy, now that every surface settled ----
+#
+# The scripts walk above records (rather than applies) a sync of the script this
+# process is executing; apply it here, last, via the same atomic staging path.
+apply_deferred_self_sync
 
 # ---------- targeted field edit: loom-workspace package.json version (#4285) ----------
 #
@@ -817,7 +1034,7 @@ suggest_commit_if_resync_only_dirt() {
         path="${path%\"}"
         path="${path#\"}"
         case "$path" in
-            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json|.gitattributes)
+            .loom/hooks/*|.loom/scripts/*|.loom/roles/*|.loom/docs/*|.loom/runtimes/*|.loom/bin/*|.claude/commands/loom/*|.loom/install-metadata.json|.gitattributes)
                 resync_paths+=("$path")
                 ;;
             *)
@@ -833,7 +1050,7 @@ suggest_commit_if_resync_only_dirt() {
     note "${BLUE}[resync] The tree is dirty with only resync output above — stage and commit it so the main-health gate doesn't skip on it:${NC}"
     printf '%b\n' "    ${BOLD}git add ${resync_paths[*]} && git commit -m 'chore: resync installed Loom surfaces'${NC}"
 }
-[[ "$DRY_RUN" -eq 1 ]] || suggest_commit_if_resync_only_dirt
+[[ "$DRY_RUN" -eq 1 || "$N_FAILED" -gt 0 ]] || suggest_commit_if_resync_only_dirt
 
 # ---------- summary ----------
 
@@ -846,6 +1063,22 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     fi
     printf '%b\n' "${GREEN}[resync] DRY RUN: already in sync (${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped).${NC}"
     exit 0
+fi
+
+# A failed file makes the refresh PARTIAL — say so explicitly and exit non-zero
+# rather than folding it into a success summary (#4669). Nothing is ever left
+# half-written (every copy is staged off to the side and renamed), so the
+# recovery is simply "fix the cause, re-run".
+if [[ "$N_FAILED" -gt 0 ]]; then
+    printf '%b\n' "${RED}${BOLD}[resync] PARTIAL REFRESH: ${N_FAILED} file(s) could NOT be synced (${N_UPDATED} updated, ${N_UNCHANGED} unchanged, ${N_SKIPPED} skipped).${NC}"
+    printf '%b\n' "${RED}Failed to sync:${NC}"
+    for failed_rel in "${FAILED_RELS[@]}"; do
+        printf '%b\n' "${RED}    $failed_rel${NC}"
+    done
+    printf '%b\n' "${YELLOW}This install is now MIXED: the ${N_UPDATED} file(s) reported above are current, the failed ones are still stale.${NC}"
+    printf '%b\n' "${YELLOW}No file was left half-written (each copy is staged beside its destination and renamed atomically),${NC}"
+    printf '%b\n' "${YELLOW}so fixing the cause (permissions, disk space, read-only mount) and re-running completes the refresh.${NC}"
+    exit 1
 fi
 
 if [[ "$N_UPDATED" -gt 0 ]]; then

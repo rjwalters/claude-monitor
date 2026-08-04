@@ -26,6 +26,15 @@
 # forever (200+ dead files observed). Bulk pruning of baselines left behind by a
 # SIGKILLed sweep is `loom-daemon clean`'s job.
 #
+# That reaping is only safe if "dead" is judged correctly. Before #4691 it was
+# not: the recorded PID was the script's literal `$PPID`, which under an agent
+# harness is the ONE-SHOT `<shell> -c …` process spawned for that single tool
+# call and reaped seconds later. Every registered run therefore looked dead to
+# the very next peer scan, which pruned a LIVE run's entry and deleted its
+# main-clean baseline mid-sweep — and, since the entry vanished before the
+# baseline was even written, left that baseline orphaned forever. One root cause,
+# both reported symptoms (over-eager prune + unbounded leak).
+#
 # The run id is portable (macOS/Linux, no `uuidgen`): a compact UTC timestamp, a
 # PID component, and a random suffix, e.g.
 #   sweep-20260722T231500Z-84213-a3f9c1
@@ -41,10 +50,11 @@
 #   }
 #
 # The "pid" is the LIVENESS handle for peer detection: `peers` treats an entry as
-# a live peer only when `kill -0 <pid>` succeeds, and prunes the entry otherwise —
-# the same pattern as the legacy `.loom/daemon-loop.pid` check. It defaults to the
-# invoking process's parent PID ($PPID, i.e. the long-lived orchestrator/session
-# process that outlives each ephemeral Bash tool call), overridable with `--pid`.
+# a live peer only when the PID is still alive, and prunes the entry otherwise —
+# the same pattern as the legacy `.loom/daemon-loop.pid` check. It must name the
+# long-lived orchestrator/session process that spans the WHOLE sweep, and is
+# overridable with `--pid`. The default is resolved by `resolve_liveness_pid`,
+# NOT taken as a bare `$PPID` — see the "Liveness (#4691)" section in the source.
 #
 # Usage:
 #   sweep-run-registry.sh new [--pid P]     # print a fresh RUN_ID, register it
@@ -62,8 +72,11 @@
 
 set -euo pipefail
 
+# Print the leading comment header (from line 3 to the first non-comment line) as
+# usage text. Derived, not a hard-coded line range, so editing the header can
+# never silently truncate `--help`.
 usage() {
-    sed -n '3,61p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR < 3 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
     exit 1
 }
 
@@ -99,6 +112,78 @@ remove_run_artifacts() {
     rm -f "$(checkpoint_dir)/main-clean-baseline-${rid}.txt"
 }
 
+# ---------------------------------------------------------------------------
+# Liveness (#4691)
+# ---------------------------------------------------------------------------
+#
+# Is `$1` a one-shot `<shell> -c …` wrapper process?
+#
+# An agent harness (Claude Code's Bash tool, and any `bash -c`/`zsh -c` wrapper)
+# spawns a FRESH shell per tool call and reaps it the moment that call returns.
+# Such a process is never a valid liveness handle for a sweep that spans hundreds
+# of tool calls. An INTERACTIVE or login shell (no `-c`) is long-lived and IS a
+# valid handle, so the `-c` flag — not merely "is a shell" — is the discriminator.
+is_oneshot_shell() {
+    local pid="${1:-}" comm base args a0 a1
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+    [[ -n "$comm" ]] || return 1
+    base="${comm##*/}"
+    base="${base#-}" # a login shell reports as "-zsh"
+    case "$base" in
+        sh | bash | zsh | dash | ksh | ksh93 | mksh) ;;
+        *) return 1 ;;
+    esac
+    args=$(ps -o args= -p "$pid" 2>/dev/null) || return 1
+    # argv[1] carries the flags; `-c`, `-lc`, `-ec` … all mean "run this string".
+    read -r a0 a1 _ <<< "$args"
+    [[ -n "$a0" ]] || return 1
+    [[ "${a1:-}" == -*c* ]]
+}
+
+# Resolve the PID to record as this run's liveness handle: walk up from $PPID
+# past every one-shot shell wrapper to the first ancestor that outlives a single
+# tool call (in practice the `claude -p /loom:sweep …` orchestrator). Falls back
+# to $PPID whenever `ps` is unavailable or the walk cannot proceed, which is
+# exactly the pre-#4691 behavior — never worse.
+resolve_liveness_pid() {
+    local pid="${PPID:-$$}" parent depth=0
+    while ((depth < 8)); do
+        is_oneshot_shell "$pid" || break
+        parent=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+        # Stop at an unreadable parent, or at pid 1 (init is not a sweep owner).
+        if ! [[ "$parent" =~ ^[0-9]+$ ]] || ((parent <= 1)); then
+            break
+        fi
+        pid="$parent"
+        depth=$((depth + 1))
+    done
+    echo "$pid"
+}
+
+# Is `$1` a live process, biased to fail SAFE (#4691)?
+#
+# POSIX `kill(2)` has two distinct failure modes and a bare `kill -0` conflates
+# them:
+#   ESRCH — no such process        → genuinely dead, safe to prune.
+#   EPERM — the process EXISTS but this caller may not signal it (different UID,
+#           sandbox, namespace)    → NOT dead; pruning it destroys live state.
+# `ps -p` answers "does this PID exist?" without needing signal permission, so it
+# separates the two without parsing locale-dependent errno strings. A zombie
+# (state `Z`) has exited and is only awaiting reaping, so it counts as dead.
+pid_is_live() {
+    local pid="${1:-}" state
+    if ! [[ "$pid" =~ ^[0-9]+$ ]] || ((pid <= 0)); then
+        return 1
+    fi
+    # Fast path: the signal would be deliverable ⇒ definitely alive.
+    kill -0 "$pid" 2>/dev/null && return 0
+    state=$(ps -o state= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    [[ -n "$state" ]] || return 1        # ESRCH (or no usable `ps`): treat as dead.
+    [[ "${state:0:1}" == "Z" ]] && return 1
+    return 0 # EPERM and friends: the process exists — fail safe, treat as alive.
+}
+
 iso_now() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
@@ -126,7 +211,8 @@ gen_run_id() {
 }
 
 cmd_new() {
-    local pid="${PPID:-$$}"
+    local pid
+    pid="$(resolve_liveness_pid)"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --pid)
@@ -176,7 +262,7 @@ prune_dead() {
         rid=$(json_field "$file" run_id)
         [[ -n "$skip" && "$rid" == "$skip" ]] && continue
         pid=$(json_num "$file" pid)
-        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        if ! pid_is_live "$pid"; then
             # Dead run: reap its baseline too, so a crashed sweep self-heals on
             # the next sweep's peer scan instead of waiting for the bulk path.
             remove_run_artifacts "$rid"
@@ -201,7 +287,7 @@ cmd_peers() {
         # Skip our own entry.
         [[ "$rid" == "$self" ]] && continue
         pid=$(json_num "$file" pid)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if pid_is_live "$pid"; then
             ts=$(json_field "$file" timestamp)
             echo "$rid $pid $ts"
         else

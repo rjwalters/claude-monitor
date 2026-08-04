@@ -16,6 +16,9 @@
 #   (j) local-only custom role -> survives untouched
 #   (k) resync-ignore pins a new-surface file -> reported "skipped"
 #   (l) symlinked install target -> skipped, not clobbered
+#   (l2) symlinked SOURCE file -> resolved to its content (not a copied link),
+#        appears in the per-file report (updated/unchanged), destination-side
+#        symlink protection (l) is unaffected (#5222)
 #   (m) recorded loom_source gone -> clear error, exit 1
 #   (n) metadata re-stamp -> loom_version/loom_commit/last_resync present after apply
 # Canonical-guard-defer (#4041, #4403, #4566):
@@ -26,6 +29,13 @@
 #   (q) invoked from a linked worktree -> non-zero exit, NOTHING written to main
 #   (r) --allow-worktree / LOOM_RESYNC_ALLOW_WORKTREE=1 -> permitted (warns)
 #   (s) main checkout (incl. a subdirectory of it)      -> unaffected, exit 0
+# Self-update safety (#4669):
+#   (t) the REAL script, installed as a padded "older" copy, resyncs itself from
+#       a substantially different newer source -> run completes, no mid-run
+#       syntax error, self-copy applied LAST, other surfaces fully refreshed
+#   (u) an updated file gets a new inode (staged + renamed, not truncated) with
+#       its permissions preserved, and leaves no .resync-stage.* dirt
+#   (v) an unsyncable file -> explicit PARTIAL REFRESH report + exit 1
 # Plus contract checks:
 #   - --help prints usage (documenting --allow-worktree), exit 0
 #   - unknown arg exits 1
@@ -86,6 +96,10 @@ export GIT_COMMITTER_NAME="test" GIT_COMMITTER_EMAIL="test@example.com"
 #   .loom/scripts/custom-only.sh     (repo-specific, no defaults/ counterpart)
 # Widened surfaces (#4239):
 #   defaults/roles/builder.md            -> .loom/roles/builder.md (drift)
+#   defaults/roles/symlinked-role.md     -> .loom/roles/symlinked-role.md (SOURCE
+#                                            is a symlink to a sibling file, #5222 —
+#                                            mirrors defaults/roles/*.md -> ../.claude/
+#                                            commands/loom/*.md in the real repo)
 #   defaults/docs/troubleshooting.md     -> .loom/docs/troubleshooting.md (drift)
 #   defaults/.loom/bin/loom              -> .loom/bin/loom (drift)
 #   defaults/.claude/commands/loom/x.md  -> .claude/commands/loom/x.md (drift)
@@ -118,6 +132,12 @@ make_fixture() {
     printf 'ROLE-NEW\n' > "$repo/defaults/roles/builder.md"
     printf 'ROLE-OLD\n' > "$repo/.loom/roles/builder.md"
     printf 'CUSTOM-ROLE\n' > "$repo/.loom/roles/custom-role.md"   # local-only
+
+    # #5222: a SOURCE-side symlink, mirroring the real defaults/roles/*.md ->
+    # ../.claude/commands/loom/*.md skillification layout. sync_one/resync_tree
+    # must resolve this to its target's content, never copy the link itself.
+    printf 'SYMLINK-TARGET-CONTENT\n' > "$repo/defaults/roles/_symlink-target.md"
+    ln -s "_symlink-target.md" "$repo/defaults/roles/symlinked-role.md"
 
     printf 'DOC-NEW\n' > "$repo/defaults/docs/troubleshooting.md"
     printf 'DOC-OLD\n' > "$repo/.loom/docs/troubleshooting.md"
@@ -324,6 +344,69 @@ if [[ -L "$REPO/.loom/docs/troubleshooting.md" ]]; then
     pass "(l) symlink left intact (not clobbered into a regular file)"
 else
     fail "(l) symlink was clobbered"
+fi
+
+# --- (l2) symlinked SOURCE file is resolved to content, not silently skipped -
+#
+# #5222: defaults/roles/symlinked-role.md (built by make_fixture as a symlink
+# to the sibling defaults/roles/_symlink-target.md) mirrors the real repo's
+# defaults/roles/*.md -> ../.claude/commands/loom/*.md skillification layout.
+# Before the fix, plain `find -type f` lstats each entry, a symlink never
+# matches `-type f`, so this file fell out of the walk entirely -- never
+# reported, never copied -- while the consumer's install-metadata.json still
+# got re-stamped current. The regression check: the resolved destination must
+# be a REGULAR FILE with the target's content, not a symlink, and the file
+# must show up in the per-file report.
+echo "Test group 10b: symlinked SOURCE file is resolved to content (#5222)"
+REPO="$(make_fixture)"
+DRY_OUT="$(cd "$REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+RC=$?
+if [[ $RC -eq 2 ]] && grep -q "roles/symlinked-role.md" <<<"$DRY_OUT"; then
+    pass "(l2) --dry-run reports the symlinked source file, not silently omitted"
+else
+    fail "(l2) --dry-run did not report roles/symlinked-role.md (rc=$RC)"
+fi
+if [[ ! -e "$REPO/.loom/roles/symlinked-role.md" ]]; then
+    pass "(l2) --dry-run created nothing for the symlinked source file"
+else
+    fail "(l2) --dry-run unexpectedly wrote .loom/roles/symlinked-role.md"
+fi
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(l2) apply exits 0"; else fail "(l2) apply exits 0 (got $RC)"; fi
+if grep -q "roles/symlinked-role.md" <<<"$OUT"; then
+    pass "(l2) apply reports the symlinked source file in the per-file output"
+else
+    fail "(l2) apply did not report roles/symlinked-role.md"
+fi
+if [[ -f "$REPO/.loom/roles/symlinked-role.md" && ! -L "$REPO/.loom/roles/symlinked-role.md" ]]; then
+    pass "(l2) destination is a REGULAR FILE (not a copied symlink)"
+else
+    fail "(l2) destination is missing or is itself a symlink"
+fi
+if [[ "$(cat "$REPO/.loom/roles/symlinked-role.md" 2>/dev/null)" == "SYMLINK-TARGET-CONTENT" ]]; then
+    pass "(l2) destination content matches the symlink's RESOLVED target"
+else
+    fail "(l2) destination content does not match the resolved target"
+fi
+# Idempotent rerun: no drift once the symlinked source has been resolved once.
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(l2) rerun is a clean no-op (symlinked source treated as unchanged)"
+else
+    fail "(l2) rerun was not a clean no-op (rc=$RC)"
+fi
+# The destination-side symlink protection case (l) must be completely
+# unaffected by resolving SOURCE-side symlinks.
+REPO2="$(make_fixture)"
+rm -f "$REPO2/.loom/docs/troubleshooting.md"
+ln -s "../../defaults/docs/troubleshooting.md" "$REPO2/.loom/docs/troubleshooting.md"
+(cd "$REPO2" && bash "$SCRIPT" >/dev/null 2>&1)
+if [[ -L "$REPO2/.loom/docs/troubleshooting.md" ]]; then
+    pass "(l2) destination-side symlink protection (l) still holds alongside the source-side fix"
+else
+    fail "(l2) destination-side symlink protection (l) regressed"
 fi
 
 # --- (m) recorded loom_source gone -> clear error, exit 1 --------------------
@@ -533,9 +616,16 @@ fi
 echo "Test group 12c: absent daemon binary -> loud warning, apply still exits 0 (#4280)"
 REPO="$(make_fixture)"
 # Force the resolver to find nothing: no LOOM_DAEMON_BIN, no PATH loom-daemon,
-# no build-output under the fixture's SOURCE_ROOT (the fixture repo).
-OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="/usr/bin:/bin" bash "$SCRIPT" 2>&1)"
+# no build-output under the fixture's SOURCE_ROOT (the fixture repo), and no
+# machine-level install fallback (step 4 of loom_locate_daemon_bin) -- on a
+# host with a genuine machine-level Loom install, leaving $HOME/
+# LOOM_DAEMON_BIN_DIR untouched would let that step resolve the real binary
+# and defeat this fixture (#5183).
+NO_BIN_HOME="$(mktemp -d)"
+OUT="$(cd "$REPO" && env -u LOOM_DAEMON_BIN PATH="/usr/bin:/bin" HOME="$NO_BIN_HOME" \
+    LOOM_DAEMON_BIN_DIR="/nonexistent" bash "$SCRIPT" 2>&1)"
 RC=$?
+rm -rf "$NO_BIN_HOME"
 if [[ $RC -eq 0 ]]; then
     pass "(#4280) apply still exits 0 when no daemon binary resolves"
 else
@@ -613,7 +703,7 @@ fi
 echo "Test group 14: canonical guard present + tracked vendored guard is preserved (#4403)"
 REPO="$(make_fixture)"
 mkdir -p "$REPO/.claude/skills/repo/hooks"
-printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\necho canonical\n' \
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\necho canonical\n' \
     > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 printf '#!/usr/bin/env bash\necho vendored\n' \
     > "$REPO/defaults/hooks/guard-destructive-generic.sh"
@@ -669,7 +759,7 @@ fi
 echo "Test group 15: canonical guard present + UNTRACKED vendored guard is still removed (#4403)"
 REPO="$(make_fixture)"
 mkdir -p "$REPO/.claude/skills/repo/hooks"
-printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\necho canonical\n' \
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard\n# implements worktree-write-confinement\necho canonical\n' \
     > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
 printf '#!/usr/bin/env bash\necho vendored\n' \
     > "$REPO/defaults/hooks/guard-destructive-generic.sh"
@@ -689,6 +779,32 @@ if grep -q "removed.*hooks/guard-destructive-generic.sh" <<<"$OUT"; then
     pass "(#4403) removal reported as before"
 else
     fail "(#4403) removal not reported"
+fi
+
+# --- (#4894) capability-gap canonical guard: vendored guard must be KEPT ----
+# The canonical guard carries the repo#29 VERSION marker but NOT the
+# write-confinement CAPABILITY marker (the Repo Skills 0.7.0 shape that
+# motivated #4894). Before #4894, CANONICAL_GUARD_PRESENT was version-only, so
+# this untracked vendored copy would have been removed here too — stripping
+# the dispatcher's fallback out from under it and leaving zero destructive-
+# command coverage, since the dispatcher (correctly, post-#4894) declines to
+# exec a canonical guard that fails the capability probe.
+echo "Test group 15b: canonical guard has version marker but NOT capability marker -> vendored guard is kept, not removed (#4894)"
+REPO="$(make_fixture)"
+mkdir -p "$REPO/.claude/skills/repo/hooks"
+printf '#!/usr/bin/env bash\n# rjwalters/repo#29 canonical guard ONLY\necho canonical\n' \
+    > "$REPO/.claude/skills/repo/hooks/guard-destructive.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/defaults/hooks/guard-destructive-generic.sh"
+printf '#!/usr/bin/env bash\necho vendored\n' \
+    > "$REPO/.loom/hooks/guard-destructive-generic.sh"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then pass "(#4894) apply exits 0 with a capability-gap canonical guard present"; else fail "(#4894) apply exits 0 (got $RC)"; fi
+if [[ -f "$REPO/.loom/hooks/guard-destructive-generic.sh" ]]; then
+    pass "(#4894) vendored guard-destructive-generic.sh is KEPT (dispatcher's fallback preserved)"
+else
+    fail "(#4894) vendored guard-destructive-generic.sh was removed despite the canonical guard lacking write-confinement"
 fi
 
 # --- (#4563) refuse to run from a linked worktree ----------------------------
@@ -791,6 +907,226 @@ if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
     pass "(#4563) run from a main-checkout subdirectory still applies the resync"
 else
     fail "(#4563) run from a main-checkout subdirectory did not apply the resync"
+fi
+
+# --- (#4669) the resync must survive updating the script it is running -------
+#
+# resync-installed.sh is itself a file under defaults/scripts/, so every run
+# copies a newer version over the very path the running bash process is still
+# reading from. The old in-place `cp` truncated and rewrote that file, letting
+# bash resume reading the (shorter) new file at a stale byte offset -> `syntax
+# error near unexpected token`, aborting the run with dozens of surfaces
+# already partially refreshed.
+#
+# This drives the REAL script as the installed/running copy, padded so it
+# differs substantially in both content and byte offsets from the newer source
+# that replaces it mid-run — the exact reported scenario.
+echo "Test group 18: self-update is atomic + deferred; the run completes (#4669)"
+
+# Builds $1/.loom/scripts/resync-installed.sh as a padded "older" variant of the
+# real script, with the real script as the defaults/ source it will sync from.
+make_self_update_fixture() {
+    local repo="$1"
+    mkdir -p "$repo/defaults/scripts" "$repo/.loom/scripts"
+    cp "$SCRIPT" "$repo/defaults/scripts/resync-installed.sh"
+    chmod +x "$repo/defaults/scripts/resync-installed.sh"
+    {
+        head -n 1 "$SCRIPT"
+        awk 'BEGIN { for (i = 0; i < 6000; i++) print "# old-installed-version padding line " i }'
+        tail -n +2 "$SCRIPT"
+    } > "$repo/.loom/scripts/resync-installed.sh"
+    chmod +x "$repo/.loom/scripts/resync-installed.sh"
+}
+
+REPO="$(make_fixture)"
+make_self_update_fixture "$REPO"
+INSTALLED_RESYNC="$REPO/.loom/scripts/resync-installed.sh"
+RC=0; OUT="$(cd "$REPO" && bash "$INSTALLED_RESYNC" 2>&1)" || RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(#4669) a self-updating run completes cleanly (exit 0)"
+else
+    fail "(#4669) a self-updating run did not exit 0 (got $RC)"
+fi
+if grep -qiE "syntax error|unexpected token|unexpected end of file" <<<"$OUT"; then
+    fail "(#4669) the running script observed a half-written copy of itself: $(grep -iE "syntax error|unexpected token|unexpected end of file" <<<"$OUT" | head -1)"
+else
+    pass "(#4669) no mid-run syntax error from the rewritten script"
+fi
+if cmp -s "$REPO/defaults/scripts/resync-installed.sh" "$INSTALLED_RESYNC"; then
+    pass "(#4669) the installed resync script was updated to match defaults/"
+else
+    fail "(#4669) the installed resync script was not updated"
+fi
+if [[ -x "$INSTALLED_RESYNC" ]] && bash -n "$INSTALLED_RESYNC" 2>/dev/null; then
+    pass "(#4669) the updated installed script is executable and syntactically whole"
+else
+    fail "(#4669) the updated installed script is not executable/parseable"
+fi
+# The self-update must not cost the rest of the refresh (the reported failure
+# left unrelated surfaces half-refreshed).
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" && -f "$REPO/.loom/scripts/lib/bar.sh" && \
+      "$(cat "$REPO/.loom/roles/builder.md")" == "ROLE-NEW" && \
+      "$(cat "$REPO/.claude/commands/loom/builder.md")" == "CMD-NEW" ]]; then
+    pass "(#4669) every other surface was still fully refreshed in the same run"
+else
+    fail "(#4669) the self-updating run left other surfaces unrefreshed"
+fi
+# Deferral: the self-copy is applied only after every other surface settled.
+SELF_LINE="$(grep -n "scripts/resync-installed.sh" <<<"$OUT" | tail -1 | cut -d: -f1)"
+OTHER_LINE="$(grep -n "commands/loom/builder.md" <<<"$OUT" | tail -1 | cut -d: -f1)"
+if [[ -n "$SELF_LINE" && -n "$OTHER_LINE" && "$SELF_LINE" -gt "$OTHER_LINE" ]]; then
+    pass "(#4669) the self-copy is applied last, after the other surfaces"
+else
+    fail "(#4669) the self-copy was not deferred to the end (self=$SELF_LINE other=$OTHER_LINE)"
+fi
+# Rerunning the freshly-updated installed copy is a clean no-op.
+RC=0; OUT="$(cd "$REPO" && bash "$INSTALLED_RESYNC" 2>&1)" || RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(#4669) rerunning the updated installed copy is idempotent (already in sync)"
+else
+    fail "(#4669) rerunning the updated installed copy was not a clean no-op (rc=$RC)"
+fi
+# --dry-run must still preview the self-update without writing it.
+REPO="$(make_fixture)"
+make_self_update_fixture "$REPO"
+INSTALLED_RESYNC="$REPO/.loom/scripts/resync-installed.sh"
+cp "$INSTALLED_RESYNC" "$WORKDIR/self-before-dry-run"
+RC=0; OUT="$(cd "$REPO" && bash "$INSTALLED_RESYNC" --dry-run 2>&1)" || RC=$?
+if [[ $RC -eq 2 ]] && grep -q "scripts/resync-installed.sh" <<<"$OUT"; then
+    pass "(#4669) --dry-run previews the self-update (exit 2)"
+else
+    fail "(#4669) --dry-run did not preview the self-update (rc=$RC)"
+fi
+if cmp -s "$WORKDIR/self-before-dry-run" "$INSTALLED_RESYNC"; then
+    pass "(#4669) --dry-run left the running script byte-identical"
+else
+    fail "(#4669) --dry-run modified the running script"
+fi
+
+# --- (#4669) writes are staged + renamed, never done in place ----------------
+echo "Test group 19: installed files are replaced by atomic rename (#4669)"
+REPO="$(make_fixture)"
+INODE_BEFORE="$(ls -i "$REPO/.loom/hooks/guard.sh" | awk '{print $1}')"
+MODE_BEFORE="$(ls -l "$REPO/.loom/docs/troubleshooting.md" | awk '{print $1}')"
+(cd "$REPO" && bash "$SCRIPT" >/dev/null 2>&1)
+INODE_AFTER="$(ls -i "$REPO/.loom/hooks/guard.sh" | awk '{print $1}')"
+MODE_AFTER="$(ls -l "$REPO/.loom/docs/troubleshooting.md" | awk '{print $1}')"
+if [[ -n "$INODE_BEFORE" && "$INODE_BEFORE" != "$INODE_AFTER" ]]; then
+    pass "(#4669) an updated file gets a NEW inode (renamed into place, not truncated)"
+else
+    fail "(#4669) the updated file kept its inode (still rewritten in place)"
+fi
+if [[ "$MODE_BEFORE" == "$MODE_AFTER" ]]; then
+    pass "(#4669) the rename preserves the destination's permissions (not mktemp's 0600)"
+else
+    fail "(#4669) permissions changed across the rename ($MODE_BEFORE -> $MODE_AFTER)"
+fi
+STRAY_STAGE="$(find "$REPO" -name '.resync-stage.*' 2>/dev/null | wc -l | tr -d '[:space:]')"
+if [[ "$STRAY_STAGE" == "0" ]]; then
+    pass "(#4669) no staging temp files are left behind"
+else
+    fail "(#4669) $STRAY_STAGE staging temp file(s) left behind"
+fi
+
+# --- (#4669) a failed file is reported as a PARTIAL refresh, never swallowed --
+echo "Test group 20: an unsyncable file reports a PARTIAL refresh and exits 1 (#4669)"
+if [[ "$(id -u)" -eq 0 ]]; then
+    skip "(#4669) running as root — an unwritable destination cannot be simulated"
+else
+    REPO="$(make_fixture)"
+    chmod 500 "$REPO/.loom/scripts/lib"      # scripts/lib/bar.sh cannot be staged here
+    RC=0; OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)" || RC=$?
+    chmod 700 "$REPO/.loom/scripts/lib"
+    if [[ $RC -eq 1 ]]; then
+        pass "(#4669) an unsyncable file exits 1"
+    else
+        fail "(#4669) an unsyncable file did not exit 1 (got $RC)"
+    fi
+    if grep -q "PARTIAL REFRESH" <<<"$OUT" && grep -q "scripts/lib/bar.sh" <<<"$OUT"; then
+        pass "(#4669) the summary names the partial state and the failed path"
+    else
+        fail "(#4669) the summary did not report the partial state / failed path"
+    fi
+    if grep -qi "re-running completes the refresh\|fixing the cause" <<<"$OUT"; then
+        pass "(#4669) the summary states the recovery action"
+    else
+        fail "(#4669) the summary does not state a recovery action"
+    fi
+    if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "A" ]]; then
+        pass "(#4669) unrelated surfaces are still refreshed despite the failure"
+    else
+        fail "(#4669) the failure aborted the rest of the refresh"
+    fi
+    if grep -q "Already in sync\|file(s) updated," <<<"$OUT"; then
+        fail "(#4669) a partial refresh still printed a success summary"
+    else
+        pass "(#4669) no success summary is printed for a partial refresh"
+    fi
+fi
+
+# --- (w) .loom/runtimes/ backfill for a workspace that never had it (#4688) --
+echo "Test group 21: .loom/runtimes/ is backfilled when absent (#4688)"
+# Builds its own throwaway repo rather than reusing make_fixture(), so it can
+# deliberately NOT create .loom/runtimes/ at all — the exact live-incident
+# layout: .loom/roles/ (and the rest of a normal install) present, but
+# .loom/runtimes/ was never provisioned by any prior install/resync.
+RUNTIMES_REPO="$WORKDIR/runtimes-repo"
+rm -rf "$RUNTIMES_REPO"
+mkdir -p "$RUNTIMES_REPO/defaults/roles" "$RUNTIMES_REPO/defaults/runtimes" \
+         "$RUNTIMES_REPO/.loom/roles"
+git -C "$RUNTIMES_REPO" init -q
+printf 'ROLE\n' > "$RUNTIMES_REPO/defaults/roles/builder.md"
+printf 'ROLE\n' > "$RUNTIMES_REPO/.loom/roles/builder.md"
+printf '{"runtime":"claude","capabilities":{"mcp":"yes"}}\n' > "$RUNTIMES_REPO/defaults/runtimes/claude.json"
+printf '{\n  "loom_version": "0.0.0",\n  "loom_commit": "old",\n  "install_date": "2020-01-01",\n  "loom_source": "%s",\n  "installed_files": []\n}\n' \
+    "$RUNTIMES_REPO" > "$RUNTIMES_REPO/.loom/install-metadata.json"
+git -C "$RUNTIMES_REPO" add -A >/dev/null 2>&1
+git -C "$RUNTIMES_REPO" commit -qm "fixture" >/dev/null 2>&1
+
+if [[ ! -d "$RUNTIMES_REPO/.loom/runtimes" ]]; then
+    pass "(w) fixture precondition: .loom/runtimes/ absent before resync"
+else
+    fail "(w) fixture precondition: .loom/runtimes/ unexpectedly present before resync"
+fi
+
+# --dry-run must report the directory would be populated, without writing.
+OUT="$(cd "$RUNTIMES_REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+if grep -q "runtimes/claude.json" <<<"$OUT"; then
+    pass "(w) --dry-run reports runtimes/claude.json would be created"
+else
+    fail "(w) --dry-run did not mention runtimes/claude.json"
+fi
+if [[ ! -d "$RUNTIMES_REPO/.loom/runtimes" ]]; then
+    pass "(w) --dry-run does not create .loom/runtimes/"
+else
+    fail "(w) --dry-run created .loom/runtimes/ (should be preview-only)"
+fi
+
+# apply: the directory must now exist and be populated from defaults/.
+OUT="$(cd "$RUNTIMES_REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]]; then
+    pass "(w) apply exits 0"
+else
+    fail "(w) apply did not exit 0 (got $RC)"
+fi
+if [[ -d "$RUNTIMES_REPO/.loom/runtimes" ]]; then
+    pass "(w) .loom/runtimes/ created by apply"
+else
+    fail "(w) .loom/runtimes/ was not created by apply"
+fi
+if [[ "$(cat "$RUNTIMES_REPO/.loom/runtimes/claude.json" 2>/dev/null)" == '{"runtime":"claude","capabilities":{"mcp":"yes"}}' ]]; then
+    pass "(w) .loom/runtimes/claude.json populated from defaults/runtimes/"
+else
+    fail "(w) .loom/runtimes/claude.json missing or content mismatch"
+fi
+# second run is a clean no-op.
+OUT="$(cd "$RUNTIMES_REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -q "Already in sync" <<<"$OUT"; then
+    pass "(w) runtimes backfill is idempotent (second run already in sync)"
+else
+    fail "(w) runtimes backfill is not idempotent (rc=$RC)"
 fi
 
 # --- contract checks ---------------------------------------------------------

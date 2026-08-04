@@ -25,6 +25,10 @@
 #      exit-code passthrough
 #   9. LOOM_RUNTIME=codex resolution through spawn-worker.sh
 #  10. classify-error.sh `codex` provider vectors (+ `claude` unchanged)
+#  11. managed `pre_tool_use` hook readiness/trust preflight (#4495): mutable
+#      roles exit 78 before the CLI starts on any not-ready state; read-only
+#      roles keep the conservative fallback with an explicit warning; the
+#      capability manifest stays evidence-gated at `partial`
 #
 # Usage:
 #   ./.loom/scripts/tests/test-spawn-codex.sh
@@ -325,6 +329,61 @@ assert_not_contains "--use-wrapper" "$out" \
 out="$(run_argv LOOM_EFFORT=high -- -p x -c model_reasoning_effort=low)"
 assert_not_contains "model_reasoning_effort=high" "$out" \
     "an explicit -c model_reasoning_effort= wins over LOOM_EFFORT"
+
+# ============================================================
+# Section 3b: Claude-shaped model refusal (issue #5028)
+# ============================================================
+
+echo ""
+echo "Testing spawn-codex.sh Claude-shaped model refusal..."
+
+run_refusal() {
+    # usage: run_refusal [VAR=val ...] -- <args...>
+    local -a envs=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do envs+=("$1"); shift; done
+    shift || true
+    set +e
+    out="$(env -u CODEX_HOME -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE \
+        -u LOOM_CODEX_SANDBOX -u LOOM_CODEX_NETWORK -u LOOM_MODEL \
+        -u LOOM_EFFORT -u LOOM_CODEX_MODEL \
+        LOOM_SWEEP_NICE=0 LOOM_SPAWN_NO_EXPORT=1 \
+        ${envs[@]+"${envs[@]}"} \
+        bash "$SPAWN_CODEX" "$@" 2>&1)"
+    REFUSAL_RC=$?
+    set -e
+    REFUSAL_OUT="$out"
+}
+
+for claude_model in opus opusplan sonnet haiku fable claude-opus-5 OPUS "sonnet@xhigh"; do
+    run_refusal -- -p x -m "$claude_model"
+    assert_eq "78" "$REFUSAL_RC" "explicit -m $claude_model exits 78 (EX_CONFIG)"
+    assert_contains "refusing Claude-shaped model" "$REFUSAL_OUT" \
+        "the refusal message names the problem for -m $claude_model"
+    assert_contains "autonomous.roleRunner.roleModels" "$REFUSAL_OUT" \
+        "the refusal names the config key to fix for -m $claude_model"
+done
+
+# The refusal fires identically via LOOM_MODEL and LOOM_CODEX_MODEL, not just -m.
+run_refusal LOOM_MODEL=sonnet -- -p x
+assert_eq "78" "$REFUSAL_RC" "LOOM_MODEL=sonnet exits 78"
+run_refusal LOOM_CODEX_MODEL=opus -- -p x
+assert_eq "78" "$REFUSAL_RC" "LOOM_CODEX_MODEL=opus exits 78"
+
+# No argv is ever assembled for a refused launch.
+run_refusal -- -p x -m sonnet
+assert_not_contains "would-exec" "$REFUSAL_OUT" \
+    "a refused launch never reaches argv assembly/dispatch"
+
+# Fail-open: Codex-valid and unrecognized model names are never refused.
+for ok_model in gpt-5-codex o3-mini gpt-4.1 mystery-model-9000; do
+    out="$(run_argv -- -p x -m "$ok_model")"
+    assert_contains "-m $ok_model" "$out" "a Codex/unrecognized model '$ok_model' is never refused"
+done
+
+# Escape hatch: with LOOM_CODEX_NO_EXEC=1 (argv-only mode), the refusal check
+# is bypassed entirely and the run proceeds to normal argv assembly.
+out="$(run_argv LOOM_CODEX_MODEL_CHECK=0 -- -p x -m sonnet)"
+assert_contains "-m sonnet" "$out" "LOOM_CODEX_MODEL_CHECK=0 disables the refusal"
 
 # ============================================================
 # Section 4: git-repo trust check (live-CLI behavior)
@@ -830,6 +889,238 @@ assert_classify "RECOVERABLE" "Not inside a trusted directory" 1 amp \
 assert_eq "FATAL" \
     "$(LOOM_RUNTIME=codex classify_error "Not inside a trusted directory" 1)" \
     "LOOM_RUNTIME=codex selects the codex table for a two-arg call"
+
+# ============================================================
+# Managed Codex hook readiness / trust preflight (issue #4495)
+#
+# Hermetic: only temporary CODEX_HOME profiles and the repo's own bridge file.
+# The real Codex CLI is never invoked (LOOM_CODEX_NO_EXEC=1 short-circuits
+# before any exec, and the preflight runs BEFORE that hook anyway).
+# ============================================================
+echo ""
+echo "Testing managed Codex hook readiness preflight (#4495)..."
+
+PROVISION_SCRIPT="$SCRIPTS_DIR/provision-codex-hooks.sh"
+BRIDGE_SCRIPT="$(cd "$SCRIPTS_DIR/../hooks" 2>/dev/null && pwd)/guard-codex-bridge.sh"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if bash -n "$PROVISION_SCRIPT" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: provision-codex-hooks.sh passes bash -n"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: provision-codex-hooks.sh fails bash -n"
+fi
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if bash -n "$BRIDGE_SCRIPT" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: guard-codex-bridge.sh passes bash -n"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: guard-codex-bridge.sh fails bash -n"
+fi
+
+HOOKTMP="$(mktemp -d)"
+mk_hook_profile() {
+    local name="$1"
+    local dir="$HOOKTMP/$name"
+    mkdir -p "$dir"
+    printf '{"tokens":{"refresh_token":"sk-loom-FAKE-4495"}}\n' > "$dir/auth.json"
+    printf '%s' "$dir"
+}
+
+# run_preflight <expect-exit> <description> [VAR=val ...]
+#
+# Publishes the combined stdout+stderr in the global PREFLIGHT_OUT rather than
+# printing it: the assertions below must run in THIS shell, not inside a
+# command substitution, or their TESTS_RUN/TESTS_PASSED increments are lost in
+# the subshell and the suite silently under-counts.
+PREFLIGHT_OUT=""
+run_preflight() {
+    local expected="$1" desc="$2"
+    shift 2
+    local rc=0
+    PREFLIGHT_OUT="$(env -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE -u LOOM_CODEX_SANDBOX \
+        -u LOOM_CODEX_NETWORK -u LOOM_MODEL -u LOOM_EFFORT -u LOOM_CODEX_MODEL -u LOOM_ROLE \
+        LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_SPAWN_NO_EXPORT=1 \
+        "$@" bash "$SPAWN_CODEX" -p "hi" 2>&1)" || rc=$?
+    assert_eq "$expected" "$rc" "$desc"
+}
+
+READY_PROFILE="$(mk_hook_profile ready)"
+# No explicit --bridge here: production `install` never passes one either, so
+# this must resolve the bridge the exact same way spawn-codex.sh's `verify`
+# call does (via resolve_bridge()'s --workspace-relative candidate). Pinning
+# to $BRIDGE_SCRIPT (the defaults/ copy) would diverge from verify's
+# resolution whenever a workspace-local .loom/hooks/guard-codex-bridge.sh
+# copy also exists (see #4787), spuriously reporting hooks=not-ready.
+bash "$PROVISION_SCRIPT" install --codex-home "$READY_PROFILE" \
+    --workspace "$(pwd)" >/dev/null 2>&1
+printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$READY_PROFILE/config.toml"
+
+BARE_PROFILE="$(mk_hook_profile bare)"
+
+# (1) Builder with a ready profile starts.
+run_preflight 0 "builder + ready managed hook -> proceeds" \
+    LOOM_ROLE=builder CODEX_HOME="$READY_PROFILE"
+out="$PREFLIGHT_OUT"
+assert_contains "hooks=ready" "$out" "audit line reports hooks=ready"
+assert_contains "trust-bypass=never" "$out" "audit line records that trust is never bypassed"
+assert_not_contains "sk-loom-FAKE-4495" "$out" "the audit line leaks no credential material"
+assert_not_contains "auth.json" "$out" "the audit line names no credential file for a ready profile"
+
+# (2) Builder with an unprovisioned profile fails closed BEFORE the CLI starts.
+run_preflight 78 "builder + unprovisioned profile -> exit 78" \
+    LOOM_ROLE=builder CODEX_HOME="$BARE_PROFILE"
+out="$PREFLIGHT_OUT"
+assert_not_contains "would-exec" "$out" "no codex argv is assembled when the preflight fails"
+assert_contains "not ready" "$out" "the failure explains that hook parity is not ready"
+
+# (3) Builder with a provisioned-but-untrusted profile fails closed.
+UNTRUSTED_PROFILE="$(mk_hook_profile untrusted)"
+bash "$PROVISION_SCRIPT" install --codex-home "$UNTRUSTED_PROFILE" \
+    --workspace "$(pwd)" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
+run_preflight 78 "builder + installed-but-untrusted profile -> exit 78" \
+    LOOM_ROLE=builder CODEX_HOME="$UNTRUSTED_PROFILE"
+
+# (4) Builder with a STALE (tampered) entry fails closed.
+STALE_PROFILE="$(mk_hook_profile stale)"
+bash "$PROVISION_SCRIPT" install --codex-home "$STALE_PROFILE" \
+    --workspace "$(pwd)" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
+printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$STALE_PROFILE/config.toml"
+jq '(.hooks.PreToolUse[].hooks[] | select(.command | contains("guard-codex-bridge.sh")) | .command) |= (. + " --tampered")' \
+    "$STALE_PROFILE/hooks.json" > "$STALE_PROFILE/hooks.tmp" \
+    && mv "$STALE_PROFILE/hooks.tmp" "$STALE_PROFILE/hooks.json"
+run_preflight 78 "builder + stale managed-hook entry -> exit 78" \
+    LOOM_ROLE=builder CODEX_HOME="$STALE_PROFILE"
+
+# (5) Doctor is a mutable role too.
+run_preflight 78 "doctor + unprovisioned profile -> exit 78" \
+    LOOM_ROLE=doctor CODEX_HOME="$BARE_PROFILE"
+run_preflight 78 "pr-fixer (doctor alias) -> exit 78" \
+    LOOM_ROLE=pr-fixer CODEX_HOME="$BARE_PROFILE"
+run_preflight 78 "development-worker (builder alias) -> exit 78" \
+    LOOM_ROLE=development-worker CODEX_HOME="$BARE_PROFILE"
+run_preflight 78 "BUILDER (case-insensitive) -> exit 78" \
+    LOOM_ROLE=BUILDER CODEX_HOME="$BARE_PROFILE"
+# Issue #4768: a daemon-dispatched sweep child is admitted against Builder's
+# requirements and gets LOOM_ROLE=sweep-lifecycle (never a bare "builder") —
+# it must get the SAME mutable-role fail-closed treatment, not the read-only
+# fallback an unrecognized role would silently take.
+run_preflight 78 "sweep-lifecycle (daemon sweep-child alias) -> exit 78" \
+    LOOM_ROLE=sweep-lifecycle CODEX_HOME="$BARE_PROFILE"
+
+# (6) Read-only roles keep the conservative fallback, with an explicit warning.
+run_preflight 0 "judge + unprovisioned profile -> proceeds (read-only role)" \
+    LOOM_ROLE=judge CODEX_HOME="$BARE_PROFILE"
+out="$PREFLIGHT_OUT"
+assert_contains "hook parity unavailable" "$out" \
+    "a read-only role is told, explicitly, that hook parity is unavailable"
+assert_contains "NOT Builder-capable" "$out" \
+    "a read-only fallback session is never reported as Builder-capable"
+assert_contains "would-exec" "$out" "a read-only role still assembles the codex argv"
+
+run_preflight 0 "no LOOM_ROLE + unprovisioned profile -> proceeds" \
+    CODEX_HOME="$BARE_PROFILE"
+out="$PREFLIGHT_OUT"
+assert_contains "role=unset" "$out" "the audit line reports an unset role"
+
+# (7) Ambient auth (no CODEX_HOME) is reported as unavailable, not ready.
+out="$(env -u CODEX_HOME -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE \
+    LOOM_SWEEP_NICE=0 LOOM_CODEX_NO_EXEC=1 LOOM_SPAWN_NO_EXPORT=1 \
+    LOOM_ROLE=judge bash "$SPAWN_CODEX" -p "hi" 2>&1)" || true
+assert_contains "hooks=unavailable" "$out" \
+    "ambient Codex login state reports hooks=unavailable"
+
+# (8) The adapter must never pass Codex's hook-trust bypass flag.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -nE '^[^#]*--dangerously-bypass-hook-trust' "$SPAWN_CODEX" \
+    | grep -vqE 'log_(error|warn|info)'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: spawn-codex.sh must never pass --dangerously-bypass-hook-trust"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: spawn-codex.sh never passes --dangerously-bypass-hook-trust"
+fi
+
+# ...and the config-key spelling of the same waiver (`-c bypass_hook_trust=true`),
+# which the 0.146.0 binary honors identically.
+TESTS_RUN=$((TESTS_RUN + 1))
+if grep -nE 'bypass_hook_trust' "$SPAWN_CODEX" | grep -vqE '#|log_(error|warn|info)'; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: spawn-codex.sh sets the bypass_hook_trust config key"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: spawn-codex.sh never sets the bypass_hook_trust config key"
+fi
+
+# (9) Capability truth stays gated: the manifest must remain `partial` until the
+#     #4495 evidence gate is satisfied, so #4494's admission keeps rejecting
+#     Builder/Doctor + Codex.
+CODEX_MANIFEST="$SCRIPTS_DIR/../runtimes/codex.json"
+assert_eq "partial" "$(jq -r '.capabilities.worktreeIsolation' "$CODEX_MANIFEST")" \
+    "codex.json worktreeIsolation is still 'partial' (evidence-gated, #4478/#4495)"
+assert_eq "partial" "$(jq -r '.capabilities.hooks' "$CODEX_MANIFEST")" \
+    "codex.json hooks is still 'partial' (evidence-gated, #4478/#4495)"
+assert_eq "no" "$(jq -r '.capabilities.subagents' "$CODEX_MANIFEST")" \
+    "codex.json subagents is unchanged by this phase"
+assert_eq "yes" "$(jq -r '.capabilities.mcp' "$CODEX_MANIFEST")" \
+    "codex.json mcp is unchanged by this phase"
+TESTS_RUN=$((TESTS_RUN + 1))
+if jq -e '.capabilityGate.pending | type == "array" and length > 0' "$CODEX_MANIFEST" >/dev/null 2>&1; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: codex.json records the outstanding promotion evidence"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: codex.json records the outstanding promotion evidence"
+fi
+
+# (10) Doctor declares the isolation/mutation requirements its real work needs,
+#      so capability admission rejects Doctor + Codex while the manifest is
+#      partial and admits it only once the capability is proven.
+DOCTOR_ROLE="$SCRIPTS_DIR/../roles/doctor.json"
+TESTS_RUN=$((TESTS_RUN + 1))
+if jq -e '.runtimeRequirements | index("worktreeIsolation") != null' "$DOCTOR_ROLE" >/dev/null 2>&1; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: doctor.json declares worktreeIsolation"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: doctor.json declares worktreeIsolation"
+fi
+
+set +e
+bash "$SCRIPTS_DIR/check-runtime-capabilities.sh" --role doctor --runtime codex \
+    --dir "$SCRIPTS_DIR/.." >/dev/null 2>&1
+doctor_codex_rc=$?
+set -e
+assert_eq "78" "$doctor_codex_rc" "doctor + codex is rejected while the manifest is partial (#4494)"
+
+# The same checker admits doctor + claude, so the new requirement is not a
+# blanket rejection.
+set +e
+bash "$SCRIPTS_DIR/check-runtime-capabilities.sh" --role doctor --runtime claude \
+    --dir "$SCRIPTS_DIR/.." >/dev/null 2>&1
+doctor_claude_rc=$?
+set -e
+assert_eq "0" "$doctor_claude_rc" "doctor + claude remains admitted"
+
+# ...and with a hypothetical PROMOTED codex manifest, doctor is admitted — the
+# inverse assertion that proves the gate is the manifest value, not a hard-coded
+# runtime denylist.
+PROMOTED_DIR="$HOOKTMP/promoted"
+mkdir -p "$PROMOTED_DIR/runtimes" "$PROMOTED_DIR/roles"
+jq '.capabilities.worktreeIsolation = "yes" | .capabilities.hooks = "yes"' \
+    "$CODEX_MANIFEST" > "$PROMOTED_DIR/runtimes/codex.json"
+cp "$DOCTOR_ROLE" "$PROMOTED_DIR/roles/doctor.json"
+set +e
+bash "$SCRIPTS_DIR/check-runtime-capabilities.sh" --role doctor --runtime codex \
+    --dir "$PROMOTED_DIR" >/dev/null 2>&1
+promoted_rc=$?
+set -e
+assert_eq "0" "$promoted_rc" "doctor + codex is admitted once the manifest declares the capability"
+
+rm -rf "$HOOKTMP"
 
 # ============================================================
 # Summary

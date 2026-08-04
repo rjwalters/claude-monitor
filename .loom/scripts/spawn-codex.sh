@@ -21,6 +21,12 @@
 # `pre_tool_use` event, but Loom does not wire into it yet (see gap 1 in that
 # doc), so Loom's guard hooks do not fire for a Codex worker today.
 #
+# Production sandbox posture (issue #4478, decided 2026-07-31): read-only
+# default, with Builder-role-only escalation to workspace-write (+
+# LOOM_CODEX_NETWORK=1 for push access) — no fleet-wide danger-full-access.
+# See guardrail-parity-codex.md § "Promotion gate" for the full decision and
+# its relationship to the hooks/worktreeIsolation evidence gate above.
+#
 # ---------------------------------------------------------------------------
 # Minimum supported Codex CLI version: 0.146.0
 #
@@ -157,6 +163,8 @@
 #   LOOM_CODEX_MODEL     Static per-adapter default model, used only when
 #                        neither an explicit flag nor LOOM_MODEL is present.
 #                        Unset by default (no `-m` emitted).
+#   LOOM_CODEX_MODEL_CHECK  Set to 0 to disable the Claude-shaped-model refusal
+#                        below (issue #5028). Default on (`1`).
 #   LOOM_EFFORT          Reasoning effort, mapped to
 #                        `-c model_reasoning_effort=<value>`. Skipped when an
 #                        explicit `-c model_reasoning_effort=` override is
@@ -185,6 +193,14 @@
 #                        Scheduling priority, applied by this runner exactly the
 #                        way spawn-claude.sh applies it (issue #4233 — priority
 #                        is a per-runner policy, never the dispatcher's).
+#   LOOM_ROLE            The acting role (builder/doctor/judge/... or their
+#                        development-worker/pr-fixer/sweep-lifecycle aliases),
+#                        used ONLY by the managed-hook mutable-role preflight
+#                        below. `loom-daemon` sets this for every admitted
+#                        dispatch (sweep child or role-runner tick, issue
+#                        #4768); an UNSET or unrecognized value is treated as
+#                        read-only, NOT fail-closed — see that preflight's
+#                        comments for why this is deliberate today.
 
 set -euo pipefail
 
@@ -448,6 +464,44 @@ else
     log_info "spawn-codex: model=default"
 fi
 
+# --- Claude-shaped model refusal (issue #5028, follow-up to #5001 AC2/AC3) ---
+# The daemon-native role runner independently refuses this same conflict
+# (`loom-daemon/src/sweep_registry/model.rs::model_runtime_mismatch`) before
+# ever shelling out, but any OTHER caller that pins a model onto this runtime
+# (sweep dispatch, a hand-run `LOOM_RUNTIME=codex`) reaches this adapter
+# directly with no daemon preflight in front of it. Loom's logical Claude
+# tiers/aliases (`opus`, `opusplan`, `sonnet`, `haiku`, `fable`) and any
+# `claude*`-prefixed pinned ID are never valid on Codex's wire — the CLI 400s
+# on them. Catching it here, before any auth/dispatch work, means a
+# misconfigured caller fails fast and names the fix instead of burning an
+# entire session on a doomed spawn. Escape hatch: LOOM_CODEX_MODEL_CHECK=0
+# (e.g. if a future Codex model is genuinely named something like
+# "sonnet-mini").
+EFFECTIVE_MODEL=""
+if [[ "$HAS_MODEL_ARG" == "true" ]]; then
+    EFFECTIVE_MODEL="$EXPLICIT_MODEL"
+elif [[ -n "${LOOM_MODEL:-}" ]]; then
+    EFFECTIVE_MODEL="$LOOM_MODEL"
+elif [[ -n "$CODEX_DEFAULT_MODEL" ]]; then
+    EFFECTIVE_MODEL="$CODEX_DEFAULT_MODEL"
+fi
+if [[ -n "$EFFECTIVE_MODEL" && "${LOOM_CODEX_MODEL_CHECK:-1}" != "0" ]]; then
+    _model_base="${EFFECTIVE_MODEL%%@*}"
+    _model_key="$(printf '%s' "$_model_base" | tr '[:upper:]' '[:lower:]')"
+    case "$_model_key" in
+        opus | opusplan | sonnet | haiku | fable | claude*)
+            log_error "spawn-codex: refusing Claude-shaped model '$EFFECTIVE_MODEL' on the Codex runtime (#5028)."
+            log_error "This model/runtime combination is guaranteed to fail on the wire (HTTP 400)."
+            log_error "Fix one of:"
+            log_error "  - set autonomous.roleRunner.roleModels.<role> to a Codex-valid model in .loom/config.json"
+            log_error "  - set LOOM_MODEL / LOOM_CODEX_MODEL to a Codex-valid model for this invocation"
+            log_error "  - point this role/runtime binding back at Claude (unset runtimes.roles.<role> / LOOM_RUNTIME_<ROLE>)"
+            log_error "Escape hatch: LOOM_CODEX_MODEL_CHECK=0 (only if this really is a valid Codex model name)."
+            exit 78 # EX_CONFIG
+            ;;
+    esac
+fi
+
 # --- Effort selection ---
 # `codex exec` has no `--effort` flag; the equivalent knob is the
 # `model_reasoning_effort` config key. Mirrors the model precedence: an explicit
@@ -591,6 +645,95 @@ else
     else
         log_info "spawn-codex: no Codex profile requested — using the Codex CLI's ambient login state (~/.codex)"
     fi
+fi
+
+# --- Managed hook readiness / trust preflight (issue #4495) ---
+#
+# Loom's guard intent is enforced for Codex through a managed `pre_tool_use`
+# hook installed into the SELECTED profile's CODEX_HOME (see
+# provision-codex-hooks.sh and defaults/hooks/guard-codex-bridge.sh). That hook
+# is the only mechanism that gives a Codex worker managed-worktree confinement,
+# destructive-command blocking, and Loom workflow interception.
+#
+# Roles are therefore split by whether they mutate:
+#
+#   MUTABLE roles (builder, doctor) MUST prove the managed hook is installed at
+#   the expected version, pinned, readable, points at THIS workspace's bridge,
+#   and that the profile has established Codex hook trust. Any failure exits 78
+#   BEFORE the CLI starts. `--dangerously-bypass-hook-trust` is never passed —
+#   #4495's scope guards forbid it, and waiving trust would defeat the very
+#   boundary this preflight exists to prove.
+#
+#   READ-ONLY roles keep the existing conservative sandbox fallback, but the
+#   audit line states explicitly that hook parity was unavailable. They are
+#   never reported as Builder-capable; capability truth lives in
+#   defaults/runtimes/codex.json, which stays `partial` until the evidence gate
+#   in #4495 is satisfied.
+#
+# The audit line names the profile DIRECTORY NAME and the readiness verdict
+# only — never a profile path's contents and never a byte of auth.json.
+LOOM_CODEX_MUTABLE_ROLES="builder doctor"
+_hook_role="$(printf '%s' "${LOOM_ROLE:-}" | tr '[:upper:]_' '[:lower:]-')"
+case "$_hook_role" in
+    development-worker) _hook_role="builder" ;;
+    pr-fixer)           _hook_role="doctor" ;;
+    # A full `/loom:sweep` dispatch is modelled daemon-side as one
+    # "sweep-lifecycle" launch, admitted against Builder's (strongest
+    # lifecycle) capability requirements (see loom-daemon's
+    # runtime_admission.rs module doc) — it runs the Builder/Doctor phases
+    # in-process, so it needs the same mutable-role hook-trust preflight
+    # `builder`/`doctor` get. `loom-daemon` sets `LOOM_ROLE=sweep-lifecycle`
+    # for every daemon-dispatched sweep child (issue #4768).
+    sweep-lifecycle)   _hook_role="builder" ;;
+esac
+
+_hook_role_is_mutable=false
+if [[ -n "$_hook_role" && " $LOOM_CODEX_MUTABLE_ROLES " == *" $_hook_role "* ]]; then
+    _hook_role_is_mutable=true
+fi
+
+_hook_provisioner="${_SCRIPT_DIR}/provision-codex-hooks.sh"
+_hook_status="unknown"
+_hook_reason=""
+
+if [[ ! -x "$_hook_provisioner" && ! -r "$_hook_provisioner" ]]; then
+    _hook_status="unavailable"
+    _hook_reason="provision-codex-hooks.sh is not installed next to this adapter"
+elif [[ -z "${CODEX_HOME:-}" ]]; then
+    # Ambient auth (tier 4): Loom never provisions into the operator's own
+    # ~/.codex, so there is no managed hook to verify.
+    _hook_status="unavailable"
+    _hook_reason="ambient Codex login state (no Loom-managed profile selected)"
+else
+    _hook_verify_out=""
+    if _hook_verify_out="$(bash "$_hook_provisioner" verify \
+            --codex-home "$CODEX_HOME" --workspace "$WORKSPACE" --json 2>/dev/null)"; then
+        _hook_status="ready"
+    else
+        _hook_status="not-ready"
+    fi
+    if [[ -n "$_hook_verify_out" ]] && command -v jq >/dev/null 2>&1; then
+        _hook_reason="$(printf '%s' "$_hook_verify_out" | jq -r '.reason // empty' 2>/dev/null)" || _hook_reason=""
+    fi
+fi
+
+log_info "spawn-codex: hooks=$_hook_status role=${_hook_role:-unset} mutable=$_hook_role_is_mutable trust-bypass=never${_hook_reason:+ reason=\"$_hook_reason\"}"
+
+if [[ "$_hook_role_is_mutable" == "true" && "$_hook_status" != "ready" ]]; then
+    log_error "Role '$_hook_role' mutates the repository, but Loom's managed Codex pre_tool_use hook is not ready (status=$_hook_status)."
+    [[ -n "$_hook_reason" ]] && log_error "  reason: $_hook_reason"
+    log_error "Without it a Codex worker runs with NO managed-worktree confinement,"
+    log_error "NO destructive-command blocking, and NO Loom workflow interception."
+    log_error "Provision and trust the profile, then retry:"
+    log_error "  .loom/scripts/provision-codex-hooks.sh install --all-profiles --workspace $WORKSPACE"
+    log_error "  CODEX_HOME=<profile> codex     # accept the hook-trust prompt once per profile"
+    log_error "  .loom/scripts/provision-codex-hooks.sh verify --all-profiles --workspace $WORKSPACE --json"
+    log_error "Loom will not pass --dangerously-bypass-hook-trust (issue #4495)."
+    exit 78  # EX_CONFIG
+fi
+
+if [[ "$_hook_role_is_mutable" != "true" && "$_hook_status" != "ready" ]]; then
+    log_warn "spawn-codex: hook parity unavailable — this session gets ONLY the Codex sandbox (${SANDBOX_MODE}) as a boundary. Read-only roles may proceed; this session is NOT Builder-capable."
 fi
 
 # --- Assemble the codex invocation ---

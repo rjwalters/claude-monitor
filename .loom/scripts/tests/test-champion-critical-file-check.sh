@@ -175,11 +175,11 @@ echo
 echo "--- Doc pins: shipped markdown uses the paginated REST endpoint, not the truncating gh pr view field ---"
 
 assert_doc_contains "$CHAMPION_MD" \
-    'FILES=$(gh api "repos/{owner}/{repo}/pulls/<number>/files" --paginate --jq -r '"'"'.[].filename'"'"')' \
+    'FILES=$(gh api "repos/{owner}/{repo}/pulls/<number>/files" --paginate --jq '"'"'.[].filename'"'"')' \
     "criterion #3 FILES command ships the paginated REST endpoint"
 
 assert_doc_contains "$CHAMPION_MD" \
-    'gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq -r' \
+    'gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq' \
     "criterion #2 evidence-gathering command ships the paginated REST endpoint"
 
 assert_doc_lacks "$CHAMPION_MD" \
