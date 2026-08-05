@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-05
 
+- **Issue #60** (closed): Guide: document-maintenance phase creates a self-perpetuating docs-PR loop
+- **PR #61**: fix(guide): exclude self-authored docs-maintenance PRs from work-log scan
 - **PR #58**: docs: Guide document maintenance update
 - **PR #57**: docs: Guide document maintenance update
 - **PR #56**: docs: Guide document maintenance update
