@@ -2,6 +2,10 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-08-05
+
+- **PR #56**: docs: Guide document maintenance update
+
 ### 2026-08-04
 
 - **PR #54**: Order capped accounts by time until they are usable again
