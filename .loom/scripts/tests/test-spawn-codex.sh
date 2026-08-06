@@ -903,6 +903,27 @@ echo "Testing managed Codex hook readiness preflight (#4495)..."
 PROVISION_SCRIPT="$SCRIPTS_DIR/provision-codex-hooks.sh"
 BRIDGE_SCRIPT="$(cd "$SCRIPTS_DIR/../hooks" 2>/dev/null && pwd)/guard-codex-bridge.sh"
 
+# Pin the workspace this section provisions/verifies against to LOOM_WORKSPACE
+# instead of leaving it to spawn-codex.sh's own git-common-dir resolution
+# (issue #5350). provision-codex-hooks.sh install below bakes in whatever
+# --workspace value we pass it (here, $(pwd)); spawn-codex.sh's internal verify
+# call resolves its OWN --workspace via _resolve_workspace(), which always
+# returns the MAIN checkout path via `git rev-parse --git-common-dir`/dirname
+# — by design (mirrors guard-worktree-paths.sh's confinement anchor) and NOT
+# something this harness change alters. When this suite runs with its CWD
+# inside a linked worktree, that main-checkout resolution diverges from the
+# $(pwd) this section provisioned against, so the managed-hook verify sees a
+# bogus "different bridge than this workspace's" mismatch. Exporting
+# LOOM_WORKSPACE here makes both sides agree by construction, regardless of
+# which directory the suite is invoked from — LOOM_WORKSPACE is
+# _resolve_workspace()'s highest-precedence input, unchanged.
+#
+# Scope: this script is always run as its own `bash <file>` process (see
+# .github/workflows/ci.yml and test-spawn-generic.sh, which reference this
+# file by path, never `source` it), so this export cannot leak into another
+# suite's shell.
+export LOOM_WORKSPACE="$(pwd)"
+
 TESTS_RUN=$((TESTS_RUN + 1))
 if bash -n "$PROVISION_SCRIPT" 2>/dev/null; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -956,7 +977,7 @@ READY_PROFILE="$(mk_hook_profile ready)"
 # resolution whenever a workspace-local .loom/hooks/guard-codex-bridge.sh
 # copy also exists (see #4787), spuriously reporting hooks=not-ready.
 bash "$PROVISION_SCRIPT" install --codex-home "$READY_PROFILE" \
-    --workspace "$(pwd)" >/dev/null 2>&1
+    --workspace "$LOOM_WORKSPACE" >/dev/null 2>&1
 printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$READY_PROFILE/config.toml"
 
 BARE_PROFILE="$(mk_hook_profile bare)"
@@ -980,14 +1001,14 @@ assert_contains "not ready" "$out" "the failure explains that hook parity is not
 # (3) Builder with a provisioned-but-untrusted profile fails closed.
 UNTRUSTED_PROFILE="$(mk_hook_profile untrusted)"
 bash "$PROVISION_SCRIPT" install --codex-home "$UNTRUSTED_PROFILE" \
-    --workspace "$(pwd)" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
+    --workspace "$LOOM_WORKSPACE" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
 run_preflight 78 "builder + installed-but-untrusted profile -> exit 78" \
     LOOM_ROLE=builder CODEX_HOME="$UNTRUSTED_PROFILE"
 
 # (4) Builder with a STALE (tampered) entry fails closed.
 STALE_PROFILE="$(mk_hook_profile stale)"
 bash "$PROVISION_SCRIPT" install --codex-home "$STALE_PROFILE" \
-    --workspace "$(pwd)" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
+    --workspace "$LOOM_WORKSPACE" --bridge "$BRIDGE_SCRIPT" >/dev/null 2>&1
 printf 'hooks.state."loom".trusted_hash = "deadbeef"\n' > "$STALE_PROFILE/config.toml"
 jq '(.hooks.PreToolUse[].hooks[] | select(.command | contains("guard-codex-bridge.sh")) | .command) |= (. + " --tampered")' \
     "$STALE_PROFILE/hooks.json" > "$STALE_PROFILE/hooks.tmp" \

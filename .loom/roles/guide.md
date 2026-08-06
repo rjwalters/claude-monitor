@@ -1005,6 +1005,43 @@ The Guide maintains three documents at the repository root:
 
 This phase supplements the existing `discover_project_goals()` function, which continues to read README.md for prioritization context.
 
+### Where This Phase Writes (a managed worktree, never the main checkout)
+
+**This is the only role phase that writes repository files, and it cannot write
+them where it starts.** The daemon's role runner launches every scheduled role
+with its working directory set to the **workspace root** — the main checkout
+(`loom-daemon/src/role_runner.rs` → `cmd.current_dir(workspace_root)`). Loom's
+worktree-isolation guards deny writes there:
+
+| Guard | What it denies |
+|-------|----------------|
+| `guard-worktree-paths.sh` | any `Edit`/`Write` whose path resolves into the main checkout while at least one managed worktree exists (the normal state on an active host) |
+| `guard-destructive-generic.sh` | the same target reached through Bash (`>`, `>>`, `tee`, `sed -i`, `cp`, `mv`) — retrying via Bash is **not** a workaround |
+
+So `Edit`-ing `WORK_LOG.md` in place is structurally impossible under
+role-runner dispatch, no matter how this prompt is worded. That was a silent,
+second root cause of the phase's 2026-02→2026-08 outage (#5413), independent of
+the `roleRunner.roles` allowlist gap (#5392/#5407) that stopped it dispatching
+at all.
+
+**Do not disable a guard, and do not reach for `python3`/another interpreter to
+write the file.** Get a managed worktree — the same thing every Builder works
+in — and write there:
+
+```bash
+# Run this AFTER Step 1's open-docs-PR check has decided not to return early,
+# and BEFORE any of Steps 2-5. Idempotent: one stable slot, reused every tick.
+DOCS_WT="$(./.loom/scripts/docs-worktree.sh | tail -1)"
+echo "$DOCS_WT"   # e.g. <repo>/.loom/worktrees/docs-guide
+```
+
+`docs-worktree.sh` creates (or resets) `<worktree-root>/docs-guide` on a fresh
+`docs/guide-update-<UTC timestamp>` branch off `origin/<default-branch>`, writes
+the `.loom-managed` sentinel that makes writes inside it legal, and prints the
+absolute path as its only stdout line. **Every path in Steps 2-5 below is
+`"$DOCS_WT/<file>"`** — a bare `WORK_LOG.md` resolves against the main checkout
+and will be denied.
+
 ### State Tracking
 
 Derive high-water marks **from the committed documents themselves**, not from a
@@ -1023,14 +1060,19 @@ highest PR / issue number it already contains:
 ```bash
 # Highest PR number already recorded in WORK_LOG.md (0 if none / file absent)
 work_log_max_pr() {
-  { grep -oE 'PR #[0-9]+' WORK_LOG.md 2>/dev/null | grep -oE '[0-9]+'; echo 0; } | sort -rn | head -1
+  { grep -oE 'PR #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+'; echo 0; } | sort -rn | head -1
 }
 
 # Highest closed-issue number already recorded in WORK_LOG.md (0 if none)
 work_log_max_issue() {
-  { grep -oE 'Issue #[0-9]+' WORK_LOG.md 2>/dev/null | grep -oE '[0-9]+'; echo 0; } | sort -rn | head -1
+  { grep -oE 'Issue #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+'; echo 0; } | sort -rn | head -1
 }
 ```
+
+Read them from `$DOCS_WT` (a fresh checkout of `origin/<default-branch>`), not
+from the main checkout — the main checkout can be many commits behind on a host
+whose daemon has not pulled recently, which would re-append PRs that a previous
+tick already recorded.
 
 These are idempotent across a fresh checkout: whatever is already in the
 committed WORK_LOG.md defines the watermark, so the same PR is never appended
@@ -1062,14 +1104,37 @@ If a docs PR is already open, **skip the entire document maintenance phase** to 
 Append entries for newly merged PRs and closed issues since the last high-water mark.
 
 ```bash
+# #5454 BUG, DO NOT REINTRODUCE: this phase's OWN merged PRs must never count as
+# "new content". Every `docs: Guide document maintenance update` PR is itself a
+# merged PR, so if it is allowed into `new_prs`, merging PR N manufactures the
+# very "there is something to append" signal that justifies PR N+1 — the skip
+# branch below can never be true two ticks in a row and the phase emits a PR
+# forever (observed: 23 self-referential PRs, one every ~15-30 min, all carrying
+# zero-information WORK_LOG lines about themselves).
+#
+# Excluded by BOTH identifying marks the phase controls: the head-branch prefix
+# `docs-worktree.sh` creates (`docs/guide-update-<timestamp>` — the same prefix
+# Step 1's open-docs-PR guard matches on) and the exact title `create_docs_pr`
+# passes to `gh pr create` in Step 5. Either one alone is enough; requiring only
+# one to match keeps the filter working if a docs PR is ever retitled or lands
+# from a differently-named branch.
+#
+# Keep this expression a single line assigned exactly as written: the regression
+# suite (defaults/scripts/tests/test-guide-work-log-self-loop.sh) extracts THIS
+# line out of THIS file and runs it against fixtures, so the prompt and the test
+# can never drift apart.
+GUIDE_DOCS_PR_EXCLUDE='((.headRefName // "") | startswith("docs/guide-update")) or (.title == "docs: Guide document maintenance update")'
+
 update_work_log() {
   # High-water marks come from the committed WORK_LOG.md (survives fresh checkout)
   local last_pr=$(work_log_max_pr)
   local last_issue=$(work_log_max_issue)
 
-  # Get newly merged PRs (after high-water mark)
-  local new_prs=$("$GH_READ" pr list --state merged --limit 50 --json number,title,mergedAt \
-    --jq "[.[] | select(.number > $last_pr)] | sort_by(.mergedAt) | reverse")
+  # Get newly merged PRs (after high-water mark), minus this phase's own docs PRs.
+  # `headRefName` MUST stay in the --json field list — jq cannot filter on a field
+  # gh was not asked to return, and `.headRefName` would silently be null.
+  local new_prs=$("$GH_READ" pr list --state merged --limit 50 --json number,title,mergedAt,headRefName \
+    --jq "[.[] | select(.number > $last_pr) | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
 
   # Get newly closed issues (after high-water mark)
   local new_issues=$("$GH_READ" issue list --state closed --limit 50 --json number,title,closedAt \
@@ -1078,19 +1143,33 @@ update_work_log() {
   # If nothing new, skip. NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR"
   # | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escapes by default,
   # corrupting captured `gh --json` output before jq ever parses it (#5094).
+  # A tick whose only merged PRs above the watermark are this phase's own docs
+  # PRs lands HERE — `new_prs` is empty after the exclusion, so the phase reports
+  # "current" and returns 1, and (with WORK_PLAN/README also unchanged) Step 5's
+  # `git diff --cached --quiet` finds nothing to commit and creates no PR.
   if [ "$(printf '%s\n' "$new_prs" | jq 'length')" -eq 0 ] && [ "$(printf '%s\n' "$new_issues" | jq 'length')" -eq 0 ]; then
     echo "No new merged PRs or closed issues. WORK_LOG.md is current."
     return 1
   fi
 
-  # Group entries by date and prepend to WORK_LOG.md
+  # Group entries by date and prepend them to "$DOCS_WT/WORK_LOG.md" (below the
+  # header/comment block, above the newest existing `### ` section).
   # Format: ### YYYY-MM-DD
   #         - **PR #N**: Title
   #         - **Issue #N** (closed): Title
   #
+  # Append ONLY what is in `$new_prs` / `$new_issues` — never hand-add a docs
+  # PR the filter above removed, and never "helpfully" log this tick's own PR.
+  #
+  # Write with the Edit/Write tool against the ABSOLUTE "$DOCS_WT/WORK_LOG.md"
+  # path — a repo-relative `WORK_LOG.md` resolves to the main checkout and is
+  # denied by the worktree-isolation guards (see "Where This Phase Writes").
+  #
   # No side-car watermark to update: the newly-written PR/issue numbers ARE the
   # new watermark the next tick reads back from WORK_LOG.md via work_log_max_pr /
-  # work_log_max_issue.
+  # work_log_max_issue. Excluded docs PRs therefore never advance the watermark
+  # either — harmless: they are re-queried every tick and re-filtered every tick,
+  # so they can never be appended no matter how far the watermark lags them.
 
   return 0
 }
@@ -1110,55 +1189,118 @@ update_work_log() {
 
 Regenerate the roadmap from current GitHub label state. Only rewrite if labels have changed.
 
+The generated region of `WORK_PLAN.md` is delimited by
+`<!-- guide:plan-body:start -->` / `<!-- guide:plan-body:end -->`. **Everything
+between those markers is machine-generated and is overwritten wholesale; nothing
+else in the file is touched.** Put any hand-written annotation *outside* the
+markers — an annotation left inside is both wiped on the next tick and, until
+then, guarantees the "no changes" comparison below can never match.
+
 ```bash
-update_work_plan() {
-  # Fetch current label state
-  local urgent=$("$GH_READ" issue list --label "loom:urgent" --state open --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title)"')
-
-  local ready=$("$GH_READ" issue list --label "loom:issue" --state open --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title)"')
-
-  local proposed_architect=$("$GH_READ" issue list --label "loom:architect" --state open --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title) *(architect)*"')
-  local proposed_hermit=$("$GH_READ" issue list --label "loom:hermit" --state open --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title) *(hermit)*"')
-  local proposed_curated=$("$GH_READ" issue list --label "loom:curated" --state open --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title) *(curated)*"')
-  local proposed="${proposed_architect}${proposed_hermit:+$'\n'}${proposed_hermit}${proposed_curated:+$'\n'}${proposed_curated}"
-
-  local epics=$("$GH_READ" issue list --label "loom:epic" --state open --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title)"')
-
-  # Detect changes by comparing the freshly-rendered plan body against the
-  # committed WORK_PLAN.md — no gitignored hash side-car (which resets to "" on
-  # every fresh cron checkout). Use a portable hash: `md5` is macOS-only, so
-  # prefer `md5sum` (Linux / ubuntu runners) and fall back to `shasum`/`cksum`.
-  portable_hash() {
-    if command -v md5sum >/dev/null 2>&1; then md5sum | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | awk '{print $1}'
-    elif command -v md5 >/dev/null 2>&1; then md5 -q
-    else cksum | awk '{print $1}'; fi
+# Render the plan body EXACTLY as it will be written between the markers —
+# headings, blurbs, blank lines and all. `render_plan_body` is the single
+# source of truth for that region's shape.
+render_plan_body() {
+  # $1 = heading, $2 = blurb (may be empty), $3 = body (may be empty)
+  section() {
+    printf '## %s\n' "$1"
+    [ -n "$2" ] && printf '\n%s\n' "$2"
+    printf '\n%s\n' "${3:-_None._}"
   }
+  # Bullet count of a section body ("" -> 0), for the Backlog Balance table.
+  count() { [ -z "$1" ] && printf '0' || printf '%s\n' "$1" | grep -c '^- '; }
 
-  local content_hash=$(printf '%s' "${urgent}${ready}${proposed}${epics}" | portable_hash)
-  # Compare against a hash of the CURRENT committed WORK_PLAN.md body (the
-  # regenerated region). If unchanged, skip; the committed file is the state.
-  local last_hash=$(sed -n '/<!-- guide:plan-body:start -->/,/<!-- guide:plan-body:end -->/p' WORK_PLAN.md 2>/dev/null | portable_hash)
+  local urgent ready building review approved curated proposals epics
+  urgent=$("$GH_READ" issue list --label "loom:urgent" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title)"')
+  ready=$("$GH_READ" issue list --label "loom:issue" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title)"')
+  building=$("$GH_READ" issue list --label "loom:building" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title)"')
+  review=$("$GH_READ" pr list --label "loom:review-requested" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title)"')
+  approved=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title)"')
+  curated=$("$GH_READ" issue list --label "loom:curated" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title) *(curated)*"')
+  local architect hermit
+  architect=$("$GH_READ" issue list --label "loom:architect" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title) *(architect)*"')
+  hermit=$("$GH_READ" issue list --label "loom:hermit" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title) *(hermit)*"')
+  proposals="${architect}${architect:+${hermit:+$'\n'}}${hermit}"
+  epics=$("$GH_READ" issue list --label "loom:epic" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title)"')
 
-  if [ "$content_hash" = "$last_hash" ]; then
+  section "Urgent" "Issues flagged as highest priority (\`loom:urgent\`)." "$urgent"
+  echo
+  section "Ready" "Human-approved issues ready for implementation (\`loom:issue\`)." "$ready"
+  echo
+  section "In Progress" "Issues currently being built (\`loom:building\`)." "$building"
+  echo
+  section "PRs Awaiting Review" "PRs waiting on Judge (\`loom:review-requested\`)." "$review"
+  echo
+  section "Approved (Awaiting Merge)" "PRs that passed review and are queued for Champion auto-merge (\`loom:pr\`)." "$approved"
+  echo
+  section "Proposed" "Issues carrying \`loom:curated\`." "$curated"
+  echo
+  section "Proposed (Architect / Hermit)" "" "$proposals"
+  echo
+  section "Epics" "" "$epics"
+  echo
+  # Derived from the same variables — no extra forge queries, and it can never
+  # disagree with the sections above the way a hand-maintained table would.
+  section "Backlog Balance" "" "$(printf '%s\n' \
+    '| Tier | Count |' \
+    '|------|-------|' \
+    "| Urgent | $(count "$urgent") |" \
+    "| Ready (\`loom:issue\`) | $(count "$ready") |" \
+    "| In Progress (\`loom:building\`) | $(count "$building") |" \
+    "| PRs awaiting review | $(count "$review") |" \
+    "| Approved PRs awaiting merge | $(count "$approved") |" \
+    "| Curated | $(count "$curated") |" \
+    "| Architect / Hermit proposals | $(count "$proposals") |" \
+    "| Active epics | $(count "$epics") |")"
+}
+
+update_work_plan() {
+  # Change detection: compare the freshly-rendered body against the body already
+  # committed between the markers. No gitignored side-car (which resets to "" on
+  # every fresh checkout) — the committed file IS the state.
+  #
+  # #5413 BUG, DO NOT REINTRODUCE: this used to hash the bare concatenation
+  # `${urgent}${ready}${proposed}${epics}` and compare it to a hash of
+  # `sed -n '/start/,/end/p' WORK_PLAN.md` — bullet lines with no headings vs. a
+  # file region *with* marker lines, headings and blurbs. Those two strings are
+  # different by construction, so the hashes could never be equal, the "skip"
+  # branch was dead code, and every tick unconditionally rewrote the file.
+  # Comparing the SAME rendered text on both sides is what makes the skip real;
+  # a hash buys nothing here, so compare the strings directly.
+  local new_body old_body
+  new_body="$(render_plan_body)"
+  # `sed '1d;$d'` drops the two marker lines, leaving only the generated region.
+  old_body="$(sed -n '/<!-- guide:plan-body:start -->/,/<!-- guide:plan-body:end -->/p' \
+    "$DOCS_WT/WORK_PLAN.md" 2>/dev/null | sed '1d;$d')"
+
+  if [ "$new_body" = "$old_body" ]; then
     echo "WORK_PLAN.md is current (no label changes detected)."
     return 1
   fi
 
-  # Regenerate WORK_PLAN.md with current state
-  # Use the template structure: Urgent, Ready, Proposed, Epics, wrapping the
-  # generated region in the <!-- guide:plan-body:start/end --> markers so the
-  # next tick can diff against it.
+  # Replace ONLY the text between the markers in "$DOCS_WT/WORK_PLAN.md" with
+  # $new_body (keep both marker lines, and everything outside them, untouched).
+  # Both sides above are `$(...)`-captured, so trailing newlines are stripped on
+  # both — only the internal structure has to match.
 
   return 0
 }
 ```
+
+The section set rendered above must stay in lockstep with the committed
+`WORK_PLAN.md`: if the file carries a section `render_plan_body` does not emit,
+that section is silently deleted on the next tick (and vice versa, the
+comparison mismatches until the file catches up). Adding a section means editing
+`render_plan_body` **and** the committed file in the same change.
 
 ### Step 4: Check README.md Staleness
 
@@ -1180,7 +1322,8 @@ check_readme_staleness() {
 
   echo "Architectural changes detected in PRs: $recent_prs"
   echo "Review README.md for staleness."
-  # The Guide should read the affected sections and update if needed
+  # The Guide should read the affected sections of "$DOCS_WT/README.md" and
+  # update them there if needed — never the main checkout's copy.
   return 0
 }
 ```
@@ -1191,34 +1334,37 @@ README updates should be **conservative**: only update sections that are clearly
 
 If any documents were updated, bundle all changes into a single PR.
 
+Every git operation runs against `$DOCS_WT` via `git -C`. The branch already
+exists — `docs-worktree.sh` created it — so **never** `git checkout -b` in the
+main checkout: that mutates the shared primary clone that concurrent sweeps,
+`check-main-clean.sh`, and the operator all assume is sitting on the default
+branch.
+
 ```bash
 create_docs_pr() {
-  local timestamp=$(date +%Y%m%d-%H%M%S)
-  local branch="docs/guide-update-${timestamp}"
+  local branch
+  branch="$(git -C "$DOCS_WT" branch --show-current)"
 
-  # Create branch from main
-  git checkout -b "$branch" main
-
-  # Stage all document changes
-  git add WORK_LOG.md WORK_PLAN.md README.md
+  # Stage all document changes (paths are relative to the worktree root, which
+  # is what `git -C "$DOCS_WT"` makes them).
+  git -C "$DOCS_WT" add WORK_LOG.md WORK_PLAN.md README.md
 
   # Check if there are actual changes to commit
-  if git diff --cached --quiet; then
+  if git -C "$DOCS_WT" diff --cached --quiet; then
     echo "No document changes to commit."
-    git checkout -
-    git branch -D "$branch"
     return
   fi
 
   # Commit and push
-  git commit -m "docs: update WORK_LOG, WORK_PLAN, and README
+  git -C "$DOCS_WT" commit -m "docs: update WORK_LOG, WORK_PLAN, and README
 
 Automated document maintenance by Guide triage agent."
 
-  git push -u origin "$branch"
+  git -C "$DOCS_WT" push -u origin "$branch"
 
-  # Create PR
-  gh pr create \
+  # Create PR. `gh pr create` infers the head branch from the working
+  # directory, so run it from inside the docs worktree.
+  (cd "$DOCS_WT" && gh pr create \
     --title "docs: Guide document maintenance update" \
     --label "loom:review-requested" \
     --body "$(cat <<'PRBODY'
@@ -1238,13 +1384,13 @@ See issue #1784 for the feature specification.
 ---
 *Automated by Guide role - document maintenance phase*
 PRBODY
-)"
+)")
 
   # No side-car state to update — the committed WORK_LOG.md / WORK_PLAN.md carried
-  # in this PR ARE the durable state the next cron tick reads back.
-
-  # Return to previous branch
-  git checkout -
+  # in this PR ARE the durable state the next tick reads back.
+  #
+  # Nothing to "return to": the main checkout was never switched off its branch,
+  # and the docs worktree is a persistent slot that the next tick resets.
 }
 ```
 
@@ -1255,25 +1401,41 @@ The full document maintenance flow runs at the end of each triage cycle:
 ```
 Document Maintenance Phase
   ├─ Check for open docs PR → skip if one exists
-  ├─ Update WORK_LOG.md (append new entries)
-  ├─ Update WORK_PLAN.md (regenerate if labels changed)
-  ├─ Check README.md staleness (only if architecture changed)
+  ├─ DOCS_WT=$(./.loom/scripts/docs-worktree.sh | tail -1)
+  │    └─ managed worktree on docs/guide-update-<timestamp>; the ONLY place
+  │       this phase may write (guards deny the main checkout)
+  ├─ Update "$DOCS_WT/WORK_LOG.md" (append new entries; this phase's OWN
+  │    docs PRs are filtered out — see the #5454 note in Step 2)
+  ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
+  ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
-  │    ├─ Create branch: docs/guide-update-<timestamp>
-  │    ├─ Commit all document changes
+  │    ├─ Commit all document changes (git -C "$DOCS_WT")
   │    ├─ Push and create PR with loom:review-requested
   │    └─ (committed WORK_LOG.md / WORK_PLAN.md ARE the durable state)
   └─ If no changes: skip (no PR created)
 ```
 
 **Important constraints:**
+- **Every write goes to `$DOCS_WT`, never the main checkout** — the role runner
+  starts this role in the workspace root, where both worktree-isolation guards
+  deny writes. This was a silent root cause of the #5413 outage; do not "fix" a
+  denial by disabling a guard or switching write tool
+- The main checkout is never `git checkout`-ed onto another branch — concurrent
+  sweeps and `check-main-clean.sh` assume it stays on the default branch
 - Only one docs PR open at a time (prevents accumulation) — the open-PR check
   matches the `docs/guide-update` branch **prefix** (`head:` search), so it
-  catches the timestamped branches Step 5 creates
+  catches the timestamped branches `docs-worktree.sh` creates
 - High-water marks are derived from the committed WORK_LOG.md itself (not a
   gitignored side-car that resets every fresh cron checkout), so they survive
   across ticks and prevent duplicate WORK_LOG entries
-- WORK_PLAN is only regenerated when label state actually changes
+- **This phase's own merged docs PRs are excluded from `new_prs`** (#5454) — by
+  the `docs/guide-update` head-branch prefix *or* the exact
+  `docs: Guide document maintenance update` title. Without that exclusion the
+  phase is self-perpetuating: its own merged PR is "new content" for the next
+  tick, so merging PR N always justifies PR N+1 and the loop never terminates
+- WORK_PLAN is only regenerated when label state actually changes — which
+  requires `render_plan_body`'s output and the committed marker region to be
+  comparable byte-for-byte (see the #5413 bug note in Step 3)
 - README updates are conservative (stale sections only)
 - All changes go through the standard PR review pipeline
 

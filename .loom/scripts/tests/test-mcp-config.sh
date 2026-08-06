@@ -124,7 +124,7 @@ else
 fi
 
 # ============================================================
-# Section 2: socket resolution (config > LOOM_SAFEHOUSE_SOCKET > SAFEHOUSED_SOCKET)
+# Section 2: socket resolution (LOOM_SAFEHOUSE_SOCKET > SAFEHOUSED_SOCKET > config)
 # ============================================================
 echo "Testing loom_mcp_safehouse_socket..."
 
@@ -147,8 +147,11 @@ if $HAVE_JQ; then
 { "safehouse": { "socket": "/run/cfg.sock" } }
 JSON
     assert_eq "/run/cfg.sock" \
+        "$(loom_mcp_safehouse_socket "$_sock_repo")" \
+        "config safehouse.socket is used when no env override is set"
+    assert_eq "/tmp/env.sock" \
         "$(LOOM_SAFEHOUSE_SOCKET=/tmp/env.sock loom_mcp_safehouse_socket "$_sock_repo")" \
-        "config safehouse.socket wins over env (matches daemon resolve order)"
+        "env wins over config (matches daemon resolve order)"
     rm -rf "$_sock_repo"
 fi
 
@@ -870,6 +873,89 @@ JSON
     rm -rf "$_home_no_file"
 else
     echo -e "  ${YELLOW}SKIP${NC}: check_global_mcp_configs presence tests (python3 not installed)"
+fi
+
+# ============================================================
+# Section 12: check_workspace_trust preflight check (#5314)
+#
+# The function must warn — but never abort — when the current workspace's
+# ~/.claude.json entry is missing or `hasTrustDialogAccepted` is not `true`,
+# and stay silent when it is `true`. Mirrors Section 11's structure.
+# ============================================================
+echo ""
+echo "Testing check_workspace_trust preflight check (#5314)..."
+
+if $HAVE_PYTHON3; then
+    _ws_dir="$(mktemp -d)"
+
+    # 12a. ~/.claude.json missing entirely -> warns (with the fix command),
+    # never aborts.
+    _home_no_state="$(mktemp -d)"
+    _out_no_state="$(HOME="$_home_no_state" LOOM_WORKSPACE="$_ws_dir" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_workspace_trust
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_contains "not marked trusted" "$_out_no_state" \
+        "user .claude.json missing entirely: warns that the workspace is not trusted"
+    assert_contains "workspace add" "$_out_no_state" \
+        "missing-state-file warning names the 'loom-daemon workspace add' fix"
+    assert_contains "RC=0" "$_out_no_state" \
+        "missing-state-file check never aborts (warning-only contract)"
+    rm -rf "$_home_no_state"
+
+    # 12b. ~/.claude.json present, but no entry for this workspace -> warns.
+    _home_no_entry="$(mktemp -d)"
+    cat >"$_home_no_entry/.claude.json" <<JSON
+{ "projects": { "/some/other/workspace": { "hasTrustDialogAccepted": true } } }
+JSON
+    _out_no_entry="$(HOME="$_home_no_entry" LOOM_WORKSPACE="$_ws_dir" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_workspace_trust
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_contains "is not trusted" "$_out_no_entry" \
+        "workspace has no projects[] entry: warns that it is not trusted"
+    assert_contains "RC=0" "$_out_no_entry" \
+        "no-entry check never aborts"
+    rm -rf "$_home_no_entry"
+
+    # 12c. ~/.claude.json has this workspace with hasTrustDialogAccepted=false
+    # -> warns.
+    _home_false="$(mktemp -d)"
+    cat >"$_home_false/.claude.json" <<JSON
+{ "projects": { "$_ws_dir": { "hasTrustDialogAccepted": false } } }
+JSON
+    _out_false="$(HOME="$_home_false" LOOM_WORKSPACE="$_ws_dir" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_workspace_trust
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_contains "is not trusted" "$_out_false" \
+        "workspace explicitly untrusted (hasTrustDialogAccepted=false): warns"
+    assert_contains "RC=0" "$_out_false" \
+        "explicitly-untrusted check never aborts"
+    rm -rf "$_home_false"
+
+    # 12d. ~/.claude.json has this workspace trusted -> no warning.
+    _home_trusted="$(mktemp -d)"
+    cat >"$_home_trusted/.claude.json" <<JSON
+{ "projects": { "$_ws_dir": { "hasTrustDialogAccepted": true } } }
+JSON
+    _out_trusted="$(HOME="$_home_trusted" LOOM_WORKSPACE="$_ws_dir" CLAUDE_WRAPPER_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        check_workspace_trust
+        echo "RC=$?"
+    ' _ "$WRAPPER" 2>&1)"
+    assert_not_contains "is not trusted" "$_out_trusted" \
+        "workspace trusted: no warning"
+    assert_eq "RC=0" "$_out_trusted" \
+        "workspace trusted: no output at all, RC=0"
+    rm -rf "$_home_trusted"
+
+    rm -rf "$_ws_dir"
+else
+    echo -e "  ${YELLOW}SKIP${NC}: check_workspace_trust tests (python3 not installed)"
 fi
 
 # ============================================================

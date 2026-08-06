@@ -353,8 +353,34 @@ if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
     warn "No running loom-daemon found (nothing to stop)."
     rm -f "$PID_FILE"
     launchd_bootout_if_loaded
+    # #5131: apply the SAME scoping to the teardown that already protects the
+    # kill. The pid resolver's last-resort  tier is deliberately skipped
+    # for a non-default LOOM_LAUNCHD_LABEL (#4078) — "stop THAT daemon, not
+    # whatever else is named loom-daemon". But the marker and watchdog are
+    # HOST-GLOBAL ($LOOM_DIR/autonomy-desired), while PID_FILE is per-workspace,
+    # so a label-scoped stop that legitimately finds nothing would still disarm
+    # the whole host and exit 0 — silently, since "nothing to stop" reads like a
+    # correct no-op.
+    #
+    # An invocation that scoped its label but NOT its marker is asking to stop
+    # one specific daemon; it is not asking to revoke host-wide autonomy. Only
+    # tear down when this stop owns that state: the default label (the
+    # operator's real daemon), or an explicit LOOM_AUTONOMY_MARKER (the caller
+    # scoped the marker too — what the test suites do via
+    # live_state_sandbox_init).
+    _teardown_is_in_scope=true
+    if [[ "$LAUNCHD_LABEL" != "$DEFAULT_LAUNCHD_LABEL" && -z "${LOOM_AUTONOMY_MARKER:-}" ]]; then
+        _teardown_is_in_scope=false
+    fi
     if [[ "$KEEP_INTENT" != "true" ]]; then
-        teardown_autonomy_intent
+        if [[ "$_teardown_is_in_scope" == "true" ]]; then
+            teardown_autonomy_intent
+        else
+            warn "Label-scoped stop (LOOM_LAUNCHD_LABEL=$LAUNCHD_LABEL) found no daemon;"
+            warn "  leaving the host-global autonomy marker and watchdog untouched (#5131)."
+            warn "  Set LOOM_AUTONOMY_MARKER to scope the marker too, or use the default"
+            warn "  label, if this stop is meant to disarm the host."
+        fi
     fi
     exit 0
 fi

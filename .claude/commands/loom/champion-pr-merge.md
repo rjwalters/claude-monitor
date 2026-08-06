@@ -114,7 +114,11 @@ if echo "$LABELS" | grep -qw "loom:changes-requested"; then
   # tick doesn't re-post while the contradiction is being resolved.
   # Cached ("$GH_READ") — a marker grep only answers "did I already post
   # this?", and your own `--clear-cache` after posting keeps it honest.
-  if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$JANITOR_MARKER"; then
+  # `startswith`, not a bare substring match: a genuine notice always emits
+  # the marker as its literal first line, but a later comment can quote it
+  # in prose while discussing the notice without being the notice itself
+  # (#5371) — a substring match would then wrongly suppress the real post.
+  if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$JANITOR_MARKER\"))")" = "true" ]; then
     echo "Verdict-janitor notice already posted for #$PR_NUMBER — skipping (still not eligible to merge)"
   else
     gh pr comment "$PR_NUMBER" --body "$JANITOR_MARKER
@@ -273,8 +277,15 @@ HOLD_MARKER="<!-- champion:merge-risk-hold -->"
 # releases it. One call serves the whole precheck.
 PR_JSON=$(gh pr view "$PR_NUMBER" --json comments,commits,labels,headRefOid)
 
+# `startswith`, not `contains`: a genuine hold comment always emits the
+# marker as its literal first line, but a *later* comment (e.g. a Judge
+# approval) can legitimately quote or discuss the marker in prose without
+# being the hold's owning comment. `contains` + `last` would then select
+# that discussing comment instead of the real hold — HOLD_HEAD extraction
+# comes up empty and the release logic silently degrades to the less
+# precise fallback path (#5371).
 HOLD_BODY=$(jq -r --arg m "$HOLD_MARKER" \
-  '[.comments[] | select(.body | contains($m))] | last | .body // ""' <<<"$PR_JSON")
+  '[.comments[] | select(.body | startswith($m))] | last | .body // ""' <<<"$PR_JSON")
 
 if [ -z "$HOLD_BODY" ]; then
   PRIOR_HOLD=false          # never held — today's behavior, unchanged
@@ -283,7 +294,7 @@ else
   PRIOR_HOLD=true
   HOLD_OVERRIDE=false
   HOLD_AT=$(jq -r --arg m "$HOLD_MARKER" \
-    '[.comments[] | select(.body | contains($m))] | last | .createdAt' <<<"$PR_JSON")
+    '[.comments[] | select(.body | startswith($m))] | last | .createdAt' <<<"$PR_JSON")
   # Persisted state written by the hold template below:
   #   <!-- champion:hold-state head=<sha> -->
   # Empty for legacy holds posted before that line existed — the timestamp
@@ -459,7 +470,11 @@ HEAD_SHA=$(jq -r '.headRefOid' <<<"$PR_JSON")
 # operator clearing comment, a new push, or a new Judge review — never by a
 # fresh re-read of the same diff.
 # Cached ("$GH_READ") — idempotency-marker grep; see "Cached forge reads".
-if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$HOLD_MARKER"; then
+# `startswith`, not a bare substring match — same rationale as the
+# sticky-hold precheck above (#5371): a later comment quoting this marker
+# in prose must never be mistaken for the hold notice's own comment, or
+# the real notice silently never gets posted.
+if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$HOLD_MARKER\"))")" = "true" ]; then
   echo "Merge-risk hold already posted for #$PR_NUMBER — hold stands, no comment"
 else
   gh pr comment "$PR_NUMBER" --body "$HOLD_MARKER
@@ -1413,7 +1428,10 @@ STALE_MARKER="<!-- champion:stale-pr-notice -->"
 # Idempotency guard: only comment + relabel once. If a prior tick already
 # posted the stale notice, do nothing (prevents per-tick comment spam).
 # Cached ("$GH_READ") — idempotency-marker grep.
-if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$STALE_MARKER"; then
+# `startswith`, not a bare substring match — a later comment discussing or
+# quoting this marker must never be mistaken for the notice's own comment
+# and wrongly suppress the real post (#5371).
+if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$STALE_MARKER\"))")" = "true" ]; then
   echo "Stale-PR notice already posted for #$PR_NUMBER — skipping"
 else
   gh pr comment "$PR_NUMBER" --body "$STALE_MARKER
@@ -1479,8 +1497,11 @@ Read the **whole** thread — that complete post-mortem view is the entire reaso
 
 ```bash
 # How many extra cycles this pass has already granted (0 for a first-time decision).
+# `startswith`, not a bare substring match — a comment that merely quotes
+# this marker while discussing a grant must not be double-counted as a
+# genuine grant (#5371).
 PRIOR_GRANTS=$("$GH_READ" pr view "$PR_NUMBER" --json comments \
-  --jq '[.comments[] | select(.body | contains("champion:capped-pr-grant"))] | length')
+  --jq '[.comments[] | select(.body | startswith("<!-- champion:capped-pr-grant -->"))] | length')
 ```
 
 The two comments the decision turns on are the **latest** Judge rejection and the **immediately preceding** one.
@@ -1558,7 +1579,10 @@ LATEST_REJECTION_ID=$(gh pr view "$PR_NUMBER" --json comments \
 PARK_MARKER="<!-- champion:capped-pr-parked:$LATEST_REJECTION_ID -->"
 
 # Cached ("$GH_READ") — idempotency-marker grep.
-if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$PARK_MARKER"; then
+# `startswith`, not a bare substring match — a later comment quoting this
+# marker in prose must never be mistaken for the verdict's own comment and
+# wrongly suppress the real post (#5371).
+if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$PARK_MARKER\"))")" = "true" ]; then
   echo "Keep-parked verdict already posted for #$PR_NUMBER on this rejection — skipping"
 else
   gh pr comment "$PR_NUMBER" --body "$PARK_MARKER
@@ -1587,7 +1611,10 @@ PR_NUMBER=<number>
 CLOSE_MARKER="<!-- champion:capped-pr-close-recommended -->"
 
 # Cached ("$GH_READ") — idempotency-marker grep.
-if "$GH_READ" pr view "$PR_NUMBER" --json comments --jq '.comments[].body' | grep -qF "$CLOSE_MARKER"; then
+# `startswith`, not a bare substring match — a later comment quoting this
+# marker in prose must never be mistaken for the recommendation's own
+# comment and wrongly suppress the real post (#5371).
+if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$CLOSE_MARKER\"))")" = "true" ]; then
   echo "Close recommendation already posted for #$PR_NUMBER — skipping"
 else
   gh pr comment "$PR_NUMBER" --body "$CLOSE_MARKER

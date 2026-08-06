@@ -51,25 +51,24 @@ loom_mcp_safehouse_enabled() {
 }
 
 # loom_mcp_safehouse_socket <repo_root> -> echoes the resolved socket path, or
-# empty when none resolves. Precedence mirrors safehouse.rs `resolve_socket`
-# combined with the config layer: safehouse.socket (config) >
-# LOOM_SAFEHOUSE_SOCKET (env) > SAFEHOUSED_SOCKET (env). Config wins here
-# because the daemon reads the configured socket before falling back to the
-# conventional env var.
+# empty when none resolves. Precedence mirrors safehouse.rs `resolve_socket`:
+# LOOM_SAFEHOUSE_SOCKET (env) > SAFEHOUSED_SOCKET (env) > safehouse.socket
+# (config). Env wins here so a host-specific env override always takes effect
+# over a committed/shared config value.
 loom_mcp_safehouse_socket() {
     local repo_root="$1"
-    local cfg
-    cfg="$(loom_config_get "$repo_root" "safehouse.socket" "")"
-    if [[ -n "$cfg" && "$cfg" != "null" ]]; then
-        printf '%s\n' "$cfg"
-        return 0
-    fi
     if [[ -n "${LOOM_SAFEHOUSE_SOCKET:-}" ]]; then
         printf '%s\n' "$LOOM_SAFEHOUSE_SOCKET"
         return 0
     fi
     if [[ -n "${SAFEHOUSED_SOCKET:-}" ]]; then
         printf '%s\n' "$SAFEHOUSED_SOCKET"
+        return 0
+    fi
+    local cfg
+    cfg="$(loom_config_get "$repo_root" "safehouse.socket" "")"
+    if [[ -n "$cfg" && "$cfg" != "null" ]]; then
+        printf '%s\n' "$cfg"
         return 0
     fi
     printf '\n'

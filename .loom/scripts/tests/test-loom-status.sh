@@ -298,6 +298,63 @@ run_status LOOM_DAEMON_BIN="$WORKDIR/does-not-exist" LOOM_WORKSPACES_PATH="$WORK
 assert_eq 0 "$RC" "non-executable LOOM_DAEMON_BIN still exits 0"
 assert_contains "No agents running." "$OUT" "non-executable LOOM_DAEMON_BIN falls back to the original message"
 
+# ===================================================================
+# 10. Outstanding quarantine stashes (#5185). A quarantined contamination
+#     used to leave NO operator-facing trace outside a structured log, so
+#     rescue stashes accumulated unreconciled for days. `loom status` now
+#     delegates to check-main-clean.sh --list-quarantined; the report is
+#     stubbed here so the assertions are about loom-status.sh's rendering
+#     and its degradation behavior, not about git stash mechanics (those
+#     are covered by test-check-main-clean.sh).
+# ===================================================================
+# write_quarantine_stub <exit-code> [json-payload]
+write_quarantine_stub() {
+    local target="$REPO/.loom/scripts/check-main-clean.sh"
+    mkdir -p "$REPO/.loom/scripts"
+    printf '#!/usr/bin/env bash\n' > "$target"
+    printf "cat <<'JSONEOF'\n%s\nJSONEOF\n" "${2:-}" >> "$target"
+    printf 'exit %s\n' "$1" >> "$target"
+    chmod +x "$target"
+}
+
+echo "Test 10: no check-main-clean.sh present -- section omitted, JSON null"
+rm -f "$REPO/.loom/scripts/check-main-clean.sh"
+run_status LOOM_DAEMON_BIN=/nonexistent LOOM_WORKSPACES_PATH="$WORKDIR/no-such-registry.json"
+assert_eq 0 "$RC" "missing check-main-clean.sh still exits 0"
+assert_not_contains "Quarantined work" "$OUT" "no quarantine section without check-main-clean.sh"
+run_status_json LOOM_DAEMON_BIN=/nonexistent LOOM_WORKSPACES_PATH="$WORKDIR/no-such-registry.json"
+assert_eq "null" "$(echo "$OUT" | jq -r '.quarantine_stashes' 2>/dev/null)" \
+    "quarantine_stashes is null when the report is unavailable"
+
+echo "Test 11: outstanding entries are surfaced with count and attribution"
+write_quarantine_stub 0 '{"main":"/tmp/repo","count":2,"empty_count":1,"stashes":[{"ref":"stash@{0}","commit":"abcdef0123456789","age":"4 hours ago","producer":"quarantine","empty":false,"issue":"5137","run":"sweep-X","message":"On main: loom-quarantine: run=sweep-X issue=5137"},{"ref":"stash@{1}","commit":"fedcba9876543210","age":"2 days ago","producer":"quarantine","empty":true,"issue":"5021","run":null,"message":"On main: loom-quarantine: issue=5021"}]}'
+run_status LOOM_DAEMON_BIN=/nonexistent LOOM_WORKSPACES_PATH="$WORKDIR/no-such-registry.json"
+assert_eq 0 "$RC" "quarantine section case exits 0"
+assert_contains "Quarantined work (unreconciled): 2" "$OUT" "human output names the outstanding count"
+assert_contains "abcdef012345" "$OUT" "human output identifies the entry by commit, not just index"
+assert_contains "issue=5137" "$OUT" "human output carries the issue attribution"
+assert_contains "[EMPTY]" "$OUT" "human output flags an entry that captured nothing"
+assert_contains "--list-quarantined" "$OUT" "human output points at the full listing command"
+run_status_json LOOM_DAEMON_BIN=/nonexistent LOOM_WORKSPACES_PATH="$WORKDIR/no-such-registry.json"
+assert_eq "2" "$(echo "$OUT" | jq -r '.quarantine_stashes.count' 2>/dev/null)" \
+    "quarantine_stashes.count is passed through to --json"
+assert_eq "5137" "$(echo "$OUT" | jq -r '.quarantine_stashes.stashes[0].issue' 2>/dev/null)" \
+    "quarantine_stashes entries are passed through to --json"
+
+echo "Test 12: a quiet stack prints nothing; an older installed copy degrades"
+write_quarantine_stub 0 '{"main":"/tmp/repo","count":0,"empty_count":0,"stashes":[]}'
+run_status LOOM_DAEMON_BIN=/nonexistent LOOM_WORKSPACES_PATH="$WORKDIR/no-such-registry.json"
+assert_not_contains "Quarantined work" "$OUT" "no section when nothing is outstanding"
+# An installed copy predating --list-quarantined exits 2 on the unknown flag.
+write_quarantine_stub 2 ''
+run_status LOOM_DAEMON_BIN=/nonexistent LOOM_WORKSPACES_PATH="$WORKDIR/no-such-registry.json"
+assert_eq 0 "$RC" "an older check-main-clean.sh does not break loom status"
+assert_not_contains "Quarantined work" "$OUT" "no section when the report flag is unsupported"
+run_status_json LOOM_DAEMON_BIN=/nonexistent LOOM_WORKSPACES_PATH="$WORKDIR/no-such-registry.json"
+assert_eq "null" "$(echo "$OUT" | jq -r '.quarantine_stashes' 2>/dev/null)" \
+    "quarantine_stashes is null when the flag is unsupported"
+rm -f "$REPO/.loom/scripts/check-main-clean.sh"
+
 fi # TMUX_MISSING
 
 # ---------------------------------------------------------------------------

@@ -68,8 +68,25 @@ Env overrides (each wins over config for that key):
 | `LOOM_SAFEHOUSE_ROOMS_BY_REPO` | `rooms.byRepo`, as `repo=room[,repo=room…]` (#4225) |
 | `LOOM_SAFEHOUSE_ROOM_CLAIMS` | `rooms.claims` — dedicated peer-claim coordination room (#4713) |
 
-**Socket resolution**: configured `socket` → `$LOOM_SAFEHOUSE_SOCKET` →
-`$SAFEHOUSED_SOCKET`. If none resolves, narration logs one `warn!` and stays off.
+**Socket resolution** (precedence **env > config**, `resolve_socket` in
+`loom-daemon/src/safehouse.rs`): `$LOOM_SAFEHOUSE_SOCKET` → `$SAFEHOUSED_SOCKET`
+(the unprefixed convention `safehoused` clients also read) → the configured
+`socket` value. If none resolves, narration logs one `warn!` and stays off — no
+built-in `$HOME`-relative default, since safehouse is opt-in per-host.
+
+**`socket` must never be committed to the shared `.loom/config.json`** — like
+`observability.ingestKeyFile` (`observability.md`), it is host-specific by
+definition (every host's `safehoused` binds a different, unshareable path). Leave
+it unset in the committed file and either install `safehoused` at the
+conventional path each host's `$SAFEHOUSED_SOCKET` already points at, or set a
+per-host override in the gitignored `.loom-local/local.json` tier
+(`config_resolver.rs`, highest precedence) or via `$LOOM_SAFEHOUSE_SOCKET` —
+never in the committed file. #5457 is exactly the failure mode this avoids: a
+macOS `safehouse.socket` path was committed to this repo's own shared
+`.loom/config.json`, and — because `resolve_socket` checked the configured
+value *before* env at the time — every other host that `git pull`ed `main`
+inherited a path to a socket that did not exist on it, with no env override able
+to take effect while that stale path stayed committed.
 
 ### Room routing by attention class (`safehouse.rooms`, #4225)
 
@@ -312,8 +329,10 @@ hand is still documented as the debug fallback.
    controls this) for the next step.
 4. **Socket env or config.** Either export `SAFEHOUSED_SOCKET=<path>` (the
    convention safehoused's own clients read) machine-wide, or set
-   `safehouse.socket` explicitly in this host's `.loom/config.json` — see
-   [Socket resolution](#configuration) above for the full precedence.
+   `safehouse.socket` in this host's gitignored `.loom-local/local.json`
+   override (never in the shared, committed `.loom/config.json` — see the
+   callout above) — see [Socket resolution](#configuration) above for the
+   full precedence.
 5. **Enable the `safehouse` config block** in `.loom/config.json` (per
    workspace, since it lives in the per-repo config tier) or export
    `LOOM_SAFEHOUSE_ENABLED=1` machine-wide:
@@ -364,8 +383,8 @@ reboot — the interactive-host counterpart to the cloud-host provisioning path
 Parameters (precedence **flag > env > config > default**): `--bin`
 (`SAFEHOUSED_BIN`, else `command -v safehoused`); `--exec "<argv>"`
 (`SAFEHOUSED_EXEC`) for a full ExecStart override when safehoused needs flags;
-`--socket` (else the shared `safehouse.socket` → `$LOOM_SAFEHOUSE_SOCKET` →
-`$SAFEHOUSED_SOCKET` chain the daemon resolves); `--config`
+`--socket` (else the `$LOOM_SAFEHOUSE_SOCKET` → `$SAFEHOUSED_SOCKET` →
+`safehouse.socket` chain the daemon resolves); `--config`
 (`SAFEHOUSED_CONFIG`); `--log` (default `~/.loom/logs/safehoused.log`);
 `--label` / `--unit` for the launchd label / systemd unit name.
 

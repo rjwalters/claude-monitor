@@ -590,6 +590,50 @@ else
 fi
 
 # ============================================================
+# ============================================================
+# #5131: a label-scoped stop that finds NO daemon must not tear down the
+# HOST-GLOBAL autonomy marker.
+#
+# The pid resolver's last-resort  tier is skipped for a non-default
+# LOOM_LAUNCHD_LABEL (#4078), so such an invocation reaches the "nothing to
+# stop" path whenever its own per-workspace PID_FILE is absent. Before this
+# fix it still ran teardown_autonomy_intent, deleting
+# $LOOM_DIR/autonomy-desired and booting the watchdog for the WHOLE host --
+# then exited 0, so it read as a correct no-op.
+#
+# Scoping rule under test: tear down only when this stop owns that state --
+# the default label, or an explicit LOOM_AUTONOMY_MARKER (what
+# live_state_sandbox_init sets, which is why the suites were never bitten).
+# ============================================================
+scope_dir="$(mktemp -d)"
+mkdir -p "$scope_dir/loomdir"
+
+# (a) non-default label, marker NOT scoped -> marker must survive
+: > "$scope_dir/loomdir/autonomy-desired"
+( LOOM_SOCKET_PATH="$scope_dir/loomdir/loom-daemon.sock"   LOOM_PID_FILE="$scope_dir/absent.pid"   LOOM_LAUNCHD_LABEL="com.example.scratch-5131"   bash "$STOP_SCRIPT" ) >/dev/null 2>&1
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -f "$scope_dir/loomdir/autonomy-desired" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #5131: label-scoped stop with nothing to stop preserves the host-global marker"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #5131: label-scoped stop with nothing to stop preserves the host-global marker"
+fi
+
+# (b) non-default label WITH an explicit marker -> teardown still happens
+#     (the sandboxed-suite path must keep working)
+: > "$scope_dir/loomdir/autonomy-desired"
+( LOOM_SOCKET_PATH="$scope_dir/loomdir/loom-daemon.sock"   LOOM_PID_FILE="$scope_dir/absent.pid"   LOOM_LAUNCHD_LABEL="com.example.scratch-5131"   LOOM_AUTONOMY_MARKER="$scope_dir/loomdir/autonomy-desired"   bash "$STOP_SCRIPT" ) >/dev/null 2>&1
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -f "$scope_dir/loomdir/autonomy-desired" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #5131: an explicitly-scoped marker is still torn down (sandboxed suites unaffected)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #5131: an explicitly-scoped marker is still torn down (sandboxed suites unaffected)"
+fi
+rm -rf "$scope_dir"
+
 # Live daemon state guard (#5179, adopted here per #5191): every live `.loom`
 # state path reachable from the ambient environment (the real $HOME/.loom, the
 # live checkout's .loom, an ambient LOOM_PID_FILE / LOOM_WORKSPACE /
