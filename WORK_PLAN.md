@@ -5,17 +5,59 @@ Prioritized roadmap derived from current GitHub label state. Regenerated automat
 <!-- guide:plan-body:start -->
 ## Urgent
 
-_None. The urgent queue is empty — no `loom:issue` work is currently in the top-3 priority slots._
+Issues flagged as highest priority (`loom:urgent`).
 
-## Ready (`loom:issue`)
+_None._
 
-_None. There is no human/Champion-approved work currently queued for a Builder._
+## Ready
+
+Human-approved issues ready for implementation (`loom:issue`).
+
+_None._
+
+## In Progress
+
+Issues currently being built (`loom:building`).
+
+- **#63**: Copy/Paste Accounts silently drops OpenAI/Codex accounts; copy count over-reports
+
+## PRs Awaiting Review
+
+PRs waiting on Judge (`loom:review-requested`).
+
+- **#64**: fix: report accurate exported-account count when copying accounts
+
+## Approved (Awaiting Merge)
+
+PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
+
+_None._
 
 ## Proposed
 
-- **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)* — labeled `loom:operator-only`; regenerating the screenshots requires a human running the app against live accounts, so this is not Builder-automatable and awaits human action.
+Issues carrying `loom:curated`.
 
-## Active Epics
+- **#63**: Copy/Paste Accounts silently drops OpenAI/Codex accounts; copy count over-reports *(curated)*
+- **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)*
 
-_None open._
+## Proposed (Architect / Hermit)
+
+_None._
+
+## Epics
+
+_None._
+
+## Backlog Balance
+
+| Tier | Count |
+|------|-------|
+| Urgent | 0 |
+| Ready (`loom:issue`) | 0 |
+| In Progress (`loom:building`) | 1 |
+| PRs awaiting review | 1 |
+| Approved PRs awaiting merge | 0 |
+| Curated | 2 |
+| Architect / Hermit proposals | 0 |
+| Active epics | 0 |
 <!-- guide:plan-body:end -->
