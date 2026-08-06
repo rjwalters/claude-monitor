@@ -346,6 +346,25 @@ CI (`.github/workflows/build.yml`) runs on pushes to `main` and on pull requests
 two jobs build the package — macOS and a `swift:6.1` Linux container — and each
 runs `ClaudeMonitor selftest`, with the Linux job also smoke-running `--once`.
 
+**Manually re-triggering CI.** The `push`/`pull_request` webhook deliveries
+that normally queue a run can silently stop firing for a stretch of time —
+with no change to the workflow file, Actions settings, or repo state (see
+[#66](https://github.com/rjwalters/claude-monitor/issues/66)). Since the
+workflow also carries a bare `workflow_dispatch:` trigger, you can queue a run
+directly against any branch (including an open PR's head) without depending
+on that webhook:
+
+```bash
+gh workflow run build.yml --ref <branch-name>
+```
+
+or use the Actions tab's "Run workflow" button. If checks are missing on an
+open PR and re-running doesn't help, next check (needs repo-admin access):
+Settings → Actions → General (Actions permissions toggle), Settings →
+Webhooks → Recent Deliveries (look for failed/missing `pull_request`
+deliveries), and https://www.githubstatus.com/history for an Actions/Webhooks
+incident.
+
 ### Build for Distribution
 
 ```bash

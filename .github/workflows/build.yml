@@ -5,6 +5,13 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  # Manual fallback: `pull_request`/`push` webhook deliveries can silently
+  # stop firing (see issue #66) without any change to this file or the repo's
+  # Actions settings. `workflow_dispatch` lets a run be queued directly
+  # against any branch/PR head, independent of webhook delivery, via
+  # `gh workflow run build.yml --ref <branch>` or the Actions UI "Run
+  # workflow" button. No inputs needed.
+  workflow_dispatch:
 
 jobs:
   build-macos:
