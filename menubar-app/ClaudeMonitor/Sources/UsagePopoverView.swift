@@ -653,7 +653,7 @@ struct UsagePopoverView: View {
     /// Serialize active accounts into env format and put them on the clipboard so
     /// they can be pasted into a Claude Monitor on another machine.
     private func copyAccounts() {
-        guard let env = oauthPoller.exportAccountsEnv() else {
+        guard let (env, count) = oauthPoller.exportAccountsEnv() else {
             flashTransferStatus("Nothing to copy")
             return
         }
@@ -661,8 +661,17 @@ struct UsagePopoverView: View {
         pb.clearContents()
         pb.setString(env, forType: .string)
         clipboardHasAccounts = true
-        let count = store.accounts.count
-        flashTransferStatus("Copied \(count) account\(count == 1 ? "" : "s")")
+
+        // The env format can only express Anthropic accounts (see
+        // `exportAccountsEnv`), so any non-Anthropic account is silently
+        // excluded from what's on the clipboard. Call that out explicitly
+        // rather than reporting `store.accounts.count`, which would overstate
+        // the copy by counting accounts that never made it onto the clipboard.
+        let excluded = store.accounts.filter { $0.provider != .anthropic }.count
+        let excludedNote = excluded == 0
+            ? ""
+            : " (\(excluded) Codex account\(excluded == 1 ? "" : "s") not included)"
+        flashTransferStatus("Copied \(count) account\(count == 1 ? "" : "s")\(excludedNote)")
     }
 
     /// Import accounts from env-formatted text on the clipboard.
