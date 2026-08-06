@@ -362,7 +362,12 @@ class OAuthPoller: ObservableObject {
     /// expiry, and pasting its access token back in would be re-imported down
     /// the Anthropic path and fail. Those accounts move between hosts via
     /// `claude-monitor accounts export/import`, which carries all three fields.
-    func exportAccountsEnv() -> String? {
+    ///
+    /// Returns the serialized env text alongside the number of accounts it
+    /// actually contains, so callers can report an accurate count rather than
+    /// re-deriving it from `store.accounts.count` (which includes accounts
+    /// this format can't express, e.g. Codex/OpenAI — see above).
+    func exportAccountsEnv() -> (env: String, count: Int)? {
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
         do {
             let db = try openDatabase(dbPath, readonly: true)
@@ -392,7 +397,7 @@ class OAuthPoller: ObservableObject {
                 # Paste into the app (Add Account → Bulk Import) or save as ~/.claude-monitor/accounts.env
 
                 """
-            return header + lines.joined(separator: "\n") + "\n"
+            return (header + lines.joined(separator: "\n") + "\n", n)
         } catch {
             flog.error("exportAccountsEnv failed: \(error.localizedDescription)", category: fcat)
             return nil

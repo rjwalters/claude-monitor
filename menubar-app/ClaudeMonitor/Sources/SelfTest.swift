@@ -65,6 +65,7 @@ enum SelfTest {
         testRankingExportCarriesProvider()
         testNamedLimitsRoundTrip()
         testOpenAIImportResolvesExistingAccountByEmail()
+        testExportAccountsEnvCountExcludesNonAnthropic()
         testAccountSyncImportIsProviderScoped()
         testMergeDuplicateAccountsSharingEmail()
 
@@ -658,6 +659,68 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("openai import account resolution test threw: \(error)")
+        }
+    }
+
+    // MARK: - Copy/Paste accounts export count
+
+    /// `exportAccountsEnv()` reports its own count so `copyAccounts()` can
+    /// build an accurate "Copied N accounts" message instead of over-reporting
+    /// with `store.accounts.count` (issue #63). The env format can only
+    /// express Anthropic credentials, so a mixed-provider store's reported
+    /// count must match only the Anthropic rows — and the Codex/OpenAI email
+    /// must never appear in the serialized text.
+    private static func testExportAccountsEnvCountExcludesNonAnthropic() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('anthropic-1', 'Claude One', 'one@example.com', 'Max', '2026-01-01T00:00:00Z', 0, 'anthropic')
+            """)
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('anthropic-2', 'Claude Two', 'two@example.com', 'Pro', '2026-01-01T00:00:00Z', 1, 'anthropic')
+            """)
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 2, 'openai')
+            """)
+            for (accountId, token) in [
+                ("anthropic-1", "token-one"),
+                ("anthropic-2", "token-two"),
+                ("codex-1", "token-codex"),
+            ] {
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, access_token, is_active, created_at, updated_at, provider)
+                    VALUES (?, ?, ?, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                            (SELECT provider FROM accounts WHERE id = ?))
+                """, accountId, accountId, token, accountId)
+            }
+
+            let poller = OAuthPoller(dbPath: dbPath)
+            guard let (env, count) = poller.exportAccountsEnv() else {
+                checks += 1
+                failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
+                return
+            }
+
+            expectEqual(count, 2, "exported count covers only the Anthropic rows")
+            expect(env.contains("one@example.com"), "export includes the first Anthropic account")
+            expect(env.contains("two@example.com"), "export includes the second Anthropic account")
+            expect(!env.contains("codex@example.com"), "export never includes the Codex/OpenAI account")
+        } catch {
+            checks += 1
+            failures.append("exportAccountsEnv count test threw: \(error)")
         }
     }
 
