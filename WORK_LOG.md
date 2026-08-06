@@ -2,6 +2,11 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-08-06
+
+- **PR #64**: fix: report accurate exported-account count when copying accounts
+- **Issue #63** (closed): Copy/Paste Accounts silently drops OpenAI/Codex accounts; copy count over-reports
+
 ### 2026-08-05
 
 - **Issue #60** (closed): Guide: document-maintenance phase creates a self-perpetuating docs-PR loop

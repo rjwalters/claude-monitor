@@ -7,7 +7,7 @@ Prioritized roadmap derived from current GitHub label state. Regenerated automat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-_None._
+- **#66**: GitHub Actions not triggering on open PRs (#64, #65)
 
 ## Ready
 
@@ -19,13 +19,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#63**: Copy/Paste Accounts silently drops OpenAI/Codex accounts; copy count over-reports
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#64**: fix: report accurate exported-account count when copying accounts
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -37,7 +37,7 @@ _None._
 
 Issues carrying `loom:curated`.
 
-- **#63**: Copy/Paste Accounts silently drops OpenAI/Codex accounts; copy count over-reports *(curated)*
+- **#66**: GitHub Actions not triggering on open PRs (#64, #65) *(curated)*
 - **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -52,10 +52,10 @@ _None._
 
 | Tier | Count |
 |------|-------|
-| Urgent | 0 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 2 |
 | Architect / Hermit proposals | 0 |
