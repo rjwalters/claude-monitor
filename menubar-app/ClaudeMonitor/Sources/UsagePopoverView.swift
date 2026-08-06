@@ -645,14 +645,22 @@ struct UsagePopoverView: View {
 
     /// True when the general pasteboard holds text with ACCOUNT_EMAIL_N /
     /// ACCOUNT_KEY_N pairs — i.e. accounts copied from this or another instance.
+    /// The multi-provider keys #67 adds (`ACCOUNT_PROVIDER_N` etc.) are
+    /// additive to this same base pair, so no separate detection is needed
+    /// for a payload that also carries OpenAI/Codex entries.
     static func clipboardContainsAccounts() -> Bool {
         guard let s = NSPasteboard.general.string(forType: .string) else { return false }
         return s.contains("ACCOUNT_EMAIL_") && s.contains("ACCOUNT_KEY_")
     }
 
-    /// Serialize active accounts into env format and put them on the clipboard so
-    /// they can be pasted into a Claude Monitor on another machine.
+    /// Serialize active accounts (every provider — see `exportAccountsEnv`,
+    /// #67) into env format and put them on the clipboard so they can be
+    /// pasted into a Claude Monitor on another machine.
     private func copyAccounts() {
+        // `exportAccountsEnv` now serializes every active provider (#67), so
+        // this nil branch only fires when the store is genuinely empty or
+        // every credential is inactive/tokenless — not, as before #67, merely
+        // because the only accounts present were Codex/OpenAI.
         guard let (env, count) = oauthPoller.exportAccountsEnv() else {
             flashTransferStatus("Nothing to copy")
             return
@@ -661,17 +669,7 @@ struct UsagePopoverView: View {
         pb.clearContents()
         pb.setString(env, forType: .string)
         clipboardHasAccounts = true
-
-        // The env format can only express Anthropic accounts (see
-        // `exportAccountsEnv`), so any non-Anthropic account is silently
-        // excluded from what's on the clipboard. Call that out explicitly
-        // rather than reporting `store.accounts.count`, which would overstate
-        // the copy by counting accounts that never made it onto the clipboard.
-        let excluded = store.accounts.filter { $0.provider != .anthropic }.count
-        let excludedNote = excluded == 0
-            ? ""
-            : " (\(excluded) Codex account\(excluded == 1 ? "" : "s") not included)"
-        flashTransferStatus("Copied \(count) account\(count == 1 ? "" : "s")\(excludedNote)")
+        flashTransferStatus("Copied \(count) account\(count == 1 ? "" : "s")")
     }
 
     /// Import accounts from env-formatted text on the clipboard.
@@ -690,19 +688,26 @@ struct UsagePopoverView: View {
 
                 store.loadFromDatabase()
 
-                // Replace semantics: the pasted list is now the full set. Remove any
-                // account whose email isn't in the paste (compared case-insensitively).
-                // Emails come from the paste even for entries whose token failed to
-                // import, so a transient failure won't delete an account that's listed.
+                // Replace semantics: the pasted list is now the full set — but
+                // only for the provider(s) the paste actually described (#67).
+                // Emails come from the paste even for entries whose token
+                // failed to import, so a transient failure won't delete an
+                // account that's listed.
                 //
-                // Scoped to Anthropic rows: the env format can only *express*
-                // Anthropic credentials (see `exportAccountsEnv`), so an
-                // Anthropic-only paste must not silently delete the OpenAI
-                // accounts it was never able to describe.
-                let pastedEmails = Set(results.map { $0.email.lowercased() })
-                let toRemove = store.accounts.filter {
-                    $0.provider == .anthropic
-                        && !pastedEmails.contains(($0.email ?? "").lowercased())
+                // A pre-#67, Anthropic-only paste carries no OpenAI entries,
+                // so `providersInPaste` is just {.anthropic} and OpenAI
+                // accounts are left untouched exactly as before — the
+                // provider-scoping this replaced was doing the same job less
+                // generally. Only when the paste actually carries an entry
+                // for a given provider does that provider's absent accounts
+                // get removed.
+                let providersInPaste = Set(results.map { $0.provider })
+                let pastedEmailsByProvider = Dictionary(grouping: results, by: { $0.provider })
+                    .mapValues { Set($0.map { $0.email.lowercased() }) }
+                let toRemove = store.accounts.filter { account in
+                    guard providersInPaste.contains(account.provider) else { return false }
+                    let pastedEmails = pastedEmailsByProvider[account.provider] ?? []
+                    return !pastedEmails.contains((account.email ?? "").lowercased())
                 }
                 for account in toRemove { removeAccount(account) }
                 if !toRemove.isEmpty { store.loadFromDatabase() }
