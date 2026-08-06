@@ -7,7 +7,7 @@ Prioritized roadmap derived from current GitHub label state. Regenerated automat
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#66**: GitHub Actions not triggering on open PRs (#64, #65)
+_None._
 
 ## Ready
 
@@ -37,7 +37,6 @@ _None._
 
 Issues carrying `loom:curated`.
 
-- **#66**: GitHub Actions not triggering on open PRs (#64, #65) *(curated)*
 - **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -52,12 +51,12 @@ _None._
 
 | Tier | Count |
 |------|-------|
-| Urgent | 1 |
+| Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 2 |
+| Curated | 1 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
