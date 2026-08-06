@@ -114,6 +114,14 @@ struct EnvImportResult {
     let email: String
     let success: Bool
     let error: String?
+    /// Which upstream this entry authenticated against. Defaults to
+    /// `.anthropic` so existing call sites that predate multi-provider
+    /// clipboard transfer (#67) — the file-read-error path in
+    /// `importFromEnvFile`, `syncFromAccountFiles`, which stays Anthropic-only
+    /// — don't need updating. `pasteAccounts()` (UsagePopoverView.swift) reads
+    /// this to scope its replace-semantics deletion to only the providers a
+    /// paste actually described.
+    var provider: AccountProvider = .anthropic
 }
 
 // `@Published`-driven state is only ever read/written from the main thread
@@ -328,7 +336,10 @@ class OAuthPoller: ObservableObject {
         return await importFromEnvString(content)
     }
 
-    /// Parse an env string for ACCOUNT_EMAIL_N / ACCOUNT_KEY_N pairs and import each.
+    /// Parse an env string for ACCOUNT_EMAIL_N / ACCOUNT_KEY_N pairs (plus the
+    /// additive `ACCOUNT_PROVIDER_N` / `ACCOUNT_REFRESH_N` / `ACCOUNT_EXPIRES_N`
+    /// keys #67 adds) and import each, dispatching to the provider-appropriate
+    /// add-account path.
     func importFromEnvString(_ content: String) async -> [EnvImportResult] {
         let accounts = parseAccountPairs(content)
 
@@ -341,42 +352,74 @@ class OAuthPoller: ObservableObject {
 
         var results: [EnvImportResult] = []
         for account in accounts {
-            let (_, error) = await addAccountWithToken(account.token, email: account.email)
+            let error: String?
+            switch account.provider {
+            case .anthropic:
+                (_, error) = await addAccountWithToken(account.token, email: account.email)
+            case .openai:
+                (_, error) = await addOpenAIAccount(
+                    accessToken: account.token,
+                    refreshToken: account.refreshToken,
+                    expiresAt: account.tokenExpiresAt
+                )
+            }
             results.append(EnvImportResult(
                 email: account.email,
                 success: error == nil,
-                error: error
+                error: error,
+                provider: account.provider
             ))
         }
 
         return results
     }
 
-    /// Serialize active accounts (email + access token) into ACCOUNT_EMAIL_N /
-    /// ACCOUNT_KEY_N env format, the same format the Bulk Import field and the
-    /// account list files accept. Returns nil if there are no exportable accounts
-    /// (so the caller can disable the Copy button). Order follows sort_order.
+    /// Serialize active accounts into ACCOUNT_EMAIL_N / ACCOUNT_KEY_N env
+    /// format, the same base format the Bulk Import field and the account
+    /// list files accept. Returns nil if there are no exportable accounts (so
+    /// the caller can disable the Copy button). Order follows sort_order.
     ///
-    /// **Anthropic accounts only.** The env format carries a single long-lived
-    /// bearer string; an OpenAI credential is an access token + refresh token +
-    /// expiry, and pasting its access token back in would be re-imported down
-    /// the Anthropic path and fail. Those accounts move between hosts via
-    /// `claude-monitor accounts export/import`, which carries all three fields.
+    /// **Every active provider round-trips (#67).** An Anthropic entry is
+    /// just `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N`, exactly as before this
+    /// format was extended. A non-Anthropic (OpenAI/Codex) entry additionally
+    /// carries:
+    ///   - `ACCOUNT_PROVIDER_N` — the provider tag (e.g. `openai`)
+    ///   - `ACCOUNT_REFRESH_N` — its refresh token, the credential the import
+    ///     path actually needs long-term, since the access token in
+    ///     `ACCOUNT_KEY_N` expires in ~10 days
+    ///   - `ACCOUNT_EXPIRES_N` — the access token's own expiry (ISO 8601), so
+    ///     an importing host knows to renew proactively rather than waiting
+    ///     for a 401
+    ///
+    /// All three are additive keys: an old build's `parseAccountPairs()`
+    /// doesn't recognize them and ignores them, so a new-format paste into an
+    /// old build still imports the Anthropic entries unchanged and only fails
+    /// — harmlessly, no account is created — on the OpenAI ones, whose access
+    /// token doesn't authenticate against the Anthropic API an old build
+    /// assumes.
     ///
     /// Returns the serialized env text alongside the number of accounts it
     /// actually contains, so callers can report an accurate count rather than
-    /// re-deriving it from `store.accounts.count` (which includes accounts
-    /// this format can't express, e.g. Codex/OpenAI — see above).
+    /// re-deriving it from `store.accounts.count`.
     func exportAccountsEnv() -> (env: String, count: Int)? {
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
         do {
             let db = try openDatabase(dbPath, readonly: true)
+            // `provider` (accounts) and `token_expires_at` (oauth_credentials)
+            // are migrated columns (#28) — select them only when present so a
+            // database opened before that migration ran still exports its
+            // (necessarily all-Anthropic) accounts instead of failing the
+            // query outright.
+            let hasAcctProvider = tableColumns(db, "accounts").contains("provider")
+            let hasTokenExpiry = tableColumns(db, "oauth_credentials").contains("token_expires_at")
             let stmt = try db.prepare("""
-                SELECT COALESCE(a.email, a.account_name, c.label) AS email, c.access_token
+                SELECT COALESCE(a.email, a.account_name, c.label) AS email, c.access_token,
+                       \(hasAcctProvider ? "a.provider" : "NULL") AS provider,
+                       c.refresh_token,
+                       \(hasTokenExpiry ? "c.token_expires_at" : "NULL") AS token_expires_at
                 FROM oauth_credentials c
                 JOIN accounts a ON a.id = c.account_id
                 WHERE c.is_active = 1 AND c.access_token IS NOT NULL
-                  AND COALESCE(a.provider, 'anthropic') = 'anthropic'
                 ORDER BY a.sort_order, a.id
             """)
 
@@ -386,8 +429,18 @@ class OAuthPoller: ObservableObject {
                 guard let token = row[1] as? String, !token.isEmpty else { continue }
                 n += 1
                 let email = (row[0] as? String) ?? "account-\(n)"
+                let provider = AccountProvider(stored: row[2] as? String)
                 lines.append("ACCOUNT_EMAIL_\(n)=\(email)")
                 lines.append("ACCOUNT_KEY_\(n)=\(token)")
+                if provider != .anthropic {
+                    lines.append("ACCOUNT_PROVIDER_\(n)=\(provider.rawValue)")
+                    if let refresh = row[3] as? String, !refresh.isEmpty {
+                        lines.append("ACCOUNT_REFRESH_\(n)=\(refresh)")
+                    }
+                    if let expiresISO = row[4] as? String, !expiresISO.isEmpty {
+                        lines.append("ACCOUNT_EXPIRES_\(n)=\(expiresISO)")
+                    }
+                }
             }
 
             guard n > 0 else { return nil }
@@ -404,9 +457,24 @@ class OAuthPoller: ObservableObject {
         }
     }
 
-    /// Parse env content into ordered (email, token) pairs from ACCOUNT_EMAIL_N /
-    /// ACCOUNT_KEY_N. Gaps in numbering are skipped; order follows the index N.
-    private func parseAccountPairs(_ content: String) -> [(email: String, token: String)] {
+    /// One parsed clipboard/env entry. `provider`/`refreshToken`/
+    /// `tokenExpiresAt` are additive (#67): an old-format entry (no
+    /// `ACCOUNT_PROVIDER_N` key) parses as `.anthropic` with no refresh
+    /// token, exactly as every entry parsed before this format was extended.
+    // Not private: exercised directly by SelfTest (no network access needed
+    // to verify parsing), same pattern as `resolveOpenAIAccountId` below.
+    struct ParsedAccountEntry {
+        let email: String
+        let token: String
+        let provider: AccountProvider
+        let refreshToken: String?
+        let tokenExpiresAt: Date?
+    }
+
+    /// Parse env content into ordered entries from ACCOUNT_EMAIL_N /
+    /// ACCOUNT_KEY_N (plus the additive per-index provider/refresh/expiry
+    /// keys). Gaps in numbering are skipped; order follows the index N.
+    func parseAccountPairs(_ content: String) -> [ParsedAccountEntry] {
         var env: [String: String] = [:]
         for line in content.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -417,13 +485,19 @@ class OAuthPoller: ObservableObject {
             env[key] = value
         }
 
-        var pairs: [(email: String, token: String)] = []
+        var pairs: [ParsedAccountEntry] = []
         for i in 1...99 {
             guard let email = env["ACCOUNT_EMAIL_\(i)"],
                   let token = env["ACCOUNT_KEY_\(i)"] else {
                 continue  // Skip gaps — files may have non-consecutive numbering
             }
-            pairs.append((email: email, token: token))
+            let provider = AccountProvider(stored: env["ACCOUNT_PROVIDER_\(i)"])
+            let refreshToken = env["ACCOUNT_REFRESH_\(i)"]
+            let tokenExpiresAt = env["ACCOUNT_EXPIRES_\(i)"].flatMap { UsageRecord.parseISO($0) }
+            pairs.append(ParsedAccountEntry(
+                email: email, token: token, provider: provider,
+                refreshToken: refreshToken, tokenExpiresAt: tokenExpiresAt
+            ))
         }
         return pairs
     }
@@ -446,10 +520,18 @@ class OAuthPoller: ObservableObject {
     /// them (local overrides master for a matching email and appends new emails),
     /// and additively import each. Accounts already in the DB but absent from the
     /// merged list are left untouched — this never removes accounts.
+    ///
+    /// Anthropic-only, unlike `importFromEnvString`: these are periodic
+    /// background files, not a one-shot clipboard/file paste, and the
+    /// `ACCOUNT_PROVIDER_N` key #67 adds is not expected to appear here. A
+    /// non-Anthropic entry (if one ever did appear) is imported via
+    /// `addAccountWithToken` same as before — it fails harmlessly (invalid
+    /// token against the Anthropic API), matching the pre-#67 behavior for
+    /// any account this format couldn't express.
     @discardableResult
     func syncFromAccountFiles() async -> [EnvImportResult] {
         let fm = FileManager.default
-        var merged: [(email: String, token: String)] = []
+        var merged: [ParsedAccountEntry] = []
         var indexByEmail: [String: Int] = [:]
 
         func apply(_ path: String, label: String) {

@@ -65,7 +65,9 @@ enum SelfTest {
         testRankingExportCarriesProvider()
         testNamedLimitsRoundTrip()
         testOpenAIImportResolvesExistingAccountByEmail()
-        testExportAccountsEnvCountExcludesNonAnthropic()
+        testExportAccountsEnvIncludesAllProviders()
+        testParseAccountPairsBackwardCompatibleWithOldFormat()
+        testParseAccountPairsRoundTripsOpenAIFields()
         testAccountSyncImportIsProviderScoped()
         testMergeDuplicateAccountsSharingEmail()
 
@@ -662,15 +664,18 @@ enum SelfTest {
         }
     }
 
-    // MARK: - Copy/Paste accounts export count
+    // MARK: - Copy/Paste accounts export/import round trip (#67)
 
     /// `exportAccountsEnv()` reports its own count so `copyAccounts()` can
     /// build an accurate "Copied N accounts" message instead of over-reporting
-    /// with `store.accounts.count` (issue #63). The env format can only
-    /// express Anthropic credentials, so a mixed-provider store's reported
-    /// count must match only the Anthropic rows — and the Codex/OpenAI email
-    /// must never appear in the serialized text.
-    private static func testExportAccountsEnvCountExcludesNonAnthropic() {
+    /// with `store.accounts.count` (issue #63). As of #67 the env format
+    /// round-trips every provider — a mixed-provider store's reported count
+    /// covers *all* active, tokened rows, the Codex/OpenAI email appears in
+    /// the serialized text, and the OpenAI entry carries the additive
+    /// `ACCOUNT_PROVIDER_N` / `ACCOUNT_REFRESH_N` / `ACCOUNT_EXPIRES_N` keys
+    /// while the Anthropic entries carry none of them (so an old-format,
+    /// Anthropic-only export is byte-for-byte what it was before #67).
+    private static func testExportAccountsEnvIncludesAllProviders() {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -697,7 +702,6 @@ enum SelfTest {
             for (accountId, token) in [
                 ("anthropic-1", "token-one"),
                 ("anthropic-2", "token-two"),
-                ("codex-1", "token-codex"),
             ] {
                 try db.run("""
                     INSERT INTO oauth_credentials
@@ -706,6 +710,13 @@ enum SelfTest {
                             (SELECT provider FROM accounts WHERE id = ?))
                 """, accountId, accountId, token, accountId)
             }
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, access_token, refresh_token, token_expires_at,
+                     is_active, created_at, updated_at, provider)
+                VALUES ('codex-1', 'codex-1', 'token-codex', 'refresh-codex',
+                        '2026-08-15T00:00:00Z', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+            """)
 
             let poller = OAuthPoller(dbPath: dbPath)
             guard let (env, count) = poller.exportAccountsEnv() else {
@@ -714,13 +725,119 @@ enum SelfTest {
                 return
             }
 
-            expectEqual(count, 2, "exported count covers only the Anthropic rows")
+            expectEqual(count, 3, "exported count covers every active, tokened row regardless of provider")
             expect(env.contains("one@example.com"), "export includes the first Anthropic account")
             expect(env.contains("two@example.com"), "export includes the second Anthropic account")
-            expect(!env.contains("codex@example.com"), "export never includes the Codex/OpenAI account")
+            expect(env.contains("codex@example.com"), "export now includes the Codex/OpenAI account (#67)")
+            expect(env.contains("ACCOUNT_PROVIDER_3=openai"), "the OpenAI entry is tagged with its provider")
+            expect(env.contains("ACCOUNT_REFRESH_3=refresh-codex"), "the OpenAI entry carries its refresh token")
+            expect(env.contains("ACCOUNT_EXPIRES_3=2026-08-15T00:00:00Z"), "the OpenAI entry carries its access-token expiry")
+            expect(!env.contains("ACCOUNT_PROVIDER_1"), "an Anthropic entry emits no provider marker")
+            expect(!env.contains("ACCOUNT_PROVIDER_2"), "an Anthropic entry emits no provider marker")
+            expect(!env.contains("ACCOUNT_REFRESH_1") && !env.contains("ACCOUNT_REFRESH_2"),
+                   "an Anthropic entry emits no refresh-token key")
         } catch {
             checks += 1
-            failures.append("exportAccountsEnv count test threw: \(error)")
+            failures.append("exportAccountsEnv provider test threw: \(error)")
+        }
+    }
+
+    /// `parseAccountPairs` must keep parsing an old-format, Anthropic-only
+    /// paste (no `ACCOUNT_PROVIDER_N` key at all) exactly as it did before
+    /// #67: every entry resolves to `.anthropic` with no refresh token or
+    /// expiry — the backward-compatibility constraint the issue calls out.
+    private static func testParseAccountPairsBackwardCompatibleWithOldFormat() {
+        let poller = OAuthPoller(dbPath: "/nonexistent/does-not-matter-for-parsing.db")
+        let legacy = """
+            # Claude Monitor accounts — 2 account(s)
+            ACCOUNT_EMAIL_1=one@example.com
+            ACCOUNT_KEY_1=token-one
+            ACCOUNT_EMAIL_2=two@example.com
+            ACCOUNT_KEY_2=token-two
+            """
+        let parsed = poller.parseAccountPairs(legacy)
+        expectEqual(parsed.count, 2, "both legacy entries parse")
+        for entry in parsed {
+            expectEqual(entry.provider, .anthropic, "a legacy entry with no provider marker resolves to Anthropic")
+            expect(entry.refreshToken == nil, "a legacy entry carries no refresh token")
+            expect(entry.tokenExpiresAt == nil, "a legacy entry carries no token expiry")
+        }
+        expectEqual(parsed[0].email, "one@example.com", "order follows the ACCOUNT_EMAIL_N index")
+        expectEqual(parsed[1].email, "two@example.com", "order follows the ACCOUNT_EMAIL_N index")
+    }
+
+    /// A new-format, mixed-provider paste round-trips through
+    /// `exportAccountsEnv` → `parseAccountPairs`: the Anthropic entries parse
+    /// exactly as before, and the OpenAI entry recovers its provider tag,
+    /// refresh token, and expiry — the credential material
+    /// `addOpenAIAccount` needs to re-authenticate on the destination host.
+    /// Also asserts an unrecognized future key (`ACCOUNT_FOOBAR_1`) doesn't
+    /// perturb parsing of the known ones — the graceful-degradation property
+    /// an older build's parser relies on when it meets a still-newer format.
+    private static func testParseAccountPairsRoundTripsOpenAIFields() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('anthropic-1', 'Claude One', 'one@example.com', 'Max', '2026-01-01T00:00:00Z', 0, 'anthropic')
+            """)
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 1, 'openai')
+            """)
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, access_token, is_active, created_at, updated_at, provider)
+                VALUES ('anthropic-1', 'anthropic-1', 'token-one', 1,
+                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'anthropic')
+            """)
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, access_token, refresh_token, token_expires_at,
+                     is_active, created_at, updated_at, provider)
+                VALUES ('codex-1', 'codex-1', 'token-codex', 'refresh-codex',
+                        '2026-08-15T00:00:00Z', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+            """)
+
+            let poller = OAuthPoller(dbPath: dbPath)
+            guard let (env, _) = poller.exportAccountsEnv() else {
+                checks += 1
+                failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
+                return
+            }
+
+            // A future key an older/newer build might add — must not disturb
+            // parsing of the keys this build understands.
+            let withUnknownKey = env + "\nACCOUNT_FOOBAR_1=surprise\n"
+            let parsed = poller.parseAccountPairs(withUnknownKey)
+            expectEqual(parsed.count, 2, "both entries parse despite the unrecognized key")
+
+            guard let anthropicEntry = parsed.first(where: { $0.email == "one@example.com" }),
+                  let openaiEntry = parsed.first(where: { $0.email == "codex@example.com" }) else {
+                checks += 1
+                failures.append("round-trip parse is missing an expected entry")
+                return
+            }
+
+            expectEqual(anthropicEntry.provider, .anthropic, "the Anthropic entry round-trips as Anthropic")
+            expect(anthropicEntry.refreshToken == nil, "the Anthropic entry carries no refresh token")
+
+            expectEqual(openaiEntry.provider, .openai, "the OpenAI entry round-trips as OpenAI")
+            expectEqual(openaiEntry.token, "token-codex", "the OpenAI entry round-trips its access token")
+            expectEqual(openaiEntry.refreshToken, "refresh-codex", "the OpenAI entry round-trips its refresh token")
+            expectEqual(openaiEntry.tokenExpiresAt, UsageRecord.parseISO("2026-08-15T00:00:00Z"),
+                        "the OpenAI entry round-trips its access-token expiry")
+        } catch {
+            checks += 1
+            failures.append("parseAccountPairs OpenAI round-trip test threw: \(error)")
         }
     }
 
