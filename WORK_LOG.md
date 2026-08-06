@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-06
 
+- **PR #70**: feat: round-trip OpenAI/Codex credentials through clipboard account transfer
+- **Issue #67** (closed): Extend clipboard account transfer format to round-trip OpenAI/Codex credentials
 - **PR #64**: fix: report accurate exported-account count when copying accounts
 - **Issue #63** (closed): Copy/Paste Accounts silently drops OpenAI/Codex accounts; copy count over-reports
 
