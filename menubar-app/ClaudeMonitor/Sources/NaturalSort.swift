@@ -156,7 +156,7 @@ enum NaturalSort {
 
         // Realistic mixed account names, including emails.
         expectOrder(
-            ["agent-2@2amlogic.com", "agent-10@2amlogic.com", "robb@2amlogic.com"],
+            ["agent-2@example.com", "agent-10@example.com", "owner@example.com"],
             "email account names"
         )
 
