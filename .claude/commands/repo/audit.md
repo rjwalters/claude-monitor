@@ -42,7 +42,10 @@ Run each of the following checks and compile results into a single report:
 ### 4. Gitignore Issues (see [[gitignore]])
 - Files that are ignored but probably shouldn't be
 - Build artifacts that aren't ignored but should be
-- Redundant or stale gitignore rules
+- Redundant or stale gitignore rules — but **not** `X` + `X/` pairs unless `X`
+  is verified to be a real, non-symlink directory (`[ -d "X" ] && [ ! -L "X" ]`);
+  see [[gitignore]] for the full check. A trailing slash never matches a
+  symlink, so wrongly deduping such a pair silently un-ignores one.
 
 ### 5. Branch & Worktree Hygiene (see [[branches]])
 - Local branches whose PRs are merged

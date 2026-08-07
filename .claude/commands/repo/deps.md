@@ -248,7 +248,10 @@ gh pr list --author "app/dependabot" --state open \
 
 # REST fallback when GraphQL's rate-limit bucket is exhausted. Note the author
 # spelling differs: gh's --author filter wants "app/dependabot", the REST
-# payload carries login "dependabot[bot]".
+# payload carries login "dependabot[bot]". This jq deliberately emits only
+# number/title — if a later step starts consuming headRefName/createdAt/
+# statusCheckRollup/labels, widen it, or the fallback path silently loses them
+# (statusCheckRollup has no REST field: use `gh pr checks <N>` per PR instead).
 gh api repos/OWNER/REPO/pulls --paginate \
   --jq '.[] | select(.user.login == "dependabot[bot]") | "#\(.number) \(.title)"'
 ```
@@ -259,17 +262,84 @@ land within minutes rather than on the stated interval.
 ### 8. Classify each PR
 
 For every PR report: **ecosystem**, **update type** (major vs minor/patch —
-majors flagged), **CI status**, and what actually changed.
+majors flagged), **CI status**, **whether it's stale** (the manifest on the
+base branch already satisfies it — see the sub-step below), and what actually
+changed.
 
 Update type comes from the title/branch (`bump X from 1.2.3 to 2.0.0` →
 compare the leading version components) — confirm against the diff rather than
 trusting the title alone:
 
 ```bash
-gh pr view <N> --json title,body,files
+# REST rather than `gh pr view --json` — same reason as the label lookup above:
+# any `--json` flag on `gh pr`/`gh issue` forces a GraphQL query. `gh pr diff`
+# and `gh pr checks` take no `--json` and are already REST-backed.
+gh api repos/OWNER/REPO/pulls/<N> --jq '{title, body}'
+gh api repos/OWNER/REPO/pulls/<N>/files --paginate --jq '[.[].filename]'
 gh pr diff <N>
 gh pr checks <N>
 ```
+
+#### Stale check — compare the PR's target against the manifest on the base branch
+
+**Dependabot's open PRs go stale after any bulk-update merge.** Its scan runs
+on an interval, so a scan that started before a "update everything" PR landed
+will still open PRs proposing versions the merge already declared — or *older*
+ones. Counting those as pending upgrade work is a false signal, and it is
+exactly the state the repo is in right after someone merges a bulk update and
+runs this command to confirm the repo is clean. Before classifying update type,
+decide whether each PR is **stale** (already satisfied by the manifest) or
+**real** (still forward work):
+
+1. **Identify the manifest(s) the PR touches.** Reuse the
+   `pulls/<N>/files` filenames already fetched above — the manifest is the
+   ecosystem file among them (`package.json`, `Cargo.toml`,
+   `requirements*.txt`, `pyproject.toml`, `go.mod`, `Gemfile`,
+   `composer.json`, …), the same set step 2 detects. Dependabot may touch a
+   lockfile too; read the **manifest**, since that is where the declared range
+   lives.
+
+2. **Read each manifest from the base branch, not the PR head.** The PR head
+   necessarily contains the bump, so comparing against it always reports
+   "satisfied". Read the base branch instead:
+
+   ```bash
+   # <base> is the PR's baseRefName (usually the default branch); <path> is the
+   # manifest filename from pulls/<N>/files.
+   git show <base>:<path>
+   ```
+
+   Extract the currently-declared range for the dependency named in the PR
+   title (e.g. `vitest`, `@biomejs/biome`) from that base-branch manifest.
+
+3. **Compare with semver ordering, not string equality.** The PR is satisfied
+   by a manifest when the range that manifest already declares permits a
+   version **at or above** the PR's proposed target:
+   - an exact/`^`/`~` range that already permits the PR's target — `^4.1.10`
+     permits a PR proposing `4.1.10` → satisfied;
+   - a declared version that is itself **ahead** of the PR's target — `^2.5.7`
+     against a PR proposing `2.5.6`, or `^5.20260804.1` against
+     `5.20260801.1` → satisfied (the PR is behind). Use semver ordering:
+     `2.5.7` > `2.5.6`, so string comparison alone would misread it.
+
+   This is the same leading-component comparison the update-type classification
+   already uses for "major vs minor/patch".
+
+4. **Multi-manifest workspaces: stale only if _every_ targeted manifest is at
+   or ahead.** A dependency declared in several packages (a monorepo/workspace)
+   is stale **only** when every manifest Dependabot's config targets for that
+   ecosystem already satisfies the PR's target. If even one manifest still
+   declares a range below the PR's version, the PR is **real, pending work** —
+   not stale — because that lagging package genuinely needs the bump. (In the
+   reported case `vitest` was `^4.1.10` in `tools/pulse` and `tools/xctl` but
+   `^4.0.0` in `website`; had the PR targeted `4.1.10`, the `website` package
+   would still have needed it — a single satisfied manifest is not enough.)
+
+A PR that is satisfied everywhere it is declared is **stale** — note it as
+`stale — already satisfied by manifest`. A stale PR is **excluded from the
+majors tally** even when its title/branch names a major-version bump: it
+represents no forward change, so it must never be counted as, or described as,
+pending upgrade work.
 
 For **GitHub Actions** bumps specifically, check whether the update **clears a
 deprecation annotation** — often the actual reason to take a scary-looking
@@ -287,15 +357,32 @@ major bump that removes a *"Node.js 20 is deprecated"* annotation, with CI
 green on every matrix leg, is a much easier yes than "a major bump, seems
 risky."
 
+The `Note` column carries the `stale — already satisfied by manifest` flag
+alongside the existing CI-status/diff notes, so a stale PR is visible as such at
+a glance:
+
 ```
 OPEN DEPENDABOT PRs
 ===================
-| PR  | Ecosystem      | Update                     | Type  | CI    | Note                          |
-|-----|----------------|----------------------------|-------|-------|-------------------------------|
-| #12 | github-actions | actions/checkout 4 → 5     | MAJOR | green | clears "Node.js 20 deprecated"|
-| #13 | npm            | 6 packages (minor + patch) | minor | green | grouped                       |
-| #14 | npm            | playwright-core 1.4 → 2.0  | MAJOR | red   | browser binary coupling       |
+| PR  | Ecosystem      | Update                     | Type  | CI    | Note                              |
+|-----|----------------|----------------------------|-------|-------|-----------------------------------|
+| #12 | github-actions | actions/checkout 4 → 5     | MAJOR | green | clears "Node.js 20 deprecated"    |
+| #13 | npm            | 6 packages (minor + patch) | minor | green | grouped                           |
+| #14 | npm            | playwright-core 1.4 → 2.0  | MAJOR | red   | browser binary coupling           |
+| #15 | npm            | @biomejs/biome 2.5.5 → 2.5.6 | patch | green | stale — already satisfied by manifest (base declares ^2.5.7) |
 ```
+
+Summarize the split explicitly below the table so callers (including
+`/repo:all`) get the counts without re-deriving them —
+**open**, **majors** (real forward majors only), and **stale**:
+
+```
+4 open, 2 majors, 1 stale — already satisfied by manifest
+```
+
+The majors count excludes every stale PR. A PR whose title names a major bump
+but whose manifest is already at or ahead (stale) is **not** a major here — it
+is counted only in the stale total.
 
 ### 9. Offer to merge the safe ones (confirm first)
 

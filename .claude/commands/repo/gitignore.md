@@ -56,6 +56,35 @@ Find tracked files that are probably build artifacts:
 - Rules that match zero files (stale after cleanup)
 - Scattered `.gitignore` files that could be consolidated
 
+**Do not flag `X` and `X/` as duplicates without verification.** A trailing
+slash restricts a gitignore pattern to directories — it never matches a
+symlink, even one that points at a directory (`man gitignore`: "If there is a
+separator at the end of the pattern then the pattern will only match
+directories"). The two rules are therefore not interchangeable:
+
+| Path at `X`           | Matched by `X` | Matched by `X/` |
+|-----------------------|:--------------:|:---------------:|
+| Real directory        | yes            | yes             |
+| Symlink (to anything) | yes            | **no**          |
+| Regular file          | yes            | **no**          |
+
+`X` and `X/` in the same file are true duplicates only when `X` is guaranteed
+never to be a symlink. Verify it — don't eyeball it:
+
+```bash
+[ -d "X" ] && [ ! -L "X" ]   # true only for a real, non-symlink directory
+```
+
+`[ -d "X" ]` alone is **not** sufficient: it follows symlinks, so a symlink to
+a directory passes it. If the check fails, `X` doesn't exist to test, or `X`
+could plausibly become a symlink in this repo (vendored trees, external
+volumes, build outputs relocated to another disk), the pair is **not
+redundant** — keep both rules in the suggested-fix output and report the pair
+as intentional rather than collapsing it. Dropping the bare rule un-ignores any
+symlink at that path, because `X/` alone won't re-cover it. This caused a live
+regression: `.lake` + `.lake/` were deduped to `.lake/`, unignoring a `.lake`
+symlink (rjwalters/lean-genius#43683).
+
 ### 4. Large Untracked Files
 Find untracked files >1 MB that might need a decision:
 - Should they be tracked? (data files, docs)
@@ -86,9 +115,11 @@ moment you report it, leaving this command claiming a fix that is no longer on
 disk.
 
 So immediately after applying each fix, and **before counting it as applied**,
-confirm the edit is still there: re-read the changed region of the file, or run
-`git diff -- <path>` / `git status --porcelain -- <path>` and check the change
-is still present.
+re-read the changed region of the file and confirm your specific edit is
+present. `git diff -- <path>` / `git status --porcelain -- <path>` is a cheap
+first pass, but only proves the path differs from HEAD — it cannot distinguish
+your edit from someone else's, so it must not be the sole check when the file
+may carry other uncommitted changes.
 
 This check is **unconditional** — run it whether or not you have any reason to
 suspect a concurrent writer. Detecting a daemon first would be racy (one can

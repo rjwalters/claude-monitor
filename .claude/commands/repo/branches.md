@@ -45,23 +45,38 @@ For every local branch, classify it into one of these buckets:
 #### PROTECTED (never delete)
 - The default branch (`main`/`master`) and the currently checked-out branch
 - Any branch currently checked out by a worktree
-- Any branch with an **open** PR (`gh pr list --head <branch> --state open`)
+- Any branch with an **open** PR:
+  `gh api "repos/{owner}/{repo}/pulls?state=open&head={owner}:<branch>" --jq length`
 - Long-lived branches the repo's own docs (CLAUDE.md, CONTRIBUTING.md) name as
   release/project branches — if such a list exists, honor it
 
 #### MERGED PR BRANCHES
 - Branches matching common PR patterns: `feature/*`, `fix/*`, `feat/*`, `pr-*`
-- Check if a PR exists and is merged:
-  `gh pr list --head <branch> --state merged --json number --jq length`
-- If the PR is merged, the branch is safe to delete
+- Check whether a PR exists for the branch's head and is merged (the REST form
+  below) — a count `>= 1` means the branch is safe to delete
 - Also safe: any branch fully merged into the default branch
-  (`git branch --merged <default>`)
+  (`git branch --merged <default>`). Reachability is **sufficient but not
+  necessary** — a squash-merged branch is never `--merged`, so its absence from
+  that list means nothing. Step 5 decides.
+
+```bash
+gh api "repos/{owner}/{repo}/pulls?state=all&head={owner}:<branch>" \
+  --jq '[.[] | select(.merged_at != null)] | length'
+```
+
+REST's `pulls` endpoint has no `state=merged` value — only `open`, `closed`, and
+`all` — so merged-ness is a **client-side** filter on `.merged_at != null` over
+`state=all`. An older closed-but-unmerged PR on the same head is correctly
+excluded by it. Step 5b arm 4 runs the same call for the final verdict.
 
 #### CLOSED ISSUE BRANCHES
 - Branches whose names embed an issue number (e.g. `feature/issue-123`,
   `loom/issue-123`)
-- Check the linked issue: `gh issue view <number> --json state --jq .state`
-- If the issue is CLOSED and no open PR exists for the branch, it's safe to delete
+- Check the linked issue:
+  `gh api repos/{owner}/{repo}/issues/<number> --jq .state`
+- REST returns a **lowercase** state (`open`/`closed`); GraphQL's enum form was
+  uppercase (`OPEN`/`CLOSED`), so compare against the lowercase string
+- If the issue is `closed` and no open PR exists for the branch, it's safe to delete
 
 #### ORPHANED AUTOMATION BRANCHES
 - Ephemeral branches created by tooling and abandoned — e.g. `worktree-agent-*`,
@@ -79,13 +94,24 @@ linked issue for active labels before treating it as stale:
 
 ```bash
 issue=$(echo "$branch" | grep -oE 'issue-[0-9]+' | grep -oE '[0-9]+')
-gh issue view "$issue" --json state,labels --jq '[.state, (.labels[].name)] | join(",")'
+# REST, not a `gh issue`/`gh pr` subcommand with --json — see step 5b arm 4 for
+# why. The state field is lowercase here (`open`/`closed`), not GraphQL's
+# `OPEN`/`CLOSED`; the label names are unaffected.
+gh api "repos/{owner}/{repo}/issues/$issue" --jq '[.state, (.labels[].name)] | join(",")'
 ```
 
 Active labels (`loom:building`, `loom:review-requested`,
 `loom:changes-requested`) mean a builder is mid-work — do NOT remove.
 
 ### 4. Present findings
+
+Every branch line carries the **tag of the check that cleared (or failed to
+clear) it** in step 5, so the operator can see which rule applied. "This work
+landed as a squash commit" and "this branch never had unique commits" and "this
+work exists nowhere else" are three different states, and a report that collapses
+them to a bare `SAFE TO DELETE` hides the only distinction that matters. A SAFE
+line with no tag is a bug — it means the branch was never run through the loss
+check.
 
 ```
 BRANCH AUDIT
@@ -94,12 +120,15 @@ BRANCH AUDIT
 Local branches: 53
 Worktrees: 4
 
-SAFE TO DELETE (32 branches):
+SAFE TO DELETE (32 branches):      [tag = which step-5 check cleared it]
   Merged PR branches: 15
-    fix/123-parser-crash (PR #150, merged 2026-06-28)
+    fix/123-parser-crash — landed (squash), merged PR #150 (2026-06-28)
+    fix/88-null-deref — landed (squash), content-verified (merge-tree)
     ...
   Closed issue branches: 3
+    feature/issue-77 — landed (squash), patch-id equivalent (git cherry)
   Orphaned automation branches: 14
+    wt/agent-3 — no unique commits
 
 PROTECTED (10 branches):
   main
@@ -107,12 +136,29 @@ PROTECTED (10 branches):
   ...
 
 UNKNOWN (11 branches):
-  experiment-quantizer — no PR found, no issue linked
+  experiment-quantizer — unique work: 3 commits found nowhere else
+  spike/cache — unverifiable: forge lookup failed (rate limited)
   ...
 
 STALE WORKTREES (0):
   (none)
 ```
+
+The tag vocabulary is fixed — exactly one per branch, naming the check that
+fired:
+
+| Tag | Meaning | Set by |
+|-----|---------|--------|
+| `no unique commits` | the branch adds nothing that isn't already reachable elsewhere | 5a (empty) |
+| `landed (squash), content-verified (merge-tree)` | merging it into `<default>` would change nothing | 5b arm 1 |
+| `landed, identical tree` | the branch's tree equals `<default>`'s | 5b arm 2 |
+| `landed (squash), patch-id equivalent (git cherry)` | every commit's patch is already in `<default>` | 5b arm 3 |
+| `landed (squash), merged PR #N (<date>)` | the forge says the branch's PR merged | 5b arm 4 |
+| `unique work: N commits found nowhere else` | no arm could establish containment | 5b exhausted → KEEP |
+| `unverifiable: <reason>` | a check errored or could not run | 5c → KEEP |
+
+Only the first five are deletable. The last two classify UNKNOWN and are never
+auto-removed, `--prune` or not.
 
 ### 5. If `--prune` flag is set
 
@@ -131,7 +177,8 @@ branch — not reachable from the default branch and not present on any remote:
 git log --oneline <branch> --not <default> --remotes
 ```
 
-- **Empty** → the branch carries no commits of its own; safe to delete.
+- **Empty** → the branch carries no commits of its own; safe to delete, tagged
+  `no unique commits`.
 - **Non-empty** → this proves nothing yet. Go to 5b before concluding.
 
 `--not` is a **toggle**, not a per-argument negation: it flips the sense of every
@@ -144,36 +191,88 @@ empty only when unrelated refs happen to cover the tip. **Never add a second
 `--not`.** If `--remotes` is too broad for the repo, spell the exclusions out
 instead: `git log --oneline <branch> --not <default> origin/<default>`.
 
-#### 5b. Content — does `<default>` already contain this work?
+#### 5b. Content and merge state — does `<default>` already have this work?
 
 A non-empty 5a result does **not** mean the work would be lost. A squash-merge
 replays the branch's changes as one brand-new commit whose parent is
 `<default>`'s prior tip, so the branch's original commits never become ancestors
 of `<default>` and *always* appear in 5a — even when every line of the work is
-already merged. Decide with **content containment**, not SHA ancestry:
+already merged. On a squash-merging repo that describes **every merged branch**,
+so a reachability answer on its own would protect all of them and `--prune`
+would never delete a single one.
+
+Decide with **content containment and forge merge state**, not SHA ancestry. Try
+the arms below in order and stop at the first that proves containment; the arm
+that fired is the branch's report tag (step 4). Reaching the end without a proof
+is not a failure of the check — it is the check working.
+
+**Arm 1 — tree containment** → `landed (squash), content-verified (merge-tree)`
 
 ```bash
 # Would merging the branch into <default> change anything at all?
-# `--write-tree` requires git >= 2.38; on older git this errors and you take the fallback below.
+# `--write-tree` requires git >= 2.38; on older git this errors and you take arm 2.
 [ "$(git merge-tree --write-tree <default> <branch>)" = "$(git rev-parse '<default>^{tree}')" ]
 ```
 
 Equal trees → `<default>` already holds the branch's content → safe to delete.
+
+**Arm 2 — exact tree match** → `landed, identical tree`
+
 If `git merge-tree` is unsupported (git < 2.38) or reports a conflict, fall back
 to the exact-match form `git diff --quiet <default> <branch>`: exit 0 (identical
 trees) is also proof of containment, while a non-zero exit proves nothing either
-way. Failing both, ask the forge whether the branch's PR was merged:
+way.
+
+**Arm 3 — patch-id equivalence** → `landed (squash), patch-id equivalent (git cherry)`
+
+The forge-independent squash detector, and the arm that rescues the common case
+arms 1 and 2 cannot: a branch that landed *and* whose files `<default>` has since
+edited, so the trees no longer agree at all.
 
 ```bash
-gh pr list --head <branch> --state merged --json number --jq length
+git cherry <default> <branch>     # '-' = this patch is already in <default>, '+' = it is not
 ```
 
-A count `>= 1` means the work landed through that PR; safe to delete.
+Containment is proven only when the output is non-empty and **every** line starts
+with `-`. A single `+` means at least one commit's patch is not in `<default>` —
+fall through to arm 4, do not delete. Know the limit: patch-ids are per commit,
+so a branch of *several* commits squashed into one lands as a single patch that
+matches none of them individually and correctly reports `+`. `git cherry` clears
+the single-commit squash (much the commonest case) and stays quiet otherwise; it
+is never a reason to delete on its own.
 
-If none of these establish containment, the 5a commits would be **permanently
+**Arm 4 — forge merge state** → `landed (squash), merged PR #N (<date>)`
+
+Ask the forge whether the branch's head had a merged PR. This is the only arm
+that can clear a branch whose content `<default>` has moved past entirely. **One**
+REST call answers the containment question and supplies the number and merge date
+the report tag needs — do not put a separate count query in front of it:
+
+```bash
+gh api "repos/{owner}/{repo}/pulls?state=all&head={owner}:<branch>" \
+  --jq '[.[] | select(.merged_at != null)] | "\(length) \(.[0].number // "") \((.[0].merged_at // "")[0:10])"'
+```
+
+`gh` substitutes `{owner}` and `{repo}` from the current repository; `<branch>`
+is the branch name. A leading count `>= 1` means the work landed through that
+PR — safe to delete — and the same line carries the number and date the tag
+needs. Empty output or a non-zero exit is 5c, not "no merged PR".
+
+Use `gh api` for this and for any **new** forge call added here. Every `gh
+pr`/`gh issue` subcommand invoked with `--json` is GraphQL-backed and spends the
+much smaller GraphQL rate-limit budget, which on a busy multi-agent host is
+routinely exhausted while the REST `core` bucket sits nearly unused — and a
+rate-limited forge lookup here costs a branch its verdict (5c: KEEP), so the
+cheaper bucket is the one to spend. REST's `pulls` endpoint has no
+`state=merged` value — only `open`, `closed`, and `all` — so merged-ness is the
+client-side `.merged_at != null` filter above, which correctly ignores an older
+closed-but-unmerged PR on the same head.
+
+If no arm establishes containment, the 5a commits would be **permanently
 lost**. Do NOT auto-delete even under `--prune`. Reclassify the branch as
-UNKNOWN, show the count and the commit subjects, and require an explicit
-per-branch confirmation.
+UNKNOWN, tag it `unique work: N commits found nowhere else`, show the commit
+subjects, and require an explicit per-branch confirmation. No PR and no
+patch-id match is precisely the case the protective default exists for.
 
 **Do NOT "simplify" 5b to `git branch --merged <default>`.** That lists only
 branches whose commits are literal ancestors of `<default>`, which is never true
@@ -186,11 +285,13 @@ pruning needs "does `<default>` already have this work". Different questions.
 
 If any command in 5a or 5b exits non-zero unexpectedly, emits output that cannot
 be parsed, or cannot run at all — `gh` missing, unauthenticated, or rate-limited;
-no network; an unknown or ambiguous ref; `git merge-tree` unsupported — the
-branch is classified **UNKNOWN / KEEP**. **Never SAFE.** Ambiguity is never
-resolved in favour of deletion, and this holds under `--prune` exactly as it does
-without it. A branch wrongly kept costs one line of report noise; a branch
-wrongly deleted costs the work.
+no network; an unknown or ambiguous ref; no containment arm able to run — the
+branch is classified **UNKNOWN / KEEP** and tagged `unverifiable: <reason>`.
+**Never SAFE.** (`git merge-tree` being unsupported is not by itself an error:
+that is what arms 2 and 3 are for, and both run offline on any git. It becomes
+5c only when no arm can answer.) Ambiguity is never resolved in favour of deletion, and this holds
+under `--prune` exactly as it does without it. A branch wrongly kept costs one
+line of report noise; a branch wrongly deleted costs the work.
 
 For each worktree about to be removed, refuse if it has uncommitted changes —
 that work exists nowhere else:
@@ -203,17 +304,33 @@ else
 fi
 ```
 
-Then delete the branches that passed the loss check:
+Then delete the branches that passed the loss check. **Which flag to use follows
+from the branch's step-4 tag, never from what git happens to accept:**
 
 ```bash
-git branch -d <branch_name>           # -d (safe): refuses if not merged
-# escalate to -D only for a branch the loss check proved is pushed, or whose
-# content 5b proved is already contained in <default> (the squash-merge case,
-# where -d refuses because the original SHAs are not ancestors of <default>)
+# tag `no unique commits`  -> -d succeeds on its own
+git branch -d <branch_name>
+
+# tag `landed (...)`       -> -d WILL refuse: after a squash-merge the branch's
+#                             original SHAs are not ancestors of <default>. 5b
+#                             already proved the content is contained, so the
+#                             refusal carries no information here. Escalate:
+git branch -D <branch_name>
 ```
 
-Report what was deleted, what was skipped for potential data loss, and what
-remains.
+> **`git branch -d` is not the classifier — and `-D` is not the fix.**
+> On a squash-merging repo `-d` refuses *every* landed branch, because squashing
+> makes the branch's original commits unreachable from `<default>` forever. Git's
+> hint text on that refusal literally suggests re-running with `-D`, and taking
+> the hint is the inverse failure: `-D` ignores merge state entirely and deletes
+> genuinely unmerged work just as happily. One refuses everything, the other
+> refuses nothing; **neither can tell "landed" from "lost"** — that is what step 5
+> is for. Escalate to `-D` only for a branch step 5 tagged `landed (...)`. If the
+> tag is `unique work` or `unverifiable`, the `-d` refusal is correct: leave the
+> branch alone and let a human look at it.
+
+Report what was deleted **with each branch's tag**, what was skipped for
+potential data loss, and what remains.
 
 ### 6. If no `--prune` flag
 
@@ -231,13 +348,19 @@ To investigate unknown branches: git log --oneline -5 <branch>
 4. **Always report before deleting** — the user must see the full list before `--prune` acts
 5. **When in doubt, classify as UNKNOWN** — let the user decide
 6. **Never destroy unique work** — run the permanent-loss check (step 5) before
-   any deletion; a branch with commits found nowhere else, or a worktree with
-   uncommitted changes, is never removed automatically, regardless of flags
+   any deletion; a branch whose *content* is found nowhere else, or a worktree
+   with uncommitted changes, is never removed automatically, regardless of flags.
+   "Found nowhere else" means content, not reachability: a squash-merge always
+   breaks reachability, so `git branch -d`'s refusal (or the absence of a branch
+   from `git branch --merged`) is not evidence of unique work
 
 ## Notes
 
-- PR/issue lookups need the `gh` CLI and GitHub auth; without them, fall back
-  to `git branch --merged` analysis only and say so in the report
+- PR/issue lookups need the `gh` CLI and GitHub auth; without them, arms 1–3 of
+  the loss check (`merge-tree`, `diff --quiet`, `git cherry`) still work fully
+  offline — fall back to those, and say so in the report. Do **not** fall back to
+  `git branch --merged`: it answers a different question and calls every
+  squash-merged branch unsafe
 - Rate limiting: if there are hundreds of branches, batch `gh` calls
 - Remote branch pruning is NOT done by this command; to prune stale remote
   tracking refs: `git fetch --prune` (safe, only removes local refs to deleted
