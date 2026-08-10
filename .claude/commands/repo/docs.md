@@ -76,6 +76,12 @@ skill/command wikilinks, and nested CLAUDE.md paths. Fold its findings in the
 same way. Broken CLAUDE.md paths remain **critical** — they're the primary
 navigation paths for agents.
 
+That includes [[links]]' resolution rules, not just its finding list: where the
+repo declares an install-template mapping in `.repo/link-roots.json`, fold in
+the mapping table too and keep the "resolved via install mapping" annotation on
+individual links. A consolidated report that drops it turns a wrong mapping into
+a silent zero.
+
 ## Output Format
 
 One consolidated report, grouped by layer so it's clear which are mechanical
@@ -125,9 +131,11 @@ can revert a file between the moment you fix it and the moment you report it,
 leaving this command claiming a fix that is no longer on disk.
 
 So immediately after applying each fix, and **before counting it as applied**,
-confirm the edit is still there: re-read the changed region of the file, or run
-`git diff -- <path>` / `git status --porcelain -- <path>` and check the change
-is still present.
+re-read the changed region of the file and confirm your specific edit is
+present. `git diff -- <path>` / `git status --porcelain -- <path>` is a cheap
+first pass, but only proves the path differs from HEAD — it cannot distinguish
+your edit from someone else's, so it must not be the sole check when the file
+may carry other uncommitted changes.
 
 This check is **unconditional** — run it whether or not you have any reason to
 suspect a concurrent writer. Detecting a daemon first would be racy (one can

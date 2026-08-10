@@ -46,14 +46,20 @@ git clean -ndX
 git clean -nd
 
 # Empty directories
-find . \( -path './.git' -o -name node_modules -o -name target \
+find . \( -name .git -o -name node_modules -o -name target \
           -o -name dist -o -name .venv \) -prune \
      -o -type d -empty -print
 
 # Large files in the working tree (>10 MB, tracked or not)
-find . \( -path './.git' -o -name node_modules -o -name target \
+find . \( -name .git -o -name node_modules -o -name target \
           -o -name dist -o -name .venv \) -prune \
      -o -type f -size +10M -print
+
+# Orphaned environment content — packages still on disk that the current
+# lockfile no longer references. Detect the lockfile and its package manager;
+# the prune itself is an ASK item (see Categorize), never run from here.
+[ -f pnpm-lock.yaml ]     && echo "prunable: pnpm"   # pnpm prune
+[ -f package-lock.json ]  && echo "prunable: npm"    # npm prune
 
 # Git worktree roots — authoritative and tool-agnostic. RETAIN this output as a
 # path set for step 2's denylist; do not just print it. `--porcelain` gives one
@@ -93,10 +99,10 @@ git does its own traversal. When editing the prune list:
 - **Draw entries from the denylist and CACHE categories already named in step 2**
   (`node_modules/`, `.venv/`, `dist/`, plus `target/` for Rust builds) instead
   of growing a second, inconsistent list.
-- **Match by `-name`, not `-path`** (except `./.git`, which is unambiguously at
-  the root). `-name` prunes at any depth, so nested copies like
-  `packages/foo/node_modules/` are covered — the old
-  `-not -path './node_modules/*'` only ever matched the top-level one.
+- **Match by `-name`, not `-path`.** `-name` prunes at any depth, so nested
+  copies like `packages/foo/node_modules/` and a vendored `vendor/foo/.git/`
+  are covered — the old `-not -path './node_modules/*'` only ever matched the
+  top-level one.
 - **Coordination roots (`.loom/`, `.anvil/`, `.wrangler/`) are deliberately not
   pruned.** They are small, and step 2 needs to see their empty directories in
   order to route them to ASK.
@@ -167,7 +173,10 @@ regenerable build output, kept unless `--caches`); a **never-delete denylist**
 overrides both; everything else gitignored falls through to ASK.
 
 Apply these tests in order — **denylist first, then the SAFE and CACHE
-allowlists, then fall through to ASK**:
+allowlists, then fall through to ASK**. For empty directories specifically, a
+**reference scan runs after the allowlist match, as an additional net, not a
+replacement for it** — see the SAFE empty-directory bullet below; the
+denylist/allowlist check still runs first and still wins:
 
 **Never-delete denylist (always ASK, never SAFE or CACHE — checked first,
 overrides everything below, regardless of gitignore status):**
@@ -236,6 +245,22 @@ reserved for tracked files.
     neither gitignore nor the denylist — so this check must be applied to its
     output before anything is deleted.
 
+    **Reference scan (additional net, after the denylist check, not instead of
+    it).** The denylist above is an enumerated/prefix-matched allowlist of known
+    tools (`.loom/`, `.anvil/`, `.wrangler/`, git worktree roots); it does not
+    cover a tool that is not on that list — a custom app's own state/spool dir,
+    or a future tool's coordination root not yet added here. For any empty
+    directory that clears the denylist check, run a cheap cross-reference scan
+    before finalizing SAFE: `grep -rl` its path (or just its dirname, for a
+    generic name) across tracked files. Any hit — a script, config, or source
+    file that names the directory — demotes it from SAFE to ASK, reported with
+    its reason (e.g. "referenced by N files"), regardless of whether the
+    directory matched a named tool-scaffolding prefix. A directory with no
+    reference hit and no denylist match remains SAFE. This scan never *promotes*
+    anything the denylist already routed to ASK — it only ever demotes a
+    would-be SAFE empty directory, and only when the allowlist match already let
+    it through.
+
   Nothing in this category may be tracked by git or match a source-code
   extension.
 - **CACHE** — regenerable compilation/tool/build output. Same certainty as SAFE
@@ -259,6 +284,10 @@ reserved for tracked files.
   - **Any empty directory whose path matches the denylist** (a `.loom/`,
     `.anvil/`, or `.wrangler/` coordination or runtime-state dir) — emptiness
     is that tool's normal state, so it lands here rather than in SAFE.
+  - **Any empty directory demoted by the reference scan** (see the SAFE
+    empty-directory bullet above) — a tracked file references its path even
+    though it matched no denylist entry. Report it with the reason, e.g.
+    "referenced by N files", rather than silently skipping it.
   - **Any git worktree root** detected in step 1 — surfaced on its own
     `worktree:` inventory line (see Report), never auto-deleted, whether or not
     it is gitignored and whether or not it sits under a recognized tool
@@ -266,6 +295,41 @@ reserved for tracked files.
   - **Any gitignored file that does not match the SAFE or CACHE allowlist** (a
     novel/unrecognized cache dir, unrecognized local state) — when in doubt, it
     lands here, not in SAFE or CACHE.
+  - **An orphaned-environment prune offer**, when step 1 detected a lockfile
+    and its package manager. This is the one ASK entry that is a **verb, not a
+    path** — see below.
+
+  **The prune offer (ASK-tier, and why).** Dependency churn leaves packages in
+  `node_modules/` that the current lockfile no longer references. After a round
+  of major bumps, one real repo's `node_modules/` went from 60 MB to 106 MB
+  because `node_modules/.pnpm` retained both the old and new TypeScript side by
+  side — ~46 MB unreferenced by the lockfile. That is exactly the dead weight
+  from dependency churn that tidy exists to catch, and until now there was no
+  tier that could reach it: `node_modules/` is denylisted as an *environment*,
+  so the only options were keep-the-whole-tree or delete-the-whole-tree.
+
+  The prune is the missing middle. It removes **only** packages the lockfile
+  does not reference, so it cannot break the working install and forces no
+  reinstall of anything in use. It nonetheless lands in **ASK, not CACHE**:
+  it mutates an environment in place, and ASK is the tier whose contract is
+  *never automatic under any flag* (Apply, below). `--caches` deliberately does
+  not reach it. This **adds a tier and relaxes nothing** — `node_modules/`
+  full-tree deletion stays denylisted and ASK exactly as before.
+
+  Two things not to overstate:
+
+  - **pnpm is the real case; npm is usually a near-no-op.** `pnpm prune` clears
+    the `.pnpm` link farm, where the duplication actually accumulates. `npm
+    install` already reconciles extraneous packages as part of its own run, so
+    `npm prune` typically reclaims little. Offer it, but do not present the two
+    as equivalent wins. In a pnpm workspace the prune must be run recursively
+    (`-r`) or it only touches the root package.
+  - **A pre-run size estimate is optional.** Diffing `node_modules/.pnpm`
+    entries against lockfile references to predict the reclaim is real parsing
+    work on every run, for a number that can be wrong. Reporting the current
+    `node_modules/` size and the **actual** bytes freed afterwards — what every
+    other category effectively does — is enough. Compute the estimate only if
+    it is cheap and reliable in the repo at hand; never block the offer on it.
 
   Deciding which worktrees, branches, and stashes are *stale* remains
   [[reset]]'s job — point there instead of pruning them here. `/repo:tidy`'s
@@ -273,7 +337,119 @@ reserved for tracked files.
   (and its size under `--sizes`) so the operator can see the footprint, and
   never delete one.
 - **KEEP** — flagged only as information: tracked files that look like they
-  don't belong (build output that got committed — point to [[gitignore]]).
+  don't belong. Nothing here is ever deleted — safety rule 1 is absolute — but
+  "looks like it doesn't belong" covers two shapes whose remedies are
+  **opposite**, so KEEP is reported as two named sub-cases and never as one
+  collapsed list:
+  - **KEEP (generated)** — a tracked file that looks like build output or some
+    other regenerable artifact that got committed by accident
+    (`assets/build.min.js`). It is inert: nothing reads it as source, it is
+    just noise in the history and the diff. The remedy is to stop tracking it
+    and ignore it going forward, which is [[gitignore]]'s job — point there.
+    This is what KEEP has always meant, and this sub-case is unchanged.
+  - **KEEP (name collision)** — a tracked file whose **trailing extension is a
+    live source extension in this repo**, so every tool that walks the project
+    by extension (compilers, EDA tools, linters, IDEs) opens it as real source.
+    This one is not inert, and [[gitignore]] is the **wrong** pointer for it:
+    the file is already tracked, already on disk, and already being parsed, so
+    adding an ignore rule changes nothing about the harm. The only remedy is a
+    deliberate `git rm` — see **The printed recipe** below.
+
+    Detection is a **naming heuristic, not a content check**: no file is opened
+    or parsed to make this call. It runs over **tracked files only**, since an
+    untracked or gitignored file is another tier's problem:
+
+    ```bash
+    # The candidate set and the sibling set are both drawn from here.
+    git ls-files
+    ```
+
+    A tracked file is a name collision when **all three** conditions hold:
+
+    1. Its basename carries a backup/copy marker **in the stem — before the
+       final `.`**: the substring `backup`, `copy`, or `orig`, matched
+       **case-insensitively** (`Connectors_BACKUP_20260427.kicad_sch`,
+       `schematic copy.kicad_sch`, `parser.orig.rs`).
+    2. Its trailing extension has **real siblings**: at least one *other*
+       tracked file ends in the same `.<ext>` and carries **no** such marker.
+       That sibling test is what makes `<ext>` a live source extension *for
+       this repo*. Never match against a hardcoded global extension list — a
+       `.kicad_sch` collision matters only in a repo that has real `.kicad_sch`
+       files, and in a repo with no such siblings the same filename is just a
+       file with an unusual name. **An extension that itself carries a marker
+       is never live**, however many files share it: `.backup-20260427_163100`
+       and `.orig` are provenance suffixes, nothing parses them as source, and
+       a `*.orig` merge leftover is the SAFE tier's leftover rule, not this
+       one — that exclusion is what keeps the two rules from overlapping in a
+       repo whose `*.rs.orig` leftovers would otherwise make `orig` look live.
+    3. The marker reads as a **provenance stamp on an existing file**, not as
+       the file's subject. Strip the **marker run** off the *end* of the stem
+       — the marker word, the separator run (space, `_`, `-`, `.`) in front of
+       it, and any timestamp or copy index (digits and separators) behind it —
+       and what remains must be a non-empty stem that names a **base sibling**:
+       another tracked file `<base>.<ext>`, same extension, **same directory**,
+       matched **case-insensitively** (same rationale as condition 1 — this
+       preserves real-world filesystem behavior on macOS/Windows, where
+       `Connectors.kicad_sch` and `connectors.kicad_sch` name the same file).
+       `connectors_backup_20260427_163100.kicad_sch` → `connectors.kicad_sch`,
+       `schematic copy.kicad_sch` → `schematic.kicad_sch`, `sheet - Copy
+       2.kicad_sch` → `sheet.kicad_sch`, `parser.orig.rs` → `parser.rs`. The
+       base sibling is the file this one is a copy *of*; if it cannot be
+       named, this is not a collision.
+
+    Condition 1 is deliberately about the **stem**, and that is what keeps the
+    inert shape out. `connectors_backup_20260427_163100.kicad_sch` collides:
+    its trailing extension really is `.kicad_sch`, so KiCad loads it as a
+    schematic sheet and its contents are counted a second time.
+    `connectors.kicad_sch.backup-20260427_163100` does **not** collide: its
+    trailing extension is `.backup-20260427_163100`, the marker *is* the
+    extension rather than part of the stem, no other tracked file shares that
+    extension, and no extension-walking tool will ever open it. Flagging the
+    second shape alongside the first would bury the signal, which is the whole
+    point of the sub-case: separate the backups that are actively being parsed
+    from the ones that are harmlessly sitting there.
+
+    Condition 3 is what tells a **stamp** from a **topic**, and without it
+    conditions 1 and 2 flag ordinary source in any repo that merely discusses
+    backups or copying. `src/backup.py` and `src/copy.py` strip to nothing.
+    `copyright.py`, `BackupManager.ts`, `useCopyToClipboard.ts` and
+    `deepcopy_helpers.py` have no marker *run* at all — the marker is glued
+    into a longer word, with no separator in front of it and no
+    separator-or-digits behind it. `copy_utils.ts` carries the marker at the
+    **front**, with no base in front of it to be a copy of.
+    `docs/backup-strategy.md` has both problems. None of these are backups of
+    anything and none may appear in this sub-case: it prints `git rm`, and a
+    pasted false positive here is the one recipe in `/repo:tidy` that costs a
+    source file.
+
+    The trade is deliberate — precision bought with recall. A genuine backup
+    whose base file was since renamed or deleted, or that was moved into a
+    `backups/` directory away from its original, has no base sibling and is
+    **not** reported here even though a tool would still parse it. It is not
+    lost: like the inert shapes, it stays in the **generated** sub-case with
+    the [[gitignore]] pointer. Only the alarm and the `git rm` recipe are
+    withheld, and they are withheld exactly when tidy cannot say truthfully
+    what the file is a backup of — which is the same circumstance in which the
+    `why:` line below could not be written honestly.
+
+    **The printed recipe.** For each collision, print a literal,
+    copy-pasteable `git rm <path>` line plus a one-line reason naming the tool
+    class that parses the file and what that costs. The reason is only ever
+    written from what conditions 2 and 3 established — the sibling count that
+    made the extension live, and the base sibling the file is a copy of. **If
+    that sentence cannot be written truthfully, the file is not a collision
+    and must not be reported here**; never assert that a file is a backup of
+    something tidy could not name. `/repo:tidy` **prints this string and
+    nothing else** — it never runs `git rm`, never stages it, and never
+    offers to run it, not under `--ask`, `--apply`, or any other flag.
+    Removing a tracked file is a commit the user makes deliberately (safety
+    rule 1); the recipe exists so that decision is one paste away instead of a
+    research task, exactly as the [[gitignore]] pointer is for the generated
+    sub-case.
+
+  Print each sub-header **only when it has entries**. A repo with nothing
+  colliding must not grow an empty `name collision` heading — an empty tier
+  reads as a finding, and this one is meant to read as an alarm.
 
 ### 3. Report
 
@@ -294,6 +470,7 @@ ASK:
   .env                     gitignored, 1 KB  ← credentials, never auto-deleted
   .venv/                   gitignored, 240 MB  ← virtualenv, expensive to rebuild
   node_modules/            gitignored, 310 MB  ← environment, reinstall via npm; not a --caches target
+  prune node_modules       pnpm-lock.yaml detected  ← run `pnpm prune` to drop lockfile-unreferenced packages
   .loom/locks/             gitignored, empty  ← coordination root, empty is normal state
   .wrangler/tmp/           gitignored, empty  ← tool runtime dir, empty between builds
   notes-scratch.md         untracked, 3 KB, modified today  ← might be real work
@@ -306,9 +483,28 @@ WORKTREES (4 roots — never auto-deleted, listed for visibility; --sizes to mea
   worktree: /private/tmp/wt-bisect        ← live git worktree (outside repo root)
   Pruning stale worktrees is /repo:reset's call, not tidy's.
 
-KEEP (informational):
-  assets/build.min.js      tracked but looks generated — see /repo:gitignore
+KEEP (informational) — tracked files, never deleted by tidy (safety rule 1):
+
+  generated — committed build output; stop tracking it going forward:
+    assets/build.min.js      tracked but looks generated — see /repo:gitignore
+
+  name collision — tracked AND parsed as real source; gitignoring fixes nothing:
+    connectors_backup_20260427_163100.kicad_sch
+      why: backup of connectors.kicad_sch, and 14 real .kicad_sch files make
+           that a live extension here — KiCad opens this backup as a schematic
+           sheet too, so its contents are counted twice
+      run deliberately (tidy will not run this for you):
+        git rm connectors_backup_20260427_163100.kicad_sch
 ```
+
+The two KEEP sub-blocks are formatted differently on purpose: the generated
+sub-case is a one-line pointer at another command, while the name-collision
+sub-case gets its own indented `why:` line and a `git rm` recipe on a line of
+its own, because the operator has to read the reason before running it. Print
+whichever sub-blocks have entries and omit the others entirely — on the common
+repo where nothing collides, the output is the single `generated` block and is
+byte-for-byte what it has always been. The `git rm` line above is **report
+text**: it is printed for the operator to run, never executed by `/repo:tidy`.
 
 With `--sizes`, the same block gains a right-aligned size column and a total
 (`size unavailable` for any root that hit the `timeout`):
@@ -354,6 +550,24 @@ guessing** at a command that may not exist.
   CACHE; delete only what they approve. (`--ask` already surfaces caches for a
   decision, so `--caches` is redundant with it — the flag only affects the
   non-interactive default.)
+- **KEEP is never part of the apply step, under any flag.** Both sub-cases are
+  tracked files, so both are report-only: `/repo:tidy` never runs `git rm`,
+  never stages a tracked-file deletion, and never prompts to do either — not
+  even for a name collision, and not even under `--ask`. The `git rm <path>`
+  line in the report is a string printed for the operator, in exactly the same
+  sense as the `see /repo:gitignore` pointer beside it. If a future change ever
+  needs tidy to *perform* it, that is a different command with a different
+  safety story, not a flag on this one.
+
+**The prune offer, if accepted, runs the package manager's own verb and
+nothing else** — `pnpm prune` (add `-r` in a workspace) or `npm prune`, from
+the repo root. Never `git clean`, never `rm` inside `node_modules/`, and never
+a hand-rolled walk of `.pnpm`: the whole safety argument for this tier is that
+the package manager decides what is unreferenced, so bypassing it forfeits the
+guarantee. Report the actual bytes freed by measuring `node_modules/` before
+and after. If the prune command fails, report the failure and leave the tree
+alone — a partially pruned `node_modules/` is the package manager's to
+reconcile on the next install, not tidy's to repair.
 
 The default auto-delete is scoped to **SAFE-allowlisted paths only** (plus the
 CACHE allowlist when `--caches` is passed). Never pass a denylisted path
@@ -407,3 +621,12 @@ inventory to confirm and report bytes freed.
    than deleting a worktree is telling the operator their 94 GB tree is clean.
    Sizing those roots is a `du` with no `-prune`, so it is opt-in behind
    `--sizes` and bounded per root; the report itself never is.
+10. **Prune only through the package manager** — the orphaned-environment
+   offer runs `pnpm prune` / `npm prune` and nothing else. Never `rm` inside
+   `node_modules/`, never `git clean` against it, never a hand-rolled walk of
+   `node_modules/.pnpm`. The tier is defensible *because* the package manager
+   decides what the lockfile no longer references; deciding that ourselves
+   forfeits the only guarantee that makes it safe. And the offer is ASK-tier,
+   so rule 7's `--caches` opt-in does not reach it and no flag makes it
+   automatic — `node_modules/` full-tree deletion remains denylisted and ASK
+   exactly as under rule 6.

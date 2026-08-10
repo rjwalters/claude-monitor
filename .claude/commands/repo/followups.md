@@ -63,30 +63,38 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
   ```
 
 - **Upstream tool repos**: discover installed tools exactly as
-  `/repo:update-tools` step 1 does — find their metadata files, then resolve
-  each tool's local source clone **sidecar-first**, and derive a GitHub slug
-  from that clone's `origin` remote.
+  `/repo:update-tools` step 1 does — sweep for their metadata files, then
+  resolve each tool's local source clone **sidecar-first**, and derive a
+  GitHub slug from that clone's `origin` remote.
 
   ```bash
-  # a. Find installed-tool metadata (same locations update-tools checks)
-  ls .loom/install-metadata.json .anvil/install-metadata.json 2>/dev/null
-  ls .claude/skills/*/install-metadata.json 2>/dev/null
+  # a. Find installed-tool metadata (same sweep /repo:update-tools step 1 uses)
+  find . -maxdepth 4 -name "install-metadata.json" \
+    -not -path "*/node_modules/*" -not -path "*/.venv/*" 2>/dev/null
   ```
 
-  Resolve each tool's `source` clone path in this order (each step failing is
-  "source unknown", not an error):
+  A fixed list of known paths structurally cannot find a family member added
+  after this doc was last updated (repo#165) — sweep for the file itself
+  instead. `-maxdepth 4` reaches every known tool root (`.loom/`, `.anvil/`,
+  `.kct/` at depth 2, and the two-levels-deeper `.claude/skills/*/` at depth 4).
 
-  1. **Sidecar first.** For Repo Skills read
-     `.claude/skills/repo/.install-local.json` (generally
-     `.claude/skills/*/.install-local.json`); it holds `source` /
-     `installed_at`. Loom uses the plain-text `.loom/loom-source-path` sidecar
-     for the same purpose. A sidecar is gitignored, so it exists only on the
-     machine that ran the install.
-  2. **Legacy inline fallback.** Pre-split installs still embed `source` /
-     `installed_at` directly in `install-metadata.json` — read from there if no
-     sidecar exists.
-  3. **Unknown → GitHub.** If neither yields a path, the local source clone is
-     simply unknown (normal on a fresh clone elsewhere).
+  Resolve each tool's `source` clone path with the **sidecar → legacy inline →
+  unknown** order that is normative in the [tool-package installer
+  contract][contract] (requirement **C6**, which also covers the repo#96 signature
+  below). Each step failing is "source unknown", not an error. Do not re-derive
+  the order from what a given tool happens to do — read C6.
+
+  [contract]: https://github.com/rjwalters/repo/blob/main/INSTALLER-CONTRACT.md
+
+  **kicad-tools does not conform to C6.** `.kct/install-metadata.json` carries
+  `kct_version` / `kct_commit` and no sidecar — it always records `source_mode`
+  (`"path"` or `"git"`) and `source_ref` inline instead. When `source_mode` is
+  `"path"`, `source_ref` **is** the local clone path — read its `origin`
+  remote directly, skipping the sidecar ladder above. When `source_mode` is
+  `"git"` (kicad-tools' default), there is no local clone at all — this
+  degrades to "source unknown" exactly like a fresh clone, not an error, and
+  the slug can be read straight off `source_ref` (a `<git-url>@<tag-or-rev>`
+  string) without a `git -C <source> config` lookup.
 
   Then derive the slug from the resolved clone's remote:
 
@@ -95,16 +103,27 @@ Every candidate has to land in *some* repo. Build the routing table by reusing
   ```
 
   `install-metadata.json` (tracked) is JSON, and key names vary by tool
-  (`version` vs `loom_version` / `anvil_version`, etc.) — read whichever variant
-  is present, same as `/repo:update-tools`. Neither the tracked metadata nor the
-  sidecar stores an `owner/repo` slug directly; it is always derived from the
-  source clone's `origin` remote.
+  (`version` vs `loom_version` / `anvil_version` / `kct_version`, etc.) — read
+  whichever variant is present, same as `/repo:update-tools`. Neither the
+  tracked metadata nor the sidecar stores an `owner/repo` slug directly for
+  Loom / Anvil / Repo Skills — it is always derived from the source clone's
+  `origin` remote; kicad-tools' `source_ref` in `"git"` mode is the one
+  exception, since it already embeds the full GitHub URL to parse directly.
 
 - **Unresolvable targets.** If a tool's source clone is unknown (no sidecar, no
   legacy field) there is no local remote to read — mark that follow-up
   **UNKNOWN** and surface it for the user to name a slug, per the safety rules.
   Likewise, if a candidate doesn't clearly belong to any discovered repo,
   surface it for a target decision rather than dropping it or guessing.
+
+  **Signature check** (contract **C6**, "the repo#96 signature"): when
+  `install-metadata.json` exists but neither a sidecar nor legacy inline fields
+  do, that is also what a previously *tracked* sidecar leaves behind once it is
+  untracked upstream. Still mark the target UNKNOWN — there is no path to read —
+  but append C6's distinct suggestion (`"sidecar missing but
+  install-metadata.json present — …"`) rather than treating it identically to a
+  fresh clone, which gets no such suggestion. This is the same handling
+  `/repo:update-tools` step 1 applies, and both follow C6 rather than each other.
 
 Honor scope flags: `--here` keeps only this-repo targets; `--repo <tool>`
 restricts to a single discovered tool.
@@ -120,9 +139,23 @@ gh api "search/issues?q=repo:<slug>+state:open+<key+terms>&per_page=30" \
   --jq '.items[] | "#\(.number) \(.title) \(.html_url)"'
 ```
 
+**Pull requests are deliberately in scope.** `search/issues` returns both
+issues **and pull requests** — the `issues` in the route name is GitHub's
+issue-tracker sense of the word, and the step title uses it the same loose way.
+This is intentional and is *not* narrowed with `+is:issue`: an open PR covering
+a candidate is a **stronger** dedup signal than an open issue, because it means
+the work is already in flight rather than merely proposed. Filtering PRs out
+would discard exactly the signal that matters most for "don't re-file something
+already being worked on". The cost of the wider result set is absorbed by
+safety rule 2 — near-matches are always flagged to the user, never
+auto-skipped or auto-filed-over — and `html_url` discloses which kind each
+match is.
+
 Search result items already carry `number`, `title`, and `html_url`, so this is
 a straight replacement for the old `--json number,title,url` output shape — no
-second-pass mapping needed.
+second-pass mapping needed. That parity covers the output **shape** only, not
+the result **set**: the old `gh issue list --search` form returned issues only,
+while this one is deliberately broader (see above).
 
 Terms go into `q` as `+`-joined tokens; URL-encode anything that isn't
 alphanumeric, and quote the whole URL so the shell leaves it alone.
@@ -134,12 +167,20 @@ a third bucket again (30 requests/minute authenticated), so deduping here costs
 nothing from the pool step 5 needs to actually file. Check live budgets with
 `gh api rate_limit --jq .resources` if either step starts failing.
 
-Classify each candidate against its target repo's open issues:
+Classify each candidate against its target repo's open issues **and pull
+requests** (the search returns both, per the note above):
 
 - **New** — no match; propose to file.
-- **Near-match** — a similar issue exists; **flag it for the user** with the
-  existing issue's number/URL and let them choose: file anyway, skip, or
+- **Near-match** — a similar item exists; **flag it for the user** with the
+  existing item's number/URL and let them choose: file anyway, skip, or
   comment on the existing one. Never silently file over it or silently drop it.
+- **A near-match may itself be a pull request.** Check `html_url` for `/pull/`
+  vs `/issues/` to tell which, and say so when flagging it — e.g. "near #99
+  (PR, work already in flight)" alongside "near #217 (issue)". A PR match
+  normally argues *more* strongly for skip-or-comment than an issue match does.
+  Commenting works either way (`POST /issues/<n>/comments` accepts a PR
+  number), but on a PR the comment lands in that PR's conversation rather than
+  on a standalone issue, so confirm that's what the user wants.
 
 ### 4. Report the proposed set and confirm
 
@@ -148,29 +189,43 @@ Present the full proposal and get explicit approval before touching any repo:
 ```
 FOLLOW-UPS FROM THIS SESSION
 ============================
-| # | Target repo        | Title                              | Dedup            |
-|---|--------------------|------------------------------------|------------------|
-| 1 | rjwalters/repo     | orphans check misses nested dirs   | NEW              |
-| 2 | rjwalters/loom     | worktree.sh fails on detached HEAD | near #217 (flag) |
-| 3 | rjwalters/anvil    | (docs gap) …                       | NEW              |
-| 4 | UNKNOWN            | kicad-tools DRC false positive     | ask — no slug    |
+| # | Target repo        | Title                              | Dedup                   |
+|---|--------------------|------------------------------------|-------------------------|
+| 1 | rjwalters/repo     | orphans check misses nested dirs   | NEW                     |
+| 2 | rjwalters/loom     | worktree.sh fails on detached HEAD | near #217 (issue, flag) |
+| 3 | rjwalters/repo     | followups dedup also matches PRs   | near #99 (PR, flag)     |
+| 4 | rjwalters/anvil    | (docs gap) …                       | NEW                     |
+| 5 | UNKNOWN            | kicad-tools DRC false positive     | ask — no slug           |
 ```
 
 For each proposed issue show the target repo, title, a body preview (context /
 repro / suggested acceptance criteria), and dedup status. Then confirm which to
 file. **If `--dry-run` was passed, stop here — file nothing.**
 
+The `Dedup` column carries step 3's classification: `NEW`, a flagged
+near-match, or `ask` for an unresolved target. A flagged near-match may resolve
+to **either an open issue or an open pull request** — step 3 searches both on
+purpose — so name which kind it is (rows 2 and 3 above), since a PR match means
+the work is already in flight and usually changes the user's choice.
+
 ### 5. File the approved issues
 
 For each approved, non-UNKNOWN candidate, write the body to a scratch file and
-POST it through REST:
+POST it through REST. **Use a literal, spelled-out scratch path — never a
+shell variable — as the `>` redirect target and the `--input` argument.** In a
+Loom-managed repo the destructive-write guard denies a write whose target is
+an unexpanded shell variable outright, because it cannot statically resolve
+where the write lands and a variable-rooted path might resolve inside a repo
+with live worktrees (#4921/#4178); a literal path sidesteps that ambiguity
+entirely, so do not "clean this back up" into `$BODY` / `$PAYLOAD` variables
+for readability. Prefer the session's own scratchpad directory when the
+agent has one (it is both literal and guaranteed outside every repo);
+otherwise spell out a `/tmp/...` path directly:
 
 ```bash
-BODY="${TMPDIR:-/tmp}/followup-body.md"
-PAYLOAD="${TMPDIR:-/tmp}/followup-payload.json"
-
-# 1. Write the issue body to "$BODY" using your own file-write capability —
-#    NOT a shell heredoc (see below). Content is the usual shape:
+# 1. Write the issue body to a literal scratch path using your own
+#    file-write capability — NOT a shell heredoc (see below). Content is the
+#    usual shape:
 #      ## Context
 #      <where this came up in the session / repro>
 #
@@ -178,10 +233,10 @@ PAYLOAD="${TMPDIR:-/tmp}/followup-payload.json"
 #      - [ ] …
 
 # 2. Build the create payload, then POST it (REST `core` pool, not GraphQL).
-jq -n --arg t "<title>" --rawfile b "$BODY" \
-  '{title: $t, body: $b, labels: []}' > "$PAYLOAD"
+jq -n --arg t "<title>" --rawfile b /tmp/followup-body.md \
+  '{title: $t, body: $b, labels: []}' > /tmp/followup-payload.json
 
-gh api --method POST "repos/<slug>/issues" --input "$PAYLOAD" --jq '.html_url'
+gh api --method POST "repos/<slug>/issues" --input /tmp/followup-payload.json --jq '.html_url'
 ```
 
 Two reasons this is the documented form rather than
@@ -203,12 +258,13 @@ it `[]` here, per the labeling note below.
 
 Print the resulting issue URLs. For near-matches the user chose to comment on
 instead of file, use the same REST shape (`gh issue comment` is GraphQL-backed
-too):
+too) and the same literal-scratch-path rule as above — never a `$BODY` /
+`$PAYLOAD` variable as the write target:
 
 ```bash
-jq -n --rawfile b "$BODY" '{body: $b}' > "$PAYLOAD"
-gh api --method POST "repos/<slug>/issues/<n>/comments" --input "$PAYLOAD" \
-  --jq '.html_url'
+jq -n --rawfile b /tmp/followup-body.md '{body: $b}' > /tmp/followup-payload.json
+gh api --method POST "repos/<slug>/issues/<n>/comments" \
+  --input /tmp/followup-payload.json --jq '.html_url'
 ```
 
 Leave UNKNOWN / skipped candidates unfiled and list them so nothing is silently
