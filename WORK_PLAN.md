@@ -3,6 +3,12 @@
 Prioritized roadmap derived from current GitHub label state. Regenerated automatically by the Guide role whenever labels change — see [WORK_LOG.md](WORK_LOG.md) for completed work.
 
 <!-- guide:plan-body:start -->
+## Operator Attention: Merge-Risk-Hold Pileup
+
+Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementation work is done, only a human merge decision is missing.
+
+_None._
+
 ## Urgent
 
 Issues flagged as highest priority (`loom:urgent`).
@@ -51,6 +57,7 @@ _None._
 
 | Tier | Count |
 |------|-------|
+| Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
