@@ -369,6 +369,8 @@ assert_contains "$COMMENT" "2AMLogic/klayout-tools#391" "comment names the OTHER
 assert_contains "$COMMENT" "champion:dep-cycle:" "comment carries the idempotency marker"
 LABELS="$(cat "$STUB_DIR/labels-2AMLogic_marketing_56.log" 2>/dev/null || true)"
 assert_contains "$LABELS" "loom:operator-only" "routes to loom:operator-only"
+assert_contains "$LABELS" "loom:operator-decision" "routes to the loom:operator-decision sub-kind (#5671) — breaking a cycle is a judgement call"
+assert_contains "$COMMENT" "Blocked by 2AMLogic/klayout-tools#391 2AMLogic/marketing#56" "comment names the blocker(s) in machine-readable form (#5671)"
 
 echo
 echo "--- --report is idempotent: the same cycle is surfaced once ---"

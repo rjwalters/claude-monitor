@@ -634,6 +634,142 @@ else
 fi
 rm -rf "$scope_dir"
 
+# ============================================================
+# ============================================================
+# #5501: LOOM_DAEMON_STOP_DRYRUN — a supported way to exercise default-label
+# semantics without ever touching a real supervised job.
+#
+# Reproduces the incident shape: LOOM_LAUNCHD_LABEL pointed at the REAL
+# production label, no PID file (as if LOOM_PID_FILE were sandboxed/empty —
+# the harness's actual mistake), so the target pid is resolved via the
+# launchd-label fallback, exactly how a "prove default-label behaviour is
+# unchanged" test reached the operator's real daemon. A fake `launchctl`
+# stub simulates "the production job is loaded" with a decoy's pid, so this
+# reproduction is safe regardless of DRYRUN — nothing here ever calls the
+# REAL launchctl. Darwin-only: launchd_job_loaded short-circuits on
+# non-Darwin, so the label-fallback path used here cannot be exercised there.
+# ============================================================
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    DR_BIN="$WORKDIR/dryrun-bin"; mkdir -p "$DR_BIN"
+    DR_LOG="$WORKDIR/dryrun-launchctl.log"
+    make_dr_launchctl() {
+        local pid="$1"
+        : > "$DR_LOG"
+        cat > "$DR_BIN/launchctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$DR_LOG"
+case "\$1" in
+  print)   printf '\tpid = %s\n' "$pid"; exit 0 ;;
+  bootout) exit 0 ;;
+  *)       exit 0 ;;
+esac
+EOF
+        chmod +x "$DR_BIN/launchctl"
+    }
+    rm -f "$SLEEP_PID_FILE"
+
+    # DR1. WITHOUT the seam: the real-labeled job's resolved pid IS killed —
+    #      proves this fixture genuinely reproduces the incident (not vacuous).
+    sleep 30 &
+    dr_decoy_pid="$!"
+    bg_proc_track "$dr_decoy_pid"
+    make_dr_launchctl "$dr_decoy_pid"
+    ( cd "$WORKDIR" && PATH="$DR_BIN:$PATH" LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon" \
+        LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" >/dev/null 2>&1 )
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if ! kill -0 "$dr_decoy_pid" 2>/dev/null; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} #5501 repro: without the dry-run seam, a real-labeled resolved pid IS stopped (fixture is not vacuous)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} #5501 repro: without the dry-run seam, a real-labeled resolved pid IS stopped (fixture is not vacuous)"
+        kill -9 "$dr_decoy_pid" 2>/dev/null || true
+    fi
+
+    # DR2. WITH LOOM_DAEMON_STOP_DRYRUN=1: the SAME shape never sends a real
+    #      signal and never issues a real launchctl bootout -- only logs what
+    #      it would have done.
+    sleep 30 &
+    dr_decoy_pid2="$!"
+    bg_proc_track "$dr_decoy_pid2"
+    make_dr_launchctl "$dr_decoy_pid2"
+    DR_ACTIONS="$WORKDIR/dryrun-actions.log"
+    dr_out=$( cd "$WORKDIR" && PATH="$DR_BIN:$PATH" LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon" \
+        LOOM_DAEMON_STOP_DRYRUN=1 LOOM_DAEMON_STOP_DRYRUN_LOG="$DR_ACTIONS" \
+        LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" 2>&1 )
+    dr_rc=$?
+    assert_eq "0" "$dr_rc" "#5501 dry-run: stop exits 0"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if kill -0 "$dr_decoy_pid2" 2>/dev/null; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} #5501 dry-run: the real-labeled resolved pid SURVIVES (no real signal sent)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} #5501 dry-run: the real-labeled resolved pid SURVIVES (no real signal sent)"
+    fi
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if grep -q "would SIGTERM pid $dr_decoy_pid2" "$DR_ACTIONS" 2>/dev/null; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} #5501 dry-run: the dry-run log records the SIGTERM that would have been sent"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} #5501 dry-run: the dry-run log records the SIGTERM that would have been sent"
+        echo "  actions log: $(cat "$DR_ACTIONS" 2>/dev/null)"
+        echo "  stop output: $dr_out"
+    fi
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if grep -q 'would launchctl bootout' "$DR_ACTIONS" 2>/dev/null; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} #5501 dry-run: the dry-run log records the launchctl bootout that would have been issued"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} #5501 dry-run: the dry-run log records the launchctl bootout that would have been issued"
+    fi
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if ! grep -q '^bootout' "$DR_LOG" 2>/dev/null; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} #5501 dry-run: no REAL launchctl bootout invocation was recorded"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} #5501 dry-run: no REAL launchctl bootout invocation was recorded"
+        echo "  launchctl calls: $(cat "$DR_LOG")"
+    fi
+    kill -9 "$dr_decoy_pid2" 2>/dev/null || true
+
+    # DR3. --help documents the seam.
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if echo "$help_out" | grep -q 'LOOM_DAEMON_STOP_DRYRUN'; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "${GREEN}✓${NC} --help documents LOOM_DAEMON_STOP_DRYRUN"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "${RED}✗${NC} --help documents LOOM_DAEMON_STOP_DRYRUN"
+    fi
+else
+    echo "  (skipping #5501 dry-run reproduction — not Darwin)"
+fi
+
+# DR4 (platform-independent): the supervisor-identity guard in
+# lib/live-state-sandbox.sh flags this exact real-label combination outside
+# dry-run, and is exempt from flagging it while the seam is active (#5501 AC2
+# wiring between the two files).
+TESTS_RUN=$((TESTS_RUN + 1))
+if LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon" live_state_sandbox_assert_supervisor_scoped 2>/dev/null; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #5501: the supervisor-identity guard flags the real label outside dry-run"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #5501: the supervisor-identity guard flags the real label outside dry-run"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if LOOM_LAUNCHD_LABEL="com.rjwalters.loom-daemon" LOOM_DAEMON_STOP_DRYRUN=1 live_state_sandbox_assert_supervisor_scoped 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #5501: LOOM_DAEMON_STOP_DRYRUN=1 is the supported bypass for the guard"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #5501: LOOM_DAEMON_STOP_DRYRUN=1 is the supported bypass for the guard"
+fi
+
 # Live daemon state guard (#5179, adopted here per #5191): every live `.loom`
 # state path reachable from the ambient environment (the real $HOME/.loom, the
 # live checkout's .loom, an ambient LOOM_PID_FILE / LOOM_WORKSPACE /

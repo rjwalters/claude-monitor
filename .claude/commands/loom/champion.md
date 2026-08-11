@@ -53,6 +53,24 @@ terminal — `title`/`body` feed `champion-issue-promo.md`'s body-hash
 idempotency check (the issue's aggregate `updatedAt` is deliberately NOT used
 for it, #4966):
 
+> **`loom:operator-only` is excluded here, but not unexamined (#5664).**
+> `champion-issue-promo.md` → "Pass 0: Self-Healing Un-Escalation Re-Scan" runs
+> one bounded scan of `loom:operator-only` proposals *before* this discovery
+> query and removes the label from any whose escalation was Champion's own,
+> dependency-only, and whose recorded blocker has since closed. Those issues then
+> match the query below in the same pass. Without that scan, an escalation for an
+> open dependency — a condition that clears itself — would be permanent, because
+> the only actor that could notice the blocker closed is the one this exclusion
+> tells to ignore it.
+>
+> **Separately, if a `loom:operator-only` proposal you happen to read is
+> actually blocked on missing capability rather than a genuine operator
+> ruling**, relabel it to `loom:needs-capability` per
+> `.loom/docs/label-state-machine.md` → "Bidirectional routing:
+> `loom:operator-only` ↔ `loom:needs-capability`" (#5818) — this is an
+> opportunistic per-occurrence judgment call, not a scheduled scan like Pass 0
+> above.
+
 ```bash
 gh issue list \
   --label="loom:curated" \

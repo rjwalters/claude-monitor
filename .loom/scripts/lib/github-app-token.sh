@@ -237,8 +237,19 @@ _github_app_cache_path() {
 # mapping cache file path. This value is not a secret (an installation id is
 # just an integer identifying a repo grant) so it does not need 0600, but it
 # lives in the same 0700 directory as the token cache for simplicity.
+#
+# Keyed by (owner, app id) rather than owner alone (#5912): a host running
+# daemons for two repos that share a GitHub account but are backed by two
+# different GitHub Apps would otherwise collide on one cache entry --
+# whichever app resolves first wins, and the second app then mints against an
+# installation id its JWT has no claim on (404), silently falling back to
+# ambient `gh` auth. `_GH_APP_ID` is populated by `_github_app_load_config`
+# (via `github_app_configured`) before every call site here is reached.
+# Pre-existing owner-only cache files (`owner-<owner>.installation`) are
+# simply left as dead filenames -- no migration needed.
 _github_app_installation_cache_path() {
-  echo "$(_github_app_cache_dir)/owner-${1}.installation"
+  local app_id="${_GH_APP_ID:-unknown}"
+  echo "$(_github_app_cache_dir)/owner-${1}-app-${app_id}.installation"
 }
 
 # _github_app_write_cache <installation_id> <token> <expires_at_iso8601> ->

@@ -123,6 +123,15 @@ never `refs/stash`, so no concurrent builder's stash can land between your
 push and pop — and, unlike raw `git stash pop`, it does not trip the
 `stash-scope` ask that would stall a headless sweep.
 
+**This is enforced, not merely advised (#5754).** Inside a managed worktree,
+while a second managed worktree is active, a raw stash *create* — `git stash`,
+`git stash push`, `git stash save` — is **denied** by the guard, with the exact
+`snapshot` / `stash-push` / `stash-pop` command (issue number already filled
+in) in the deny message. The deny is lossless: nothing ran and your working
+tree is untouched, so just rerun with the command it hands you.
+`git stash pop` / `drop` / `clear` stay an *ask*, not a deny, on purpose —
+once WIP is on `refs/stash`, popping it is the only way to get it back.
+
 ## ⚠️ `--body @path` Does NOT Expand — It Posts the Literal String
 
 **If a comment you're posting (fix summary, clarifying question, conflict-only
@@ -346,6 +355,91 @@ gh pr list --search "is:open is:pr label:loom:changes-requested -label:loom:bloc
 > auto-claims a held PR. This does not change PR Fix Mode or an explicit user
 > instruction naming a PR by number — those remain a deliberate human
 > decision to work on that specific PR, same as everywhere else in this file.
+
+### Applying `loom:operator-only`: a sub-kind label is REQUIRED (#5819)
+
+Doctor's normal flow only **filters** on `loom:operator-only` (the queries
+above) — it does not route work to the operator on its own. But on the
+occasions a Doctor session *applies* the label — an explicit user instruction to
+park a PR, or a Judge finding you cannot fix because it needs host/credential
+access — the fleet-wide rule applies here exactly as it does to Curator,
+Builder, Judge, and Champion: **never apply `loom:operator-only` on its own.**
+Choose exactly one sub-kind and apply both labels in the **same** command. This
+is purely additive — the base label is never removed or replaced, so the
+operator-hold exclusion above and every other filter keyed on it are unaffected:
+
+| Sub-kind | Apply when |
+|---|---|
+| `loom:operator-blocked` | Waiting on a **named** issue/PR/piece of infrastructure that does not exist yet — self-clearing once that lands |
+| `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required (the typical Doctor case: a fix that requires a secret rotation or a machine you cannot reach) |
+| `loom:operator-decision` | The fix requires authority you structurally cannot hold — a preference call or an authority act (binds the entity, irreversible disclosure, spending, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) |
+| `loom:operator-objective` | The fix is determined once the operator states an objective — name the candidate objectives and the answer under each (#5826) |
+
+```bash
+gh pr comment <number> --body "Routing to the operator: <what a human must do>."
+gh pr edit <number> --add-label "loom:operator-only,loom:operator-mechanical"
+```
+
+**Being unsure which sub-kind applies means you haven't finished diagnosing
+the fix, not that the bare label is safe to reach for (#5826).**
+`loom:operator-decision` is **not** a safe default when the kind is not
+obvious — before applying it, run the falsifiability test from
+`.loom/docs/label-state-machine.md`: name the axis two well-informed people
+would still disagree on, and show it is a preference, not a fact. If you
+cannot name that axis, the fix is determined — finish diagnosing it instead of
+parking. If the only gap is a missing objective, that's
+`loom:operator-objective`, not `loom:operator-decision`.
+
+**If you chose `loom:operator-blocked`**, the same comment MUST name the blocker
+in machine-readable form: a literal `Blocked by #N` / `Depends on #N` /
+`Requires #N` line (the exact phrasings `detect-dependency-cycle.sh` and
+`warn-operator-gated.sh` parse by regex). A backtick-quoted reference in prose
+does not satisfy this.
+
+**If you chose `loom:operator-decision`**, the same comment MUST name the
+disagreement axis and state why it is a preference rather than a fact.
+
+**If you chose `loom:operator-objective`**, the same comment MUST list the
+candidate objectives and the answer under each, not just "needs an
+objective."
+
+Full taxonomy and rationale: `.loom/docs/label-state-machine.md` →
+"`loom:operator-only` sub-kinds".
+
+### Stale-Verdict Check (before claiming from Priority 1 or Priority 2)
+
+Both queues above select on a **terminal review verdict** — `loom:pr` or
+`loom:changes-requested` — and a verdict is a statement about a specific tree,
+not about a PR. When the head SHA has moved since the verdict was rendered
+(rebase, force-push, or just new commits), the rejection you would be
+dispatched to fix may already be resolved, and the approval you would be
+dispatched to de-conflict may cover code nobody reviewed (#5686 — observed on
+rjwalters/repo#192, where a rebase made a rejected PR's CI green and the
+`loom:changes-requested` label never moved).
+
+Run the guard on each candidate **before** claiming it with `loom:treating`:
+
+```bash
+./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear
+case $? in
+  0)  : ;;   # FRESH — the verdict describes the current tree; proceed to claim
+  10) : ;;   # no verdict label (raced away) — skip, nothing to fix
+  11) : ;;   # UNVERIFIABLE (verdict written before the marker convention) —
+             # proceed as today; the guard fails safe and keeps the verdict
+  12) continue ;;  # STALE — the guard re-queued it for Judge. NOT Doctor work.
+  *)  continue ;;  # gh/env error — skip this PR, do not guess
+esac
+```
+
+**On exit 12 the PR is now `loom:review-requested`, not your work.** Do not
+claim it, do not "fix" the cleared rejection, and do not re-apply
+`loom:changes-requested` — a Judge re-evaluates the current tree first. Full
+convention: `judge.md` → "Verdict SHA Marker" / "Stale-Verdict Sweep".
+
+This is deliberately **not** the same thing as the Pre-Push Head-SHA Recheck
+below: that one protects *your own in-flight work* from a concurrent push;
+this one asks whether the verdict that sent you here still describes reality
+at all.
 
 ### Other PRs Needing Attention
 
@@ -874,6 +968,42 @@ sleep 30 && gh pr checks <PR_NUMBER>
 
 # If any still failing, repeat assessment (but should be rare now)
 ```
+
+### CRITICAL: Never End Your Turn on a Background CI Monitor
+
+The "Time budget — do not hang" rule above forbids waiting *too long*. This rule forbids the opposite-looking failure that costs just as much: **pretending to wait** by arming a watcher and ending the turn.
+
+**Every result you are waiting on — remote CI after the push above, a long local check run (`buildGate.command`, `pnpm check:ci`), a slow test suite during conflict resolution — must be resolved inside the same turn that started it. It must NEVER be resolved by starting a background monitor (a `Monitor`/`ScheduleWakeup` timer, a `run_in_background` Bash watcher, a `gh pr checks --watch` you walk away from) and ending your turn narrating *"the monitor will re-invoke me when CI concludes."***
+
+This is the Doctor-side counterpart of the orchestrator guardrail in `sweep.md` ("ending your turn IS the kill signal", issue #4257) and of the identical rule in `judge.md`. **One rule, both dispatch surfaces:**
+
+- **Headless (`claude -p` sweep, daemon dispatch)**: ending your turn *terminates the process*. The watcher dies with it, the CI result is never read, and the PR is stranded mid-treatment — still `loom:treating`, never handed back to Judge, with nobody left to release the claim.
+- **Interactive (Task-tool subagent)**: the re-invocation never arrives; the sweep stalls until a human nudges you (incident #5659 — roughly eight manual nudges in one sweep).
+
+**There are exactly two safe paths when CI has not settled:**
+
+1. **You have made the fix and pushed it: hand back to Judge instead of waiting.** This is the correct default. Verifying the final CI verdict is **Judge's** gate — complete the `loom:changes-requested` → `loom:review-requested` transition, state in your PR comment that CI was still running at hand-off, and finish your turn. A later Judge pass re-evaluates once CI settles.
+2. **Single-PR / manual invocation where a settled result is expected before your turn ends: block-poll in the foreground.** Loop **inside this same turn** — `gh pr checks`, `sleep`, repeat — until the checks resolve or you hit an explicit, bounded cap. This is an ordinary shell loop that runs to completion and returns control to you before you write your final message; nothing about it depends on a future turn.
+
+```bash
+# Foreground block-poll after `git push` — bounded, in-turn, no watcher.
+# MAX_WAIT caps the total wait; never loop unboundedly (see "Time budget" above).
+MAX_WAIT=1200   # 20 min cap — tune to the repo's typical CI duration
+INTERVAL=60
+ELAPSED=0
+while gh pr checks <PR_NUMBER> | grep -qE "(pending|queued|in_progress)"; do
+  if [ "$ELAPSED" -ge "$MAX_WAIT" ]; then
+    echo "CI still pending after ${MAX_WAIT}s — handing back to Judge unsettled."
+    break
+  fi
+  sleep "$INTERVAL"
+  ELAPSED=$((ELAPSED + INTERVAL))
+  echo "…CI still running (${ELAPSED}s)"
+done
+gh pr checks <PR_NUMBER>
+```
+
+**If the cap is reached, do not extend the wait and do not substitute a background watcher for either path.** Comment on the PR that the fixes are pushed but CI had not settled after the bounded wait, complete the `loom:review-requested` hand-off exactly as path 1 does, and finish. **If you have not personally read the result in this turn**, you have not verified it — do not write a final message that implies CI is green or that a verdict is "in progress elsewhere."
 
 ### Example: Complete CI Assessment
 

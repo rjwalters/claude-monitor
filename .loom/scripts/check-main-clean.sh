@@ -68,6 +68,18 @@
 #   - `--log FILE` appends the same one-line JSON entry to FILE (best effort;
 #     never fails the check). Defaults to `<main>/.loom/logs/main-quarantine.log`
 #     when that directory exists.
+#   - Forge breadcrumb (#5691): on a SUCCESSFUL quarantine, if `--label` carries
+#     an `issue=N` field (the run-id/issue-number attribution every caller
+#     already passes, e.g. `run=$RUN_ID issue=$N`), a best-effort
+#     `gh issue comment N` is posted naming the stashed paths, the host, and the
+#     stash ref/commit — so an operator (or the issue's own history) has a
+#     forge-visible trail back to `stash@{N}` on a specific host, not just the
+#     structured log line. A missing/unauthenticated `gh`, a label with no
+#     `issue=` field (e.g. the post-wave `run=... wave=...` label), or a failed
+#     API call are all silent no-ops that never change this check's exit code;
+#     the attempt's own outcome is recorded as a distinct
+#     `"event":"main-clean.quarantine-comment"` log line. Opt out entirely with
+#     `LOOM_QUARANTINE_COMMENT=0`.
 #   - Exit 4 (not 3) on a SUCCESSFUL quarantine: main is provably back at the
 #     baseline, so the caller can log and continue rather than hard-blocking. If
 #     the quarantine could not be completed, the exit stays 3 (hard-block).
@@ -539,6 +551,63 @@ emit_quarantine_log() {
     fi
 }
 
+# post_quarantine_breadcrumb <label> <stash-sha> (#5691)
+# Best-effort forge breadcrumb: posts a comment on the issue named by the
+# label's `issue=` field (the run-id/issue-number attribution every
+# check-main-clean.sh caller already carries in its --label, e.g.
+# "run=$RUN_ID issue=$N" — see sweep.md's wave-lifecycle backstop) stating
+# which paths were stashed, on which host, and as which stash ref. Reads the
+# offending path list from the global OFFENDING_PATHS array populated by
+# collect_offending_paths just before this is called.
+#
+# This is PURELY additive: nothing here can change the check's exit code or
+# verdict. A label with no `issue=` field (e.g. the post-wave `run=...
+# wave=...` label — nothing to comment on), a missing/unauthenticated `gh`
+# binary, LOOM_QUARANTINE_COMMENT=0, or a failed API call are all silent
+# no-ops from the caller's perspective; the outcome is only ever recorded (via
+# emit_quarantine_log, reusing the same structured log file rather than a new
+# one) as its own "main-clean.quarantine-comment" event, distinct from the
+# "main-clean.quarantine" event this augments.
+post_quarantine_breadcrumb() {
+    local label="$1" stash_sha="$2"
+    local issue_num
+    issue_num=$(stash_field "$label" "issue")
+    [[ -n "$issue_num" ]] || return 0
+    [[ "${LOOM_QUARANTINE_COMMENT:-1}" != "0" ]] || return 0
+    command -v gh >/dev/null 2>&1 || return 0
+
+    local host
+    host=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "")
+    [[ -n "$host" ]] || host="unknown-host"
+
+    local paths_display="" p
+    for p in "${OFFENDING_PATHS[@]}"; do
+        [[ -n "$paths_display" ]] && paths_display+=", "
+        paths_display+="\`$p\`"
+    done
+    [[ -n "$paths_display" ]] || paths_display="(no paths recorded)"
+
+    local body
+    body=$(cat <<EOF
+Quarantine: uncommitted changes to ${paths_display} were stashed on \`${host}\` as \`stash@{0}\` (commit \`${stash_sha:0:12}\`) by \`check-main-clean.sh --quarantine\`.
+
+Nothing was discarded — recover the diff on that host with \`git stash show -p ${stash_sha}\`, or list every outstanding quarantine with \`./.loom/scripts/check-main-clean.sh --list-quarantined\`.
+
+<!-- loom:quarantine-breadcrumb stash=${stash_sha} -->
+EOF
+)
+
+    local comment_ts comment_err rc=0
+    comment_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+    comment_err=$(gh issue comment "$issue_num" --body "$body" 2>&1) || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        emit_quarantine_log "{\"event\":\"main-clean.quarantine-comment\",\"ts\":\"$comment_ts\",\"result\":\"posted\",\"issue\":\"$(json_escape "$issue_num")\",\"host\":\"$(json_escape "$host")\",\"stash_commit\":\"$stash_sha\"}"
+    else
+        emit_quarantine_log "{\"event\":\"main-clean.quarantine-comment\",\"ts\":\"$comment_ts\",\"result\":\"failed\",\"issue\":\"$(json_escape "$issue_num")\",\"host\":\"$(json_escape "$host")\",\"stash_commit\":\"$stash_sha\",\"reason\":\"$(json_escape "$(printf '%s' "$comment_err" | tr '\n' ' ')")\"}"
+    fi
+    return 0
+}
+
 # Collect the offending (NEW) paths from the porcelain lines. Rename lines
 # ("old -> new") contribute BOTH sides so the rename is undone as a whole.
 collect_offending_paths() {
@@ -680,6 +749,9 @@ if [[ -n "$effective_status" && "$QUARANTINE" -eq 1 ]]; then
     fi
 
     emit_quarantine_log "{\"event\":\"main-clean.quarantine\",\"ts\":\"$ts\",\"result\":\"quarantined\",\"label\":\"$(json_escape "$QUARANTINE_LABEL")\",\"main\":\"$(json_escape "$main_root")\",\"stash_ref\":\"stash@{0}\",\"stash_commit\":\"$stash_sha\",\"stash_message\":\"$(json_escape "$stash_msg")\",\"paths\":[$paths_json],\"count\":${#OFFENDING_PATHS[@]}}"
+
+    # Best-effort breadcrumb: never affects this check's verdict (#5691).
+    post_quarantine_breadcrumb "$QUARANTINE_LABEL" "$stash_sha"
 
     echo "check-main-clean.sh: QUARANTINED ${#OFFENDING_PATHS[@]} contaminating path(s) from the main worktree." >&2
     echo "       Main worktree: $main_root (now matches the baseline)" >&2

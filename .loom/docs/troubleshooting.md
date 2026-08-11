@@ -44,6 +44,31 @@ cat .loom/logs/hook-errors.log
 
 If the log is absent or empty and hooks aren't blocking, confirm Claude Code is invoked with `--dangerously-skip-permissions` (not `bypassPermissions`).
 
+### `worktree.sh N` skips a stale post-squash-merge remote branch (#5657)
+
+`worktree.sh N` prefers reusing `refs/remotes/origin/feature/issue-N` over
+branching fresh from the base ref when no local copy exists (#4823, so an
+in-flight Doctor/Builder cycle's real PR history isn't silently discarded).
+But if that remote branch's current tip is already the head of an
+already-**merged** PR — e.g. the target repo has "auto-delete head branches"
+disabled, or any other path that leaves a merged branch's ref on `origin` —
+reusing it would build the new worktree on top of already-merged, now
+foreign-to-`main` history, producing a `CONFLICTING` PR with zero CI runs.
+This matters most with the partial-increment (#3667/#3599) slice convention,
+where the *same* branch name `feature/issue-N` is deliberately reused across
+an issue's slices, so a squash-merged prior slice's branch can still be
+sitting on `origin` when the next slice's worktree is created.
+
+`worktree.sh` now checks the remote branch's tip against the forge (reusing
+the same `_worktree_merged_pr_head_sha` helper already used by the worktree
+**removal** path, #4889) before reusing it: if the tip matches an
+already-merged PR's head, it creates a fresh branch from the base ref instead
+and prints which PR made the old branch stale. If the forge lookup is
+unavailable (network/auth failure), it fails open to the pre-existing reuse
+behavior — a forge outage never blocks worktree creation. The #4823 in-flight
+case (remote branch exists, not yet merged, possibly diverged from base) is
+unaffected and still reused exactly as before.
+
 ### Cleaning Up Stale Worktrees and Branches
 
 Use the `loom-clean` command to restore your repository to a clean state:
@@ -68,7 +93,7 @@ loom-clean --deep --dry-run  # Preview deep clean
 
 `loom-clean` is a thin shim for `loom-daemon clean` and needs a `loom-daemon`
 binary built at or after commit `dba33666` (PR #4301) — see [fail on a stale
-binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384)
+binary](#loom-clean--cleanupsh--loom-recover-orphans-fail-on-a-stale-binary-4384)
 if it errors out instead of running.
 
 **What loom-clean does**:
@@ -130,7 +155,122 @@ git worktree remove .loom/worktrees/issue-42 --force
 git worktree prune
 ```
 
-### `loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a stale binary (#4384)
+### A worktree vanished mid-session — who removed it? (#5950)
+
+**Symptom**: a Builder's worktree and/or its `feature/issue-N` branch disappears
+while work is still in progress, and the loss shows up as "my branch is gone" or
+"my commits are gone". This is the shape reported in #5950 (lost during issue
+#5919's session), where a `loom-daemon clean` transcript in the same shell had
+explicitly printed `Issue #5919 is OPEN - preserving`.
+
+**First move — read the removal ledger** (#5950). Every Loom-owned removal path
+appends one JSON line to `.loom/logs/worktree-removals.log`:
+
+```bash
+# Everything that removed a worktree for issue 5919
+grep 'issue-5919' .loom/logs/worktree-removals.log
+
+# Everything removed in a time window, most recent last
+jq -r 'select(.ts > "2026-08-10T20:00:00") | "\(.ts) \(.mechanism) \(.reason) \(.worktree)"' \
+  .loom/logs/worktree-removals.log
+```
+
+`mechanism` is one of `clean`, `clean --aggressive`, `worktree_reaper`,
+`terminal_destroy`, `loom-recover-orphans`, `merge-pr.sh`, `worktree.sh remove`,
+`agent-destroy.sh` — all eight of Loom's removal paths; `reason` is the exact
+decision that authorized it (e.g. `force_override_unreachable`, `pr_merged`).
+**An absent entry is evidence too**: no Loom code path removed it, so look at
+host-level/manual action — a bare `rm -rf`, a hand-run `git worktree remove`, a
+`git worktree prune` against a directory that was moved, or another checkout of
+the same repo on the same host.
+
+Nothing rotates this file (`archive-logs.sh` prunes `.loom/logs/archive/`, not
+`.loom/logs/*.log`) — deliberately, since its value is being readable long after
+an incident. One ~150-byte line per removal keeps that cheap.
+
+**Second move — the daemon log**. The periodic reaper logs one `info` line per
+pass naming both what it removed and what it preserved:
+
+```bash
+grep 'worktree_reaper:' ~/.loom/daemon.log | tail -40
+# → worktree_reaper: /path/to/repo scanned=14 removed=[] preserved=[5919, 5923, …]
+```
+
+Before #5950 the reaper's preservation decisions were `log::debug!` while the
+daemon initializes its logger at `info`, so a pass that removed nothing logged
+nothing at all and could be neither blamed nor cleared after the fact. The
+per-issue *reasons* are still `debug`; run the daemon with `RUST_LOG=debug` to
+see them.
+
+**Why the "preserving" line did not protect it.** Loom has more than one
+worktree-removal decision surface, and they do not share one gate:
+
+| Path | Consults issue-open state? |
+|------|---------------------------|
+| `loom-daemon clean` (interactive) | Yes — anything not `CLOSED` is preserved, and prints `Issue #N is <state> - preserving` |
+| `worktree_reaper` (daemon, periodic) | Yes — same `classify_worktree` gate as above |
+| `loom-daemon clean --aggressive` | **Only since #5950** — see below |
+| `loom-recover-orphans` | No — but it removes only a worktree that is 0 commits ahead of `origin/main` with build-artifact-only dirt, so there is nothing to lose |
+| `merge-pr.sh` / `worktree.sh remove` / `agent-destroy.sh` / terminal-destroy | No — these are explicitly requested removals |
+
+`clean --aggressive` is a separate decision tree (`worktree_ops/aggressive.rs`)
+that reaches its own removal decisions from open-PR + uncommitted-changes +
+reachability-from-`origin/main`. Until #5950 it never consulted issue state at
+all, so a live Builder session's worktree on an **open** issue was removable by
+it — including under plain `--force`, with unpushed local commits and no PR
+opened yet. Two things that look like they should have covered that did not: its
+`active_shepherd` gate only protects issues holding a `.loom/locks/issue-<N>/`
+claim-lock, which **only daemon-dispatched sweeps take** (a manually run
+`/loom:sweep` has none), and aggressive mode deliberately overrides
+`.loom-in-use` markers and the process-table guard.
+
+Note also that **`-y` is a visible alias of `--force`**, not a separate
+"auto-confirm" flag (`loom-daemon clean`'s `#[arg(short = 'f', long,
+visible_alias = "yes", visible_short_alias = 'y')] force`). Scripting the
+aggressive pass unattended — the obvious `clean --aggressive -y` — therefore
+runs it *forcing*, which is the mode that reaches
+`Force-remove (HEAD not on origin/main — would lose work)`. Before #5950 that
+removal consulted no issue state whatsoever.
+
+**Current behavior (#5950)**: `clean --aggressive` keeps a worktree whose issue
+is not `CLOSED` (`UNKNOWN` — a failed forge probe — counts as not closed, fail
+closed) **unless the removal cannot lose anything**: the working tree is clean
+*and* the work is landed (HEAD reachable from `origin/main`, or a merged PR).
+That carve-out is deliberate — partial-increment slices (`Part of #N`) merge
+while the family issue stays open indefinitely, and those worktrees must stay
+reclaimable. It reports as `Skip (issue is not CLOSED — a Builder may be
+mid-session)`. Worktrees with no `issue-N` branch (detached, `pr-NNNN`,
+user-provisioned paths) have no issue state to consult and are unaffected.
+
+**What the #5919 post-mortem could and could not establish.** The ledger exists
+because this incident was *not* attributable from the evidence that existed at
+the time. Against `~/.loom/daemon.log` (+ rotations `.1`–`.5`, covering
+2026-08-01 → 2026-08-11) for the incident window — issue #5919 filed
+`2026-08-10T21:01:18Z`, PR #5942 opened `23:31:21Z`:
+
+- **Ruled out — the periodic reaper.** The string `5919` does not appear in the
+  daemon log at all. Reaper *removals* are `info`-level and name the issue
+  (`worktree_reaper: <repo> scanned=14 removed=1 … removed=[5916]`), so a
+  removal would have been logged; none was.
+- **Ruled out — the daemon's terminal-destroy path.** `Removing worktree at …`
+  (also `info`) appears zero times in the whole log.
+- **Ruled out — the scheduled fleet clean.** The `com.rjwalters.loom-fleet-clean`
+  launchd job runs `loom-daemon clean --workspace <w> --deep --safe -y` and never
+  `--aggressive`; its first run was `2026-08-11T01:02:44Z`, after the window.
+- **Not exculpated — `clean --aggressive` and manual/host-level removal.** Both
+  were unfalsifiable: aggressive mode is an interactive CLI that printed to a
+  terminal and wrote no persistent artifact anywhere, and a hand-run `rm -rf` /
+  `git worktree remove` leaves nothing either. Exactly the gap the ledger closes.
+- **Relevant detail**: the #5919 session was never daemon-dispatched (no sweep
+  for it in the log), so it held no `.loom/locks/issue-5919/` claim-lock — the
+  one guard that would have made aggressive mode's `active_shepherd` check fire.
+
+So the mechanism remains formally unproven, and the fix is deliberately two
+things rather than one: the issue-open gate closes the one path that was
+*structurally capable* of it, and the ledger makes the next occurrence a single
+`grep` instead of another post-mortem.
+
+### `loom-clean` / `cleanup.sh` / `loom-recover-orphans` fail on a stale binary (#4384)
 
 **Symptom**: one of the three commands below fails outright instead of doing
 anything — either with a `No module named loom_tools.clean` traceback (an
@@ -176,6 +316,20 @@ leave `from loom_tools.clean import main` shims earlier on `PATH` that will
 never work again. Confirm with `command -v loom-clean` and remove them (e.g.
 `pip uninstall loom-tools`, or delete the stale shim) so the daemon-backed one
 resolves.
+
+**Eleven other `~/.local/bin/loom-*` names have no daemon-backed replacement
+at all** (`loom-agent-monitor`, `loom-auto-merge`, `loom-baseline-health`,
+`loom-check-completions`, `loom-cleanup`, `loom-daemon-diagnostic`,
+`loom-forge`, `loom-health-monitor`, `loom-status`, `loom-stuck-detection`,
+`loom-worktree`) — their loom-tools console scripts were retired without a
+loom-daemon subcommand to shim to, so a dangling symlink under any of these
+names is permanently dead, not repairable (#5738; see
+`docs/migration/daemon-state-consumers.md` for the per-name disposition).
+Both `scripts/install/provision-daemon.sh` (every install/reprovision) and
+`scripts/uninstall-loom.sh` (Step 5b) now remove these automatically when
+they find one — scoped to a symlink whose target resolves through a
+`loom-tools` path segment and no longer exists, so a same-named script you
+authored yourself is never touched. No manual action needed on either path.
 
 ### Corrupted local git identity (`...github.comecho`, "cannot overwrite multiple values") (#4369)
 
@@ -253,9 +407,9 @@ gh label create "loom:operator-only" --color F97316 \
 longer description fails to sync (HTTP 422 "description is too long") and the label
 silently never gets created. Keep descriptions at or under 100 chars.
 
-#### `loom:blocked` vs `loom:operator-only`
+#### `loom:blocked` vs `loom:operator-only` vs `loom:needs-capability`
 
-These two status labels look similar but mean different things to the automation:
+These status labels look similar but mean different things to the automation:
 
 - **`loom:blocked`** — work is *automatable* but currently waiting on a dependency
   (another issue, an unmerged PR, missing context). The intent is "unblock it, then
@@ -266,10 +420,19 @@ These two status labels look similar but mean different things to the automation
   TODO on owner-tracked code, where the design direction is the owner's call).
   Sweep skips these in pre-flight rather than attempting them; a human must
   do the work off-automation before the issue can proceed.
+- **`loom:needs-capability`** (#5817) — a narrower claim than `loom:operator-only`:
+  blocked on a missing tool/agent capability, not an operator-by-right decision.
+  Sweep skips these identically to `loom:operator-only` in pre-flight today; the
+  filed capability-request issue should be linked (`Depends on #N` / `Requires
+  #N`). See `.loom/docs/label-state-machine.md` § "`loom:needs-capability` — a
+  narrower claim than `loom:operator-only`" for the full split rationale.
 
-Reaching for `loom:blocked` when you mean `loom:operator-only` conflates "waiting on
-a dependency" with "needs a human action," which muddies the daemon/sweep skip
-semantics. Use `loom:operator-only` for the human-must-act-off-automation case.
+Reaching for `loom:blocked` when you mean `loom:operator-only` (or
+`loom:needs-capability`) conflates "waiting on a dependency" with "needs a human
+action outside automation," which muddies the daemon/sweep skip semantics. Use
+`loom:operator-only` for the human-must-act-off-automation case, and
+`loom:needs-capability` specifically when the blocker is missing tooling rather
+than a human ruling.
 
 ### An operator edit to `.loom/config.json` disappeared (#4641)
 
@@ -477,8 +640,8 @@ loom-recover-orphans --json
 
 `loom-recover-orphans` is a thin shim for `loom-daemon recover-orphans` — if it
 fails with `No module named loom_tools.orphan_recovery` or a "stale build"
-error, see [`loom-clean` / `loom-cleanup` / `loom-recover-orphans` fail on a
-stale binary](#loom-clean--loom-cleanup--loom-recover-orphans-fail-on-a-stale-binary-4384).
+error, see [`loom-clean` / `cleanup.sh` / `loom-recover-orphans` fail on a
+stale binary](#loom-clean--cleanupsh--loom-recover-orphans-fail-on-a-stale-binary-4384).
 
 **Run it from inside the checkout** (or pass `--workspace <path>`): repo-root
 resolution requires an ancestor holding **both** `.git` and `.loom/`, so a
@@ -635,6 +798,58 @@ preceded by a fresh re-derivation of the offending paths, so new ones should
 not appear (and a quarantine with nothing left to rescue logs
 `"result":"no_op"` and creates no stash at all). Existing empty entries carry
 no work and can be dropped once you have confirmed the flag.
+
+### Retiring quarantine stashes safely (#5693)
+
+Step 3 above — "check liveness before dropping anything" — is the judgement
+that does not scale: a fleet audit found **148 stashes across three hosts in
+twelve days**, of which exactly **one** held unlanded engineering content, and
+finding it took an hour of hand triage. `loom-daemon stashes` mechanises that
+triage.
+
+```bash
+loom-daemon stashes list                     # classify, read-only, never drops
+loom-daemon stashes list --paths             # + the per-path proof for every file
+loom-daemon stashes retire                   # same thing — still a dry run
+loom-daemon stashes retire --execute         # the only invocation that drops
+loom-daemon stashes retire --issue 123 --execute   # scoped to one issue's stashes
+```
+
+A stash is retirable only when **both** independent conditions hold — never
+either alone:
+
+1. **Provenance**: the issue named by the `loom-quarantine:` label is CLOSED.
+2. **Content**: *every* path in the stash is provably recoverable without it —
+   its blob is identical to `HEAD`'s, or identical to a commit reachable from
+   `HEAD` (the "superseded local copy" case: the work landed and was then built
+   on further), or it is installer-managed/regenerable (the same
+   `is_ignorable_dirt` classes the main-health gate uses, #4332/#3950/#4239),
+   or it is a machine-generated artifact (`__pycache__/`, `.venv/`,
+   `node_modules/`, `*.egg-info/`, `*.pyc`, …).
+
+Everything else is kept: an open issue, a missing `issue=` token, a forge
+lookup that failed, a `git` failure, a stash that *deletes* a file, a brand-new
+untracked source file, and — critically — a stash that is 90 % superseded and
+10 % real. `git stash drop` is all-or-nothing, so one unproven path holds the
+whole entry back. A closed issue is **not** sufficient on its own; that is
+precisely the shape of the one stash in 148 that mattered.
+
+**Notes**
+
+- Nothing is dropped without `--execute`. There is no config flag, cadence, or
+  daemon timer that drops a stash — it is an explicit operator action only.
+- Every drop is journaled to `.loom/logs/stash-retirement.log` **before** it
+  happens, recording the stash's commit sha. A dropped stash commit survives in
+  the object database as an unreachable object until gc, so
+  `git stash apply <sha>` (or `git show <sha>^3:<path>` for a file that was
+  untracked) still recovers it.
+- The operation is idempotent: re-running it after a drop, or against a stash
+  another host already dropped, is a no-op, not an error. Selectors are
+  re-resolved from each entry's commit sha immediately before the drop, because
+  `refs/stash` is one stack shared by every worktree and indices shift under
+  you.
+- It only ever considers `loom-quarantine:`-labelled entries. An Auditor drift
+  shelf, a Judge park stash, or an ad-hoc `git stash` is never a candidate.
 
 ## Several unrelated things hang at once (macOS Gatekeeper / `syspolicyd`)
 

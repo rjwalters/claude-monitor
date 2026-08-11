@@ -77,8 +77,13 @@ gh issue comment 342 --body "Assessing priority per user request"
 # Assess priority
 # ... analyze impact, urgency, blockers ...
 
-# Complete: add loom:urgent only if it's in the top 3 priorities
-# gh issue edit 342 --add-label "loom:urgent"
+# Complete: add loom:urgent only if it's in the top 3 priorities, and only
+# through the flip guard (#5643) — a user override does not exempt the write
+# from hysteresis, because a human cannot see the other hosts' in-flight ticks
+# either. If the guard suppresses it, say so instead of forcing the label; the
+# operator can re-run with LOOM_URGENT_FLIP_COOLDOWN_SECS=0 if they really mean
+# to override a fresh decision.
+# ./.loom/scripts/urgent-flip-guard.sh check 342 add && gh issue edit 342 --add-label "loom:urgent"
 ```
 
 **Why This Matters**:
@@ -146,6 +151,68 @@ Writes stay literal `gh` (so the guard hooks still see them). Full policy:
 # Find currently urgent issues (exclude building issues)
 "$GH_READ" issue list --label "loom:urgent" --search "-label:loom:building" --state open
 ```
+
+### Skip Candidates With an Open Linked PR (#5911)
+
+A `loom:issue` row whose implementing PR is already open and carries `loom:pr`
+is **not available work** — it is fully satisfied from the issue side and is
+waiting on a human merge decision (often a legitimate Champion merge-risk
+hold, `loom:operator`), not on more triage or building. Treat it as
+ineligible everywhere a `loom:issue` candidate is considered: it must never be
+selected to fill a free `loom:urgent` slot (the "Fill free slots" step below),
+never displace an incumbent, and never be cited as "the only other ready
+candidate" the way #5565 was on 2026-08-10 (which just re-triggered the same
+already-satisfied issue every ~15-30 min tick). This mirrors `/loom:sweep`'s
+own per-issue pre-flight existing-PR probe (`sweep.md` → "Existing-PR probe",
+#3359/#3677) one layer upstream, so the daemon/cron dispatch cadence never
+burns a full claim-flip + worktree/session spin-up cycle discovering what
+Guide could have skipped for free.
+
+```bash
+# GitHub's own closes-graph, not a body-grep — `closedByPullRequestsReferences`
+# returns every PR that closes this issue (via `Closes/Fixes/Resolves #N`), but
+# `gh --json` only exposes `id,number,repository,url` per referenced PR (no
+# `state`/`labels` sub-fields), so those must be looked up per-PR with a
+# separate `gh pr view` call — same pattern as `has_superseding_block()` above.
+has_open_pr_labeled_loom_pr() {
+  local number="$1"
+  local pr_numbers
+  pr_numbers=$(gh issue view "$number" --json closedByPullRequestsReferences \
+    --jq '.closedByPullRequestsReferences[].number' 2>/dev/null)
+
+  for pr in $pr_numbers; do
+    local pr_json
+    pr_json=$(gh pr view "$pr" --json state,labels 2>/dev/null) || continue
+    # NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` — zsh's
+    # `echo` builtin reinterprets `\n`/`\t` escapes by default, which
+    # corrupts captured `gh --json` output before jq ever parses it (#5094).
+    local pr_state=$(printf '%s\n' "$pr_json" | jq -r '.state')
+    local pr_has_loom_pr=$(printf '%s\n' "$pr_json" | jq -r \
+      '[.labels[].name] | any(. == "loom:pr")')
+    if [ "$pr_state" = "OPEN" ] && [ "$pr_has_loom_pr" = "true" ]; then
+      echo "true"
+      return
+    fi
+  done
+
+  echo "false"
+}
+
+# Before promoting a candidate (Fill free slots) or keeping an incumbent
+# (Evict ineligible holders), skip it if this returns "true":
+if [ "$(has_open_pr_labeled_loom_pr <number>)" = "true" ]; then
+  echo "Skipping #<number> - already has an open loom:pr PR awaiting merge, not ready work"
+fi
+```
+
+A PR still under review (`loom:review-requested` / `loom:changes-requested`,
+no `loom:pr` yet) does **not** trigger this skip — that PR hasn't cleared
+Judge yet, so the issue is legitimately mid-flight and stays a normal
+candidate. Only an already-`loom:pr`-labeled open PR (nothing left but a merge
+decision) counts. A lookup failure (rate limit, `gh` outage) fails **open** —
+same posture as every other best-effort forge probe in this workflow — so
+Guide never gets permanently stuck unable to select anything; it just doesn't
+get to skip this particular candidate this tick.
 
 ## Priority Assessment
 
@@ -369,19 +436,36 @@ delegates to it) detects orphaned work by cross-referencing GitHub
 `loom:building` labels against an authoritative liveness source (the
 `loom-daemon` registry / `.loom/locks/issue-<N>/`).
 
-**Recovery cases and actions:**
+**Recovery cases and actions** — these are the reason codes the native
+implementation actually emits (`untracked_building` orphans; the older
+`blocked_pr` / `stale_pr` rows described intended behavior that was never
+implemented and are gone):
 
 | Case | Condition | Auto-Recovery Action |
 |------|-----------|---------------------|
-| `no_pr` | `loom:building` but no worktree and no PR (>2h) | Reset to `loom:issue` |
-| `blocked_pr` | Has PR with `loom:changes-requested` label | Transition to `loom:blocked` |
-| `stale_pr` | Has PR but no activity for >24h | Flag only (needs manual review) |
+| `no_spawn_loop_entry` | `loom:building`, not live in any liveness source, no valid claim lock, no sweep journal on this host, label older than the grace period (`LOOM_LABEL_GRACE_PERIOD`, default 10m) | Reset to `loom:issue` |
+| `journal_pid_dead` | Same, but a sweep-journal entry exists and its recorded PID is dead | Reset to `loom:issue` |
+| `no_journal_record_stale` | Same, but the journal exists on this host and has **no** record for the issue — needs the longer stale-building threshold (`LOOM_STALE_BUILDING_HOURS`, default 4h) | Reset to `loom:issue` |
+
+Each reset also does a best-effort stale-worktree cleanup and posts a dedup'd
+`## Orphan Recovery` comment — a reset with **no** comment did not come from
+`loom-recover-orphans`.
 
 > **Fail-safe (#3651):** when no authoritative liveness source is available (no
 > reachable daemon registry and no `.loom/locks/`), `loom-recover-orphans` treats
 > every `loom:building` claim as ALIVE and recovers nothing — it never tears down
 > a live sweep. Use the manual verification below when you need to check a
 > specific issue by hand.
+
+> **Open linked PR blocks every reset (#5511):** before any of the three cases
+> above resets a label, the forge's closes-graph is queried for an **open** PR
+> linked to the issue (`Closes #N`, however the branch is named). A verified open
+> PR — or a probe that could not answer at all (forge outage, wedged `gh`) —
+> blocks the reset; only a *verified* "no open linked PR" lets it proceed. A
+> MERGED linked PR does not count as open. This closed the #5501 hole, where the
+> reset path consulted only registry liveness, the claim lock, and the journal —
+> never the forge — and so reset an issue whose `Closes` PR was open and actively
+> being treated.
 
 **Why proactive recovery matters:**
 
@@ -869,32 +953,163 @@ Still blocked until all dependencies resolve.
 
 ## Maximum Urgent: 3 Issues
 
-**NEVER have more than 3 issues marked `loom:urgent`.**
+**NEVER have more than 3 issues marked `loom:urgent`.** This cap is unchanged by
+everything below — the urgent set is made *stable*, never *larger*.
 
-If you need to mark a 4th issue urgent:
+### #5643 BUG, DO NOT REINTRODUCE: never recompute the top 3 from scratch
 
-1. **Review existing urgent issues**
+This section used to say only "pick the least critical of the current 3", which
+reads as *re-rank all candidates every tick and apply whatever ordering you
+arrive at*. That is not safe here, because **more than one Guide is in flight at
+once**: this host's daemon role runner, every other fleet host's daemon, and any
+manual `/loom:guide` session all tick independently every 15-30 minutes against
+the same forge. Two ticks that ranked the same boundary-case issue differently
+each overwrote the other's decision, forever.
+
+Observed on #5565: `loom:urgent` flipped **seven times in ~2.5 hours** at exactly
+Guide-tick cadence, purely because #5565 and the three incumbents (#5630, #5629,
+#5607) were all the same tier and independent ticks kept reaching different
+rank-3-vs-rank-4 conclusions. Every flip also changed the Urgent section of
+WORK_PLAN.md, so the Document Maintenance phase below correctly saw "new content"
+and opened another `docs: Guide document maintenance update` PR — 12 merged in
+~8.5 hours, several differing from their predecessor by nothing but this one
+bullet (e.g. PR #5640 added the `#5565` line that PR #5641 removed 30 min later).
+
+This is **not** the #5614 claim race (`loom:issue`/`loom:building`, fixed in the
+daemon's dispatch/claim-reconciliation path) and it is **not** fixable by
+`docs-guide-lock.sh` — that lock is a local `mkdir` and is SAME-HOST ONLY
+(#5615). The fix has two parts, both mandatory:
+
+1. **The incumbency rule** (below) — makes the selection *deterministic* given
+   forge state, so two ticks reading the same state reach the same answer
+   instead of two defensible-but-different answers.
+2. **`urgent-flip-guard.sh`** — a forge-backed hysteresis check in front of every
+   `loom:urgent` write, for the residual window where they still disagree. The
+   forge's own label-event history is the only decision record every fleet host
+   shares, so that is what it reads.
+
+### The incumbency rule
+
+**The current urgent set is the starting point of the tick, not its output.**
+Each tick performs the smallest possible edit to it, in this order:
+
+1. **Read the incumbent set.**
    ```bash
-   "$GH_READ" issue list --label "loom:urgent" --state open
+   "$GH_READ" issue list --label "loom:urgent" --search "-label:loom:building" --state open --json number,title,labels
    ```
 
-2. **Pick the least critical** of the current 3
+2. **Evict ineligible holders.** A holder is ineligible when it is closed, has
+   lost `loom:issue`, has gained `loom:building` / `loom:blocked`, or now has
+   an open linked PR carrying `loom:pr` (see "Skip Candidates With an Open
+   Linked PR" above — its Builder work is done and it is only waiting on a
+   human merge decision). This is a *state change*, never a judgment call, so
+   it is the one demotion you may make without a challenger.
 
-3. **Demote with explanation**
-   ```bash
-   gh issue edit <number> --remove-label "loom:urgent"
-   gh issue comment <number> --body "ℹ️ **Removed urgent label** - Priority shifted to #XXX which now blocks critical path. This remains \`loom:issue\` and important."
-   ```
+3. **Fill free slots.** If fewer than 3 eligible holders remain, promote the
+   highest-ranked eligible `loom:issue` candidates until the set is back to 3
+   — "eligible" excludes any candidate with an open `loom:pr`-labeled linked
+   PR per "Skip Candidates With an Open Linked PR" above (#5911). Filling a
+   free slot displaces nobody, so no comparison against an incumbent is
+   required.
 
-4. **Promote new top priority**
-   ```bash
-   gh issue edit <number> --add-label "loom:urgent"
-   gh issue comment <number> --body "🚨 **Marked as urgent** - [Explain why this is now top priority]"
-   ```
+4. **With 3 eligible holders, a candidate may displace the weakest holder ONLY
+   IF it *strictly outranks* it** (`urgency_rank` below). **A tie leaves the
+   incumbent in place.** Do not swap on "close call", "I'd sequence this
+   differently", or "this one feels more critical" — those are exactly the
+   judgments the other host's tick will make differently. If nothing strictly
+   outranks a holder, **this tick makes no `loom:urgent` writes at all**, which
+   is the normal, healthy outcome for most ticks.
+
+### `urgency_rank()` — the deterministic ladder
+
+Two independent ticks reading the **same** forge state MUST compute the same
+number here. That reproducibility, not the ladder's sophistication, is what stops
+the flap. Never rank on anything the next tick cannot re-derive mechanically.
+
+```bash
+urgency_rank() {
+  local number="$1" title labels
+  title=$(gh issue view "$number" --json title --jq '.title')
+  labels=$(gh issue view "$number" --json labels --jq '[.labels[].name] | join(",")')
+
+  # 1 — security / data loss. Matched against the TITLE only: titles are
+  #     stable across ticks, whereas Curator rewrites bodies between them.
+  if printf '%s\n' "$title" | grep -Eqi 'security|vulnerabilit|CVE-[0-9]|credential leak|data loss'; then
+    echo 1; return
+  fi
+  # 2 — the delivery pipeline itself is down (nothing ships until it is fixed).
+  if printf '%s\n' "$title" | grep -Eqi 'broken main|main is red|CI is red|pipeline (is )?(stalled|halted|wedged)|outage'; then
+    echo 2; return
+  fi
+  # 3-5 — tier labels (see "Tier-Aware Prioritization" above).
+  case ",$labels," in
+    *,tier:goal-advancing,*)  echo 3; return ;;
+    *,tier:goal-supporting,*) echo 4; return ;;
+  esac
+  echo 5   # tier:maintenance, or untiered
+}
+
+# STRICT `-lt`: equal ranks mean THE INCUMBENT KEEPS THE SLOT. #5565's flap was
+# entirely between same-rank issues, so this single comparison is what makes
+# consecutive ticks agree instead of alternating.
+strictly_outranks() { [ "$(urgency_rank "$1")" -lt "$(urgency_rank "$2")" ]; }
+```
+
+### Every `loom:urgent` write goes through `urgent-flip-guard.sh`
+
+**Never call `gh issue edit … loom:urgent` directly.** Gate it:
+
+```bash
+# exit 0 = proceed, 1 = skip this write this tick, 2 = usage/config error
+./.loom/scripts/urgent-flip-guard.sh check <number> add
+./.loom/scripts/urgent-flip-guard.sh check <number> remove
+```
+
+The guard reads the issue's own `loom:urgent` label-event history from the forge
+and refuses a write that **reverses** a decision younger than
+`LOOM_URGENT_FLIP_COOLDOWN_SECS` (default 3h — at least six ticks), or that would
+re-promote an issue already flapping (`LOOM_URGENT_FLAP_THRESHOLD` events inside
+`LOOM_URGENT_FLAP_WINDOW_SECS`). It **fails closed**: an unreadable history
+suppresses the write, the same stance the #5511 open-linked-PR gate takes above.
+
+A suppressed write is not an error and is not something to work around — do not
+retry it, do not reach for `gh api` to bypass it, and do not "just this once"
+edit the label by hand. Move on; the next tick re-evaluates. The cooldown gates
+**recency, not merit**, and only for the one issue whose decision is fresh, so a
+genuinely new top priority is delayed at most a tick or two and never blocked. If
+you need to communicate urgency in the meantime, post a comment.
+
+### Applying a swap (ordering is load-bearing)
+
+**Demote first, and promote only if the demotion actually applied.** Promoting
+first — or promoting after a suppressed demotion — is how a 4th `loom:urgent`
+label gets stranded and the cap above gets violated.
+
+```bash
+# 1. Demote the weakest incumbent (guarded)
+if ./.loom/scripts/urgent-flip-guard.sh check <weakest> remove; then
+  gh issue edit <weakest> --remove-label "loom:urgent"
+  gh issue comment <weakest> --body "ℹ️ **Removed urgent label** - Displaced by #XXX (urgency rank N vs M). This remains \`loom:issue\` and important."
+else
+  echo "Demotion of #<weakest> suppressed — leaving the urgent set unchanged this tick."
+  # Do NOT promote: the set is still full.
+fi
+
+# 2. Promote the challenger — ONLY after the demotion above succeeded, or into a
+#    genuinely free slot
+if ./.loom/scripts/urgent-flip-guard.sh check <number> add; then
+  gh issue edit <number> --add-label "loom:urgent"
+  gh issue comment <number> --body "🚨 **Marked as urgent** - urgency rank N; strictly outranks #YYY (rank M), which was demoted. [Why this is now top priority]"
+fi
+```
+
+State the mechanical rank on both sides of a swap. That comment is what lets the
+next tick — possibly on another host, hours later — see *why* the current set
+looks the way it does instead of re-litigating it from scratch.
 
 ## Safety Check: Never Mark Building Issues Urgent
 
-**Before applying `loom:urgent`, verify the issue doesn't already have `loom:building`:**
+**Before applying `loom:urgent`, verify the issue doesn't already have `loom:building`, and isn't already satisfied by an open `loom:pr` PR:**
 
 ```bash
 # Check labels before marking urgent
@@ -905,8 +1120,17 @@ if echo "$LABELS" | grep -q "loom:building"; then
   exit 0
 fi
 
-# Safe to mark urgent
-gh issue edit <number> --add-label "loom:urgent"
+# #5911: last-line-of-defense re-check, even if this candidate already passed
+# "Skip Candidates With an Open Linked PR" above — the same one-field probe.
+if [ "$(has_open_pr_labeled_loom_pr <number>)" = "true" ]; then
+  echo "Skipping #<number> - already has an open loom:pr PR awaiting merge, not ready work"
+  exit 0
+fi
+
+# Still not safe to write yet: the flip guard has the final say (#5643).
+if ./.loom/scripts/urgent-flip-guard.sh check <number> add; then
+  gh issue edit <number> --add-label "loom:urgent"
+fi
 ```
 
 **Why this matters:**
@@ -914,6 +1138,7 @@ gh issue edit <number> --add-label "loom:urgent"
 - Adding `loom:urgent` to building issues creates confusing dual-label states
 - The sweep orchestrator may be confused by conflicting labels on its assigned issues
 - The daemon may misinterpret building issues as ready work
+- An issue whose PR already carries `loom:pr` needs a human merge decision, not urgency signaling toward a Builder (#5911)
 
 **If an urgent issue is already building:**
 - Leave it alone - work is already happening
@@ -982,6 +1207,13 @@ Both remain `loom:issue` - just reordering the queue.
 - **Stay current** - consider recent context and user feedback
 - **Respect user urgency** - if user marks something urgent, keep it
 - **Max 3 urgent** - this is non-negotiable, forces real prioritization
+- **Respect the incumbent** - you are not the only Guide running. Edit the
+  existing urgent set, never recompute it from scratch; a tie keeps the
+  incumbent, and **a tick that writes no `loom:urgent` labels at all is the
+  normal outcome**, not a tick that did nothing useful (#5643)
+- **Never write `loom:urgent` unguarded** - every add/remove goes through
+  `./.loom/scripts/urgent-flip-guard.sh check <number> add|remove` first, and a
+  suppressed write is dropped, never retried or worked around
 
 By keeping the urgent queue small and well-prioritized, you help Workers focus on the most impactful work.
 
@@ -1055,7 +1287,12 @@ side-car state file.
 > are the durable source of truth for "what has already been recorded."
 
 Compute the high-water marks by scanning the existing `WORK_LOG.md` for the
-highest PR / issue number it already contains:
+highest PR / issue number it already contains. `work_log_max_pr()` /
+`work_log_max_issue()` remain available as general "highest N recorded"
+readings, but neither PR nor issue filtering uses a number watermark anymore
+— see `work_log_has_pr()` (#5516) and `work_log_has_issue()` (#5539) and the
+matching comments in `update_work_log()` below for why a pure number
+comparison silently and permanently drops out-of-order-closing PRs/issues.
 
 ```bash
 # Highest PR number already recorded in WORK_LOG.md (0 if none / file absent)
@@ -1066,6 +1303,27 @@ work_log_max_pr() {
 # Highest closed-issue number already recorded in WORK_LOG.md (0 if none)
 work_log_max_issue() {
   { grep -oE 'Issue #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+'; echo 0; } | sort -rn | head -1
+}
+
+# Whether "PR #<N>" is already literally recorded in WORK_LOG.md (#5516).
+# `grep -qx` matches a full extracted-number LINE exactly, so `#550` can
+# never false-match a recorded `#5501` the way a plain substring grep would.
+# This is the presence check update_work_log() uses INSTEAD of a pure
+# `.number > $last_pr` comparison — see the #5516 comment at its call site
+# for why number order cannot be trusted as a proxy for "already recorded".
+work_log_has_pr() {
+  grep -oE 'PR #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+' | grep -qx "$1"
+}
+
+# Whether "Issue #<N>" is already literally recorded in WORK_LOG.md (#5539,
+# mirroring work_log_has_pr()/#5516 above). Same `grep -qx` exact-line-match
+# reasoning: `#552` can never false-match a recorded `#5521`. This is the
+# presence check update_work_log() uses INSTEAD of a pure
+# `.number > $last_issue` comparison — see the #5539 comment at its call
+# site for why issue-close order cannot be trusted as a proxy for "already
+# recorded" any more than PR-merge order could.
+work_log_has_issue() {
+  grep -oE 'Issue #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+' | grep -qx "$1"
 }
 ```
 
@@ -1078,30 +1336,83 @@ These are idempotent across a fresh checkout: whatever is already in the
 committed WORK_LOG.md defines the watermark, so the same PR is never appended
 twice even though no gitignored state persists between cron ticks.
 
-### Step 1: Check for Existing Docs PR
+### Step 1: Acquire the Docs-Guide Lock, Then Check for an Existing Docs PR
 
-Before creating any changes, check if a previous docs PR is still open:
+**#5573 BUG, DO NOT REINTRODUCE:** this used to be a plain check-then-act — query
+for an open docs PR, and if none, proceed. Two Guide ticks starting within the
+same short window (a role-runner tick overlapping a manual `/loom:guide`
+session, or two role-runner ticks overlapping each other) could both see "no
+open PR" before either had pushed a branch, both call `docs-worktree.sh`
+(clobbering the shared worktree slot — see "Where This Phase Writes" above),
+and both end up creating their own docs PR (observed: #5571 and #5572, opened
+49 seconds apart with an identical diff shape). The check and the create were
+not atomic.
+
+The fix is a non-blocking mkdir-based lock (`docs-guide-lock.sh`) that must be
+held across the **entire** window from this check through Step 5's
+`gh pr create` — not just around the check itself:
+
+**#5615 GAP, DO NOT ASSUME THIS COVERS THE FLEET:** `docs-guide-lock.sh` is a
+local filesystem `mkdir` lock — it only ever serializes ticks that share a
+filesystem, i.e. concurrent ticks on the **same host**. Every independent
+fleet host running the daemon's role runner (or a cron-dispatched Guide) has
+its own checkout and its own `.loom/locks/`, so two *different* hosts can each
+acquire their own local lock, both pass this same check, and both proceed —
+reproducing the #5571/#5572/#5573 duplicate-PR symptom at a wider (cross-host)
+scope. This was observed live: #5615, PR #5612 appearing while a different
+host's local lock was continuously held. The cross-host mitigation is a
+**second, immediate re-check of this exact open-docs-PR search in Step 5**,
+positioned right before `gh pr create` (not just here in Step 1) and using an
+**uncached** `gh` call so `gh-cached`'s read TTL can never mask a PR another
+host opened moments ago. See Step 5's `create_docs_pr()` for the recheck and
+the header comment in `docs-guide-lock.sh` for the full rationale.
 
 ```bash
+# Non-blocking: a busy lock means another tick is already mid-flight through
+# this same phase, so this tick skips outright rather than waiting (waiting
+# would just shift the identical race to a later timestamp, not close it).
+if ! ./.loom/scripts/docs-guide-lock.sh acquire; then
+  echo "Another Guide tick already holds the docs-guide lock. Skipping document maintenance this tick."
+  return
+fi
+
+# From this point on, EVERY exit path from the Document Maintenance phase —
+# every early `return` below, the end of Step 5 (create_docs_pr, both its
+# "no changes" and its success paths), and any error path — MUST call
+# `./.loom/scripts/docs-guide-lock.sh release` before ending the turn. There
+# is no shell `trap` that can cover this automatically: Steps 1-5 run as
+# separate Bash tool invocations (interleaved with Edit tool calls to write
+# the docs) within one Guide turn, not one continuous process. If a tick
+# crashes without releasing, the NEXT tick's `acquire` reaps the lock
+# automatically once it is older than LOOM_DOCS_GUIDE_LOCK_STALE_SECS
+# (default 1800s / 30 min) — see docs-guide-lock.sh's header comment for why
+# staleness is age-based rather than PID-liveness here.
+
 # Match on the branch-name PREFIX, not an exact head. Docs branches are named
 # `docs/guide-update-<timestamp>` (see Step 5), so `--head "docs/guide-update"`
 # (an exact-match filter) never matched and the "only one docs PR open" guard
 # never fired — PRs accumulated. `--search "head:docs/guide-update"` matches the
-# prefix.
+# prefix. This check runs INSIDE the lock now, but it is not redundant with
+# it: the lock closes the race between two CONCURRENT ticks, while this check
+# is what makes a docs PR left open from a PRIOR (non-racing) tick — whose
+# lock was already released once its `gh pr create` succeeded — still cause
+# the next tick to skip.
 OPEN_DOCS_PR=$("$GH_READ" pr list --state open --search "head:docs/guide-update" --json number --jq '.[0].number // empty')
 
 if [ -n "$OPEN_DOCS_PR" ]; then
   echo "Docs PR #$OPEN_DOCS_PR is still open. Skipping document maintenance."
   # Optionally: check if it's stale and comment
+  ./.loom/scripts/docs-guide-lock.sh release
   return
 fi
 ```
 
-If a docs PR is already open, **skip the entire document maintenance phase** to prevent PR accumulation.
+If a docs PR is already open, **skip the entire document maintenance phase** to prevent PR accumulation (and release the lock — there is nothing left for this tick to do).
 
 ### Step 2: Update WORK_LOG.md
 
-Append entries for newly merged PRs and closed issues since the last high-water mark.
+Append entries for newly merged PRs and newly closed issues not yet recorded
+(presence checks, not number watermarks — see #5516 and #5539 below).
 
 ```bash
 # #5454 BUG, DO NOT REINTRODUCE: this phase's OWN merged PRs must never count as
@@ -1126,27 +1437,102 @@ Append entries for newly merged PRs and closed issues since the last high-water 
 GUIDE_DOCS_PR_EXCLUDE='((.headRefName // "") | startswith("docs/guide-update")) or (.title == "docs: Guide document maintenance update")'
 
 update_work_log() {
-  # High-water marks come from the committed WORK_LOG.md (survives fresh checkout)
-  local last_pr=$(work_log_max_pr)
-  local last_issue=$(work_log_max_issue)
+  # Neither PRs nor issues are filtered by a number watermark anymore — see
+  # the #5516 (PR) and #5539 (issue) comments below. `work_log_max_issue()` /
+  # `work_log_max_pr()` are not called here at all; presence checks against
+  # the committed WORK_LOG.md decide what is new for both.
 
-  # Get newly merged PRs (after high-water mark), minus this phase's own docs PRs.
-  # `headRefName` MUST stay in the --json field list — jq cannot filter on a field
-  # gh was not asked to return, and `.headRefName` would silently be null.
-  local new_prs=$("$GH_READ" pr list --state merged --limit 50 --json number,title,mergedAt,headRefName \
-    --jq "[.[] | select(.number > $last_pr) | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
+  # #5516 BUG, DO NOT REINTRODUCE: PR numbers increase in CREATION order, not
+  # MERGE order — a lower-numbered PR can sit in review/Doctor longer than a
+  # higher-numbered PR that merges first (observed: #5507 opened before, but
+  # merged after, #5509). A pure `.number > $last_pr` filter drops that PR
+  # PERMANENTLY the instant the watermark passes its number, because
+  # `> $last_pr` can never become true for it again. So PR candidates below
+  # are NOT filtered by number at all — they are bounded by merge *date*, and
+  # kept/dropped via a presence check against the committed WORK_LOG.md
+  # (Option 1 of #5516's Suggested Fix) instead of a watermark comparison.
+  #
+  # Widen the window by date, not just count: a fixed `--limit 50` can still
+  # push an out-of-order PR out of the query entirely once 50 other PRs merge
+  # after it before this phase's next tick. `merged:>=$since` bounds the
+  # query by calendar time instead, so an out-of-order PR stays reachable for
+  # as long as it is plausible for one to sit in review — 30 days is a
+  # generous ceiling for Doctor/review dwell time. `--limit 200` on top is a
+  # safety cap, not the primary bound. Shared below with the issue-side
+  # `closed:>=$since` query (#5539) for the same reason: a flat `--limit 50`
+  # on closed issues can push an out-of-order closure out of the query too.
+  local since
+  since=$(date -u -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-30d +%Y-%m-%d)
 
-  # Get newly closed issues (after high-water mark)
-  local new_issues=$("$GH_READ" issue list --state closed --limit 50 --json number,title,closedAt \
-    --jq "[.[] | select(.number > $last_issue)] | sort_by(.closedAt) | reverse")
+  # Get merged-PR candidates in the window, minus this phase's own docs PRs.
+  # `headRefName` MUST stay in the --json field list — jq cannot filter on a
+  # field gh was not asked to return, and `.headRefName` would silently be null.
+  local candidate_prs=$("$GH_READ" pr list --state merged --search "merged:>=$since" --limit 200 \
+    --json number,title,mergedAt,headRefName \
+    --jq "[.[] | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
+
+  # Presence check (#5516 fix): keep a candidate only if "PR #<N>" is not
+  # already literally recorded in WORK_LOG.md — not whether its number is
+  # above some watermark. This correctly KEEPS an out-of-order PR whose
+  # number is below every previously-recorded PR but was itself never
+  # written, and correctly DROPS anything (in or out of order, including
+  # docs PRs already excluded above) that a prior tick already recorded.
+  local new_prs="[]"
+  while IFS= read -r pr_json; do
+    [ -z "$pr_json" ] && continue
+    local n
+    n=$(printf '%s' "$pr_json" | jq -r '.number')
+    if ! work_log_has_pr "$n"; then
+      new_prs=$(printf '%s\n' "$new_prs" | jq -c --argjson pr "$pr_json" '. + [$pr]')
+    fi
+  done < <(printf '%s\n' "$candidate_prs" | jq -c '.[]')
+
+  # #5539 BUG, DO NOT REINTRODUCE: issues do not reliably CLOSE in number
+  # order either — a lower-numbered issue can stay open (blocked, deferred,
+  # reopened) longer than a higher-numbered issue that closes first
+  # (observed: 30 out-of-order-closed issues silently dropped from
+  # WORK_LOG.md). A pure `.number > $last_issue` filter drops that issue
+  # PERMANENTLY the instant the watermark passes its number, because
+  # `> $last_issue` can never become true for it again — the exact #5516
+  # failure shape, just on the issue side. So issue candidates below are NOT
+  # filtered by number at all — they are bounded by close *date*, and
+  # kept/dropped via a presence check against the committed WORK_LOG.md
+  # (mirroring #5516's Option 1 fix) instead of a watermark comparison.
+  #
+  # Widen the window by date, not just count: a fixed `--limit 50` can still
+  # push an out-of-order issue out of the query entirely once 50 other
+  # issues close after it before this phase's next tick. `closed:>=$since`
+  # bounds the query by calendar time instead (same 30-day `$since` computed
+  # above for PRs), so an out-of-order issue stays reachable for as long as
+  # it is plausible for one to sit open after a lower-numbered sibling
+  # closes.
+  local candidate_issues=$("$GH_READ" issue list --state closed --search "closed:>=$since" --limit 200 \
+    --json number,title,closedAt --jq 'sort_by(.closedAt) | reverse')
+
+  # Presence check (#5539 fix, mirroring #5516's work_log_has_pr): keep a
+  # candidate only if "Issue #<N>" is not already literally recorded in
+  # WORK_LOG.md — not whether its number is above some watermark. This
+  # correctly KEEPS an out-of-order issue whose number is below every
+  # previously-recorded issue but was itself never written, and correctly
+  # DROPS anything (in or out of order) that a prior tick already recorded.
+  local new_issues="[]"
+  while IFS= read -r issue_json; do
+    [ -z "$issue_json" ] && continue
+    local n
+    n=$(printf '%s' "$issue_json" | jq -r '.number')
+    if ! work_log_has_issue "$n"; then
+      new_issues=$(printf '%s\n' "$new_issues" | jq -c --argjson issue "$issue_json" '. + [$issue]')
+    fi
+  done < <(printf '%s\n' "$candidate_issues" | jq -c '.[]')
 
   # If nothing new, skip. NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR"
   # | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escapes by default,
   # corrupting captured `gh --json` output before jq ever parses it (#5094).
-  # A tick whose only merged PRs above the watermark are this phase's own docs
-  # PRs lands HERE — `new_prs` is empty after the exclusion, so the phase reports
-  # "current" and returns 1, and (with WORK_PLAN/README also unchanged) Step 5's
-  # `git diff --cached --quiet` finds nothing to commit and creates no PR.
+  # A tick whose only merged-PR candidates in the window are this phase's own
+  # docs PRs, or PRs already recorded, lands HERE — `new_prs` is empty after
+  # the exclusion/presence-check, so the phase reports "current" and returns
+  # 1, and (with WORK_PLAN/README also unchanged) Step 5's `git diff --cached
+  # --quiet` finds nothing to commit and creates no PR.
   if [ "$(printf '%s\n' "$new_prs" | jq 'length')" -eq 0 ] && [ "$(printf '%s\n' "$new_issues" | jq 'length')" -eq 0 ]; then
     echo "No new merged PRs or closed issues. WORK_LOG.md is current."
     return 1
@@ -1165,11 +1551,12 @@ update_work_log() {
   # path — a repo-relative `WORK_LOG.md` resolves to the main checkout and is
   # denied by the worktree-isolation guards (see "Where This Phase Writes").
   #
-  # No side-car watermark to update: the newly-written PR/issue numbers ARE the
-  # new watermark the next tick reads back from WORK_LOG.md via work_log_max_pr /
-  # work_log_max_issue. Excluded docs PRs therefore never advance the watermark
-  # either — harmless: they are re-queried every tick and re-filtered every tick,
-  # so they can never be appended no matter how far the watermark lags them.
+  # No side-car state to update: the newly-written entries themselves are
+  # what the next tick reads back from WORK_LOG.md — PR filtering via the
+  # `work_log_has_pr` presence check (#5516), issue filtering via the
+  # `work_log_has_issue` presence check (#5539). Excluded docs PRs are simply
+  # never written, so they are re-queried and re-filtered every tick no
+  # matter how long they sit outside WORK_LOG.md — harmless either way.
 
   return 0
 }
@@ -1187,14 +1574,105 @@ update_work_log() {
 
 ### Step 3: Update WORK_PLAN.md
 
-Regenerate the roadmap from current GitHub label state. Only rewrite if labels have changed.
+Regenerate the roadmap from current GitHub label state. Only rewrite if labels
+have changed **and** that change has survived a debounce window since the last
+docs-maintenance merge (see "WORK_PLAN debounce" below, #5890).
 
 The generated region of `WORK_PLAN.md` is delimited by
 `<!-- guide:plan-body:start -->` / `<!-- guide:plan-body:end -->`. **Everything
 between those markers is machine-generated and is overwritten wholesale; nothing
-else in the file is touched.** Put any hand-written annotation *outside* the
-markers — an annotation left inside is both wiped on the next tick and, until
-then, guarantees the "no changes" comparison below can never match.
+else in the file is touched.**
+
+**#5930, DO NOT put a hand-written narrative section outside the markers.**
+The "Operator Attention: Merge-Risk-Hold Pileup" call-out used to live above
+the markers as hand-written prose, updated by *appending* a fresh
+`**Update (... UTC)**:` paragraph on every tick instead of being rewritten.
+That defeated the #5890 debounce below entirely: the debounce only ever
+gated `render_plan_body()`'s output, and an appended paragraph is by
+construction never byte-identical to what came before, so
+`git diff --cached --quiet` in `create_docs_pr()` (Step 5) always found
+something to commit — ~30 `docs: Guide document maintenance update` PRs
+merged in one day, driven almost entirely by that section, with no
+corresponding change in which PRs were actually held. The fix folds it into
+`render_plan_body()` as its first `section` call instead (queried into
+`$held` below): identical `loom:operator` membership renders byte-identical
+text, so it now rides the SAME `new_body == old_body` comparison and the
+SAME `LOOM_WORK_PLAN_DEBOUNCE_SECS` gate as every other section — no separate
+mechanism to keep in sync, and nothing left to silently append to. Any other
+hand-written annotation still belongs *outside* the markers, but must be a
+static, rarely-edited note (e.g. a comment pointing at a doc), never a
+per-tick narrative log — an ever-growing log there reproduces this exact bug
+for whatever section carries it.
+
+**WORK_PLAN debounce (#5890) — a rendered diff alone is not enough to justify a
+rewrite.** Any `loom:building`/`loom:issue` transition on ANY issue reshapes
+`render_plan_body()`'s "Ready"/"In Progress" sections — and an issue bouncing
+through Builder-claim -> Judge-approve -> Champion merge-risk-hold -> re-claim
+cycles (observed on #5607/#5629) can do that several times an hour. Before
+#5890, the *only* gate here was "does the rendered body differ from the
+committed one" — true on every one of those bounces — so each bounce
+manufactured its own `docs: Guide document maintenance update` PR (9 merged in
+~8h on 2026-08-10, no substantive work in between, mirroring the #5643
+incident `urgent-flip-guard.sh` already fixed for `loom:urgent` specifically —
+this is the same failure mode for the plan-body regeneration itself).
+
+No gitignored side-car state is used here either — same reasoning as "State
+Tracking" above: a fresh-checkout cron tick would reset it to nothing every
+time. The durable, cross-host anchor is the forge's own merged-PR history: the
+`mergedAt` of the most recently merged docs-maintenance PR that actually
+**touched `WORK_PLAN.md`** — identified by `$GUIDE_DOCS_PR_EXCLUDE` (already
+defined in Step 2 above — reused verbatim here, via
+`last_work_plan_write_epoch()` below, so the two "is this a docs-maintenance
+PR" checks can never diverge) **AND** whose changed-files list includes
+`WORK_PLAN.md`. `update_work_plan()` only writes a rewritten body once at
+least `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default 3600 = 1h, spanning 2-4 Guide
+ticks at the documented 15-30 minute cadence) have elapsed since that write;
+otherwise it skips this tick's rewrite exactly as if `new_body` had matched
+`old_body`.
+
+**#5929 BUG, DO NOT REINTRODUCE:** an earlier version of this anchor
+(`last_docs_pr_merged_epoch()`) looked at the merge time of ANY
+docs-maintenance PR, including one whose commit only touched WORK_LOG.md
+(Step 5 stages `WORK_LOG.md WORK_PLAN.md README.md` together, but only files
+that actually changed end up non-empty in the diff — see `create_docs_pr()`
+below — so a WORK_LOG-only tick still produces a docs PR with no WORK_PLAN.md
+in it). On a repo with sustained merge cadence, WORK_LOG-only docs PRs kept
+landing every 15-40 minutes, which kept resetting the debounce clock forever
+even though WORK_PLAN.md's own content had gone stale far longer ago — an
+overdue rewrite could be suppressed indefinitely. Filtering the merged-PR
+history down to PRs whose `files` actually include `WORK_PLAN.md` anchors the
+clock to "time since WORK_PLAN.md's content last changed via a write" instead
+of "time since any docs-PR merge", which still fully preserves the #5890
+flap-suppression intent below (a WORK_PLAN rewrite that itself flaps still
+resets the clock on every merge that carries one) while guaranteeing a diff
+that persists eventually gets written, independent of how often unrelated
+WORK_LOG activity triggers docs-maintenance merges.
+
+This still satisfies "a genuine change is never silently dropped": `old_body`
+(the comparison baseline) only advances when a rewrite is actually committed,
+so a change that persists past the debounce window is still caught — on the
+first tick at or after the window elapses — and produces exactly one PR. A
+change that reverts before the window elapses (the flap case) never gets an
+`old_body` update to diff against, so `new_body` eventually matches `old_body`
+again on some later tick and no PR is ever produced for it.
+
+```bash
+# Epoch seconds of the most recently MERGED docs-maintenance PR whose changed
+# files actually included WORK_PLAN.md, or 0 if none has ever merged (empty
+# history / query failure). Reuses GUIDE_DOCS_PR_EXCLUDE (Step 2) as the "is
+# this a docs-maintenance PR" predicate instead of redefining it, so the two
+# checks can never drift apart. #5929: a docs-maintenance PR that only
+# touched WORK_LOG.md (or README.md) must NOT anchor this clock — see the
+# #5929 note above — hence the extra `.files[].path` filter beyond
+# GUIDE_DOCS_PR_EXCLUDE alone.
+last_work_plan_write_epoch() {
+  local ts
+  ts=$("$GH_READ" pr list --state merged --limit 30 --json number,title,mergedAt,headRefName,files \
+    --jq "[.[] | select($GUIDE_DOCS_PR_EXCLUDE) | select([(.files // [])[].path] | index(\"WORK_PLAN.md\") != null)] | sort_by(.mergedAt) | reverse | .[0].mergedAt // empty")
+  [ -z "$ts" ] && { echo 0; return; }
+  date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0
+}
+```
 
 ```bash
 # Render the plan body EXACTLY as it will be written between the markers —
@@ -1210,7 +1688,15 @@ render_plan_body() {
   # Bullet count of a section body ("" -> 0), for the Backlog Balance table.
   count() { [ -z "$1" ] && printf '0' || printf '%s\n' "$1" | grep -c '^- '; }
 
-  local urgent ready building review approved curated proposals epics
+  local held urgent ready building review approved curated proposals epics
+  # #5930: PRs carrying `loom:operator` are Judge-approved work stuck on a
+  # human merge-risk-hold decision — folded into the generated region (see
+  # the "#5930, DO NOT put a hand-written narrative section outside the
+  # markers" note above) so it is exactly as (non-)volatile as every other
+  # section here, and so it is included FIRST since it is the single
+  # highest-priority thing an operator can act on.
+  held=$("$GH_READ" pr list --label "loom:operator" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title)"')
   urgent=$("$GH_READ" issue list --label "loom:urgent" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
   ready=$("$GH_READ" issue list --label "loom:issue" --state open --limit 200 --json number,title \
@@ -1232,6 +1718,10 @@ render_plan_body() {
   epics=$("$GH_READ" issue list --label "loom:epic" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
 
+  section "Operator Attention: Merge-Risk-Hold Pileup" \
+    "Judge-approved PRs stuck under a \`loom:operator\` merge-risk hold — implementation work is done, only a human merge decision is missing." \
+    "$held"
+  echo
   section "Urgent" "Issues flagged as highest priority (\`loom:urgent\`)." "$urgent"
   echo
   section "Ready" "Human-approved issues ready for implementation (\`loom:issue\`)." "$ready"
@@ -1253,6 +1743,7 @@ render_plan_body() {
   section "Backlog Balance" "" "$(printf '%s\n' \
     '| Tier | Count |' \
     '|------|-------|' \
+    "| Operator merge-risk holds | $(count "$held") |" \
     "| Urgent | $(count "$urgent") |" \
     "| Ready (\`loom:issue\`) | $(count "$ready") |" \
     "| In Progress (\`loom:building\`) | $(count "$building") |" \
@@ -1284,6 +1775,29 @@ update_work_plan() {
 
   if [ "$new_body" = "$old_body" ]; then
     echo "WORK_PLAN.md is current (no label changes detected)."
+    return 1
+  fi
+
+  # #5890 HYSTERESIS, DO NOT REMOVE: a rendered diff alone used to be
+  # sufficient to justify a rewrite — see "WORK_PLAN debounce" above this
+  # function for the incident this reproduced (9 docs PRs merged in ~8h,
+  # driven by #5607/#5629 label bounces, with no substantive work in
+  # between). Require the debounce window to have elapsed since WORK_PLAN.md
+  # was last actually WRITTEN by a merged docs-maintenance PR (#5929 — NOT
+  # since any docs-maintenance PR merged regardless of content; see
+  # `last_work_plan_write_epoch()`'s #5929 note above for why that distinction
+  # matters) before treating this tick's diff as write-worthy.
+  # `LOOM_WORK_PLAN_DEBOUNCE_NOW` is a test seam only (mirrors
+  # `urgent-flip-guard.sh`'s `LOOM_URGENT_GUARD_NOW`) — never set it in
+  # normal operation.
+  local debounce_secs last_merged_epoch now_epoch elapsed
+  debounce_secs="${LOOM_WORK_PLAN_DEBOUNCE_SECS:-3600}"
+  last_merged_epoch="$(last_work_plan_write_epoch)"
+  now_epoch="${LOOM_WORK_PLAN_DEBOUNCE_NOW:-$(date -u +%s)}"
+  elapsed=$(( now_epoch - last_merged_epoch ))
+
+  if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$debounce_secs" ]; then
+    echo "WORK_PLAN.md differs, but only ${elapsed}s since WORK_PLAN.md was last written by a merged docs-maintenance PR (< ${debounce_secs}s debounce) — suppressing this tick's rewrite."
     return 1
   fi
 
@@ -1352,13 +1866,39 @@ create_docs_pr() {
   # Check if there are actual changes to commit
   if git -C "$DOCS_WT" diff --cached --quiet; then
     echo "No document changes to commit."
+    # Release the docs-guide lock (see Step 1) — nothing left for this tick
+    # to do, and a held lock would needlessly block the next one.
+    ./.loom/scripts/docs-guide-lock.sh release
     return
   fi
 
-  # Commit and push
+  # Commit locally first — deliberately BEFORE pushing, so the cross-host
+  # recheck below can bail out without ever pushing a branch or opening a PR
+  # (nothing to clean up on the remote if it does; docs-worktree.sh resets
+  # this worktree's branch on the next tick regardless).
   git -C "$DOCS_WT" commit -m "docs: update WORK_LOG, WORK_PLAN, and README
 
 Automated document maintenance by Guide triage agent."
+
+  # #5615 CROSS-HOST GUARD, DO NOT REMOVE: docs-guide-lock.sh (held since
+  # Step 1) only ever serializes ticks on THIS host — see its header comment.
+  # A different fleet host's tick can commit/push/open its own docs PR at any
+  # point up to this line without ever touching this host's lock. Re-run the
+  # EXACT same open-docs-PR search Step 1 used, as the LAST check before
+  # push+create, to shrink the TOCTOU window this local lock cannot close
+  # from "the full Step 1-5 phase" down to "the gap between this line and
+  # `gh pr create` below" — the same narrowing tactic Judge/Champion's
+  # Verdict-Time CAS Recheck uses for the analogous PR-label race, not a hard
+  # guarantee. Deliberately uses plain `gh`, NOT `$GH_READ` — `$GH_READ` may
+  # resolve to `gh-cached`, whose default 30s read TTL is scoped per-host and
+  # would happily hand back a stale "no open PR" answer even though another
+  # host opened one seconds ago; only an uncached read is trustworthy here.
+  OPEN_DOCS_PR_RECHECK=$(gh pr list --state open --search "head:docs/guide-update" --json number --jq '.[0].number // empty')
+  if [ -n "$OPEN_DOCS_PR_RECHECK" ]; then
+    echo "Docs PR #$OPEN_DOCS_PR_RECHECK appeared (likely another fleet host's tick) since Step 1's check. Discarding this tick's local commit instead of opening a duplicate PR."
+    ./.loom/scripts/docs-guide-lock.sh release
+    return
+  fi
 
   git -C "$DOCS_WT" push -u origin "$branch"
 
@@ -1386,6 +1926,12 @@ See issue #1784 for the feature specification.
 PRBODY
 )")
 
+  # Release the docs-guide lock (see Step 1) now that the PR exists. Step 1's
+  # open-docs-PR check — not this lock — is what prevents the NEXT tick from
+  # creating another one while this PR is still open; this lock's only job
+  # was to keep concurrent ticks from racing each other to this point.
+  ./.loom/scripts/docs-guide-lock.sh release
+
   # No side-car state to update — the committed WORK_LOG.md / WORK_PLAN.md carried
   # in this PR ARE the durable state the next tick reads back.
   #
@@ -1400,7 +1946,8 @@ The full document maintenance flow runs at the end of each triage cycle:
 
 ```
 Document Maintenance Phase
-  ├─ Check for open docs PR → skip if one exists
+  ├─ Acquire the docs-guide lock (non-blocking) → skip if another tick holds it
+  ├─ Check for open docs PR → skip (and release the lock) if one exists
   ├─ DOCS_WT=$(./.loom/scripts/docs-worktree.sh | tail -1)
   │    └─ managed worktree on docs/guide-update-<timestamp>; the ONLY place
   │       this phase may write (guards deny the main checkout)
@@ -1409,10 +1956,15 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
-  │    ├─ Commit all document changes (git -C "$DOCS_WT")
+  │    ├─ Commit all document changes (git -C "$DOCS_WT", NOT pushed yet)
+  │    ├─ Cross-host recheck: re-run the open-docs-PR search with an
+  │    │    UNCACHED `gh` call — if a PR now exists (another fleet host's
+  │    │    tick), discard the local commit and release the lock instead of
+  │    │    pushing/creating (#5615)
   │    ├─ Push and create PR with loom:review-requested
+  │    ├─ Release the docs-guide lock
   │    └─ (committed WORK_LOG.md / WORK_PLAN.md ARE the durable state)
-  └─ If no changes: skip (no PR created)
+  └─ If no changes: release the docs-guide lock, skip (no PR created)
 ```
 
 **Important constraints:**
@@ -1422,9 +1974,33 @@ Document Maintenance Phase
   denial by disabling a guard or switching write tool
 - The main checkout is never `git checkout`-ed onto another branch — concurrent
   sweeps and `check-main-clean.sh` assume it stays on the default branch
+- **The docs-guide lock (`docs-guide-lock.sh`) serializes concurrent ticks —
+  SAME HOST ONLY** (#5573) — held from Step 1's acquire through Step 5's
+  release, so two ticks starting within the same short window on **the same
+  host** can never both pass the open-PR check and race each other into
+  `docs-worktree.sh` / `gh pr create`. Non-blocking (a busy tick just skips)
+  and self-healing (a lock older than `LOOM_DOCS_GUIDE_LOCK_STALE_SECS`,
+  default 30 min, is reaped by the next `acquire` — see the script's header
+  comment for why staleness is age-based, not PID-based, in this context). It
+  is a local `mkdir` under this checkout's `.loom/locks/` — it provides **no**
+  protection across different fleet hosts, each of which has its own
+  checkout and its own lock (#5615)
+- **Cross-host guard: an uncached recheck immediately before `gh pr create`**
+  (#5615) — `create_docs_pr()` re-runs Step 1's exact open-docs-PR search a
+  second time, right after committing but before pushing/creating, using
+  plain `gh` (never `$GH_READ`/`gh-cached`, whose per-host read TTL could mask
+  a PR another host just opened). If that recheck finds a PR, this tick
+  discards its local commit and releases the lock instead of pushing —
+  shrinking the cross-host TOCTOU window from the whole Step 1-5 phase down to
+  the gap between the recheck and the create call, the same narrowing tactic
+  Judge/Champion's Verdict-Time CAS Recheck uses for the analogous PR-label
+  race
 - Only one docs PR open at a time (prevents accumulation) — the open-PR check
   matches the `docs/guide-update` branch **prefix** (`head:` search), so it
-  catches the timestamped branches `docs-worktree.sh` creates
+  catches the timestamped branches `docs-worktree.sh` creates. This is
+  distinct from the lock above: the lock stops concurrent ticks from racing
+  each other, this check stops a later tick from piling a second PR onto a
+  still-open one from an earlier, non-racing tick
 - High-water marks are derived from the committed WORK_LOG.md itself (not a
   gitignored side-car that resets every fresh cron checkout), so they survive
   across ticks and prevent duplicate WORK_LOG entries
@@ -1436,6 +2012,30 @@ Document Maintenance Phase
 - WORK_PLAN is only regenerated when label state actually changes — which
   requires `render_plan_body`'s output and the committed marker region to be
   comparable byte-for-byte (see the #5413 bug note in Step 3)
+- **A WORK_PLAN diff must also survive `LOOM_WORK_PLAN_DEBOUNCE_SECS` (default
+  1h) since WORK_PLAN.md was last actually WRITTEN by a merged docs-maintenance
+  PR before it is written again** (#5890, refined by #5929 to anchor on a PR
+  that touched WORK_PLAN.md specifically, not any docs-maintenance PR
+  regardless of content) — otherwise a rapidly bouncing
+  `loom:building`/`loom:issue` transition on any issue (Builder-claim ->
+  Judge-approve -> Champion merge-risk-hold -> re-claim, observed on
+  #5607/#5629) manufactures a fresh docs PR on every tick, or (the #5929
+  failure mode) an unrelated stream of WORK_LOG-only docs PRs keeps resetting
+  the clock and suppresses an overdue WORK_PLAN rewrite indefinitely. A change
+  that persists past the window still produces exactly one PR; a change that
+  reverts before the window elapses produces none (see Step 3)
+- **Hand-written regions of `WORK_PLAN.md` are subject to the same churn
+  prevention as the generated region, not exempt from it** (#5930) — the
+  "Operator Attention: Merge-Risk-Hold Pileup" call-out that used to live
+  above the markers as a hand-appended narrative log is now rendered by
+  `render_plan_body()` (Step 3) as its FIRST generated section, so it rides
+  the same byte-for-byte comparison and the same `LOOM_WORK_PLAN_DEBOUNCE_SECS`
+  gate as Ready/Urgent/etc. Do not
+  reintroduce a hand-appended `**Update (... UTC)**:` paragraph for it, or
+  for any other section that needs per-tick freshness — that bypasses the
+  debounce the same way it did before, because an appended paragraph is
+  never byte-identical to the previous commit even when the underlying facts
+  (which PRs are held, why) have not changed
 - README updates are conservative (stale sections only)
 - All changes go through the standard PR review pipeline
 

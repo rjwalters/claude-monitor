@@ -69,8 +69,10 @@ Env overrides (each wins over config for that key):
 | `LOOM_SAFEHOUSE_ROOM_CLAIMS` | `rooms.claims` — dedicated peer-claim coordination room (#4713) |
 
 **Socket resolution** (precedence **env > config**, `resolve_socket` in
-`loom-daemon/src/safehouse.rs`): `$LOOM_SAFEHOUSE_SOCKET` → `$SAFEHOUSED_SOCKET`
-(the unprefixed convention `safehoused` clients also read) → the configured
+`loom-daemon/src/safehouse.rs`; the bash-side worker-injection path
+(`defaults/scripts/lib/mcp-config.sh`'s `loom_mcp_safehouse_socket()`) mirrors
+the same chain): `$LOOM_SAFEHOUSE_SOCKET` → `$SAFEHOUSED_SOCKET` (the
+unprefixed convention `safehoused` clients also read) → the configured
 `socket` value. If none resolves, narration logs one `warn!` and stays off — no
 built-in `$HOME`-relative default, since safehouse is opt-in per-host.
 
@@ -87,6 +89,47 @@ macOS `safehouse.socket` path was committed to this repo's own shared
 value *before* env at the time — every other host that `git pull`ed `main`
 inherited a path to a socket that did not exist on it, with no env override able
 to take effect while that stale path stayed committed.
+
+**Why there is still no built-in default, even after #5523.** #5457's fix left
+a gap: with the committed default gone and nothing installed in its place, an
+affected host's `safehouse.enabled: true` silently resolved to no socket at
+all, and the only signal was a `log_warn` inside each sweep's own per-role log
+— nobody was tailing those, so a real host ran with **zero** safehouse
+narration for 11 hours before a human noticed the public 2amlogic.com fleet
+pulse had gone stale (#5523). The tempting fix — teach the resolver a
+conventional-path fallback (e.g. `~/.loom/safehoused/state/safehoused.sock`) —
+was deliberately **rejected** for #5523: a code-level default *would* avoid
+re-triggering #5457's exact mechanism (it can't go stale via `git pull` the
+way a committed value can), but it would reintroduce the same underlying risk
+in a different shape — "resolves to *something*" would quietly stop meaning
+"actually reaches a live `safehoused`", which is precisely the gap that let
+#5523 run unnoticed. #5523's fix instead makes the **absence** loud and cheap
+to detect, in two ways, without touching this resolution chain at all:
+
+- `spawn-claude.sh`'s warning, when `safehouse.enabled` is true and no socket
+  resolves, now names the consequence ("no safehouse narration will be
+  recorded... the 2amlogic.com public fleet pulse is fed exclusively from
+  safehouse narration") instead of only the mechanism ("skipping safehouse MCP
+  injection") — still a `log_warn`, never a failed spawn (the degradation
+  contract above is unchanged: `safehouse.enabled: false`/absent stays a
+  byte-for-byte no-op, and `enabled: true` never blocks a sweep).
+- **`defaults/scripts/check-safehouse-socket.sh`** (installed as
+  `.loom/scripts/check-safehouse-socket.sh`) is a new standalone, on-demand
+  check that reports — per managed repo, without reading a single sweep log —
+  whether `safehouse.enabled` is set and, if so, whether a socket resolves AND
+  is present on disk. With no arguments it walks this host's machine-level
+  workspace registry (`~/.loom/workspaces.json`, the same registry
+  `loom-daemon workspace add/list` manages) and checks every registered repo
+  in one pass; pass explicit repo roots to check a subset. `--json` emits a
+  parseable array (`{repo, enabled, socket, present, status}` per repo) for
+  scripting/cron. It exits `0` when every repo is either not configured or
+  resolved-and-present, and `1` the moment any repo is enabled with an
+  unreachable socket — the exact condition #5523 needed surfaced. Unlike the
+  pre-existing static `Safehouse:` line in `loom-daemon-start.sh`'s startup
+  banner (below), this check has **no dependency on the daemon
+  (re)starting** — it can be run any time, which is what the incident
+  actually needed: the affected daemon never restarted across the 11-hour
+  window, so its own start-time check never re-ran.
 
 ### Room routing by attention class (`safehouse.rooms`, #4225)
 
@@ -664,10 +707,10 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
        never narrated, which is acceptable since nothing was watching the feed
        at install time anyway.
 - **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
-  completed_at}` required, plus optional `issue`/`tokens`/`title`/`additions`/
-  `deletions` (envelope-v1 preserves unknown `meta` keys, so no schema rev is
-  needed for extensions). `body` stays required human prose — a room reader sees
-  a sentence, `meta` is the machine view.
+  completed_at}` required, plus optional `issue`/`tokens`/`tokens_by_model`/
+  `title`/`additions`/`deletions` (envelope-v1 preserves unknown `meta` keys,
+  so no schema rev is needed for extensions). `body` stays required human
+  prose — a room reader sees a sentence, `meta` is the machine view.
 - **`repo` is the forge `owner/repo` slug** (`gh repo view --json
   nameWithOwner`, cached per workspace for the daemon's lifetime), deliberately
   **not** the path-basename convention above: the feed links `ref` (the PR URL)
@@ -728,8 +771,33 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
     magnitude and unevenly between sweeps. Set
     `LOOM_SAFEHOUSE_TRANSCRIPT_TOKENS=0` to opt out of the transcript scan
     entirely (the key is then simply omitted on dispatch-driven hosts).
-  - Absent `tokens`/`title`/`additions`/`deletions` ⇒ the envelope is identical
-    to the pre-#4497 one; none of the four can block or fail an emission.
+  - **`tokens_by_model` (#5740)** is a per-`(model, speed, service_tier)`
+    breakdown of the same transcript scan, because `tokens`' single sum
+    cannot be priced: it merges five quantities (`input`, `cache_read`, the
+    two `cache_write` buckets, `output`) that price between 0.1x-2x of each
+    other, across models that are themselves 3-5x apart — on one measured
+    36-hour window, pricing `tokens` at the base input rate overstated real
+    spend **7.7x**. It is additive alongside `tokens` (which keeps its
+    existing flat-sum meaning) and has **only one source** — the activity DB
+    rollup has no per-model granularity to offer, so this key comes from the
+    transcript scan alone and is `None` whenever that scan is (opted out,
+    empty, or timed out).
+
+    Each array entry is
+    `{model, speed, service_tier, input, cache_read, cache_write_5m,
+    cache_write_1h, output}` — raw counts, **never cost-weighted** (a pricing
+    table change never needs a backfill of this data, same rationale as
+    `tokens_in`/`tokens_out` in [telemetry-schema.md](telemetry-schema.md)). A
+    usage block whose `model` is absent or the literal `"<synthetic>"` (Claude
+    Code stamps that on some internal/tool-echo messages) is grouped under one
+    explicit `<unattributed>` sentinel rather than dropped, and the sum across
+    every entry's counters reconciles against the flat `tokens` total for the
+    same sessions. `speed`/`service_tier` default to `"standard"` when a usage
+    block does not carry them. Omitted (never `[]`) when nothing attributable
+    was found, same "unknown != zero" contract as `tokens`.
+  - Absent `tokens`/`tokens_by_model`/`title`/`additions`/`deletions` ⇒ the
+    envelope is identical to the pre-#4497 one; none of the five can block or
+    fail an emission.
 
   > **A `null` field on 2amlogic.com is not evidence of a producer bug (#4699).**
   > The public feed applies its **own** server-side redaction on read: entries
@@ -843,10 +911,17 @@ what feeds the public fleet feed on 2amlogic.com. Loom is the producer:
 - `defaults/scripts/cli/loom-daemon-start.sh` — (#4345) the static
   pre-connect `Safehouse:` line, via `lib/mcp-config.sh`'s existing
   `loom_mcp_safehouse_enabled`/`loom_mcp_safehouse_socket` resolvers.
+- `defaults/scripts/check-safehouse-socket.sh` — (#5523) the standalone,
+  daemon-restart-independent per-repo socket-resolution drift check described
+  above under "Socket resolution".
 - Tests: `safehouse.rs`'s `mod tests` (state-cell + wire-rendering cases),
   `workspace_pool.rs`'s `mod tests` (pool wiring), `ipc.rs`'s
   `test_build_daemon_status_reports_halt_and_in_flight` (report field),
-  `defaults/scripts/tests/test-loom-daemon-start.sh` (start-wrapper line).
+  `defaults/scripts/tests/test-loom-daemon-start.sh` (start-wrapper line),
+  `defaults/scripts/tests/test-mcp-config.sh` §13 (#5523: the loudened
+  spawn-claude.sh warning text + check-safehouse-socket.sh's not-configured /
+  resolved / unreachable-no-socket / unreachable-missing-file / multi-repo /
+  `--json` behavior).
 
 ## Peer-claim coordination: cross-host soft claim (#4028)
 

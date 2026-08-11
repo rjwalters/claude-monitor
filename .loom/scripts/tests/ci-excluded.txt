@@ -23,3 +23,4 @@ scripts/test-changelog.sh  Already wired directly in build-gate.sh (bash scripts
 scripts/test-install-local-mode.sh  Already wired directly in ci.yml's "Installer local/gitignore mode" step and build-gate.sh; excluded here to avoid double-running it.
 scripts/test-installer.sh  Already wired directly in ci.yml's "Installer Integration Tests" job and build-gate.sh; excluded here to avoid double-running it.
 scripts/test-migrate-consumer.sh  Already wired directly in ci.yml's "migrate-consumer" step and build-gate.sh; excluded here to avoid double-running it.
+scripts/test-daemon-liveness.sh  Already wired directly in build-gate.sh (bash scripts/test-daemon-liveness.sh, #5548); excluded here to avoid double-running it.

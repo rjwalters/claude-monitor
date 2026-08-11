@@ -106,7 +106,8 @@ CRITICAL_PATTERNS=(
     "package.json"
     ".github/workflows/"
     ".sql"
-    "migration"
+    "migrations/"
+    "_migration.py"
 )
 
 champion_critical_file_check() {
@@ -172,6 +173,57 @@ out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
 assert_eq "PASS" "$out" "150 non-critical files pass with no false positive"
 
 echo
+echo "--- champion_critical_file_check: 'migration' pattern false positive on docs/migration/ (#5723) ---"
+
+# docs/migration/*.md is a real, intentional repo convention (this repo's own
+# CLAUDE.md links to docs/migration/v0.10.0-shepherd-deprecation.md) — it must
+# NOT be treated as a critical database-migration file.
+fixture=$'README.md\ndocs/migration/v0.10.0-shepherd-deprecation.md\ndocs/migration/daemon-state-consumers.md'
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "PASS" "$out" "docs/migration/*.md files pass (not treated as critical migration files)"
+
+# Genuine database migration files must still be caught.
+fixture=$'src/lib.rs\ndb/migrations/003_add_column.sql'
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "FAIL: db/migrations/003_add_column.sql" "$out" \
+    "a file inside a */migrations/* directory is still caught"
+
+fixture=$'src/lib.rs\npolls/migrations/0001_initial.py'
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "FAIL: polls/migrations/0001_initial.py" "$out" \
+    "a nested (Django-style) migrations/ .py file is still caught"
+
+# Root-level `migrations/` directories must be caught too — the pattern has no
+# leading `/`, so it is not restricted to nested directories. A leading-slash
+# form ("/migrations/") silently missed these, which is Alembic's and
+# Flask-Migrate's actual default `alembic init migrations` output layout
+# (`migrations/versions/*.py` at the repo root) — a non-`.sql` migration script
+# there would have bypassed the critical-file safety net entirely (#5723).
+fixture=$'src/lib.rs\nmigrations/0001_initial.py'
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "FAIL: migrations/0001_initial.py" "$out" \
+    "a root-level migrations/ .py file is caught (no leading-slash requirement)"
+
+fixture=$'src/lib.rs\nmigrations/versions/0001_add.py'
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "FAIL: migrations/versions/0001_add.py" "$out" \
+    "Alembic/Flask-Migrate's default root-level migrations/versions/*.py layout is caught"
+
+fixture=$'src/lib.rs\nbackend/0001_initial_migration.py'
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "FAIL: backend/0001_initial_migration.py" "$out" \
+    "a *_migration.py single-file migration script is still caught"
+
+# Edge case (explicitly decided, see #5723): a doc file whose name merely
+# contains "migration" as a substring with no directory/suffix convention
+# match (no "migrations/" dir, no "_migration.py" suffix) is NOT a database
+# migration file and must PASS, same as docs/migration/*.md above.
+fixture="docs/migration-notes.md"
+out="$(printf '%s\n' "$fixture" | champion_critical_file_check)"
+assert_eq "PASS" "$out" \
+    "docs/migration-notes.md (bare 'migration' substring, no directory/suffix convention) passes"
+
+echo
 echo "--- Doc pins: shipped markdown uses the paginated REST endpoint, not the truncating gh pr view field ---"
 
 assert_doc_contains "$CHAMPION_MD" \
@@ -193,6 +245,33 @@ assert_doc_lacks "$CHAMPION_MD" \
 assert_doc_contains "$CHAMPION_MD" \
     "#4613" \
     "champion-pr-merge.md documents the #4613 regression that motivated this fix"
+
+echo
+echo "--- Doc pins: shipped markdown no longer uses the bare 'migration' substring pattern (#5723) ---"
+
+assert_doc_lacks "$CHAMPION_MD" \
+    '"migration"' \
+    "CRITICAL_PATTERNS array no longer contains the bare 'migration' substring pattern"
+
+assert_doc_lacks "$CHAMPION_MD" \
+    '`*migration*` - database migration files' \
+    "prose critical-file-patterns bullet list no longer contains the bare *migration* pattern"
+
+assert_doc_lacks "$CHAMPION_MD" \
+    '"/migrations/"' \
+    "CRITICAL_PATTERNS array no longer uses the leading-slash form that missed root-level migrations/ dirs"
+
+assert_doc_contains "$CHAMPION_MD" \
+    '"migrations/"' \
+    "CRITICAL_PATTERNS array ships the narrower migrations/ directory pattern"
+
+assert_doc_contains "$CHAMPION_MD" \
+    '"_migration.py"' \
+    "CRITICAL_PATTERNS array ships the narrower _migration.py suffix pattern"
+
+assert_doc_contains "$CHAMPION_MD" \
+    "#5723" \
+    "champion-pr-merge.md documents the #5723 docs/migration/ false-positive fix"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"

@@ -253,11 +253,11 @@ dead-end login wall for an anonymous visitor.
 `dashboard.2amlogic.com` is a live, operator-owned deployment of this same
 backend (not a shared Loom service — every fleet deploys its own). Its
 specific account/database IDs, Access application layout, credential file
-locations, and cutover history (the hostname-wide Access app was retired in
-favor of the single-URL `/login`-scoped layout on 2026-07-31) are recorded
-in [`dashboard/docs/reference-deployment.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/reference-deployment.md)
-— useful as a concrete filled-in example of every value the deploy runbook
-asks you to supply, not as a second copy of the how-to.
+locations, and cutover history now live in that operator's own
+infrastructure repo (2AMLogic/2am#2), not in this repo — this repo's
+[`dashboard/docs/reference-deployment.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/reference-deployment.md)
+only records the *shape* such a document should take (which values to
+capture, and why) so you can produce the equivalent for your own instance.
 
 ## Map of every detail doc
 
@@ -268,5 +268,5 @@ asks you to supply, not as a second copy of the how-to.
 | `dashboard/docs/cloudflare-access.md` | Gating the authenticated view behind SSO; single-URL fallback |
 | `dashboard/docs/query-api.md` | `/api/*` vs `/public/*` routes, redaction policy, live tail |
 | `dashboard/docs/token-analytics.md` | Burn curves, forecasting, per-repo attribution |
-| `dashboard/docs/reference-deployment.md` | The 2AM instance specifically — concrete IDs, current state |
+| `dashboard/docs/reference-deployment.md` | Generic guidance/template for recording your own instance's deployment identity in your own infrastructure repo — carries no operator identity here |
 | `loom-daemon/src/observability/mod.rs` | Config resolution, collector/queue/exporter/sender source of truth |

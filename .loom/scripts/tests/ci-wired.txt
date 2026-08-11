@@ -36,12 +36,15 @@ test-check-ci-status.sh
 test-check-duplicate.sh
 test-check-git-identity.sh
 test-check-host-sleep.sh
+test-check-defaults-version-bump.sh
 test-check-ingest-key-file.sh
 test-check-main-clean.sh
 test-check-main-freshness.sh
 test-check-quarantine-stashes.sh
 test-check-runtime-capabilities.sh
 test-check-verified-corrections-preserved.sh
+test-classify-dependency-block.sh
+test-classify-error.sh
 test-clean-stale-binary.sh
 test-cleanup-branches-pr-review-branch.sh
 test-config-resolver.sh
@@ -49,7 +52,9 @@ test-config-tiers-cli-migration.sh
 test-default-branch.sh
 test-dependency-parse.sh
 test-detect-dependency-cycle.sh
+test-detect-startable-subset.sh
 test-disk-headroom.sh
+test-docs-guide-lock.sh
 test-docs-worktree.sh
 test-fleet-check.sh
 test-fleet-send.sh
@@ -60,7 +65,11 @@ test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
+test-guide-operator-attention-fold.sh
+test-guide-work-log-issue-out-of-order.sh
+test-guide-work-log-out-of-order-merge.sh
 test-guide-work-log-self-loop.sh
+test-guide-work-plan-debounce.sh
 test-install-active-session.sh
 test-install-full-reinstall-no-target-mutation.sh
 test-install-lock.sh
@@ -83,6 +92,7 @@ test-mcp-config.sh
 test-merge-pr-auto-merge-disabled-fallback.sh
 test-merge-pr-auto-reconcile.sh
 test-merge-pr-dirty-worktree-guard.sh
+test-merge-pr-head-mismatch.sh
 test-merge-pr-help.sh
 test-merge-pr-local-branch-cleanup.sh
 test-merge-pr-merge-ordering-guard.sh
@@ -93,6 +103,7 @@ test-merge-pr-rate-limit-fallback.sh
 test-merge-pr-unstable-fallback.sh
 test-merge-pr-worktree-awk.sh
 test-merge-pr-worktree-path.sh
+test-operator-only-subkind.sh
 test-pr-worktree-isolation.sh
 test-probe-tokens-fallback.sh
 test-provision-codex-hooks.sh
@@ -113,6 +124,8 @@ test-sweep-experiment.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
 test-sync-labels-repo-flag.sh
+test-urgent-flip-guard.sh
+test-verdict-staleness-guard.sh
 test-verify-install-scope.sh
 test-warn-operator-gated.sh
 test-warn-out-of-set-deps.sh
@@ -128,6 +141,7 @@ test-worktree-root-override.sh
 test-worktree-sentinel-reinvoke.sh
 test-worktree-sentinel.sh
 test-worktree-snapshot.sh
+test-worktree-stale-merged-branch.sh
 test-worktree-stash-baseline.sh
 
 # tests/hooks/ (repo root) — Claude-path guard suites, wired since #4769.
@@ -155,6 +169,7 @@ tests/install/test-pnpm-runnable-check.sh
 tests/install/test-provision-daemon.sh
 tests/install/test-uninstall-labels-block.sh
 tests/install/test-uninstall-preserve-siblings.sh
+tests/install/test-uninstall-shim-cleanup.sh
 
 # tests/hermit/ — the Hermit role's stateless-ceremony heuristic regression
 # guard, wired since #5275 (was previously orphaned, no CI runner at all).

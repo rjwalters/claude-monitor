@@ -191,6 +191,16 @@ assert_contains "$out" $'88\t⚠ depends on #4, which is loom:operator-only' \
 
 # =====================================================================
 echo
+echo "--- Signal 2 (#5817): dependency on a loom:needs-capability issue annotates the candidate ---"
+
+echo 'Depends on #5 (waiting on a capability request)' > "$STUB_DIR/body-92.txt"
+echo 'loom:needs-capability' > "$STUB_DIR/labels-5.txt"
+out="$(run_warn "92")"
+assert_contains "$out" $'92\t⚠ depends on #5, which is loom:needs-capability' \
+    "candidate depending on a loom:needs-capability issue is flagged"
+
+# =====================================================================
+echo
 echo "--- Dependency on a NON-operator-only issue does NOT annotate ---"
 
 echo 'Depends on #9' > "$STUB_DIR/body-89.txt"
@@ -226,6 +236,18 @@ assert_contains "$out" $'90\t⚠ body declares operator-gating: "operator-gated"
     "#90 phrase signal present"
 assert_contains "$out" $'90\t⚠ depends on #4, which is loom:operator-only' \
     "#90 dependency signal also present"
+
+# =====================================================================
+echo
+echo "--- A dependency carrying BOTH labels prints one line per label (#5817) ---"
+
+echo 'Depends on #6' > "$STUB_DIR/body-93.txt"
+echo 'loom:operator-only,loom:needs-capability' > "$STUB_DIR/labels-6.txt"
+out="$(run_warn "93")"
+assert_contains "$out" $'93\t⚠ depends on #6, which is loom:operator-only' \
+    "#93 flagged for the loom:operator-only label on #6"
+assert_contains "$out" $'93\t⚠ depends on #6, which is loom:needs-capability' \
+    "#93 flagged for the loom:needs-capability label on #6"
 
 # =====================================================================
 echo

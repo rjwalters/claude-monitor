@@ -158,7 +158,7 @@ outside that array for parsing reasons:
 read-only fast path runs *before* the floor scan, so anything it admits skips the
 floor. Its built-in allowlist cannot admit a floor member (the structural test
 rejects every command containing `;` `&` `|` `<` `>`, a backtick or `$(`, and the
-admitted first tokens are `ls`/`grep`/`rg`/`jq`/`wc`/`head`/`tail`/`test`/`find`
+admitted first tokens are `ls`/`grep`/`rg`/`jq`/`wc`/`head`/`tail`/`echo`/`test`/`find`
 plus verb-scoped `git`/`gh`/`aws` read forms). The **operator escape hatch**
 `guards.readOnlyFastPathExtra` was a different story: it admits a literal first
 word in full generality, so `{"guards":{"readOnlyFastPathExtra":["rm"]}}` used to
@@ -248,8 +248,8 @@ closed at the installer level.**
 
 Loom ships with several built-in `PreToolUse` guard hooks, registered independently under the `Bash` or `Edit|Write` matcher as noted below:
 
-- **`guard-destructive.sh`** (`Bash` matcher) — the generic repository-hygiene guard (catastrophic denies like `rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction; the segment-parsed lifecycle/cloud-CLI checks; and the `guards.sqlDdl` / `guards.cloudCli` / `guards.reversibleGh` / `guards.rmScope` / `guards.forceScope` toggle machinery documented below). Nothing about this guard is Loom-specific, so as of **#4041 its canonical home is [Repo Skills](https://github.com/rjwalters/repo)** (installed at `.claude/skills/repo/hooks/guard-destructive.sh`, carrying the rjwalters/repo#29 curl-pipe fix). In Loom, `guard-destructive.sh` is now a thin **dispatcher**: when the canonical Repo Skills guard is present **and passes both of the runtime probes below** it defers to it (and the installer does not install a second generic guard); otherwise it falls back to a clearly-marked **vendored copy** (`guard-destructive-generic.sh`) that Loom ships so standalone-Loom repos — those without Repo Skills — keep full coverage. Exactly one generic guard ever runs; the behavior and all the toggles below are unchanged either way. The pattern list itself is maintained upstream in Repo Skills, not forked in Loom. **Loom-specific exceptions:** the vendored copy also carries the Bash-tool **write-confinement** category (`>`/`>>` redirection, `tee`, `sed -i`, `cp`/`mv`, issue #4178) — see `guards.worktreeIsolation` below — and an **ungated hard deny on `gh pr comment`/`gh issue comment --body @path`** (issue #4523: this shape never expands the file — it posts the literal string `@path` as the comment body, which lost an entire Judge review on PR #4457). That rule deliberately scans the *raw* command rather than the `strip_literal_text()`-redacted copy the rest of the catastrophic scan uses, because redaction would erase the leading `@` inside a quoted `--body "@path"` value and silently defeat the check for exactly the shape most likely to occur in practice — see the comment above the check in `guard-destructive-generic.sh` for the full trap writeup. Because that rule inspects only the *static* text right after the flag, it was bypassed in the field (PR #4600, issue #4601) by the same `@path` value handed over through a shell variable, so two **additive companion denies** now sit beside it: (1) a **correlated** deny when the same command both assigns a path-shaped `@…` value to a shell variable *and* passes that same variable as `--body`/`-b` (correlation is what keeps a legitimate `--body "$SUMMARY"` allowed — an unconditional deny on any variable reference would be far too broad), and (2) a deny on `gh api … -f`/`--raw-field body=@<path>`, since only `-F`/`--field` gives `@<path>` its read-from-file meaning on `gh api` (this one is deliberately **case-sensitive** and anchors the flag on preceding whitespace, or it would match the correct `-F`/`--field` forms and deny them). Both require genuine path shape (`@/…`, `@~/…`, `@./…`, `@../…`, or a text-file extension) so bare `@mention`/`@org/team` prose is never matched. Residual gap by construction: a variable assigned in an *earlier* Bash call cannot be seen from one `PreToolUse` payload — that case is covered by the independent second layer, the "re-fetch the posted comment and confirm it renders your prose, not a path" step in the Judge/Doctor checklists. All of these stay Loom-owned even though the rest of the file mirrors upstream, the same way `resolve_worktree_root()`/`guards.rmScope` already do.
-  - **Dispatcher handoff is gated by TWO runtime probes, not one (#4894).** Deferring to the canonical guard used to require only a **version** probe — does it carry the `repo#29` curl-pipe-fix marker? That alone is not a **capability** probe: it says nothing about whether the canonical guard actually implements the Loom-only write-confinement category above. Once a consumer repo's Repo Skills install picked up `repo#29` *without* write-confinement (Repo Skills 0.7.0), the dispatcher exec'd it anyway and the `guards.worktreeIsolation` Bash-tool category **stopped running with no warning and no override** — `guards.worktreeIsolation` still read as enabled, the process implementing it was simply never started. So as of #4894 the dispatcher requires **both**: the `repo#29` marker (version) **and** the `worktree-write-confinement` decision tag (capability — the same stable tag the vendored guard's `deny()` call for that category emits). Either probe failing routes to the vendored fallback, which always carries write-confinement. See `defaults/hooks/guard-destructive.sh`'s header comment for the exact probe logic and `tests/hooks/test-guard-destructive-dispatcher.sh` (cases 6-7) for the regression coverage.
+- **`guard-destructive.sh`** (`Bash` matcher) — the generic repository-hygiene guard (catastrophic denies like `rm -rf /`, force-push to `main`, `gh repo delete`, fork bombs, curl-pipe-to-shell, cloud/SQL destruction; the segment-parsed lifecycle/cloud-CLI checks; and the `guards.sqlDdl` / `guards.cloudCli` / `guards.reversibleGh` / `guards.rmScope` / `guards.forceScope` toggle machinery documented below). Nothing about this guard is Loom-specific, so as of **#4041 its canonical home is [Repo Skills](https://github.com/rjwalters/repo)** (installed at `.claude/skills/repo/hooks/guard-destructive.sh`, carrying the rjwalters/repo#29 curl-pipe fix). In Loom, `guard-destructive.sh` is now a thin **dispatcher**: when the canonical Repo Skills guard is present **and passes all three of the runtime probes below** it defers to it (and the installer does not install a second generic guard); otherwise it falls back to a clearly-marked **vendored copy** (`guard-destructive-generic.sh`) that Loom ships so standalone-Loom repos — those without Repo Skills — keep full coverage. Exactly one generic guard ever runs; the behavior and all the toggles below are unchanged either way. The pattern list itself is maintained upstream in Repo Skills, not forked in Loom. **Loom-specific exceptions:** the vendored copy also carries the Bash-tool **write-confinement** category (`>`/`>>` redirection, `tee`, `sed -i`, `cp`/`mv`, issue #4178) — see `guards.worktreeIsolation` below — and an **ungated hard deny on `gh pr comment`/`gh issue comment --body @path`** (issue #4523: this shape never expands the file — it posts the literal string `@path` as the comment body, which lost an entire Judge review on PR #4457). That rule deliberately scans the *raw* command rather than the `strip_literal_text()`-redacted copy the rest of the catastrophic scan uses, because redaction would erase the leading `@` inside a quoted `--body "@path"` value and silently defeat the check for exactly the shape most likely to occur in practice — see the comment above the check in `guard-destructive-generic.sh` for the full trap writeup. Because that rule inspects only the *static* text right after the flag, it was bypassed in the field (PR #4600, issue #4601) by the same `@path` value handed over through a shell variable, so two **additive companion denies** now sit beside it: (1) a **correlated** deny when the same command both assigns a path-shaped `@…` value to a shell variable *and* passes that same variable as `--body`/`-b` (correlation is what keeps a legitimate `--body "$SUMMARY"` allowed — an unconditional deny on any variable reference would be far too broad), and (2) a deny on `gh api … -f`/`--raw-field body=@<path>`, since only `-F`/`--field` gives `@<path>` its read-from-file meaning on `gh api` (this one is deliberately **case-sensitive** and anchors the flag on preceding whitespace, or it would match the correct `-F`/`--field` forms and deny them). Both require genuine path shape (`@/…`, `@~/…`, `@./…`, `@../…`, or a text-file extension) so bare `@mention`/`@org/team` prose is never matched. Residual gap by construction: a variable assigned in an *earlier* Bash call cannot be seen from one `PreToolUse` payload — that case is covered by the independent second layer, the "re-fetch the posted comment and confirm it renders your prose, not a path" step in the Judge/Doctor checklists. All of these stay Loom-owned even though the rest of the file mirrors upstream, the same way `resolve_worktree_root()`/`guards.rmScope` already do.
+  - **Dispatcher handoff is gated by THREE runtime probes, not one (#4894, #5916).** Deferring to the canonical guard used to require only a **version** probe — does it carry the `repo#29` curl-pipe-fix marker? That alone is not a **capability** probe: it says nothing about whether the canonical guard actually implements the Loom-only write-confinement category above. Once a consumer repo's Repo Skills install picked up `repo#29` *without* write-confinement (Repo Skills 0.7.0), the dispatcher exec'd it anyway and the `guards.worktreeIsolation` Bash-tool category **stopped running with no warning and no override** — `guards.worktreeIsolation` still read as enabled, the process implementing it was simply never started. So as of #4894 the dispatcher requires the `repo#29` marker (version) **and** the `worktree-write-confinement` decision tag (capability — the same stable tag the vendored guard's `deny()` call for that category emits). As of #5916 it additionally requires a third capability probe: the canonical guard must carry BOTH the `--comment|--search` and `--arg|--argjson` regex-alternation substrings that only appear once a guard masks `gh --search`/`jq --arg`/`--argjson` quoted values before the catastrophic/ask scans (the #5797/#5803/#5809 fix) — without it, a canonical guard that passes the first two probes can still false-DENY a command like `gh issue list --search "docker system prune" --jq '.[] | .number'`. Any probe failing routes to the vendored fallback, which always carries all three. This third probe is INERT today (never yet passing) because rjwalters/repo has not ported an equivalent masking fix upstream as of this writing, so every real canonical guard defers to the vendored fallback for this reason alone until it does. See `defaults/hooks/guard-destructive.sh`'s header comment for the exact probe logic and `tests/hooks/test-guard-destructive-dispatcher.sh` (cases 6-7 for the #4894 regression, cases 8-9 for the #5916 regression) for the regression coverage.
 - **`guard-loom-workflow.sh`** (`Bash` matcher) — the thin, Loom-workflow-specific guard (issue #3604): the `gh pr merge` → `merge-pr.sh` redirect, the `pip install -e` worktree block (keyed on `LOOM_WORKTREE_PATH`, issues #2495 + #4079), and the `loom-daemon workspace` registry-mutation ask (issue #4326, below). **On the `pip install -e` block:** Loom's own tree no longer contains a load-bearing Python package (epic #4081 Phase 4, #4557, retired `loom-tools` — see [ADR-0013](https://github.com/rjwalters/loom/blob/main/docs/adr/0013-loom-tools-python-retirement.md)), but this guard is deliberately retained and *strengthened*, for two reasons. It protects any **Python repo under Loom orchestration** from the original hazard (parallel builders clobbering the global `.pth`, #2495); and an editable install also drops **frozen console scripts** into `~/.local/bin` that outlive the package and shadow whatever is later installed under the same name — the incident (#4079) in which a stale `pip install -e loom-tools` kept shadowing the Rust `loom-daemon` binary on PATH, and the direct motivation for epic #4081. The deny message points at `.loom/scripts/run-tests.sh` (which sets `PYTHONPATH` for the worktree) as the supported alternative; `loom-daemon-update.sh` warns about survivors that predate the guard. This guard and `guard-worktree-paths.sh` below are specific to the Loom worktree/merge/daemon workflow and stay Loom-owned.
 - **`guard-worktree-paths.sh`** (`Edit|Write` matcher, issue #2441 / #4007) — confines Edit/Write tool calls to a builder's issue worktree, denying writes that resolve into the main checkout. Two mechanisms: the `LOOM_WORKTREE_PATH` env fast path (tmux/manual sessions pinned to one worktree) and, when that env var is absent, a **path-derived fallback** — it walks up from the target path looking for the `.loom-managed` sentinel `worktree.sh` writes at every worktree root, and denies a write that lands in the main checkout while at least one managed worktree exists. The fallback exists because a daemon-dispatched sweep hosts multiple Task-subagent builders in one shared process env, so a single process-wide `LOOM_WORKTREE_PATH` cannot cover that path (#3719). Toggle: `guards.worktreeIsolation` / `LOOM_GUARD_WORKTREE_ISOLATION`, documented alongside the other guard toggles below. **This confines the Edit/Write tool matcher only** — a session denied here could historically fall back to a Bash-tool write (`>`, `tee`, `sed -i`, `cp`/`mv`) targeting the same path with nothing to stop it (the #4178 incident: sweep #4063 used exactly this to edit live guard hooks in the main checkout). `guard-destructive-generic.sh`'s write-confinement category (bullet above) now closes that gap under the identical toggle.
 - **`guard-codex-bridge.sh`** (Codex `pre_tool_use` hook, issue #4495) — **not a Claude Code hook.** It is installed into a selected `$CODEX_HOME/hooks.json` by `defaults/scripts/provision-codex-hooks.sh` and is the adapter that makes the three `PreToolUse` guards above fire for a **Codex** worker. It validates the Codex event, classifies the tool (shell / native patch / read-only / MCP / unknown), normalizes the payload into the Claude-shaped request those guards already accept, dispatches into them **unmodified** (no second policy table), and encodes the outcome on Codex's wire. Two behavioral differences from the Claude path are structural, not choices: Codex 0.146.0 accepts only `permissionDecision:"deny"` (an `allow` is expressed as *no output*, and `ask` is not on the wire at all), so every `ask` becomes a **deny** with the original reason preserved — correct anyway for headless `codex exec`, where nobody can answer; and the bridge fails **closed** (malformed payload, unknown tool, unextractable command/path, or a sub-guard that misbehaves all deny) where the Claude guards fail open. `spawn-codex.sh` refuses to start a **mutable** role (Builder/Doctor) unless the managed hook is installed, pinned, readable and the profile has established Codex hook trust — exit 78 before the CLI runs, and never `--dangerously-bypass-hook-trust`. Full reference: [`guardrail-parity-codex.md`](guardrail-parity-codex.md).
@@ -259,7 +259,7 @@ You can also add project-specific guards to protect read-only directories from a
 
 ### Which generic guard is authoritative — and why the vendored copy stays (#4403, #4566)
 
-**At runtime the canonical Repo Skills guard wins** when it is present **and passes both dispatcher probes** (version + capability, #4894 — see the bullet above): `guard-destructive.sh` is a dispatcher, so the vendored `guard-destructive-generic.sh` is a *fallback*, never a second guard running alongside it. A canonical guard that has the `repo#29` fix but not (yet) the write-confinement category still routes to the vendored fallback.
+**At runtime the canonical Repo Skills guard wins** when it is present **and passes all three dispatcher probes** (version + write-confinement capability + search/jq-mask capability, #4894 / #5916 — see the bullet above): `guard-destructive.sh` is a dispatcher, so the vendored `guard-destructive-generic.sh` is a *fallback*, never a second guard running alongside it. A canonical guard that has the `repo#29` fix but not (yet) the write-confinement and/or search/jq-mask categories still routes to the vendored fallback.
 
 Whether the vendored copy is **installed** is a separate, per-repo choice, and both answers are supported:
 
@@ -308,7 +308,9 @@ LOOM_GUARD_SQL=1 psql -c "DROP TABLE users"
 
 ### Cloud CLI Guard Opt-Out (`guards.cloudCli` / `LOOM_GUARD_CLOUD`)
 
-`guard-destructive.sh` asks for confirmation on **mutating** cloud/container CLI calls — `aws ec2 run-instances`/`create-*`/`stop-instances`/`start-instances`/`terminate-instances`, `aws s3 rm`/`rb`/`cp`/`mv`/`sync`, other mutating `aws <service> <verb>` forms, and `docker rm`/`rmi`/`stop`/`kill`/`restart`. Read-only calls (`aws ec2 describe-instances`, `aws s3 ls`, `aws lambda list-functions`, `docker ps`, `docker logs`, etc.) are **not** prompted. For a repo whose *purpose* is managing cloud infrastructure (launch/stop/terminate dev VMs, build/tear-down containers), even the mutating asks are workflow friction rather than a safety win.
+`guard-destructive.sh` asks for confirmation on **mutating** cloud/container CLI calls — `aws ec2 run-instances`/`create-*`/`stop-instances`/`start-instances`/`terminate-instances`, `aws s3 rm`/`rb`/`cp`/`mv`/`sync`, other mutating `aws <service> <verb>` forms, and `docker rmi`/`stop`/`kill`/`restart`. Read-only calls (`aws ec2 describe-instances`, `aws s3 ls`, `aws lambda list-functions`, `docker ps`, `docker logs`, etc.) are **not** prompted. For a repo whose *purpose* is managing cloud infrastructure (launch/stop/terminate dev VMs, build/tear-down containers), even the mutating asks are workflow friction rather than a safety win.
+
+`docker rm` (#5823) is narrower than the other docker verbs above: a bare/ID/name-only `docker rm [-f] <container>` (e.g. `docker ps -a --filter ancestor=... -q | xargs -r docker rm -f`) is **not** prompted — it only removes container instances, never images, volumes, or networks, so ordinary self-scoped cleanup of containers the agent created itself no longer stalls a headless run. Only the volume-destroying variant (`docker rm -v ...` / `docker rm --volumes ...`) still asks, since it can delete named/anonymous volumes another container depends on.
 
 Such repos can opt out of the cloud/docker ASK category while keeping every other guard active — including the genuinely catastrophic cloud denies (`aws s3 rm ... --recursive`, `aws s3 rb`, `aws cloudformation delete-stack`, `docker system prune`), which are **never** gated by this toggle and stay hard denies even with the cloud guard off.
 
@@ -741,9 +743,12 @@ isolated worktree, never a main-checkout test-merge).
 `guard-destructive-generic.sh` asks for confirmation on `git stash pop`,
 `git stash drop`, and `git stash clear` **only when the command's cwd resolves
 to the main checkout** — never in a linked worktree, where a stash operation
-cannot touch the main checkout's stack at all. `git stash push` / `git stash
-apply` / `git stash list` (and the bare `git stash`, which defaults to `push`)
-are **not** gated — none of them can remove an entry from the stack.
+cannot touch the main checkout's stack at all. `git stash apply` /
+`git stash list` / `git stash show` / `git stash create` are **not** gated —
+none of them removes an entry from the stack. Stash *creation* (`git stash`,
+`git stash push`, `git stash save`) is ungated in the main checkout too, but
+is **denied** inside a managed worktree — see "Create-side redirect (#5754)"
+below.
 
 The main-checkout test compares `git rev-parse --show-toplevel` against
 `git rev-parse --git-common-dir/..`, both resolved from the command's cwd: they
@@ -786,11 +791,12 @@ This is exactly the incident category that motivated #4821 (kicad-tools PRs
 on the shared stash stack. The guard now additionally asks when cwd is a
 linked worktree **and** two or more `.loom-managed` worktrees currently
 exist under `<main>/.loom/worktrees/` (a single active worktree has no one
-else's entry to collide with, so it stays ungated). The prescribed
-prevention remains procedural, not just guard-enforced — prefer
-`./.loom/scripts/worktree.sh snapshot <issue-number>` (patch-file WIP
-capture, scoped to one worktree, no shared stack) over ad-hoc `git stash`
+else's entry to collide with, so it stays ungated). The prescribed prevention
+is to prefer `./.loom/scripts/worktree.sh snapshot <issue-number>` (patch-file
+WIP capture, scoped to one worktree, no shared stack) over ad-hoc `git stash`
 for WIP handling (see `defaults/roles/builder.md` / `defaults/roles/doctor.md`).
+As of #5754 that preference is guard-enforced at the point where the entry is
+*created*, not merely documented — see "Create-side redirect" below.
 
 **Headless baseline-diff pattern (#5217).** Because a busy repo almost always
 has two or more `.loom-managed` worktrees active, the collision ask above
@@ -819,6 +825,55 @@ guard-transparent, not a guard exemption. Raw `git stash pop`/`drop`/`clear`
 stays exactly as gated as before, in the main checkout and in a linked
 worktree alike.
 
+**Create-side redirect (#5754).** Guard-decision telemetry for 2026-08-04..08
+recorded 32 `stash-scope` asks (~7.2/day), *all* of them after both the
+role-prompt guidance and the guard's own inline suggestion text had already
+shipped. Classifying them by chain shape showed the guard was gated on the
+wrong half of the stash cycle:
+
+| Shape | Share | What the guard did |
+|-------|-------|--------------------|
+| create + recovery in one chain (`cd <wt> && git stash && <check>; git stash pop`) | 15/32 | Allowed the create silently, then asked at the pop — at the *end* of the chain, about a decision made at its start |
+| recovery only (WIP already on `refs/stash` from an earlier, silently-allowed create) | 11/32 | Asked with no answerable path forward |
+| guard self-tests (`git stash pop` as inert text) | 6/32 | Asked |
+
+The hazard needs two parties: A pushes onto the shared stack, B pops. Gating
+only B protects A but strands B — `git stash pop` is the **only** reader of
+`refs/stash` (`worktree.sh stash-pop` reads a per-issue ref instead), so
+escalating pop/drop/clear to `deny` would convert "ask a human" into "lose the
+work". `pop`/`drop`/`clear` therefore stay at **ask**, deliberately.
+
+Blocking the **create** instead is lossless — the working tree is untouched,
+so the caller simply reruns with the named replacement, and no entry ever
+reaches the shared stack for anyone to collide on. So a raw stash create is
+**denied** (rule tag `stash-scope:create-redirect`), but only where a
+scriptable safe equivalent provably exists and can be named exactly. All five
+must hold:
+
+1. cwd resolves inside a **linked worktree** (the main checkout has no
+   `worktree.sh stash-push` equivalent, so creates there stay allowed);
+2. the worktree carries the `.loom-managed` sentinel;
+3. its directory name is `issue-<N>`, so the message prints the literal
+   `snapshot <N>` / `stash-push <N>` / `stash-pop <N>` commands rather than an
+   `<issue-number>` placeholder the caller has to fill in;
+4. `<main>/.loom/scripts/worktree.sh` exists on disk;
+5. **two or more** `.loom-managed` worktrees are active — the same predicate as
+   the collision ask, so the deny fires exactly where the paired pop would have
+   stalled, and a solo worktree stays fully ungated.
+
+`git stash create` is explicitly **not** a create for this purpose: it writes a
+stash-format commit without touching `refs/stash`, and is what `worktree.sh
+stash-push` runs internally — matching it would deny the sanctioned
+replacement path itself.
+
+*Verification.* Re-run
+`jq -r 'select(.pattern|startswith("stash-scope"))|.ts[0:10]' .loom/logs/guard-decisions.log | sort | uniq -c`
+at least 7 days after this ships. `stash-scope:worktree-collision` should fall
+well below the ~7.2 combined hits/day baseline of 2026-08-04..08, with any
+residue concentrated in `stash-scope:create-redirect` (a deny, which does not
+stall a headless agent) and in main-checkout hits, which are unchanged by
+design.
+
 **Examples**:
 
 ```bash
@@ -831,10 +886,18 @@ git stash clear
 # the ONLY managed worktree; asks once a second one exists (#4821):
 cd .loom/worktrees/issue-42 && git stash pop
 
-# Never gated, in either location — these cannot remove a stash entry:
-git stash push -m "wip"
+# Never gated, in either location — these cannot remove an entry from the
+# stack (and `create` is what worktree.sh stash-push uses internally):
 git stash apply
 git stash list
+git stash show
+git stash create
+
+# Creating a stash entry: allowed in the main checkout, DENIED inside a
+# managed worktree once a second one is active (#5754) — the deny names the
+# per-issue replacement, and nothing has run, so just use the replacement:
+git stash push -m "wip"                    # main checkout: allowed
+cd .loom/worktrees/issue-42 && git stash   # DENY -> use snapshot/stash-push 42
 
 # Headless clean-baseline-vs-my-diff comparison — never gated, because
 # neither verb touches refs/stash (#5217):
@@ -843,11 +906,18 @@ cargo clippy --message-format=short > /tmp/baseline.txt   # clean-tree baseline
 ./.loom/scripts/worktree.sh stash-pop 42
 cargo clippy --message-format=short > /tmp/with-wip.txt   # then diff the two
 
+# Ad-hoc "shelve my WIP" — the replacement for a bare `git stash`:
+./.loom/scripts/worktree.sh snapshot 42
+
 # Opt out for a whole repo:
 #   .loom/config.json  ->  { "guards": { "stashScope": false } }
 
-# One-off env opt-out for a single command:
-LOOM_GUARD_STASH_SCOPE=0 git stash pop
+# Env opt-out. This MUST be exported in the agent's own environment before the
+# session starts — the hook is a separate process and reads its OWN env, so an
+# inline `LOOM_GUARD_STASH_SCOPE=0 git stash pop` prefix (or an `export … &&`
+# earlier in the same Bash call) does NOT reach it. Three consecutive entries
+# in the 2026-08-08 decision log are an agent discovering that the hard way.
+export LOOM_GUARD_STASH_SCOPE=0
 ```
 
 ### Read-Only Fast-Path Guard Toggle (`guards.readOnlyFastPath` / `LOOM_GUARD_READONLY_FASTPATH`)
@@ -879,6 +949,7 @@ The fast path is **on by default**. It is resolved in this order (highest preced
 | `git` | `git status` / `git log` / `git diff` / `git show` — **bare** subcommand only (so `git -C /path status` is not admitted) |
 | `ls`, `grep`, `rg` | any arguments |
 | `jq`, `wc`, `head`, `tail` | any arguments (pure read-only text/JSON filters — none has an in-place-mutation flag) |
+| `echo` | any arguments (#5838 — a pure stdout writer with no mutation flag; the structural test above already excludes every pipe/redirect/substitution shape that could turn its printed text into an executed command) |
 | `test`, `[`, `[[` | any arguments (boolean file/string test builtins — no mutation surface) |
 | `find` | any arguments **except** those containing a dangerous action-primary — `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-fls`, `-fprint`, `-fprint0`, `-fprintf` — which structurally disqualify the command and route it to the full path |
 | `gh` | `gh <noun> view` / `gh <noun> list` (never `delete`/`close`/`archive`/…) |

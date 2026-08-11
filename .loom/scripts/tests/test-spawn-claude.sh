@@ -297,6 +297,31 @@ assert_eq "SUCCESS" "$result" "exit=0 mentioning 'reached your Fable 5 limit' is
 result=$(classify_error "reached your goal well before the team agreed on any spending limit" 1)
 assert_eq "RECOVERABLE" "$result" "a long unrelated 'reached your … limit' sentence is not exhaustion (#4501)"
 
+# --- Per-model-tier credit exhaustion (issue #5687) ---
+# "You're out of usage credits" matched none of the patterns above (no "limit"
+# token, no "extra usage") and fell through to the RECOVERABLE catch-all, so a
+# whole wave of in-session builders was retried on the SAME exhausted tier
+# instead of dropping a model rung. Its own category — the remedy is a cheaper
+# model on the SAME account, which is a different remedy in KIND from rotation.
+
+# Vector #42: the observed incident wording → MODEL_CREDITS_EXHAUSTED
+result=$(classify_error "You're out of usage credits. Run /usage-credits or switch models with /model." 1)
+assert_eq "MODEL_CREDITS_EXHAUSTED" "$result" "'out of usage credits' -> MODEL_CREDITS_EXHAUSTED (#5687)"
+
+# Vector #43 (ORDERING HAZARD): #4501's per-model ceiling also mentions
+# /usage-credits, and predates this branch — it must keep TOKEN_EXHAUSTED. This
+# only holds because #5687's branch is checked AFTER the exhaustion regex.
+result=$(classify_error "You've reached your Fable 5 limit. Run /usage-credits to continue or switch models with /model." 1)
+assert_eq "TOKEN_EXHAUSTED" "$result" "#4501's ceiling keeps TOKEN_EXHAUSTED despite naming credits (#5687 ordering)"
+
+# Vector #44 (NO FALSE POSITIVE): an unrelated "credit" mention is not a fault.
+result=$(classify_error "Payment failed: your credit card was declined" 1)
+assert_eq "RECOVERABLE" "$result" "an unrelated 'credit' mention is not credit exhaustion (#5687)"
+
+# Vector #45 (REGRESSION, #3233): exit-code-first survives the new branch too.
+result=$(classify_error "Tip: 'You're out of usage credits' means switch models." 0)
+assert_eq "SUCCESS" "$result" "exit=0 mentioning credit exhaustion is SUCCESS (#3233/#5687)"
+
 # --- Retry-verdict vectors (issue #4501) ---
 # `classification_is_transient` is now THE single source of truth for every retry
 # decision, so the printed classification and the retry choice cannot disagree.

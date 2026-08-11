@@ -390,6 +390,52 @@ Local verification:
 
 ---
 
+## Test-First Discipline (TDD line, required in PR body)
+
+**Why**: Loom's cross-session `Builder → Judge` cycle is the *between-turn* half
+of an evaluator-optimizer loop (`CLAUDE.md` § "Sweep Lifecycle"). What's
+missing is a checkable trace of the *in-Builder* half — did the test exist
+before the fix, not just after it. This section is the concrete signal ADR-0015
+(`docs/adr/0015-builder-test-first-checkpoint.md`) decided on, adapted from
+[damusix/atomic-claude](https://github.com/damusix/atomic-claude)'s
+maker/checker split (issue #5849, evaluation `docs/research/atomic-claude-evaluation.md`).
+
+**When your diff touches executing code** (anything Judge would run tests
+against — not a docs-only, ADR-only, or pure-config change), your PR body's
+`## Test Plan` section MUST include one `TDD:` line:
+
+```
+TDD: yes — <test path> written first; failed for the right reason before the fix, passes after
+TDD: no — <reason, e.g. "pure refactor, existing coverage in tests/foo_test.rs already exercises this path">
+```
+
+**How to earn a `TDD: yes` line — practice this while implementing, not
+retroactively while writing the PR body:**
+
+- **New behavior**: write the test first, run it, confirm it fails for the
+  right reason (not a typo/syntax error) — then implement until it passes.
+- **Bug fix**: write a test that reproduces the bug (fails on the pre-fix
+  code) — then fix — then confirm it passes.
+- If you did this, the `TDD:` line's `<test path>` must be a real path in your
+  diff — Judge checks it against the changed-files list (see
+  `judge.md` § "Test-First (TDD) Claim Verification"). Do not write `yes` for
+  a test you added *after* confirming the fix already worked; that is exactly
+  the unverified self-report this checkpoint exists to catch. If you didn't
+  actually write the test first, write `TDD: no` and say why (e.g. "test
+  added after implementation for coverage, not written first") — an honest
+  `no` is advisory-only; a false `yes` is a blocking Judge finding.
+- **When there is nothing to test-first** (design/investigation issues like
+  this one, docs, ADRs, `.github/labels.yml`, config-only changes), use
+  `TDD: no — <reason>` or omit the line entirely — both are advisory, never
+  blocking. Do not invent a placeholder test to satisfy this checkpoint.
+
+**This is advisory on absence, blocking only on contradiction** — a missing
+line or a plausible `TDD: no` never blocks approval; a `TDD: yes` claim the
+diff does not corroborate does. Full decision and rationale (including why
+this isn't a `buildGate` check): ADR-0015.
+
+---
+
 ## PR Titles: Conventional Commit Style Required
 
 **CRITICAL:** PR titles MUST describe the actual change. Never use generic or issue-referencing titles.
@@ -719,6 +765,7 @@ When creating a PR, verify:
 7. PR description includes verification table for each criterion
 8. Tests added/updated as needed
 9. Commits carry a `Signed-off-by:` trailer if required (`commit.signoff: true` in `.loom/config.json`, or a DCO/`sign-off` check — see "DCO sign-off")
+10. `## Test Plan` includes a `TDD:` line for any diff touching executing code (see "Test-First Discipline" above) — omit only for docs/config/ADR-only changes
 
 ### Creating the PR
 
@@ -743,6 +790,9 @@ Brief description of what this PR does and why.
 
 ## Test Plan
 How you verified the changes work.
+
+TDD: yes — tests/foo_test.rs written first, failed for the right reason, now passes
+(or: TDD: no — <reason>, e.g. docs-only / config-only / refactor with existing coverage)
 
 Closes #123
 EOF

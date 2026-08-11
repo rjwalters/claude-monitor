@@ -30,6 +30,12 @@
 #   - --list-quarantined reports outstanding Loom-produced stash entries
 #     (human + --json), covers every Loom producer, ignores human stashes, flags
 #     empty entries, and always exits 0 (#5185)
+#   - a successful --quarantine posts a best-effort forge breadcrumb comment
+#     (via a `gh` shim) naming the stashed paths/host/stash-ref on the issue
+#     named by the label's `issue=` field; a label with no `issue=` field, the
+#     LOOM_QUARANTINE_COMMENT=0 opt-out, and a failing `gh` call are all
+#     no-ops or best-effort failures that never change the check's exit code
+#     (#5691)
 #
 # Usage:
 #   ./.loom/scripts/tests/test-check-main-clean.sh
@@ -765,6 +771,140 @@ else
     fail "expected 2/2/2, got quarantine=$RC1 baseline=$RC2 json=$RC3"
 fi
 rm -rf "$REPO"
+
+# ========================================================================
+# Quarantine breadcrumb comment (#5691)
+# ========================================================================
+# A successful --quarantine rescues contamination into a stash, but until now
+# left no forge-visible trail: an operator (or the issue's own history) had no
+# way to discover a rescue happened short of grepping the structured log or
+# `--list-quarantined`. When the --label carries an `issue=N` field (every
+# current caller's --label already does — see sweep.md's
+# "run=$RUN_ID issue=$N"), a best-effort `gh issue comment` posts that
+# breadcrumb directly on the issue. This never gates the check's own verdict:
+# a missing `issue=` field, the LOOM_QUARANTINE_COMMENT=0 opt-out, or a failed
+# `gh` call are all silent (from the exit-code's perspective) — the outcome is
+# only ever recorded as its own "main-clean.quarantine-comment" log event.
+
+# Write a `gh` shim into $1/gh that records every invocation's args to
+# $1/gh-args and the value following "--body" to $1/gh-body, then either
+# succeeds (mode "success") or fails after printing to stderr (mode "fail").
+make_gh_shim() {
+    local bindir="$1" mode="$2"
+    mkdir -p "$bindir"
+    cat > "$bindir/gh" <<SHIM
+#!/usr/bin/env bash
+echo "\$@" > "$bindir/gh-args"
+prev=""
+for a in "\$@"; do
+    if [[ "\$prev" == "--body" ]]; then
+        printf '%s' "\$a" > "$bindir/gh-body"
+    fi
+    prev="\$a"
+done
+if [[ "$mode" == "fail" ]]; then
+    echo "boom: simulated gh failure" >&2
+    exit 1
+fi
+exit 0
+SHIM
+    chmod +x "$bindir/gh"
+}
+
+echo "Test 35: successful quarantine posts a breadcrumb comment via gh"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-comment.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+printf 'original tracked content\ncontaminating edit\n' > "$REPO/tracked_source.py"
+echo "def leaked(): return 1" > "$REPO/leaked_module.py"
+
+GHDIR=$(mktemp -d)
+make_gh_shim "$GHDIR" success
+
+out=$( cd "$REPO" && PATH="$GHDIR:$PATH" "$SCRIPT" --baseline "$SNAP" --quarantine \
+        --label "run=RUNID-COMMENT issue=9001" 2>&1 ); RC=$?
+
+GH_ARGS=$(cat "$GHDIR/gh-args" 2>/dev/null || echo "")
+GH_BODY=$(cat "$GHDIR/gh-body" 2>/dev/null || echo "")
+
+if [[ "$RC" -eq 4 ]] \
+   && [[ "$GH_ARGS" == "issue comment 9001 --body "* ]] \
+   && [[ "$GH_BODY" == *"tracked_source.py"* ]] \
+   && [[ "$GH_BODY" == *"leaked_module.py"* ]] \
+   && [[ "$GH_BODY" == *"stash@{0}"* ]] \
+   && [[ "$out" == *'"event":"main-clean.quarantine-comment"'* ]] \
+   && [[ "$out" == *'"result":"posted"'* ]] \
+   && [[ "$out" == *'"issue":"9001"'* ]]; then
+    pass "breadcrumb comment posted on the labeled issue naming paths + stash ref"
+else
+    fail "expected gh issue comment 9001 with paths/stash info, got rc=$RC; args='$GH_ARGS'; body='$GH_BODY'; out=$out"
+fi
+rm -rf "$GHDIR" "$REPO"
+
+echo "Test 36: a label with no issue= field skips the breadcrumb comment"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-nowave.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+printf 'original tracked content\ncontaminating edit\n' > "$REPO/tracked_source.py"
+
+GHDIR=$(mktemp -d)
+make_gh_shim "$GHDIR" success
+
+out=$( cd "$REPO" && PATH="$GHDIR:$PATH" "$SCRIPT" --baseline "$SNAP" --quarantine \
+        --label "run=RUNID-WAVE wave=2" 2>&1 ); RC=$?
+
+if [[ "$RC" -eq 4 ]] \
+   && [[ ! -f "$GHDIR/gh-args" ]] \
+   && [[ "$out" != *'"event":"main-clean.quarantine-comment"'* ]]; then
+    pass "wave-only label (no issue=) never invokes gh"
+else
+    fail "expected gh to stay untouched with a wave-only label, got rc=$RC; out=$out"
+fi
+rm -rf "$GHDIR" "$REPO"
+
+echo "Test 37: LOOM_QUARANTINE_COMMENT=0 opts out of the breadcrumb comment"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-optout.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+printf 'original tracked content\ncontaminating edit\n' > "$REPO/tracked_source.py"
+
+GHDIR=$(mktemp -d)
+make_gh_shim "$GHDIR" success
+
+out=$( cd "$REPO" && PATH="$GHDIR:$PATH" LOOM_QUARANTINE_COMMENT=0 "$SCRIPT" --baseline "$SNAP" \
+        --quarantine --label "run=RUNID-OPTOUT issue=9002" 2>&1 ); RC=$?
+
+if [[ "$RC" -eq 4 ]] \
+   && [[ ! -f "$GHDIR/gh-args" ]] \
+   && [[ "$out" != *'"event":"main-clean.quarantine-comment"'* ]]; then
+    pass "LOOM_QUARANTINE_COMMENT=0 suppresses the breadcrumb comment entirely"
+else
+    fail "expected the opt-out to suppress gh entirely, got rc=$RC; out=$out"
+fi
+rm -rf "$GHDIR" "$REPO"
+
+echo "Test 38: a failed gh call is logged but never changes the quarantine verdict"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-ghfail.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+printf 'original tracked content\ncontaminating edit\n' > "$REPO/tracked_source.py"
+
+GHDIR=$(mktemp -d)
+make_gh_shim "$GHDIR" fail
+
+out=$( cd "$REPO" && PATH="$GHDIR:$PATH" "$SCRIPT" --baseline "$SNAP" --quarantine \
+        --label "run=RUNID-GHFAIL issue=9003" 2>&1 ); RC=$?
+
+if [[ "$RC" -eq 4 ]] \
+   && [[ "$out" == *'"event":"main-clean.quarantine"'* ]] \
+   && [[ "$out" == *'"result":"quarantined"'* ]] \
+   && [[ "$out" == *'"event":"main-clean.quarantine-comment"'* ]] \
+   && [[ "$out" == *'"result":"failed"'* ]]; then
+    pass "a failed breadcrumb comment is logged but the quarantine itself still succeeds (exit 4)"
+else
+    fail "expected exit 4 with both a quarantined and a failed-comment event logged, got rc=$RC; out=$out"
+fi
+rm -rf "$GHDIR" "$REPO"
 
 # -------- Summary --------
 echo ""

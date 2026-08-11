@@ -129,7 +129,7 @@ fi
 echo "Testing loom_mcp_safehouse_socket..."
 
 assert_eq "" "$(loom_mcp_safehouse_socket "$_empty_repo")" \
-    "empty when nothing resolves"
+    "empty when nothing resolves (deliberately NO conventional-path fallback -- #5523)"
 assert_eq "/tmp/a.sock" \
     "$(LOOM_SAFEHOUSE_SOCKET=/tmp/a.sock loom_mcp_safehouse_socket "$_empty_repo")" \
     "LOOM_SAFEHOUSE_SOCKET is used"
@@ -956,6 +956,152 @@ JSON
     rm -rf "$_ws_dir"
 else
     echo -e "  ${YELLOW}SKIP${NC}: check_workspace_trust tests (python3 not installed)"
+fi
+
+# ============================================================
+# Section 13: safehouse-socket-unresolved LOUDNESS + check-safehouse-socket.sh
+# (issue #5523)
+#
+# #5457 removed the safehouse.socket default with nothing taking its place as
+# a *check*: an unresolved socket with safehouse.enabled=true degraded to a
+# `log_warn` buried in a per-role sweep log, unnoticed for 11 hours while the
+# public 2amlogic.com fleet pulse went stale. This section covers:
+#   13a. spawn-claude.sh's warning text names the consequence, not just the
+#        mechanism (a static source check -- exercising the live injection
+#        block needs a real loom-daemon binary for token selection, which
+#        test-spawn-claude.sh already covers elsewhere).
+#   13b/c/d. The new standalone drift-check script: not-configured / resolved
+#        / unreachable-no-socket / unreachable-missing-file, --json mode, and
+#        exit codes (0 = nothing wrong, 1 = drift detected).
+# ============================================================
+echo ""
+echo "Testing safehouse-socket-unresolved loudness + check-safehouse-socket.sh (#5523)..."
+
+# 13a. spawn-claude.sh's unresolved-socket warning names the consequence.
+_spawn_claude_src="$SCRIPTS_DIR/spawn-claude.sh"
+if [[ -f "$_spawn_claude_src" ]]; then
+    _warn_line="$(grep -A0 'SAFEHOUSE DRIFT' "$_spawn_claude_src" || true)"
+    assert_contains "SAFEHOUSE DRIFT" "$_warn_line" \
+        "spawn-claude.sh's unresolved-socket warning is visually loud (#5523)"
+    assert_contains "no safehouse narration" "$_warn_line" \
+        "spawn-claude.sh's warning names the narration consequence, not just the mechanism (#5523)"
+    assert_contains "2amlogic.com" "$_warn_line" \
+        "spawn-claude.sh's warning names the downstream public-pulse consequence (#5523)"
+    assert_contains "check-safehouse-socket.sh" "$_warn_line" \
+        "spawn-claude.sh's warning points at the standalone drift check (#5523)"
+else
+    echo -e "  ${YELLOW}SKIP${NC}: spawn-claude.sh warning text check (file not found at $_spawn_claude_src)"
+fi
+
+DRIFT_SCRIPT="$SCRIPTS_DIR/check-safehouse-socket.sh"
+if [[ -x "$DRIFT_SCRIPT" ]]; then
+    _drift_fixtures="$(mktemp -d)"
+
+    # not configured
+    mkdir -p "$_drift_fixtures/disabled/.loom"
+    cat >"$_drift_fixtures/disabled/.loom/config.json" <<'JSON'
+{ "safehouse": { "enabled": false } }
+JSON
+
+    # enabled, no socket resolves at all -- the exact #5523 failure mode
+    mkdir -p "$_drift_fixtures/no-socket/.loom"
+    cat >"$_drift_fixtures/no-socket/.loom/config.json" <<'JSON'
+{ "safehouse": { "enabled": true } }
+JSON
+
+    # enabled, socket resolves AND is present on disk
+    mkdir -p "$_drift_fixtures/resolved/.loom"
+    cat >"$_drift_fixtures/resolved/.loom/config.json" <<JSON
+{ "safehouse": { "enabled": true, "socket": "$_drift_fixtures/resolved/sh.sock" } }
+JSON
+    : >"$_drift_fixtures/resolved/sh.sock"
+
+    # enabled, socket resolves but nothing is there
+    mkdir -p "$_drift_fixtures/missing-file/.loom"
+    cat >"$_drift_fixtures/missing-file/.loom/config.json" <<JSON
+{ "safehouse": { "enabled": true, "socket": "$_drift_fixtures/missing-file/nope.sock" } }
+JSON
+
+    # Isolate from any ambient safehouse env (a builder sweep session sets
+    # SAFEHOUSED_SOCKET/SAFEHOUSE_PERSONA for its own fleet-comms narration --
+    # #5523's own dev/test loop hit exactly this).
+    _drift_env=(env -u SAFEHOUSED_SOCKET -u SAFEHOUSE_PERSONA -u LOOM_SAFEHOUSE_SOCKET)
+
+    if $HAVE_JQ; then
+        # 13b. Explicit REPO_ROOT args, text mode: one exit code per drift class.
+        # NOTE: capture via `|| _rc=$?` (never a bare `|| true` + later `$?`,
+        # which would clobber `$?` back to 0) -- both to survive `set -e` on a
+        # deliberately-nonzero exit AND to record the real exit code.
+        _rc_disabled=0
+        _out_disabled="$("${_drift_env[@]}" "$DRIFT_SCRIPT" "$_drift_fixtures/disabled" 2>&1)" || _rc_disabled=$?
+        assert_contains "not configured" "$_out_disabled" \
+            "check-safehouse-socket.sh: disabled repo reports not configured"
+        assert_eq "0" "$_rc_disabled" "check-safehouse-socket.sh: disabled repo exits 0"
+
+        _rc_resolved=0
+        _out_resolved="$("${_drift_env[@]}" "$DRIFT_SCRIPT" "$_drift_fixtures/resolved" 2>&1)" || _rc_resolved=$?
+        assert_contains "OK (socket resolved" "$_out_resolved" \
+            "check-safehouse-socket.sh: resolved+present repo reports OK"
+        assert_eq "0" "$_rc_resolved" "check-safehouse-socket.sh: resolved+present repo exits 0"
+
+        _rc_no_socket=0
+        _out_no_socket="$("${_drift_env[@]}" "$DRIFT_SCRIPT" "$_drift_fixtures/no-socket" 2>&1)" || _rc_no_socket=$?
+        assert_contains "DRIFT" "$_out_no_socket" \
+            "check-safehouse-socket.sh: unresolved socket reports DRIFT (#5523's own failure mode)"
+        assert_eq "1" "$_rc_no_socket" \
+            "check-safehouse-socket.sh: unresolved socket exits 1 (non-zero = detectable without reading logs)"
+
+        _rc_missing_file=0
+        _out_missing_file="$("${_drift_env[@]}" "$DRIFT_SCRIPT" "$_drift_fixtures/missing-file" 2>&1)" || _rc_missing_file=$?
+        assert_contains "DRIFT" "$_out_missing_file" \
+            "check-safehouse-socket.sh: resolved-but-absent socket reports DRIFT"
+        assert_eq "1" "$_rc_missing_file" \
+            "check-safehouse-socket.sh: resolved-but-absent socket exits 1"
+
+        # 13c. Multiple REPO_ROOT args in one invocation: exit reflects the union.
+        _rc_multi=0
+        _out_multi="$("${_drift_env[@]}" "$DRIFT_SCRIPT" \
+            "$_drift_fixtures/disabled" "$_drift_fixtures/resolved" "$_drift_fixtures/no-socket" 2>&1)" || _rc_multi=$?
+        assert_contains "not configured" "$_out_multi" \
+            "check-safehouse-socket.sh: multi-repo run still reports the disabled repo"
+        assert_contains "OK (socket resolved" "$_out_multi" \
+            "check-safehouse-socket.sh: multi-repo run still reports the resolved repo"
+        assert_contains "DRIFT" "$_out_multi" \
+            "check-safehouse-socket.sh: multi-repo run still reports the drifted repo"
+        assert_eq "1" "$_rc_multi" \
+            "check-safehouse-socket.sh: one drifted repo among several still exits 1 (union, not majority)"
+
+        # 13d. --json mode emits a parseable array with the expected shape.
+        if command -v python3 >/dev/null 2>&1; then
+            _json_out="$("${_drift_env[@]}" "$DRIFT_SCRIPT" --json \
+                "$_drift_fixtures/disabled" "$_drift_fixtures/no-socket" "$_drift_fixtures/resolved" 2>/dev/null)" || true
+            _json_status_no_socket="$(printf '%s' "$_json_out" | python3 -c "
+import json, sys
+rows = json.load(sys.stdin)
+by_status = {r['status'] for r in rows}
+print('unreachable_no_socket' in by_status and 'not_configured' in by_status and 'resolved' in by_status)
+" 2>/dev/null || echo "PARSE_FAILED")"
+            assert_eq "True" "$_json_status_no_socket" \
+                "check-safehouse-socket.sh --json: emits a parseable array covering all three states"
+        else
+            echo -e "  ${YELLOW}SKIP${NC}: check-safehouse-socket.sh --json parse check (python3 not installed)"
+        fi
+    else
+        echo -e "  ${YELLOW}SKIP${NC}: check-safehouse-socket.sh fixture-repo tests (jq not installed)"
+    fi
+
+    # 13e. No REPO_ROOT args, no workspace registry, cwd outside any repo:
+    # a clean no-op (exit 0), never a false DRIFT.
+    _no_registry_out="$(cd /tmp && "${_drift_env[@]}" LOOM_WORKSPACES_PATH=/nonexistent-registry.json "$DRIFT_SCRIPT" 2>&1)"
+    _rc_no_registry=$?
+    assert_contains "nothing to check" "$_no_registry_out" \
+        "check-safehouse-socket.sh: no registry + no enclosing repo is a clean no-op"
+    assert_eq "0" "$_rc_no_registry" \
+        "check-safehouse-socket.sh: no registry + no enclosing repo exits 0 (never a false DRIFT)"
+
+    rm -rf "$_drift_fixtures"
+else
+    echo -e "  ${YELLOW}SKIP${NC}: check-safehouse-socket.sh tests (script not found or not executable at $DRIFT_SCRIPT)"
 fi
 
 # ============================================================

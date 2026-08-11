@@ -305,21 +305,58 @@ forge_split_nwo() {
 # --- Forge-Dispatched Operations ---
 
 # Merge a PR via the forge API.
-# Usage: forge_merge_pr NWO PR_NUMBER
+# Usage: forge_merge_pr NWO PR_NUMBER [EXPECTED_HEAD_SHA]
 # GitHub: PUT /repos/{nwo}/pulls/{n}/merge with merge_method=squash
 # Gitea: POST /repos/{owner}/{repo}/pulls/{n}/merge with Do=squash
+#
+# EXPECTED_HEAD_SHA (optional, #5579): an optimistic-concurrency precondition —
+# the SHA the PR's head branch must currently match for the merge to proceed.
+# Without it, both forges will happily squash-merge whatever the CURRENT head
+# is at the moment the request lands, even if it has commits the caller never
+# saw approved (silently stranding them — squash-merge makes this invisible to
+# an ancestry check afterward, since the new squash commit is not a descendant
+# of the stranded commits either way). Pass the freshest possible head-SHA read
+# (never a cached one) immediately before calling this.
+#
+# GitHub: REST's optional `sha` field. Verified (GitHub's public OpenAPI spec,
+# 2026-08-07) to fail with HTTP 409 and message "Head branch was modified.
+# Review and try the merge again." on a mismatch — a DIFFERENT string from the
+# existing "Base branch was modified" retry case handled elsewhere in
+# merge-pr.sh; callers must not conflate the two (that one means "rebase onto
+# base and retry"; this one means "the approved diff moved out from under us,
+# do not retry-and-merge-anyway").
+#
+# Gitea: the `head_commit_id` field on MergePullRequestOption (confirmed
+# present via Gitea/Forgejo's published swagger.v1.json and upstream
+# services/pull/merge_prepare.go, 2026-08-07). A mismatch raises
+# ErrSHADoesNotMatch, which routers/api/v1/repo/pull.go maps to HTTP 409 with
+# message "head out of date".
 forge_merge_pr() {
   local nwo="$1"
   local pr_number="$2"
+  local expected_head_sha="${3:-}"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     forge_split_nwo "$nwo"
-    gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
-      -d '{"Do":"squash","delete_branch_after_merge":false}'
+    if [[ -n "$expected_head_sha" ]]; then
+      gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
+        -d "$(jq -nc --arg sha "$expected_head_sha" \
+          '{"Do":"squash","delete_branch_after_merge":false,"head_commit_id":$sha}')"
+    else
+      gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
+        -d '{"Do":"squash","delete_branch_after_merge":false}'
+    fi
   else
-    gh api "repos/$nwo/pulls/$pr_number/merge" \
-      -X PUT \
-      -f merge_method=squash 2>&1
+    if [[ -n "$expected_head_sha" ]]; then
+      gh api "repos/$nwo/pulls/$pr_number/merge" \
+        -X PUT \
+        -f merge_method=squash \
+        -f sha="$expected_head_sha" 2>&1
+    else
+      gh api "repos/$nwo/pulls/$pr_number/merge" \
+        -X PUT \
+        -f merge_method=squash 2>&1
+    fi
   fi
 }
 
@@ -489,31 +526,62 @@ forge_delete_branch() {
 }
 
 # Enable auto-merge on a PR.
-# Usage: forge_auto_merge NWO PR_NUMBER
+# Usage: forge_auto_merge NWO PR_NUMBER [EXPECTED_HEAD_SHA]
 # GitHub: GraphQL enablePullRequestAutoMerge mutation (pure API, no
 #         working-tree dependency — `gh pr merge --auto` does a local
 #         checkout that collides with worktrees owning the head branch).
 # Gitea: POST /repos/{owner}/{repo}/pulls/{n}/merge with merge_when_checks_succeed
+#
+# EXPECTED_HEAD_SHA (optional, #5579): same optimistic-concurrency precondition
+# as forge_merge_pr's — see that function's comment for the general rationale
+# and the Gitea `head_commit_id` citation (identical here; Gitea's `/merge`
+# endpoint carries both the auto-merge poll flags and the mismatch guard).
+#
+# GitHub: the GraphQL mutation's `expectedHeadOid: GitObjectID` input field
+# (confirmed present in GitHub's public GraphQL schema, 2026-08-07). The exact
+# error string GitHub returns on a mismatch could NOT be verified against a
+# live incident or public documentation as of this writing (GraphQL validation
+# error text is not part of the published schema) — merge-pr.sh's classifier
+# for this path therefore matches a best-effort pattern and should be
+# tightened against the first real occurrence, the same way the CLEAN/UNSTABLE
+# classifiers elsewhere in this file were derived from live incident text.
 forge_auto_merge() {
   local nwo="$1"
   local pr_number="$2"
+  local expected_head_sha="${3:-}"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     forge_split_nwo "$nwo"
-    gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
-      -d '{"Do":"squash","merge_when_checks_succeed":true,"delete_branch_after_merge":true}'
+    if [[ -n "$expected_head_sha" ]]; then
+      gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
+        -d "$(jq -nc --arg sha "$expected_head_sha" \
+          '{"Do":"squash","merge_when_checks_succeed":true,"delete_branch_after_merge":true,"head_commit_id":$sha}')"
+    else
+      gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
+        -d '{"Do":"squash","merge_when_checks_succeed":true,"delete_branch_after_merge":true}'
+    fi
   else
     # Resolve PR node_id (required by GraphQL mutation).
     local node_id
     node_id=$(gh api "repos/$nwo/pulls/$pr_number" --jq '.node_id' 2>/dev/null) || return 1
     [[ -z "$node_id" ]] && return 1
 
-    local mutation='mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}) { pullRequest { number autoMergeRequest { enabledAt } } } }'
+    if [[ -n "$expected_head_sha" ]]; then
+      local mutation_with_oid='mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!, $expectedHeadOid: GitObjectID) { enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod, expectedHeadOid: $expectedHeadOid}) { pullRequest { number autoMergeRequest { enabledAt } } } }'
 
-    gh api graphql \
-      -f "query=$mutation" \
-      -F "pullRequestId=$node_id" \
-      -F "mergeMethod=SQUASH" 2>/dev/null
+      gh api graphql \
+        -f "query=$mutation_with_oid" \
+        -F "pullRequestId=$node_id" \
+        -F "mergeMethod=SQUASH" \
+        -F "expectedHeadOid=$expected_head_sha" 2>/dev/null
+    else
+      local mutation='mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}) { pullRequest { number autoMergeRequest { enabledAt } } } }'
+
+      gh api graphql \
+        -f "query=$mutation" \
+        -F "pullRequestId=$node_id" \
+        -F "mergeMethod=SQUASH" 2>/dev/null
+    fi
   fi
 }
 

@@ -31,12 +31,23 @@
 #      arrives on — that ack is NOT completion, so naively diffing dispatch
 #      ids against "any tool_result observed" would (as it did for background
 #      Bash in #4389) treat the dispatch as already resolved the instant it
-#      fires. Only a LATER, distinct tool_result on that id (the real
-#      completion), or an explicit non-error, TERMINAL `TaskOutput` poll of
-#      the `agentId` recovered from the launch ack, counts as resolution. A
-#      plain `Task`-named dispatch's single ordinary tool_result satisfies the
-#      "distinct tool_result" branch directly (it never matches the launch-ack
-#      text), so back-compat needs no special casing.
+#      fires. A LATER, distinct tool_result on that id (the real completion),
+#      an explicit non-error, TERMINAL `TaskOutput` poll of the `agentId`
+#      recovered from the launch ack, or a `<task-notification>` (issue #5713
+#      — a correctly-awaited async Agent dispatch's completion arrives ONLY as
+#      a `<task-notification>`, never a second `tool_result`, so pattern 1 was
+#      structurally unable to ever resolve one; the count only grew across a
+#      session) counts as resolution. The notification resolves the dispatch
+#      when EITHER of these appears, mirroring pattern 2's already-correct
+#      background-Bash matching below:
+#        - a `<task-notification>` whose `<tool-use-id>` echoes the dispatch
+#          tool_use id, OR
+#        - a `<task-notification>` whose `<task-id>` equals the `agentId`
+#          recovered from the launch ack, for the case where only the task id
+#          is echoed.
+#      A plain `Task`-named dispatch's single ordinary tool_result satisfies
+#      the "distinct tool_result" branch directly (it never matches the
+#      launch-ack text), so back-compat needs no special casing.
 #   2. Assistant `Bash` `tool_use` entries with `input.run_in_background ==
 #      true` (issue #4389 — the #4257 recurrence) whose dispatch has no
 #      observed completion anywhere later in the transcript. A background Bash
@@ -263,15 +274,33 @@ def stopped_task_ids:
 #      `== false` triggers this; an absent field stays on the (a)/(b) path (a
 #      plain Task with no field is already resolved by its ordinary tool_result
 #      via (a), so back-compat is unchanged).
+#   d. A `<task-notification>` (issue #5713): the only completion signal a
+#      correctly-awaited async Agent dispatch actually produces in this
+#      harness is a `<task-notification>` carrying BOTH a `<task-id>` and a
+#      `<tool-use-id>` matching the original dispatch — never a second,
+#      distinct `tool_result` on the dispatch id. Pattern 2 (background Bash,
+#      below) already accepts this evidence; pattern 1 did not, so a
+#      correctly-awaited agent could never resolve and the unresolved count
+#      only grew across a session. Resolves when EITHER of these appears:
+#        - a `<task-notification>` whose `<tool-use-id>` echoes the dispatch
+#          tool_use id, OR
+#        - a `<task-notification>` whose `<task-id>` equals an `agentId`
+#          recovered from a launch-ack result on this id (branch b's ref),
+#          for the case where only the task id is echoed.
 #
 # Deliberately does NOT treat an ASYNC dispatch's launch ack as resolution (that
-# is the exact #4389 hazard recurring on this tool) — for async ids only (a) or
-# (b) counts. A genuinely orphaned async Agent dispatch (no later distinct
-# tool_result, no terminal TaskOutput poll) still blocks, the true positive this
-# detector exists for.
+# is the exact #4389 hazard recurring on this tool) — for async ids only (a),
+# (b), or (d) counts. A genuinely orphaned async Agent dispatch (no later
+# distinct tool_result, no terminal TaskOutput poll, no completion
+# notification) still blocks, the true positive this detector exists for.
 UNRESOLVED_TASK_IDS=$(jq -s -r "$JQ_PRELUDE"'
   . as $t
   | (results) as $r
+  | (notif_texts) as $n
+  | [ $n[] | ((capture("<tool-use-id>(?<v>[^<]+)</tool-use-id>")?).v) // empty
+    ] as $notified_tools
+  | [ $n[] | ((capture("<task-id>(?<v>[^<]+)</task-id>")?).v) // empty
+    ] as $notified_tasks
   | [ $t[]? | select(.type=="assistant") | .message.content[]?
       | select(.type=="tool_use" and (.name=="Task" or .name=="Agent"))
       | .id ] as $task_ids
@@ -312,10 +341,21 @@ UNRESOLVED_TASK_IDS=$(jq -s -r "$JQ_PRELUDE"'
             | select(.text | test("Async agent launched successfully"))
             | ((.text | capture("agentId: (?<v>[A-Za-z0-9_-]+)")?).v) // empty ]
         ) as $agent_ids
-      | if ($id_results | length) == 0 then $id
+      | if (($notified_tools | index($id)) != null) then empty
+        elif ( [ $agent_ids[] | . as $aid
+                 | select(($notified_tasks | index($aid)) != null) ]
+               | length ) > 0 then empty
+        elif ($id_results | length) == 0 then $id
         elif (($sync_task_ids | index($id)) != null) then empty
         elif ($real_completions | length) > 0 then empty
-        elif ( [ $agent_ids[] | select(($polled_ok_refs | index(.)) != null) ]
+        # NOTE: must bind the loop item to a variable before the lookup — a bare
+        # `index` call fed the bare `.` filter would rebind `.` to
+        # $polled_ok_refs itself (via the preceding `|`), evaluating
+        # `index($polled_ok_refs)`, which returns 0 (a match) whenever
+        # $polled_ok_refs is merely non-empty, regardless of the actual agent
+        # id (#5721).
+        elif ( [ $agent_ids[] | . as $aid
+                 | select(($polled_ok_refs | index($aid)) != null) ]
                | length ) > 0 then empty
         else $id
         end

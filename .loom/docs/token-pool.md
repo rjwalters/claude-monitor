@@ -242,8 +242,8 @@ and parses rate-limit response headers. The header parser matches by **suffix**
 `anthropic-ratelimit-tokens-*` prefix still work; the full header set is logged on
 the first probe of each run.
 
-Status assignment: `available` (utilizations < 95%), `exhausted`
-(`7d_utilization >= 0.95`), `rate_limited` (current 429), `blocked` (401 auth
+Status assignment: `available` (utilizations < 99%), `exhausted`
+(`7d_utilization >= 0.99`), `rate_limited` (current 429), `blocked` (401 auth
 failure or token listed in `.bad_tokens`). Probe failures (network, timeout, 5xx)
 are logged and skipped — one bad account does not abort the run.
 
@@ -415,7 +415,9 @@ and forecasts, and the pool-level "capacity returns at" aggregate.
 
 ## Bad-token tracking (`loom-daemon tokens mark-bad`)
 
-When a token returns `TOKEN_EXPIRED` or `TOKEN_EXHAUSTED`, callers append an entry
+When a token returns `TOKEN_EXPIRED`, `TOKEN_EXHAUSTED`, or
+`MODEL_CREDITS_EXHAUSTED` (#5687 — treated exactly like `TOKEN_EXHAUSTED` here),
+callers append an entry
 to `.loom/tokens/.bad_tokens` via `loom-daemon tokens mark-bad <name> --reason
 <text>` (native Rust, `loom-daemon/src/tokens_pool/bad_tokens.rs`, exposed as a
 CLI subcommand in #4228 — the historical Python `loom_tools.tokens.bad_tokens`
@@ -435,10 +437,21 @@ below.
 ## Error classification (`.loom/scripts/lib/classify-error.sh`)
 
 The `classify_error <output> <exit_code>` function returns one of `SUCCESS`,
-`TIMEOUT`, `CWD_DELETED`, `TOKEN_EXPIRED`, `TOKEN_EXHAUSTED`, `RECOVERABLE`.
+`TIMEOUT`, `CWD_DELETED`, `TOKEN_EXPIRED`, `TOKEN_EXHAUSTED`,
+`MODEL_CREDITS_EXHAUSTED`, `SESSION_LIMIT`, `MODEL_REFUSAL`, `RECOVERABLE`,
+`FATAL`.
 Critical fix from #3233: exit code is checked **before** output substring
 matching — clean exits (`exit_code == 0`) always return `SUCCESS` regardless of
 stdout content.
+
+`MODEL_CREDITS_EXHAUSTED` (#5687, "You're out of usage credits") is a
+per-model-**tier** credit exhaustion, not an account death. **Every pool
+mechanism treats it exactly like `TOKEN_EXHAUSTED`** — same rotation, same
+`.bad_tokens` entry, same cooldown, same retryability — because the pool tracks
+account health, not per-model account state. The distinct name exists for the
+in-session `/loom:sweep` orchestrator, which has no pool to rotate through and
+instead re-dispatches one model rung down (`sweep.md` → "Credit-exhaustion
+fallback").
 
 ## Worktree handling
 
@@ -781,8 +794,9 @@ Terminal policy is intentionally conservative:
 
 - `TOKEN_EXPIRED` requires an explicit verified-reauth clear and never expires
   merely because time passed or an ordinary success was observed.
-- `TOKEN_EXHAUSTED` cools down for
-  `LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS` (default five hours).
+- `TOKEN_EXHAUSTED` and `MODEL_CREDITS_EXHAUSTED` cool down for
+  `LOOM_CODEX_EXHAUSTED_COOLDOWN_SECS` (default five hours) — the same arm, by
+  design (#5687).
 - `RECOVERABLE` and `SESSION_LIMIT` apply short temporary backoffs.
 - Success records freshness and clears transient counters.
 - Timeouts, fatal/configuration failures, refusals, and deleted-cwd outcomes do

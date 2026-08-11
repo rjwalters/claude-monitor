@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # test-check-ci-status.sh - Unit tests for check-ci-status.sh's workflow-run
-# fold-in (issue #5495).
+# fold-in (issue #5495) and per-job status filter (issue #5748).
 #
-# Bug: analyze_status() only ever iterated over check-runs the Checks API
-# already knows about. A workflow_run that is still `queued` (no jobs
+# Bug (#5495): analyze_status() only ever iterated over check-runs the Checks
+# API already knows about. A workflow_run that is still `queued` (no jobs
 # dispatched yet, so zero check-runs exist for it) was completely invisible
 # to the pending count. If a handful of OTHER, faster/independent workflows
 # for the same commit had already completed successfully,
@@ -13,6 +13,12 @@
 # 96c2b8246403c9c91d37c2c7d6eebf7558f790f4 in the issue (4 unrelated
 # already-completed checks satisfied success>0/pending==0 while the "CI"
 # workflow_run sat `pending` with zero jobs for 3+ minutes).
+#
+# Feature (#5748): --job "<name>" reports one named check-run's own
+# status/conclusion instead of the aggregate across all checks, so a caller
+# without docker locally (e.g. Auditor) can still look up the real
+# forge-reported outcome of a docker-dependent CI leg like
+# worker-image-smoke ("loom-worker Image Smoke Test").
 #
 # check-ci-status.sh is a full CLI script (not sourced functions), so this
 # is a black-box test: stub `gh` on PATH (mirrors test-check-duplicate.sh's
@@ -282,6 +288,107 @@ EOF
 run_ccs --commit "$SHA"
 assert_contains "$OUT" "PENDING" "(f) Human-readable output shows overall PENDING"
 assert_contains "$OUT" "CI: queued (workflow run)" "(f) Human-readable pending list includes the queued workflow run"
+
+echo ""
+echo "Testing check-ci-status.sh --job per-job status filter (#5748)..."
+
+JOB="loom-worker Image Smoke Test"
+
+# (g) Job present & success.
+reset_state
+cat > "$STUB_DIR/check-runs.json" <<EOF
+{
+  "total_count": 2,
+  "check_runs": [
+    {"name": "Shellcheck", "status": "completed", "conclusion": "success"},
+    {"name": "$JOB", "status": "completed", "conclusion": "success", "html_url": "https://example.invalid/smoke"}
+  ]
+}
+EOF
+run_ccs --commit "$SHA" --job "$JOB" --quiet
+assert_eq "success" "$OUT" "(g) Job present & success -> quiet output 'success'"
+assert_eq "0" "$RC" "(g) Exit code 0 (success)"
+
+# (h) Job present & failure.
+reset_state
+cat > "$STUB_DIR/check-runs.json" <<EOF
+{
+  "total_count": 1,
+  "check_runs": [
+    {"name": "$JOB", "status": "completed", "conclusion": "failure", "html_url": "https://example.invalid/smoke"}
+  ]
+}
+EOF
+run_ccs --commit "$SHA" --job "$JOB" --quiet
+assert_eq "failure" "$OUT" "(h) Job present & failure -> quiet output 'failure'"
+assert_eq "1" "$RC" "(h) Exit code 1 (failure)"
+
+# (i) Job present & pending (queued/in_progress).
+reset_state
+cat > "$STUB_DIR/check-runs.json" <<EOF
+{
+  "total_count": 1,
+  "check_runs": [
+    {"name": "$JOB", "status": "in_progress", "conclusion": null}
+  ]
+}
+EOF
+run_ccs --commit "$SHA" --job "$JOB" --quiet
+assert_eq "pending" "$OUT" "(i) Job present & in_progress -> quiet output 'pending'"
+assert_eq "2" "$RC" "(i) Exit code 2 (pending)"
+
+# (j) Job present but skipped (its own `if:` condition evaluated false for
+# this commit, e.g. worker-image-smoke's docker-changed-files gate on a
+# non-push event) -> reported distinctly, not as a false pass/fail.
+reset_state
+cat > "$STUB_DIR/check-runs.json" <<EOF
+{
+  "total_count": 1,
+  "check_runs": [
+    {"name": "$JOB", "status": "completed", "conclusion": "skipped"}
+  ]
+}
+EOF
+run_ccs --commit "$SHA" --job "$JOB" --quiet
+assert_eq "skipped" "$OUT" "(j) Job present & skipped -> quiet output 'skipped' (not a false pass/fail)"
+assert_eq "3" "$RC" "(j) Exit code 3 (unknown bucket, per script's existing convention)"
+
+# (k) Job absent entirely from the commit's check-run set (e.g. a Gitea repo,
+# which has no GitHub Actions job of that name -- or a non-docker-path PR
+# whose workflow run never dispatched it). Must not crash and must not report
+# a false pass/fail.
+reset_state
+write_four_fast_checks
+run_ccs --commit "$SHA" --job "$JOB" --quiet
+assert_eq "not_found" "$OUT" "(k) Job absent entirely -> quiet output 'not_found'"
+assert_eq "3" "$RC" "(k) Exit code 3 (unknown bucket) when job never ran for this commit"
+
+# (l) --json output surfaces the structured job result for programmatic
+# callers.
+reset_state
+cat > "$STUB_DIR/check-runs.json" <<EOF
+{
+  "total_count": 1,
+  "check_runs": [
+    {"name": "$JOB", "status": "completed", "conclusion": "success", "html_url": "https://example.invalid/smoke"}
+  ]
+}
+EOF
+run_ccs --commit "$SHA" --job "$JOB" --json
+job_field="$(echo "$OUT" | jq -r '.job')"
+assert_eq "$JOB" "$job_field" "(l) --json .job echoes the requested job name"
+found_field="$(echo "$OUT" | jq -r '.found')"
+assert_eq "true" "$found_field" "(l) --json .found is true when the job was located"
+status_field="$(echo "$OUT" | jq -r '.status')"
+assert_eq "success" "$status_field" "(l) --json .status is 'success'"
+
+# (m) Human-readable output for a not-found job names the job and does not
+# claim a pass or a fail.
+reset_state
+write_four_fast_checks
+run_ccs --commit "$SHA" --job "$JOB"
+assert_contains "$OUT" "NOT FOUND" "(m) Human-readable output reports NOT FOUND for an absent job"
+assert_contains "$OUT" "$JOB" "(m) Human-readable output names the requested job"
 
 echo ""
 echo "=== Test Summary ==="

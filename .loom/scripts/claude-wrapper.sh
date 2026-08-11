@@ -1364,14 +1364,24 @@ is_account_exhaustion() {
     # This is why the #4501 regex fix in `lib/classify-error.sh` — adding the
     # per-model "reached your <model> limit" ceiling — reaches the rotation path
     # here with no change needed in this function.
+    #
+    # MODEL_CREDITS_EXHAUSTED (#5687) is accepted alongside TOKEN_EXHAUSTED. It
+    # is a distinct category so the in-session sweep orchestrator can name the
+    # signature it downgrades models on, but on THIS (subprocess-supervision)
+    # path there is no per-call model knob to downgrade with, so the correct
+    # response is byte-identical to TOKEN_EXHAUSTED: rotate to another account
+    # and mark this one exhausted. Keeping the two in one predicate is what
+    # makes the new category a pure rename from the wrapper's point of view.
     # Fall back to an inline regex if the classifier lib was not sourced (kept
-    # in lockstep with the classifier's pattern, including the #4501 addition).
+    # in lockstep with the classifier's patterns, including #4501 and #5687).
     if declare -F classify_error >/dev/null 2>&1; then
-        [[ "$(classify_error "${output}" "${exit_code}")" == "TOKEN_EXHAUSTED" ]]
-        return
+        case "$(classify_error "${output}" "${exit_code}")" in
+            TOKEN_EXHAUSTED|MODEL_CREDITS_EXHAUSTED) return 0 ;;
+            *) return 1 ;;
+        esac
     fi
     [[ "${exit_code}" -ne 0 ]] && echo "${output}" \
-        | grep -qiE "hit your (limit|session limit|weekly limit)|hit\.your\.limit|monthly usage limit|out of extra usage|reached your ([^[:space:]]+[[:space:]]+){0,3}limit"
+        | grep -qiE "hit your ([^[:space:]]+[[:space:]]+){0,3}limit|hit\.your\.limit|monthly usage limit|out of extra usage|reached your ([^[:space:]]+[[:space:]]+){0,3}limit|(ran |run )?out of (usage |extra |plan )?credits|no (usage |extra |plan )?credits (remaining|left)|insufficient (usage |plan )?credits"
 }
 
 # Return 0 if the captured output indicates a concurrent-session-limit fault
@@ -1444,8 +1454,9 @@ _exhaustion_phrase() {
     # Kept in lockstep with the classifier's TOKEN_EXHAUSTED regex so the
     # rotation log line quotes the phrase that actually fired — including the
     # per-model "reached your <model> limit" ceiling added in #4501 (which
-    # names the constrained model, e.g. "reached your Fable 5 limit").
-    m="$(echo "${output}" | grep -ioE "hit your (limit|session limit|weekly limit)|monthly usage limit|out of extra usage|used 100% of your weekly limit|reached your ([^[:space:]]+[[:space:]]+){0,3}limit" | head -1)"
+    # names the constrained model, e.g. "reached your Fable 5 limit") and the
+    # per-model-tier credit exhaustion added in #5687 ("out of usage credits").
+    m="$(echo "${output}" | grep -ioE "hit your ([^[:space:]]+[[:space:]]+){0,3}limit|monthly usage limit|out of extra usage|used 100% of your weekly limit|reached your ([^[:space:]]+[[:space:]]+){0,3}limit|out of (usage |extra |plan )?credits|no (usage |extra |plan )?credits (remaining|left)|insufficient (usage |plan )?credits" | head -1)"
     echo "${m:-usage limit}"
 }
 

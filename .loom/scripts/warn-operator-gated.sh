@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Loom Operator-Gate Advisory Scan for /loom:sweep all (#5137)
 #
-# The `all` sentinel's aggressive candidate taxonomy hard-skips exactly one
-# label class (`loom:operator-only`) and treats every other open issue as a
-# buildable candidate. Some issues declare operator-gating in their BODY TEXT
-# ("the index is login-walled, so acquisition is operator-gated", "Operator
-# decision: send this paired with the paper") without carrying the label —
-# so the sentinel would plan to dispatch them as ordinary build candidates.
+# The `all` sentinel's aggressive candidate taxonomy hard-skips two label
+# classes (`loom:operator-only` and, since #5817, `loom:needs-capability`)
+# and treats every other open issue as a buildable candidate. Some issues
+# declare operator-gating in their BODY TEXT ("the index is login-walled, so
+# acquisition is operator-gated", "Operator decision: send this paired with
+# the paper") without carrying either label — so the sentinel would plan to
+# dispatch them as ordinary build candidates.
 #
 # This tool scans each candidate's already-fetched `body` (the same field the
 # survey fetches for ## Affected Files overlap estimation, #4161, and
@@ -18,9 +19,10 @@
 #   2. Dependency match — the body declares `Depends on #A` / `Requires #A`
 #      (the same restricted vocabulary #3759's --auto-stack and #3747's
 #      warn-out-of-set-deps.sh both reuse) and #A currently carries the
-#      `loom:operator-only` label — the #87 -> #4 shape from the issue: the
-#      sweep would skip the prerequisite as operator-only, then dispatch the
-#      dependent that needs it.
+#      `loom:operator-only` OR `loom:needs-capability` label — the #87 -> #4
+#      shape from the issue: the sweep would skip the prerequisite as
+#      operator-only (or needs-capability), then dispatch the dependent that
+#      needs it.
 #
 # ADVISORY ONLY: this tool never hard-skips a candidate, never mutates a
 # label, and never blocks the sweep. It only ANNOTATES the confirmation-gate
@@ -37,7 +39,10 @@
 # where <annotation> is one of:
 #   ⚠ body declares operator-gating: "<matched phrase>"
 #   ⚠ depends on #<A>, which is loom:operator-only
-# A candidate matching both prints two lines (one per signal).
+#   ⚠ depends on #<A>, which is loom:needs-capability
+# A candidate matching both signal 1 and signal 2 prints two lines (one per
+# signal); a dependency carrying BOTH labels prints one dependency line per
+# label (deduplicated by label, in declared order).
 #
 # Zero matches across the whole candidate set -> zero lines of output, and the
 # caller's plan/listing is byte-for-byte unchanged from before this tool
@@ -137,20 +142,24 @@ _warn_candidate_operator_gated() {
         MATCH_COUNT=$((MATCH_COUNT + 1))
     fi
 
-    # Signal 2: a declared dependency (#A) that itself carries loom:operator-only.
+    # Signal 2: a declared dependency (#A) that itself carries
+    # loom:operator-only or loom:needs-capability (#5817 — either kind of
+    # hard-skip block means the child cannot itself be completed either).
     local dep
     for dep in $(parse_operator_gate_deps "$body"); do
         [[ "$dep" == "$candidate" ]] && continue
-        local labels
+        local labels dep_label
         if [[ -n "$REPO_NWO" ]]; then
             labels="$(gh issue view "$dep" --repo "$REPO_NWO" --json labels -q '[.labels[].name] | join(",")' 2>/dev/null || echo '')"
         else
             labels="$(gh issue view "$dep" --json labels -q '[.labels[].name] | join(",")' 2>/dev/null || echo '')"
         fi
-        if printf '%s' ",$labels," | grep -qF ',loom:operator-only,'; then
-            printf '%s\t⚠ depends on #%s, which is loom:operator-only\n' "$candidate" "$dep"
-            MATCH_COUNT=$((MATCH_COUNT + 1))
-        fi
+        for dep_label in loom:operator-only loom:needs-capability; do
+            if printf '%s' ",$labels," | grep -qF ",$dep_label,"; then
+                printf '%s\t⚠ depends on #%s, which is %s\n' "$candidate" "$dep" "$dep_label"
+                MATCH_COUNT=$((MATCH_COUNT + 1))
+            fi
+        done
     done
     return 0
 }

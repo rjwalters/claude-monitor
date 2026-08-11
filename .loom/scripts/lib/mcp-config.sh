@@ -55,6 +55,21 @@ loom_mcp_safehouse_enabled() {
 # LOOM_SAFEHOUSE_SOCKET (env) > SAFEHOUSED_SOCKET (env) > safehouse.socket
 # (config). Env wins here so a host-specific env override always takes effect
 # over a committed/shared config value.
+#
+# DELIBERATELY no conventional-path fallback (issue #5523). #5457 removed a
+# hardcoded macOS socket path that had been committed to the SHARED
+# .loom/config.json — every host that `git pull`ed main inherited a path to a
+# socket that did not exist on it, with no env override able to win while
+# that stale committed value stayed in place. Adding a code-level default here
+# would not reintroduce that exact failure mode (a code default can't go
+# stale via `git pull`), but it does reintroduce the underlying risk this
+# function's callers must not paper over: "resolves to *something*" silently
+# stops meaning "actually reaches a live safehoused". #5523's incident was
+# caused by the RESULTING silence being invisible for 11 hours, not by the
+# absence of a default — so the fix there is to make "enabled but
+# unresolved/unreachable" LOUD (see spawn-claude.sh's safehouse warning and
+# check-safehouse-socket.sh), not to guess a path here. See
+# defaults/docs/safehouse.md "Socket resolution" for the full writeup.
 loom_mcp_safehouse_socket() {
     local repo_root="$1"
     if [[ -n "${LOOM_SAFEHOUSE_SOCKET:-}" ]]; then
