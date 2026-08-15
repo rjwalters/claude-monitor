@@ -4,6 +4,14 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #118** (closed): Three CodexAppServer/OAuthPoller robustness nits from the PR #111 review
+- **PR #127**: fix: distinguish account/read decode failures from null account, make reap's wait suspend
+- **Issue #104** (closed): Retire stored OpenAI OAuth tokens and exclude Codex accounts from accounts export
+- **PR #123**: feat: null out stored OpenAI tokens and exclude Codex from account sync
+- **Issue #116** (closed): selftest writes ~14 lines into the user's real debug.log: flog.info from a pure mapper
+- **PR #125**: fix: move codex app-server usage logging out of the pure snapshot() mapper
+- **Issue #115** (closed): docs: `brew install codex` installs a stale 0.46.0 formula — the cask is the correct package
+- **PR #124**: docs: document Homebrew cask remediation, log resolved codex version
 - **Issue #112** (closed): selftest --db fails on any host with a Codex account: over-strict 'backfilled to anthropic' assertion
 - **PR #121**: fix: narrow over-strict provider-backfill assertion in selftest --db
 - **PR #119**: chore: sync User-Agent to claude-code 2.1.224
