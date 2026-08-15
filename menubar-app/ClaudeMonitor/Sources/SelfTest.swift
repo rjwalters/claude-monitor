@@ -87,10 +87,11 @@ enum SelfTest {
         testExportAccountsEnvIncludesAllProviders()
         testParseAccountPairsBackwardCompatibleWithOldFormat()
         testParseAccountPairsRoundTripsOpenAIFields()
-        testAccountSyncImportIsProviderScoped()
+        testAccountSyncExcludesOpenAIAccounts()
         testMergeDuplicateAccountsSharingEmail()
         testAccountDeletionRemovesCredentials()
         testPurgeOrphanedCredentialsMigration()
+        testNullOutOpenAITokensMigration()
         testReadOnlyOpenOfWALDatabaseWithoutSHM()
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
@@ -1771,13 +1772,17 @@ enum SelfTest {
         }
     }
 
-    // MARK: - AccountSync provider scoping
+    // MARK: - AccountSync host-local provider exclusion (#104)
 
-    /// A multi-host `accounts import` whose bundle carries an OpenAI account
-    /// must never land on an Anthropic row that shares the email. An unscoped
-    /// email match flips the Claude row's provider and overwrites its
-    /// credential in place — destroying the Claude token (this happened).
-    private static func testAccountSyncImportIsProviderScoped() {
+    /// Codex/OpenAI accounts are host-local (#104): `exportBundle` must never
+    /// emit one, and `importBundle` must skip (not fail on) one carried by a
+    /// bundle from an older version. This also covers the hazard that
+    /// motivated the original provider-scoped email match: an OpenAI entry
+    /// sharing an Anthropic account's email must never land on — or
+    /// overwrite the credential of — that Anthropic row. Exclusion is a
+    /// stronger guarantee than scoping (the entry is never touched at all),
+    /// so this single test now covers both.
+    private static func testAccountSyncExcludesOpenAIAccounts() {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -1800,30 +1805,73 @@ enum SelfTest {
                 VALUES ('claude-org-uuid', 'me@example.com', 'token', 'anthropic',
                         'sk-ant-claude-token', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
             """)
+            // A live OpenAI account, present in the local database.
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES ('user-native-openai', 'me2@example.com', 'me2@example.com', 'pro',
+                        '2026-01-01T00:00:00Z', 'openai')
+            """)
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, refresh_token, is_active,
+                     created_at, updated_at)
+                VALUES ('user-native-openai', 'me2@example.com', 'codex', 'openai',
+                        'openai-access-token', 'openai-refresh-token', 1,
+                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+            """)
 
+            // --- Export excludes the OpenAI account entirely. ---
+            let exported = try AccountSync.exportBundle(dbPath: dbPath)
+            expectEqual(exported.accounts.count, 1, "export carries only the Anthropic account")
+            expectEqual(exported.accounts.first?.provider, "anthropic",
+                        "the one exported account is the Anthropic one")
+            expect(!exported.accounts.contains { $0.provider == "openai" },
+                   "no openai account appears in the export bundle")
+
+            // --- Import skips an OpenAI entry from an older bundle, without error. ---
             let bundle = AccountSync.ExportBundle(
                 formatVersion: AccountSync.formatVersion,
                 exportedAt: "2026-07-01T00:00:00Z",
                 sourceHost: "selftest",
-                accounts: [AccountSync.ExportedAccount(
-                    id: "user-native-openai",
-                    provider: "openai",
-                    accountName: "me@example.com",
-                    email: "me@example.com",
-                    plan: "pro",
-                    lastUpdated: "2026-07-01T00:00:00Z",
-                    sortOrder: 0,
-                    credentials: [AccountSync.ExportedCredential(
-                        label: "me@example.com", source: "codex", provider: "openai",
-                        accessToken: "openai-access-token", refreshToken: "openai-refresh",
-                        expiresAt: nil, tokenExpiresAt: "2026-08-01T00:00:00Z",
-                        scopes: nil, subscriptionType: nil, rateLimitTier: nil,
-                        isActive: true, createdAt: nil, updatedAt: nil, tokenRolledAt: nil
-                    )]
-                )]
+                accounts: [
+                    AccountSync.ExportedAccount(
+                        id: "user-native-openai-imported",
+                        provider: "openai",
+                        accountName: "me@example.com",
+                        email: "me@example.com",
+                        plan: "pro",
+                        lastUpdated: "2026-07-01T00:00:00Z",
+                        sortOrder: 0,
+                        credentials: [AccountSync.ExportedCredential(
+                            label: "me@example.com", source: "codex", provider: "openai",
+                            accessToken: "openai-access-token", refreshToken: "openai-refresh",
+                            expiresAt: nil, tokenExpiresAt: "2026-08-01T00:00:00Z",
+                            scopes: nil, subscriptionType: nil, rateLimitTier: nil,
+                            isActive: true, createdAt: nil, updatedAt: nil, tokenRolledAt: nil
+                        )]
+                    ),
+                    AccountSync.ExportedAccount(
+                        id: "claude-org-uuid-2",
+                        provider: "anthropic",
+                        accountName: "second@example.com",
+                        email: "second@example.com",
+                        plan: "Max",
+                        lastUpdated: "2026-07-01T00:00:00Z",
+                        sortOrder: 1,
+                        credentials: []
+                    ),
+                ]
             )
             let summary = try AccountSync.importBundle(bundle, dbPath: dbPath)
-            expectEqual(summary.created, 1, "the OpenAI account is created as its own row")
+            expectEqual(summary.excluded, 1, "the OpenAI entry is reported as excluded, not created/updated")
+            expectEqual(summary.created, 1, "the Anthropic entry in the same bundle still imports normally")
+
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM accounts WHERE provider = 'openai'") as? Int64,
+                1, "importing a bundle with an OpenAI entry does not create a new OpenAI row")
+            expectEqual(
+                try db.scalar("SELECT id FROM accounts WHERE provider = 'openai'") as? String,
+                "user-native-openai", "the pre-existing OpenAI account is untouched by the import")
 
             let claudeProvider = try db.scalar(
                 "SELECT provider FROM accounts WHERE id = 'claude-org-uuid'") as? String
@@ -1832,25 +1880,10 @@ enum SelfTest {
             let claudeToken = try db.scalar(
                 "SELECT access_token FROM oauth_credentials WHERE account_id = 'claude-org-uuid'") as? String
             expectEqual(claudeToken, "sk-ant-claude-token",
-                        "the Claude credential is not overwritten by the OpenAI import")
-            let openaiRow = try db.scalar(
-                "SELECT id FROM accounts WHERE email = 'me@example.com' AND provider = 'openai'") as? String
-            expectEqual(openaiRow, "user-native-openai",
-                        "the OpenAI account lands under its own id")
-
-            // Same-provider re-import must still match by email and update in
-            // place (the multi-host convergence contract), not fork a row.
-            var again = bundle
-            again.accounts[0].id = "user-native-openai-renamed"
-            again.accounts[0].lastUpdated = "2026-07-02T00:00:00Z"
-            let summary2 = try AccountSync.importBundle(again, dbPath: dbPath)
-            expectEqual(summary2.updated, 1, "same-provider re-import updates the existing row")
-            let openaiCount = try db.scalar(
-                "SELECT COUNT(*) FROM accounts WHERE email = 'me@example.com' AND provider = 'openai'") as? Int64
-            expectEqual(openaiCount, 1, "same-provider re-import does not fork a second row")
+                        "the Claude credential is not overwritten by the excluded OpenAI import")
         } catch {
             checks += 1
-            failures.append("account sync provider scoping test threw: \(error)")
+            failures.append("account sync host-local exclusion test threw: \(error)")
         }
     }
 
@@ -1969,10 +2002,19 @@ enum SelfTest {
                 try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IN (?, ?)",
                               nativeId, legacyId) as? Int64,
                 1, "exactly one credential survives the merge")
+            // `access_token` itself can't be the signal any more: both seeded
+            // credentials are `provider = 'openai'`, and the same
+            // `ensureDatabase()` call nulls OpenAI tokens right after this
+            // merge runs (#104). `token_rolled_at` survives that migration
+            // untouched, so it is what proves the *more recently renewed* row
+            // — not merely "a" row — is the one reassigned to the survivor.
+            expectEqual(
+                try db.scalar("SELECT token_rolled_at FROM oauth_credentials WHERE account_id = ?", nativeId) as? String,
+                "2026-06-20T00:00:00Z",
+                "the more recently renewed credential wins, reassigned to the survivor")
             expectEqual(
                 try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?", nativeId) as? String,
-                "legacy-fresher-token",
-                "the more recently renewed credential wins, reassigned to the survivor")
+                nil, "the surviving OpenAI credential's token is nulled by the same migration pass (#104)")
 
             expectEqual(
                 try db.scalar("SELECT value FROM settings WHERE key = 'primary_account_id'") as? String,
@@ -2228,6 +2270,94 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("orphaned credential purge test threw: \(error)")
+        }
+    }
+
+    /// The healing migration for #104: `oauth_credentials` rows for
+    /// `provider = 'openai'` should carry no `access_token` / `refresh_token`
+    /// — this app now reads Codex usage via `codex app-server` / `auth.json`
+    /// rather than holding a copy of a credential OpenAI rotates on every
+    /// use. Two properties matter as much as the clearing itself: an
+    /// Anthropic credential must be untouched (Anthropic tokens are
+    /// long-lived and never proactively refreshed, so there is nothing to
+    /// clear there), and a second run must be a no-op.
+    private static func testNullOutOpenAITokensMigration() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES ('claude-account', 'claude@example.com', 'claude@example.com', 'Max',
+                        '2026-06-01T00:00:00Z', 'anthropic')
+            """)
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, refresh_token, is_active,
+                     created_at, updated_at)
+                VALUES ('claude-account', 'claude@example.com', 'token', 'anthropic',
+                        'sk-ant-oat01-selftest', NULL, 1, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+            """)
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES ('codex-account', 'codex@example.com', 'codex@example.com', 'pro',
+                        '2026-06-01T00:00:00Z', 'openai')
+            """)
+            // Pre-#104 row: exactly what a build before this migration left
+            // behind — a live access/refresh token pair stored for polling.
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, refresh_token, is_active,
+                     created_at, updated_at)
+                VALUES ('codex-account', 'codex@example.com', 'codex', 'openai',
+                        'openai-access-selftest', 'openai-refresh-selftest', 1,
+                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+            """)
+
+            // --- What the next launch does. ---
+            store.ensureDatabase()
+
+            expectEqual(
+                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'codex-account'")
+                    as? String,
+                nil, "the migration clears the OpenAI access token")
+            expectEqual(
+                try db.scalar("SELECT refresh_token FROM oauth_credentials WHERE account_id = 'codex-account'")
+                    as? String,
+                nil, "the migration clears the OpenAI refresh token")
+            expectEqual(
+                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'claude-account'")
+                    as? String,
+                "sk-ant-oat01-selftest", "an Anthropic credential is untouched by the migration")
+
+            // Re-registering a token (e.g. `codex import`) must be nulled
+            // again on the very next launch — the migration runs unconditionally.
+            try db.run("""
+                UPDATE oauth_credentials SET access_token = ?, refresh_token = ?
+                WHERE account_id = 'codex-account'
+                """, "reimported-access", "reimported-refresh")
+            store.ensureDatabase()
+            expectEqual(
+                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'codex-account'")
+                    as? String,
+                nil, "a freshly (re)written OpenAI token is cleared again on the next launch")
+
+            // Idempotent: re-running over an already-healed database changes nothing.
+            store.ensureDatabase()
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 2,
+                "re-running the migration on a healed database is a no-op")
+        } catch {
+            checks += 1
+            failures.append("null-out OpenAI tokens migration test threw: \(error)")
         }
     }
 

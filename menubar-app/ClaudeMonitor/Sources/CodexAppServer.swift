@@ -975,12 +975,17 @@ final class CodexAppServerClient: Sendable {
 
 // MARK: - UsageProviderClient conformance
 
-/// Conforms even though the protocol is credential-shaped, because the poller's
-/// `client(for:)` dispatch is the useful part and widening the protocol for a
-/// two-provider app is not worth it (option (b) in the issue). The alternative
-/// of smuggling the codex home through `ProviderCredentials.accessToken` is
-/// explicitly rejected: it would put a filesystem path in the one field every
-/// redaction rule treats as a secret.
+/// Conforms even though the protocol is credential-shaped and nothing
+/// currently dispatches to this client through the protocol type generically
+/// — `OAuthPoller.pollOpenAI` calls `fetchUsage()` on the concrete type
+/// directly (its tier ladder, not generic dispatch, picks the transport).
+/// Conforming keeps `AnthropicAPIClient` / `OpenAIAPIClient` /
+/// `CodexAppServerClient` interchangeable as `UsageProviderClient` for any
+/// future generic caller; widening the protocol itself for a two-provider app
+/// is not worth it (option (b) in the issue). The alternative of smuggling
+/// the codex home through `ProviderCredentials.accessToken` is explicitly
+/// rejected: it would put a filesystem path in the one field every redaction
+/// rule treats as a secret.
 extension CodexAppServerClient: UsageProviderClient {
     var provider: AccountProvider { .openai }
 

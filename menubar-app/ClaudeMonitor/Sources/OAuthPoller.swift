@@ -95,17 +95,6 @@ struct OAuthCredential {
         self.isActive = isActive
         self.codexHome = codexHome
     }
-
-    /// This credential in the provider-agnostic shape a `UsageProviderClient`
-    /// consumes. nil when there is no access token to present.
-    var providerCredentials: ProviderCredentials? {
-        guard let accessToken = accessToken else { return nil }
-        return ProviderCredentials(
-            accessToken: accessToken,
-            refreshToken: refreshToken,
-            expiresAt: tokenExpiresAt
-        )
-    }
 }
 
 /// Raised when a credential's access token is past expiry and could not be
@@ -154,19 +143,6 @@ class OAuthPoller: ObservableObject {
     init(dbPath: String? = nil) {
         self.dbPath = dbPath ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude-monitor/usage.db").path
-    }
-
-    /// The client that speaks a given provider's protocol.
-    ///
-    /// `.openai` resolves to the HTTP client, not `codexAppServerClient`: this
-    /// is the *credential-shaped* surface (`refreshCredentials` in particular),
-    /// and the app-server transport deliberately has no credential to refresh.
-    /// Transport selection for reads happens in `pollOpenAI`'s tier ladder.
-    private func client(for provider: AccountProvider) -> UsageProviderClient {
-        switch provider {
-        case .anthropic: return apiClient
-        case .openai: return openAIClient
-        }
     }
 
     // MARK: - Add Account with Token
@@ -1154,8 +1130,10 @@ class OAuthPoller: ObservableObject {
     ///
     /// OpenAI rotates the refresh token on every use and supports exactly one
     /// `auth.json` per machine, so *any* copy this app keeps is a copy that will
-    /// eventually invalidate Codex CLI's — and vice versa. The ladder is ordered
-    /// by how little credential handling each rung needs:
+    /// eventually invalidate Codex CLI's — and vice versa. This app stores no
+    /// OpenAI credential of its own (#104): the ladder is ordered by how little
+    /// credential handling each rung needs, and there is no stored-credential
+    /// fallback below it.
     ///
     /// 1. **`codex app-server`** — the Codex CLI owns the credential entirely;
     ///    we read nothing. Preferred whenever the binary resolves and the RPC
@@ -1163,8 +1141,6 @@ class OAuthPoller: ObservableObject {
     /// 2. **`auth.json` at request time** — read the current bearer, use it once,
     ///    never write it back and never refresh it. Removes the rotation race
     ///    even without the RPC.
-    /// 3. **Stored credential** — today's exact behaviour, proactive refresh
-    ///    included. Last resort; issue #104 deletes it.
     ///
     /// A tier that is merely *unavailable* (no codex binary, codex too old, no
     /// `auth.json`) never marks the account unhealthy — it falls through
@@ -1227,55 +1203,21 @@ class OAuthPoller: ObservableObject {
             }
         }
 
-        // MARK: Tier 3 — stored credential (unchanged; removed by #104)
-        guard let stored = credential.providerCredentials else {
-            // An account registered by home alone has no tier 3 to fall back to,
-            // so tier 1's failure *is* this account's health state. Reported and
-            // returned rather than rethrown: `pollWithRetry` would flatten an
-            // `unauthorized` throw to `.revoked`, burying "needs login" behind a
-            // state that suggests the wrong fix.
-            if let codexFailure = pendingCodexFailure(credential) {
-                let reason = codexFailure.localizedDescription
-                updateCredentialLastPoll(credential, error: reason)
-                updateCredentialStatus(credential, status: codexFailure.tokenStatus, error: reason)
-                return
-            }
-            updateCredentialStatus(credential, status: .missing, error: "No access token")
-            throw AnthropicAPIError.unauthorized
-        }
-
-        // Proactive, not reactive: renew ahead of expiry rather than waiting
-        // for a 401. Throws (loudly, with a visible token-health state) when the
-        // token is already dead and cannot be renewed.
-        let renewal = try await refreshIfNeeded(credential, stored)
-
-        let snapshot = try await openAIClient.fetchUsage(renewal.credentials)
-
-        // Prefer the stored account_id; fall back to the one the response
-        // carries so a credential imported before identification still lands.
-        let accountId = storedAccountId ?? snapshot.accountKey
-        guard !accountId.isEmpty else {
-            flog.warning("Credential \(credential.label) has no account_id", category: fcat)
+        // Every tier is now exhausted for this poll cycle — there is no
+        // stored-credential fallback (#104). An account registered by home
+        // alone has no further fallback, so tier 1's failure *is* this
+        // account's health state. Reported and returned rather than
+        // rethrown: `pollWithRetry` would flatten an `unauthorized` throw to
+        // `.revoked`, burying "needs login" behind a state that suggests the
+        // wrong fix.
+        if let codexFailure = pendingCodexFailure(credential) {
+            let reason = codexFailure.localizedDescription
+            updateCredentialLastPoll(credential, error: reason)
+            updateCredentialStatus(credential, status: codexFailure.tokenStatus, error: reason)
             return
         }
-
-        writeSnapshotToDB(accountId: accountId, snapshot: snapshot)
-
-        // A successful read does NOT clear a refresh warning: the usage figures
-        // are current, but the credential is still on a path to expiry that we
-        // could not renew. Surfacing that now (yellow dot + reason) is the whole
-        // point of refreshing proactively.
-        if let warning = renewal.warning {
-            updateCredentialLastPoll(credential, error: warning)
-            updateCredentialStatus(credential, status: .refreshing, error: warning)
-        } else {
-            updateCredentialLastPoll(credential, error: nil)
-            updateCredentialStatus(credential, status: .valid, error: nil)
-        }
-
-        await MainActor.run {
-            self.lastError = nil
-        }
+        updateCredentialStatus(credential, status: .missing, error: "No access token")
+        throw AnthropicAPIError.unauthorized
     }
 
     // MARK: - Codex app-server fallback bookkeeping
@@ -1508,90 +1450,14 @@ class OAuthPoller: ObservableObject {
         }
     }
 
-    // MARK: - Proactive Token Refresh
+    // MARK: - Import-Time Token Renewal
 
-    /// How far ahead of expiry a credential is renewed. Comfortably longer than
-    /// the poll interval, so a token never expires between two poll cycles.
+    /// How far ahead of expiry a credential is renewed. Used only by
+    /// `addOpenAIAccount`'s upfront renewal of a just-imported credential
+    /// (#104 removed the proactive per-poll renewal loop this constant used
+    /// to also drive, since polling no longer holds a stored OpenAI token to
+    /// renew).
     let refreshLeadTime: TimeInterval = 6 * 3600
-
-    /// What `refreshIfNeeded` decided: the credential to poll with, plus a
-    /// non-nil `warning` when renewal was needed but didn't happen and the
-    /// current token is nonetheless still inside its validity window.
-    struct RenewalOutcome {
-        let credentials: ProviderCredentials
-        let warning: String?
-    }
-
-    /// Renew `credentials` when they are at or near expiry, persisting the
-    /// result. Anthropic credentials state no expiry and short-circuit here.
-    ///
-    /// Failure is **never silent**:
-    /// - token already past expiry and unrenewable → `.expired` (red dot) with
-    ///   an actionable message, and the caller throws rather than issuing a
-    ///   request with a token we already know is dead;
-    /// - renewal failed but the token is still valid → a `warning` the caller
-    ///   surfaces as `.refreshing` (yellow dot), and polling continues on the
-    ///   current token.
-    private func refreshIfNeeded(
-        _ credential: OAuthCredential,
-        _ credentials: ProviderCredentials
-    ) async throws -> RenewalOutcome {
-        guard credentials.isExpiring(within: refreshLeadTime) else {
-            return RenewalOutcome(credentials: credentials, warning: nil)
-        }
-
-        var reason: String
-        if !credentials.isRefreshable {
-            reason = "Access token expires soon and no refresh token is stored — re-import with `claude-monitor codex import`"
-        } else {
-            do {
-                if let refreshed = try await client(for: credential.provider)
-                    .refreshCredentials(credentials) {
-                    persistRefreshedCredential(credential, refreshed)
-                    return RenewalOutcome(credentials: refreshed, warning: nil)
-                }
-                // Provider has nothing to refresh (Anthropic's default).
-                return RenewalOutcome(credentials: credentials, warning: nil)
-            } catch {
-                reason = "Token refresh failed: \(error.localizedDescription)"
-            }
-        }
-
-        let alreadyExpired = credentials.expiresAt.map { $0 <= Date() } ?? false
-        if alreadyExpired {
-            updateCredentialLastPoll(credential, error: reason)
-            updateCredentialStatus(credential, status: .expired, error: reason)
-            flog.error("\(credential.label): \(reason) — token already expired, skipping poll", category: fcat)
-            throw CredentialExpiredError(reason: reason)
-        }
-
-        flog.warning("\(credential.label): \(reason) — token still valid, polling with it", category: fcat)
-        return RenewalOutcome(credentials: credentials, warning: reason)
-    }
-
-    /// Write a renewed access/refresh token pair back to `oauth_credentials`.
-    /// OpenAI rotates refresh tokens, so both halves are replaced together.
-    private func persistRefreshedCredential(_ credential: OAuthCredential, _ refreshed: ProviderCredentials) {
-        guard let credId = credential.id,
-              FileManager.default.fileExists(atPath: dbPath) else { return }
-        do {
-            let db = try openDatabase(dbPath)
-            let now = ISO8601DateFormatter().string(from: Date())
-            let expiryISO = refreshed.expiresAt.map { ISO8601DateFormatter().string(from: $0) }
-            try db.run("""
-                UPDATE oauth_credentials SET
-                    access_token = ?,
-                    refresh_token = COALESCE(?, refresh_token),
-                    token_expires_at = ?,
-                    is_active = 1, last_error = NULL,
-                    updated_at = ?, token_rolled_at = ?
-                WHERE id = ?
-            """, refreshed.accessToken, refreshed.refreshToken, expiryISO, now, now, credId)
-            flog.info("Persisted refreshed credential for \(credential.label)", category: fcat)
-        } catch {
-            flog.error("Failed to persist refreshed credential: \(error.localizedDescription)", category: fcat)
-        }
-    }
 
     // MARK: - Write Usage Data to DB
 

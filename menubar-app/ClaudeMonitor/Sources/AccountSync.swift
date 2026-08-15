@@ -100,6 +100,16 @@ enum AccountSync {
             """)
             for row in acctStmt {
                 guard let id = row[0] as? String else { continue }
+                let provider = AccountProvider(stored: row[6] as? String)
+
+                // Codex/OpenAI accounts are host-local (#104): `codex_home`
+                // names a local `~/.codex` directory that means nothing on
+                // another machine, and any bearer this app still held would
+                // be a copy of a secret OpenAI rotates on every use — a copy
+                // this export is guaranteed to invalidate the moment it's
+                // imported and refreshed elsewhere. Register a Codex account
+                // per host instead (`claude-monitor codex add --home`).
+                guard provider != .openai else { continue }
 
                 let credStmt = try db.prepare("""
                     SELECT label, source, access_token, refresh_token, expires_at,
@@ -131,7 +141,7 @@ enum AccountSync {
 
                 accounts.append(ExportedAccount(
                     id: id,
-                    provider: AccountProvider(stored: row[6] as? String).rawValue,
+                    provider: provider.rawValue,
                     accountName: row[1] as? String,
                     email: row[2] as? String,
                     plan: row[3] as? String,
@@ -173,6 +183,7 @@ enum AccountSync {
             case created
             case updated
             case skippedNewer  // local record's last_updated is >= the imported one
+            case excludedProvider  // provider (e.g. openai/Codex) is host-local; never imported (#104)
         }
     }
 
@@ -181,6 +192,7 @@ enum AccountSync {
         var created: Int { outcomes.filter { $0.action == .created }.count }
         var updated: Int { outcomes.filter { $0.action == .updated }.count }
         var skipped: Int { outcomes.filter { $0.action == .skippedNewer }.count }
+        var excluded: Int { outcomes.filter { $0.action == .excludedProvider }.count }
     }
 
     /// Upserts accounts by email (falling back to id when email is absent on
@@ -209,12 +221,23 @@ enum AccountSync {
     }
 
     private static func importAccount(_ account: ExportedAccount, db: Connection) throws -> ImportOutcome {
-        var existingId: String?
-        var existingLastUpdated: String?
-
         // A bundle exported before multi-provider support carries no provider;
         // it resolves to Anthropic, which is what those hosts were polling.
-        let provider = AccountProvider(stored: account.provider).rawValue
+        let resolvedProvider = AccountProvider(stored: account.provider)
+
+        // Codex/OpenAI accounts are host-local (#104) and current exports never
+        // emit one, but an *older* bundle produced before this change may still
+        // carry one. Skip it rather than failing the whole import — importing
+        // it would be pointless (`codex_home` is never exported, so there is
+        // nothing on this host for the account to read) and any bearer it
+        // carries is a copy of a secret this host must not hold.
+        guard resolvedProvider != .openai else {
+            return ImportOutcome(email: account.email, id: account.id, action: .excludedProvider)
+        }
+        let provider = resolvedProvider.rawValue
+
+        var existingId: String?
+        var existingLastUpdated: String?
 
         // The email match MUST be scoped to the incoming account's provider: a
         // Claude and a ChatGPT account legitimately share one address, and an

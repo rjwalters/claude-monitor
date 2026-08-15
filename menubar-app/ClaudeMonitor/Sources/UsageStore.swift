@@ -415,6 +415,15 @@ class UsageStore: ObservableObject {
         // revoked. Must run *after* the merge above, which can itself delete
         // an account row in the same pass.
         purgeOrphanedCredentials(db)
+
+        // Migration: null out stored OpenAI access/refresh tokens (#104).
+        // Codex usage is read via `codex app-server` with a per-account
+        // `CODEX_HOME` (#102, #103), so this app no longer needs a copy of
+        // an OpenAI credential of its own. OpenAI rotates the refresh token
+        // on every use and supports exactly one `auth.json` per machine, so
+        // any copy left over from before this change is a dead secret that
+        // can only invalidate whichever other client refreshes next.
+        nullOutOpenAITokens(db)
     }
 
     /// Deletes `oauth_credentials` rows that reference an account which no
@@ -453,6 +462,42 @@ class UsageStore: ObservableObject {
         } catch {
             FileLogger.shared.error(
                 "purgeOrphanedCredentials: purge failed: \(error)",
+                category: "DB"
+            )
+        }
+    }
+
+    /// Clears `access_token` / `refresh_token` for every `provider = 'openai'`
+    /// row in `oauth_credentials`. Idempotent: a second run finds nothing
+    /// left to clear.
+    ///
+    /// Runs on every launch, like `purgeOrphanedCredentials` above — so a
+    /// token freshly written by `codex import` (which still stores one,
+    /// once, to validate the credential and identify the account) is nulled
+    /// again the very next launch. Ongoing polling never misses it:
+    /// `OAuthPoller.pollOpenAI` reads through the `codex app-server` /
+    /// `auth.json` tiers instead of the stored credential.
+    // Pure function of its `db` argument — touches no instance/class
+    // main-actor state, so it stays callable from the CLI/headless paths.
+    private nonisolated static func nullOutOpenAITokens(_ db: Connection) {
+        let provider = AccountProvider.openai.rawValue
+        do {
+            let count = try db.scalar(
+                """
+                SELECT COUNT(*) FROM oauth_credentials
+                WHERE provider = ? AND (access_token IS NOT NULL OR refresh_token IS NOT NULL)
+                """, provider) as? Int64 ?? 0
+            guard count > 0 else { return }
+            try db.run(
+                "UPDATE oauth_credentials SET access_token = NULL, refresh_token = NULL WHERE provider = ?",
+                provider)
+            FileLogger.shared.info(
+                "nullOutOpenAITokens: cleared \(count) OpenAI credential token(s)",
+                category: "DB"
+            )
+        } catch {
+            FileLogger.shared.error(
+                "nullOutOpenAITokens: migration failed: \(error)",
                 category: "DB"
             )
         }

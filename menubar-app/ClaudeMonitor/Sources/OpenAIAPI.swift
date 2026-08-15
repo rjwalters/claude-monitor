@@ -26,9 +26,11 @@ import FoundationNetworking
 ///   `secondary_window`, so "primary = session" is provably wrong.
 /// - **Identity rides along.** `email` / `plan_type` / `account_id` come back in
 ///   the same response; there is no separate profile call.
-/// - **Access tokens expire (~10 days).** `refreshCredentials` renews them via
-///   `POST https://auth.openai.com/oauth/token`; the poller calls it
-///   *proactively*, ahead of expiry, rather than reactively on a 401.
+/// - **Access tokens expire (~10 days).** `refresh(_:)` renews one via
+///   `POST https://auth.openai.com/oauth/token`. This app no longer stores an
+///   OpenAI credential to poll with (#104), so nothing calls this proactively
+///   any more — `addOpenAIAccount` is the one remaining caller, renewing an
+///   already-stale credential once, up front, at import time.
 ///
 /// The `/backend-api/codex/usage` route is **not** used: it is Cloudflare
 /// bot-challenged and answers 403 with an HTML interstitial.
