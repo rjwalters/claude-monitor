@@ -297,7 +297,8 @@ func tokenStatusRank(_ status: TokenStatus) -> Int {
     case .expired: return 2
     case .revoked: return 3
     case .error: return 4
-    case .missing: return 5
+    case .drifted: return 5
+    case .missing: return 6
     }
 }
 
@@ -861,11 +862,19 @@ struct SummaryRow: View {
     @State private var editedName = ""
     @FocusState private var isFocused: Bool
 
+    private var credentialStatus: CredentialStatus? {
+        oauthPoller.credentialStatuses.first(where: { $0.accountId == account.id })
+    }
+
     private var tokenStatus: TokenStatus {
-        guard let status = oauthPoller.credentialStatuses.first(where: { $0.accountId == account.id }) else {
-            return .missing
-        }
-        return status.status
+        credentialStatus?.status ?? .missing
+    }
+
+    /// True once this row's Codex home has drifted (#146) — the numbers below
+    /// stopped advancing the moment that happened, so every percent/headroom
+    /// cell must stop presenting them as current.
+    private var isDrifted: Bool {
+        tokenStatus == .drifted
     }
 
     private var tokenDotColor: Color {
@@ -873,8 +882,29 @@ struct SummaryRow: View {
         case .valid: return .green
         case .refreshing: return .yellow
         case .expired, .revoked, .error: return .red
+        case .drifted: return .orange
         case .missing: return .gray
         }
+    }
+
+    /// Hover text for the token dot. Every other state is just its bare
+    /// status word; a drifted row gets the identity + remediation detail
+    /// `OAuthPoller.driftDetailMessage` composed at poll time, so the popover
+    /// never has to re-derive or restate what `codex list` already says.
+    private var tokenStatusHelp: String {
+        if isDrifted, let detail = credentialStatus?.lastError, !detail.isEmpty {
+            return detail
+        }
+        return tokenStatus.rawValue
+    }
+
+    /// The usage this row should actually display. A drifted account's last
+    /// polled numbers are frozen — the identity behind them may already
+    /// belong to someone else — so every percent/headroom cell renders "—"
+    /// exactly as it does for an account with no data yet, rather than
+    /// presenting stale figures as current (#146).
+    private var displayUsage: UsageRecord? {
+        isDrifted ? nil : usage
     }
 
     /// Data age in seconds (nil if no usage data)
@@ -985,23 +1015,25 @@ struct SummaryRow: View {
 
             // Session and weekly cells both read the shared window model. When a
             // provider reports no session window at all, `session` is nil and
-            // both cells render "—" rather than a misleading 0% / "now".
-            percentText(usage?.rateLimit.session?.usedPercent)
+            // both cells render "—" rather than a misleading 0% / "now". A
+            // drifted row reads `displayUsage` (nil), not `usage` — same "—"
+            // rendering, for the same reason: don't present frozen numbers.
+            percentText(displayUsage?.rateLimit.session?.usedPercent)
                 .frame(width: SummaryColumns.percent, alignment: .trailing)
 
-            Text(resetLabel(usage?.rateLimit.session?.resetAt))
+            Text(resetLabel(displayUsage?.rateLimit.session?.resetAt))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .lineLimit(1)
                 .frame(width: SummaryColumns.reset, alignment: .trailing)
 
-            percentText(usage?.rateLimit.weekly?.usedPercent)
+            percentText(displayUsage?.rateLimit.weekly?.usedPercent)
                 .frame(width: SummaryColumns.percent, alignment: .trailing)
 
             fableCell
                 .frame(width: SummaryColumns.fable, alignment: .trailing)
 
-            Text(resetLabel(usage?.rateLimit.weekly?.resetAt))
+            Text(resetLabel(displayUsage?.rateLimit.weekly?.resetAt))
                 .font(.caption)
                 .foregroundColor(.secondary)
                 .lineLimit(1)
@@ -1019,7 +1051,7 @@ struct SummaryRow: View {
             Circle()
                 .fill(tokenDotColor)
                 .frame(width: 8, height: 8)
-                .help(tokenStatus.rawValue)
+                .help(tokenStatusHelp)
                 .frame(width: SummaryColumns.dot)
 
             // History column — opens the detailed chart window
@@ -1110,7 +1142,7 @@ struct SummaryRow: View {
 
     @ViewBuilder
     private var headroomCell: some View {
-        if let score = headroomScore(usage) {
+        if let score = headroomScore(displayUsage) {
             Text("\(Int(score.rounded()))")
                 .fontWeight(.semibold)
                 .foregroundColor(colorForHeadroom(score))
@@ -1143,7 +1175,7 @@ struct SummaryRow: View {
     /// Session % / Weekly % columns.
     @ViewBuilder
     private var fableCell: some View {
-        if let used = usage?.fablePercent {
+        if let used = displayUsage?.fablePercent {
             Text("\(Int(used.rounded()))%")
                 .foregroundColor(PercentSeverity(percent: used).color)
                 .help("Fable/premium weekly allowance used. At 100% the account switches to extra usage.")
@@ -1166,7 +1198,7 @@ struct SummaryRow: View {
     }
 
     private var extraDisplay: (String, Color) {
-        switch usage?.extraUsageState ?? .unknown {
+        switch displayUsage?.extraUsageState ?? .unknown {
         case .unknown: return ("—", .secondary)
         case .off:     return ("off", .secondary)
         case .empty:   return ("empty", Color(nsColor: .systemRed))
@@ -1180,7 +1212,7 @@ struct SummaryRow: View {
     }
 
     private var extraUsageTooltip: String {
-        switch usage?.extraUsageState ?? .unknown {
+        switch displayUsage?.extraUsageState ?? .unknown {
         case .unknown: return "No premium-model probe yet"
         case .off:     return "Extra usage not enabled for this account (org_level_disabled)"
         case .empty:   return "Extra usage exhausted — needs a recharge (out_of_credits)"

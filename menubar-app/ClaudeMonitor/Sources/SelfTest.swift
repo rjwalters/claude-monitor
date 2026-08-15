@@ -79,6 +79,9 @@ enum SelfTest {
         testCodexProvisionIdentityConflict()
         testCodexHomeIdentityGuard()
         testCodexIdentityDriftReporting()
+        testDriftVocabularySharedWithCodexList()
+        testCodexDriftDetailMessage()
+        testCodexIdentityConflictSetsAndClearsDriftedState()
         testCodexHomeResolution()
         testCodexHomeRegistrationEnumeration()
         testCodexListDiscoversUnregisteredHomes()
@@ -1265,6 +1268,112 @@ enum SelfTest {
             Drift.stable,
             "a stale email on the row is not drift while the stable account id still agrees"
         )
+    }
+
+    /// The popover's drift badge and `codex list`'s `drift` column must never
+    /// name this condition two different words (#146's explicit requirement
+    /// — reuse the vocabulary #134/#138 already computed, don't invent a
+    /// second one). Pinned as a literal-equality check rather than trusted by
+    /// inspection, so a future rename of either constant fails loudly instead
+    /// of silently drifting apart.
+    private static func testDriftVocabularySharedWithCodexList() {
+        expectEqual(TokenStatus.drifted.rawValue, CodexCLI.driftLabel,
+                    "OAuthPoller's drifted TokenStatus and CodexCLI's drift label are one word, not two")
+    }
+
+    /// The hover/detail text a drifted popover row shows — pure formatting,
+    /// so every shape of `CodexHomeDrift` is pinned without a poll.
+    private static func testCodexDriftDetailMessage() {
+        let credential = OAuthCredential(
+            id: 1, accountId: "user-aaa", provider: .openai, label: "work@example.com",
+            source: "codex-home", accessToken: nil, refreshToken: nil, expiresAt: nil,
+            subscriptionType: nil, rateLimitTier: nil, isActive: true,
+            codexHome: "/Users/someone/.codex-work"
+        )
+
+        let named = OAuthPoller.driftDetailMessage(
+            for: credential, drift: .drifted(reportedAccountId: "user-bbb-rest-of-id"))
+        expect(named.contains("work@example.com"), "the message names the affected account's label")
+        expect(named.contains("user-bbb…"), "the message names the identity the home now holds, truncated like every other id this app prints")
+        expect(!named.contains("someone"), "a home path is redacted to ~ — it must never name a user")
+        expect(named.contains("codex add --home"), "the message names the exact remediation command")
+        expect(named.contains("codex provision"), "the message also names the provision remediation")
+        expect(!named.lowercased().contains("stored credential"),
+               "must never claim a stored-credential fallback — #104 removed it")
+
+        let emailOnly = OAuthPoller.driftDetailMessage(for: credential, drift: .drifted(reportedAccountId: nil))
+        expect(emailOnly.contains("a different account"),
+               "drift proven by email alone names no specific id — this app never prints an email")
+
+        let noHome = OAuthPoller.driftDetailMessage(
+            for: OAuthCredential(
+                id: 2, accountId: "user-aaa", provider: .openai, label: "ambient",
+                source: "codex-home", accessToken: nil, refreshToken: nil, expiresAt: nil,
+                subscriptionType: nil, rateLimitTier: nil, isActive: true, codexHome: nil
+            ),
+            drift: .drifted(reportedAccountId: "user-ccc")
+        )
+        expect(!noHome.contains("()"), "an account with no registered home omits the empty parenthetical")
+    }
+
+    /// End-to-end coverage for #146's core promise: a Codex identity conflict
+    /// sets a distinct, queryable state rather than only a log line, and that
+    /// state clears on its own once the conflict resolves — no restart.
+    ///
+    /// Drives the real production methods (`noteCodexIdentityConflict`,
+    /// `updateCredentialStatus`) rather than reimplementing their logic here;
+    /// a real Codex subprocess is out of scope (`testCodexPerAccountHomeReachesChild`
+    /// already covers the transport), so the two calls a live poll cycle would
+    /// make are made directly.
+    private static func testCodexIdentityConflictSetsAndClearsDriftedState() {
+        withSelfTestTempDir("drift-state") { dir in
+            let poller = OAuthPoller(dbPath: dir.appendingPathComponent("usage.db").path)
+            let credential = OAuthCredential(
+                id: 4242, accountId: "user-aaa", provider: .openai, label: "work@example.com",
+                source: "codex-home", accessToken: nil, refreshToken: nil, expiresAt: nil,
+                subscriptionType: nil, rateLimitTier: nil, isActive: true,
+                codexHome: "/tmp/codex-home-fixture"
+            )
+
+            expect(poller.credentialStatuses.isEmpty, "a fresh poller starts with no cached status")
+
+            // Tier 1/2 both call this the instant they read a contradicting
+            // identity — simulating exactly what pollOpenAI does inline.
+            poller.noteCodexIdentityConflict(credential, homeAccountId: "user-bbb", homeEmail: nil)
+
+            let drifted = poller.credentialStatuses.first(where: { $0.id == credential.id })
+            expectEqual(drifted?.status, TokenStatus.drifted,
+                        "an identity conflict sets .drifted, not .valid/.missing/.revoked")
+            expect(drifted?.lastError?.contains("user-bbb") == true,
+                   "the cached detail names the identity the home now holds")
+            expect(drifted?.lastError?.contains("codex add --home") == true,
+                   "the cached detail names the remediation command")
+
+            // Two consecutive polls that both still see the conflict must not
+            // duplicate the row or otherwise churn — the same credential id
+            // is updated in place both times.
+            poller.noteCodexIdentityConflict(credential, homeAccountId: "user-bbb", homeEmail: nil)
+            expectEqual(poller.credentialStatuses.count, 1,
+                        "a repeated conflict updates the one existing row, never appends a duplicate")
+
+            // Resolved: home re-registered, or the original login restored —
+            // exactly what the next successful poll's own `updateCredentialStatus`
+            // call does, on every tier, unconditionally.
+            poller.updateCredentialStatus(credential, status: .valid, error: nil)
+            let resolved = poller.credentialStatuses.first(where: { $0.id == credential.id })
+            expectEqual(resolved?.status, TokenStatus.valid,
+                        "a resolved conflict reports .valid again on the very next successful poll")
+            expect(resolved?.lastError == nil, "a resolved row carries no stale drift detail")
+
+            // A home going from drift to genuinely missing (deleted from disk)
+            // is a different, distinguishable state — not folded into drift.
+            let missingHomeError = CodexAppServerError.homeMissing("/tmp/codex-home-fixture")
+            poller.updateCredentialStatus(credential, status: missingHomeError.tokenStatus,
+                                          error: missingHomeError.localizedDescription)
+            let afterHomeDeleted = poller.credentialStatuses.first(where: { $0.id == credential.id })
+            expect(afterHomeDeleted?.status != TokenStatus.drifted,
+                   "a deleted home reports its own status, distinct from drift")
+        }
     }
 
     /// Which `CODEX_HOME` may speak for one account — the decision that makes

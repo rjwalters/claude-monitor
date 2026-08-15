@@ -916,6 +916,7 @@ struct UsageChartWindow: View {
         case .valid: return .green
         case .refreshing: return .yellow
         case .expired, .revoked, .error: return .red
+        case .drifted: return .orange
         case .missing: return .gray
         }
     }
