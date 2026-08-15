@@ -247,15 +247,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Menubar follows the user's pinned account, or falls back to most-available.
         let targetAccount = usageStore.accounts.first(where: { $0.id == usageStore.effectivePrimaryAccountId })
 
-        if let account = targetAccount,
-           let usage = usageStore.latestUsage[account.id] {
-            let sessionPercent = usage.sessionPercent ?? 0
-            let weeklyAllPercent = usage.weeklyAllPercent ?? 0
-            percent = Int(max(sessionPercent, weeklyAllPercent))
-            isWeeklyLimit = weeklyAllPercent >= sessionPercent
-        } else if let account = targetAccount {
-            percent = Int(account.latestPercent ?? 0)
-            isWeeklyLimit = true
+        // A stale or drifted account's last-known percentage must not be
+        // presented as current (#156) — the same cause-independent gate the
+        // popover row already applies via `SummaryRow.displayUsage`. Without
+        // this, the badge is the one UI surface visible without opening the
+        // popover at all, so a frozen credential could sit silently "healthy"
+        // on the menu bar even after the popover row correctly blanks itself.
+        if let account = targetAccount {
+            let isStale = usageStore.isStale(account)
+            let tokenStatus = oauthPoller.credentialStatuses.first(where: { $0.accountId == account.id })?.status
+            let suppress = AccountFreshness.shouldSuppressPercent(isStale: isStale, tokenStatus: tokenStatus)
+
+            if !suppress {
+                if let usage = usageStore.latestUsage[account.id] {
+                    let sessionPercent = usage.sessionPercent ?? 0
+                    let weeklyAllPercent = usage.weeklyAllPercent ?? 0
+                    percent = Int(max(sessionPercent, weeklyAllPercent))
+                    isWeeklyLimit = weeklyAllPercent >= sessionPercent
+                } else {
+                    percent = Int(account.latestPercent ?? 0)
+                    isWeeklyLimit = true
+                }
+            }
         }
 
         // Create Stats-style image with "LLM" label and percentage

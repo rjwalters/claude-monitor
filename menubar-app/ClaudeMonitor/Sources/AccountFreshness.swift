@@ -47,4 +47,26 @@ enum AccountFreshness {
         guard let lastUpdated = lastUpdated else { return false }
         return isStale(age: now.timeIntervalSince(lastUpdated), pollInterval: pollInterval)
     }
+
+    /// True when a single-account summary display (the menubar badge, or any
+    /// future surface with the same shape) must suppress its last-known
+    /// percentage rather than present a frozen number as current. Two causes
+    /// are cause-independent and either alone is sufficient: the staleness
+    /// backstop above (#148), or a Codex identity that has drifted out from
+    /// under a registered home (`TokenStatus.drifted`, #146) — a drifted
+    /// credential's numbers stopped advancing the moment the identity
+    /// changed, even if the last poll happened to land inside the staleness
+    /// window.
+    ///
+    /// Mirrors `SummaryRow.displayUsage`'s `(isDrifted || isStale)` gate in
+    /// `UsagePopoverView.swift` — same decision, reused rather than
+    /// reinvented. Extracted as a pure function of simple inputs (not a
+    /// method on `UsageStore` or `OAuthPoller`) so `AppDelegate.updateStatusButton()`
+    /// in `main.swift` — `#if os(macOS)`-only AppKit code that cannot run
+    /// under `SelfTest` — can call it after computing `isStale` and
+    /// `tokenStatus` from its own `usageStore`/`oauthPoller`, while the
+    /// decision itself stays covered by `SelfTest` on macOS and Linux alike.
+    static func shouldSuppressPercent(isStale: Bool, tokenStatus: TokenStatus?) -> Bool {
+        isStale || tokenStatus == .drifted
+    }
 }

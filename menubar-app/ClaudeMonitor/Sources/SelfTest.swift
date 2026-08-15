@@ -61,6 +61,7 @@ enum SelfTest {
         testSortedAccountsForPopoverTieBreak()
         testGatingResetOrdering()
         testStalenessBackstop()
+        testBadgePercentSuppression()
         testWindowKindDerivation()
         testSnapshotFromPositionalWindows()
         testMissingSessionWindow()
@@ -382,6 +383,28 @@ enum SelfTest {
         ]
         expectEqual(store.sortedAccountsForPopover.map { $0.id }, [anthropicB.id, anthropicA.id],
                     "two fresh accounts still order purely by usage percent, unaffected by staleness")
+    }
+
+    /// The menubar badge's staleness/drift gate (#156): `AccountFreshness
+    /// .shouldSuppressPercent` is the pure decision `AppDelegate
+    /// .updateStatusButton()` (macOS-only, un-runnable under `SelfTest`)
+    /// calls before rendering the badge percentage, mirroring
+    /// `SummaryRow.displayUsage`'s `(isDrifted || isStale)` gate in
+    /// `UsagePopoverView.swift`. Covered here in isolation from any UI code,
+    /// same pattern as `testStalenessBackstop` above.
+    private static func testBadgePercentSuppression() {
+        expect(!AccountFreshness.shouldSuppressPercent(isStale: false, tokenStatus: .valid),
+               "a fresh account with a valid credential shows its badge percentage")
+        expect(!AccountFreshness.shouldSuppressPercent(isStale: false, tokenStatus: nil),
+               "a fresh account with no credential status on record still shows its badge percentage")
+        expect(AccountFreshness.shouldSuppressPercent(isStale: true, tokenStatus: .valid),
+               "a stale account suppresses its badge percentage even with a valid credential")
+        expect(AccountFreshness.shouldSuppressPercent(isStale: false, tokenStatus: .drifted),
+               "a drifted account suppresses its badge percentage even while its last poll is still fresh")
+        expect(AccountFreshness.shouldSuppressPercent(isStale: true, tokenStatus: .drifted),
+               "stale and drifted together still suppress — neither cause requires the other")
+        expect(!AccountFreshness.shouldSuppressPercent(isStale: false, tokenStatus: .expired),
+               "every other token status (expired, revoked, error, missing, refreshing) is not, by itself, a suppression cause")
     }
 
     // MARK: - Window model
