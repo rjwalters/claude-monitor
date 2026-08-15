@@ -54,13 +54,15 @@ enum AccountSync {
     }
 
     enum SyncError: Error, LocalizedError {
-        case databaseMissing
+        /// Carries the path that was actually looked at — with `--db <path>` the
+        /// default location is not the one that mattered (issue #105).
+        case databaseMissing(String)
         case sqlite(Error)
 
         var errorDescription: String? {
             switch self {
-            case .databaseMissing:
-                return "No database found at ~/.claude-monitor/usage.db"
+            case .databaseMissing(let path):
+                return "No database found at \(path)"
             case .sqlite(let error):
                 return "Database error: \(error.localizedDescription)"
             }
@@ -79,7 +81,7 @@ enum AccountSync {
     // MARK: - Export
 
     static func exportBundle(dbPath: String = defaultDBPath) throws -> ExportBundle {
-        guard FileManager.default.fileExists(atPath: dbPath) else { throw SyncError.databaseMissing }
+        guard FileManager.default.fileExists(atPath: dbPath) else { throw SyncError.databaseMissing(dbPath) }
         do {
             let db = try openDatabase(dbPath, readonly: true)
             var accounts: [ExportedAccount] = []
@@ -187,7 +189,7 @@ enum AccountSync {
     /// on match so `usage_history` / `probe_snapshots` rows stay attached.
     @discardableResult
     static func importBundle(_ bundle: ExportBundle, dbPath: String = defaultDBPath) throws -> ImportSummary {
-        guard FileManager.default.fileExists(atPath: dbPath) else { throw SyncError.databaseMissing }
+        guard FileManager.default.fileExists(atPath: dbPath) else { throw SyncError.databaseMissing(dbPath) }
         do {
             let db = try openDatabase(dbPath)
             // Bring the target database up to the current schema first — a host

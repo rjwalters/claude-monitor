@@ -86,6 +86,7 @@ enum SelfTest {
         testMergeDuplicateAccountsSharingEmail()
         testAccountDeletionRemovesCredentials()
         testPurgeOrphanedCredentialsMigration()
+        testReadOnlyOpenOfWALDatabaseWithoutSHM()
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
             testMigrationOfExistingDatabase(at: arguments[idx + 1])
@@ -1829,6 +1830,120 @@ enum SelfTest {
             LEFT JOIN accounts a ON a.id = c.account_id
             WHERE a.id IS NULL AND c.account_id IS NOT NULL AND TRIM(c.account_id) != ''
         """) as? Int64 ?? -1
+    }
+
+    // MARK: - Read-only opens of a WAL database
+
+    /// Regression for #105: `accounts export` opens the database read-only, and
+    /// a `SQLITE_OPEN_READONLY` connection cannot create the `-shm` shared index
+    /// a WAL-mode database needs. Before the fix every read-only open of a
+    /// healthy WAL database whose `-shm` was absent — the app not running, or a
+    /// plain `cp` of the file — failed with `SQLite error 14`.
+    ///
+    /// Also pins the two silent-wrong-answer hazards the escalation ladder is
+    /// shaped to avoid: WAL content must be *recovered*, never ignored, and no
+    /// read path may create a database that isn't there.
+    private static func testReadOnlyOpenOfWALDatabaseWithoutSHM() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            // --- A WAL database, checkpointed and closed. ---
+            do {
+                let writer = try openDatabase(dbPath)
+                try writer.execute("PRAGMA journal_mode=WAL")
+                try writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                try writer.run("INSERT INTO t (id, v) VALUES (1, 'one')")
+                try writer.run("INSERT INTO t (id, v) VALUES (2, 'two')")
+                try writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            }
+
+            // The reported reproduction: `cp usage.db <dir>/` — the database
+            // alone, no sidecars, exactly what CLAUDE.md's migration-check
+            // workflow invites. A read-only connection cannot create the -shm a
+            // WAL-mode database needs, so before the fix this failed outright.
+            let coldPath = try copyDatabase(from: dbPath, into: dir, named: "cold", withWAL: false)
+            expect(!FileManager.default.fileExists(atPath: coldPath + "-shm"),
+                   "the copied fixture has no -shm (the #105 condition)")
+            expect(!FileManager.default.fileExists(atPath: coldPath + "-wal"),
+                   "the copied fixture has no -wal either")
+
+            let readonly = try openDatabase(coldPath, readonly: true)
+            expectEqual(try readonly.scalar("SELECT COUNT(*) FROM t") as? Int64, 2,
+                        "a read-only open reads a WAL database with no -shm present")
+            expectEqual(try readonly.scalar("PRAGMA journal_mode") as? String, "wal",
+                        "the read-only open leaves journal_mode unchanged")
+            expectEqual(try readonly.scalar("SELECT v FROM t WHERE id = 2") as? String, "two",
+                        "no row was modified by the escalation")
+
+            // --- A database copied with a hot -wal but no -shm. `immutable=1`
+            // silently drops the WAL here, so this asserts against the
+            // stale-data failure mode, not just against the open failing. ---
+            let live = try openDatabase(dbPath)
+            for i in 3...12 {
+                try live.run("INSERT INTO t (id, v) VALUES (?, ?)", i, "row-\(i)")
+            }
+            let hotPath = try withExtendedLifetime(live) {
+                try copyDatabase(from: dbPath, into: dir, named: "hot", withWAL: true)
+            }
+            let walBytes = FileManager.default.contents(atPath: hotPath + "-wal")?.count ?? 0
+            expect(walBytes > 0, "the copied fixture actually carries WAL content")
+            expect(!FileManager.default.fileExists(atPath: hotPath + "-shm"),
+                   "the hot-WAL fixture has no -shm")
+            let hotReader = try openDatabase(hotPath, readonly: true)
+            expectEqual(try hotReader.scalar("SELECT COUNT(*) FROM t") as? Int64, 12,
+                        "WAL content is recovered, not silently ignored, on a copy with no -shm")
+
+            // --- A non-WAL database is unaffected. ---
+            let deletePath = dir.appendingPathComponent("delete-mode.db").path
+            do {
+                let writer = try openDatabase(deletePath)
+                try writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                try writer.run("INSERT INTO t (id) VALUES (7)")
+            }
+            let deleteReader = try openDatabase(deletePath, readonly: true)
+            expectEqual(try deleteReader.scalar("SELECT COUNT(*) FROM t") as? Int64, 1,
+                        "a journal_mode=delete database still opens read-only")
+
+            // --- No read path may create a database: a typo'd --db must error. ---
+            let typoPath = dir.appendingPathComponent("typo.db").path
+            var opened = true
+            do {
+                _ = try openDatabase(typoPath, readonly: true)
+            } catch {
+                opened = false
+            }
+            expect(!opened, "a read-only open of a missing database throws")
+            expect(!FileManager.default.fileExists(atPath: typoPath),
+                   "a read-only open never creates the database (no SQLITE_OPEN_CREATE)")
+
+            // --- The missing-database message names the path actually given. ---
+            let missing = AccountSync.SyncError.databaseMissing(typoPath).localizedDescription
+            expect(missing.contains(typoPath),
+                   "SyncError.databaseMissing reports the given path, got: \(missing)")
+        } catch {
+            checks += 1
+            failures.append("WAL read-only open test threw: \(error)")
+        }
+    }
+
+    /// Copies a database into a fresh subdirectory of `dir` the way `cp` does —
+    /// the database file plus, optionally, its `-wal`, and **never** the `-shm`.
+    /// Returns the copy's path.
+    private static func copyDatabase(
+        from dbPath: String, into dir: URL, named name: String, withWAL: Bool
+    ) throws -> String {
+        let target = dir.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        let copyPath = target.appendingPathComponent("usage.db").path
+        try FileManager.default.copyItem(atPath: dbPath, toPath: copyPath)
+        if withWAL, FileManager.default.fileExists(atPath: dbPath + "-wal") {
+            try FileManager.default.copyItem(atPath: dbPath + "-wal", toPath: copyPath + "-wal")
+        }
+        return copyPath
     }
 
     // MARK: - Schema migration
