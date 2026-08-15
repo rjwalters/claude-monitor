@@ -223,15 +223,26 @@ Codex CLI put it.
 
 ```bash
 claude-monitor codex list
-# ACCOUNT   PLAN        AUTH           CODEX_HOME
-# user-3f2… pro         logged in      /Users/you/.codex-work
-# user-91a… plus        needs login    /Users/you/.codex-personal
+# ACCOUNT   PLAN        AUTH               CODEX_HOME
+# user-3f2… pro         logged in          /Users/you/.codex-work
+# user-91a… plus        needs login        /Users/you/.codex-personal
+# user-77c… pro         drift → user-0d4…  /Users/you/.codex-spare
 ```
 
 `list` reports each home's live state: **logged in**, **needs login** (the home
 exists but `codex login` hasn't been run in it), **home missing** (the directory
-is gone — re-register), or **unknown** when `codex` itself is absent or too old.
-Both commands take `--db <path>` to work against a throwaway store.
+is gone — re-register), **drift** (see below), or **unknown** when `codex`
+itself is absent or too old. Both commands take `--db <path>` to work against a
+throwaway store.
+
+**drift** means that home is now logged in as a *different* account than the row
+it was registered against — someone ran `codex login` in it again with another
+identity. The poller has always refused to attribute such a reading to the wrong
+account, but silently: the row simply stopped updating. `list` now names it, and
+names the account id the home currently holds (or prints a bare `drift` when the
+home's `auth.json` carries no account id and only the email disagrees — an email
+is never printed). Fix it by logging the home back in as the original account,
+or by re-running `codex add --home <home>` to register it as its own account.
 
 An account with **no** registered home reads the ambient `$CODEX_HOME` (else
 `~/.codex`), exactly as before — which is correct as long as it is the only

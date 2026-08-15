@@ -78,6 +78,7 @@ enum SelfTest {
         testCodexProvisionArgParsing()
         testCodexProvisionIdentityConflict()
         testCodexHomeIdentityGuard()
+        testCodexIdentityDriftReporting()
         testCodexHomeResolution()
         testCodexHomeRegistrationEnumeration()
         testCodexAppServerSpawnAgainstStub()
@@ -1137,6 +1138,101 @@ enum SelfTest {
                "the single-account case, where neither side carries identity, still uses tier 1")
         expect(OAuthPoller.identitiesConflict("user-aaa", "user-bbb"),
                "the same rule guards tier 2, where auth.json carries an account id")
+    }
+
+    /// Drift is the *visible* half of that same guard: the comparison which
+    /// silently declines attribution now has a value `codex list` can name.
+    ///
+    /// Two properties are pinned here at once, and the second one is the point:
+    ///
+    /// 1. the comparison is **inspectable** — `.conflict` carries the identity
+    ///    the home now holds, so a caller can report it rather than infer it;
+    /// 2. the attribution gate is **unchanged** — `identitiesConflict` still
+    ///    answers exactly what it answered before, for every input the poller
+    ///    can hand it, because it is now a thin reading of that same
+    ///    comparison. Visibility must not move the line at which the poller
+    ///    refuses to attribute a reading.
+    private static func testCodexIdentityDriftReporting() {
+        typealias Comparison = OAuthPoller.CodexIdentityComparison
+
+        expectEqual(OAuthPoller.compareIdentities(reported: "user-BBB", stored: "user-aaa"),
+                    Comparison.conflict(reported: "user-BBB"),
+                    "a conflict names the identity the home now holds, in its original spelling")
+        expectEqual(OAuthPoller.compareIdentities(reported: " user-aaa ", stored: "USER-AAA"),
+                    Comparison.match,
+                    "matching is still case- and whitespace-insensitive")
+        expectEqual(OAuthPoller.compareIdentities(reported: nil, stored: "user-aaa"),
+                    Comparison.indeterminate,
+                    "an unknown reported identity proves nothing — neither drift nor a match")
+        expectEqual(OAuthPoller.compareIdentities(reported: "user-aaa", stored: nil),
+                    Comparison.indeterminate,
+                    "an account row with no identity proves nothing either")
+        expectEqual(OAuthPoller.compareIdentities(reported: "  ", stored: "user-aaa"),
+                    Comparison.indeterminate,
+                    "an empty reported identity is absent, not conflicting")
+
+        // Regression: the boolean the poller's attribution gate reads is now
+        // derived from the comparison above, and must answer identically for
+        // every input — including the asymmetric "absent proves nothing" cases.
+        let gateCases: [(reported: String?, stored: String?, conflicts: Bool)] = [
+            ("a@example.com", "b@example.com", true),
+            ("a@example.com", "A@Example.com ", false),
+            (nil, "a@example.com", false),
+            ("a@example.com", nil, false),
+            ("", "a@example.com", false),
+            (nil, nil, false),
+            ("user-aaa", "user-bbb", true),
+        ]
+        for gateCase in gateCases {
+            expectEqual(
+                OAuthPoller.identitiesConflict(gateCase.reported, gateCase.stored),
+                gateCase.conflicts,
+                "attribution gate unchanged for (\(gateCase.reported ?? "nil"), \(gateCase.stored ?? "nil"))"
+            )
+        }
+
+        // Drift as `codex list` asks the question: one *registered* home, the
+        // account it was registered against, and whatever identity that home
+        // currently holds.
+        typealias Drift = OAuthPoller.CodexHomeDrift
+
+        expectEqual(
+            OAuthPoller.codexHomeDrift(registeredAccountId: "user-aaa", registeredEmail: "a@example.com",
+                                       homeAccountId: "user-bbb", homeEmail: "b@example.com"),
+            Drift.drifted(reportedAccountId: "user-bbb"),
+            "a re-logged-in home is drift, and the report names the id it now holds"
+        )
+        expectEqual(
+            OAuthPoller.codexHomeDrift(registeredAccountId: "user-aaa", registeredEmail: "a@example.com",
+                                       homeAccountId: "user-aaa", homeEmail: "a@example.com"),
+            Drift.stable,
+            "the ordinary healthy home is not drift"
+        )
+        expectEqual(
+            OAuthPoller.codexHomeDrift(registeredAccountId: "user-aaa", registeredEmail: "a@example.com",
+                                       homeAccountId: nil, homeEmail: nil),
+            Drift.stable,
+            "a home logged out after registration reads as 'needs login', never as drift"
+        )
+        expectEqual(
+            OAuthPoller.codexHomeDrift(registeredAccountId: "openai-6f1c2f7e-0000-4a00-8000-000000000000",
+                                       registeredEmail: nil,
+                                       homeAccountId: "user-bbb", homeEmail: nil),
+            Drift.stable,
+            "a locally minted account id is not comparable with an auth.json account id"
+        )
+        expectEqual(
+            OAuthPoller.codexHomeDrift(registeredAccountId: "user-aaa", registeredEmail: "a@example.com",
+                                       homeAccountId: nil, homeEmail: "b@example.com"),
+            Drift.drifted(reportedAccountId: nil),
+            "drift proven by email alone is reported without naming an identity — this CLI never prints an email"
+        )
+        expectEqual(
+            OAuthPoller.codexHomeDrift(registeredAccountId: "user-aaa", registeredEmail: "old@example.com",
+                                       homeAccountId: "user-aaa", homeEmail: "new@example.com"),
+            Drift.stable,
+            "a stale email on the row is not drift while the stable account id still agrees"
+        )
     }
 
     /// Which `CODEX_HOME` may speak for one account — the decision that makes
