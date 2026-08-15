@@ -4,6 +4,22 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #112** (closed): selftest --db fails on any host with a Codex account: over-strict 'backfilled to anthropic' assertion
+- **PR #121**: fix: narrow over-strict provider-backfill assertion in selftest --db
+- **PR #119**: chore: sync User-Agent to claude-code 2.1.224
+- **Issue #101** (closed): Remove 5 unused computed properties: dead code in AnthropicAPI/UsageStore/OAuthPoller
+- **PR #120**: refactor: remove 5 unused computed properties from AnthropicAPI/UsageStore/OAuthPoller
+- **PR #109**: build(deps): bump actions/checkout from 5 to 7 in the github-actions group
+- **Issue #103** (closed): Support multiple Codex accounts via per-account CODEX_HOME
+- **PR #114**: feat: poll each Codex account from its own CODEX_HOME
+- **Issue #105** (closed): accounts export fails with SQLITE_CANTOPEN on a WAL database with no -shm file
+- **PR #113**: fix: escalate read-only SQLite opens when a WAL database has no -shm
+- **Issue #102** (closed): Read Codex usage via `codex app-server` instead of storing OAuth tokens
+- **PR #111**: feat: read Codex usage over `codex app-server` instead of a stored token
+- **Issue #106** (closed): Orphaned oauth_credentials rows retain live tokens for deleted accounts
+- **PR #110**: fix: delete an account's credential rows when the account is removed
+- **PR #108**: chore: configure Dependabot for github-actions
+- **PR #107**: docs: supersede the Codex spike — app-server replaces stored OAuth tokens
 - **Issue #98** (closed): Remove dead RateLimitSnapshot.nextReset computed property
 - **PR #99**: refactor: remove dead RateLimitSnapshot.nextReset computed property
 - **Issue #94** (closed): Dedupe RankingExporter.normalizedISO parse body onto UsageRecord.parseISO
