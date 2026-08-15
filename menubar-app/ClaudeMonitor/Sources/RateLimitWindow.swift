@@ -256,11 +256,6 @@ struct RateLimitSnapshot {
         return max(0, min(100, 100 - worst))
     }
 
-    /// The window that resets soonest among those we know about, or nil.
-    var nextReset: Date? {
-        [session?.resetAt, weekly?.resetAt].compactMap { $0 }.min()
-    }
-
     /// The window whose reset actually gates this account's next usable moment.
     ///
     /// An exhausted weekly window is the gate: the session limit rolling over in
