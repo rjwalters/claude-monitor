@@ -64,6 +64,11 @@ enum AccountSyncCLI {
                 readable storage, transfer it over a trusted channel, and \
                 delete it once the import completes.
 
+                Codex/OpenAI accounts are host-local and intentionally \
+                excluded from this export — register one on each host with \
+                `claude-monitor codex add --home <path>` instead of syncing \
+                a credential between machines.
+
                 """.utf8))
 
             if let outputPath = outputPath {
@@ -140,7 +145,7 @@ enum AccountSyncCLI {
             for outcome in summary.outcomes {
                 print("\(outcome.email ?? outcome.id): \(outcome.action.rawValue)")
             }
-            print("Done: \(summary.created) created, \(summary.updated) updated, \(summary.skipped) skipped (local record was newer or equal).")
+            print("Done: \(summary.created) created, \(summary.updated) updated, \(summary.skipped) skipped (local record was newer or equal), \(summary.excluded) excluded (host-local Codex/OpenAI account).")
             exit(0)
         } catch {
             fail("Import failed: \(error.localizedDescription)")
@@ -164,11 +169,15 @@ enum AccountSyncCLI {
             export writes an accounts.json bundle (account records + OAuth
             credentials) to stdout by default, or to --output <path> (written
             with 0600 permissions). The bundle contains plaintext OAuth
-            tokens — treat it as a secret.
+            tokens — treat it as a secret. Codex/OpenAI accounts are
+            host-local and are never included — register one on each host
+            with `claude-monitor codex add --home <path>` instead.
 
             import upserts accounts by email (falling back to id when email
             is absent), skipping any account whose local last_updated is
             newer than or equal to the imported record — safe to re-run.
+            A Codex/OpenAI account present in a bundle from an older version
+            is skipped (not an error); it never round-tripped safely.
             Reads from stdin when the path is '-'.
 
             --db <path> overrides ~/.claude-monitor/usage.db (mainly for

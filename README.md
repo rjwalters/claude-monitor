@@ -128,8 +128,10 @@ removed. Store these files with `chmod 600`; they contain live tokens.
 ChatGPT subscription accounts (Plus/Pro, the ones Codex CLI uses) are polled
 too, and no inference request is burned to read their usage.
 
-**How the reading is taken.** There are three ways to ask, and the poller tries
-them in order, preferring whichever touches the fewest credentials:
+**How the reading is taken.** There are two ways to ask, and the poller tries
+them in order, preferring whichever touches the fewest credentials. This app
+stores no OpenAI credential of its own (#104) — both tiers read through
+whatever the Codex CLI already owns:
 
 1. **`codex app-server`** (preferred). The app runs
    `codex -s read-only -a untrusted app-server`, speaks JSON-RPC over its stdio,
@@ -144,12 +146,13 @@ them in order, preferring whichever touches the fewest credentials:
    — the same endpoint Codex CLI's own `/usage` command calls — with the bearer
    read fresh out of `$CODEX_HOME/auth.json` for that one request. Never written
    back, never refreshed.
-3. **The stored credential.** The original behaviour, refresh loop included
-   (see the rotation note below). Last resort.
 
 A tier that is merely *unavailable* — no `codex` on the host, a `codex` too old,
 no readable `auth.json` — falls through silently to the next one. Only a genuine
-failure of the last tier marks the account unhealthy.
+failure of the last tier marks the account unhealthy: there is no
+stored-credential fallback below it any more, so a home that isn't logged in
+(or a host with no `codex` binary and no readable `auth.json`) shows up as a
+red Token dot rather than quietly polling a stale copy of the credential.
 
 `codex` is located by absolute path, first hit wins: `$CLAUDE_MONITOR_CODEX_BIN`,
 then each `PATH` entry, then `/opt/homebrew/bin`, `/usr/local/bin`,
@@ -213,8 +216,10 @@ credential is validated against the live usage endpoint before it's stored, and
 the account's email, plan, and OpenAI account id all come back in that same
 response — there's no separate profile call.
 
-Prefer `codex add`: a stored copy of the credential is what the rotation note
-below is about.
+Prefer `codex add`: it stores no token at all. `codex import` still stores one
+transiently to validate the credential and identify the account, but a
+healing migration nulls it out again on the app's very next launch (#104) —
+ongoing polling reads through the tiers above, not the stored copy.
 
 </details>
 
@@ -231,49 +236,25 @@ What differs from an Anthropic row once it's added:
   premium column is titled "Fable %" only when every account in the table
   is Anthropic; with any OpenAI row present it shows the neutral
   "Premium %".)
-- **Tokens expire, and are renewed for you — on tier 3 only.** An OpenAI access
-  token lives about 10 days. When the reading comes from `codex app-server` or
-  from `auth.json`, no stored token is used and none is renewed. On the stored
-  credential path, the poller renews it from the stored refresh token
-  *proactively* — 6 hours ahead of expiry, never waiting for a 401 — and the
-  Token dot reports the outcome: green (healthy), **yellow** (renewal is
-  failing but the current token still works; hover for the reason), **red**
-  (expired and unrenewable — re-run `claude-monitor codex import`). A stale
-  OpenAI account never fails silently.
+- **This app stores no OpenAI credential, and renews nothing.** Usage is read
+  via `codex app-server` (tier 1) or a one-time `auth.json` bearer read (tier
+  2); either way the Codex CLI owns the credential and its own renewal
+  entirely, and this app touches neither. The Token dot reports the outcome:
+  green (a tier read succeeded), **red** (every tier failed — most often the
+  home isn't logged in; hover for the reason, then run `codex login` or
+  register the right home with `claude-monitor codex add --home <path>`). A
+  stale OpenAI account never fails silently.
 
-> **Note on refresh-token rotation.** This applies to the **stored-credential
-> tier only**; on a host with `codex` 0.147.0+ installed and logged in, the
-> reading comes from `codex app-server` and none of the following happens.
->
-> OpenAI **does** rotate the refresh token
-> on renewal (verified 2026-07-31). This app stores the new pair in its own
-> database and does **not** write back to `~/.codex/auth.json`, so two
-> consequences follow:
->
-> - **Codex CLI will eventually need a re-login.** Its stored refresh token is
->   invalidated by the rotation. Its *access* token keeps working until it
->   expires, so nothing breaks immediately — but once it does, run
->   `codex login` and then `claude-monitor codex import`.
-> - **Other machines running this app need re-syncing.** A second host that
->   imported the same credential still holds the pre-rotation token and will
->   fail its own renewal. Push the refreshed credential to it with
->   `accounts export` → `accounts import` (see
->   [Multi-host sync](#multi-host-sync)),
->   or just re-run `codex import` there after a fresh `codex login`.
->
-> **This re-sync loop does not converge, and is being replaced.** Each holder
-> of the credential — this app on host A, this app on host B, the Codex CLI on
-> each of them — invalidates the others when it renews, so re-syncing only
-> moves which one is about to break next. Observed in practice: continuous
-> `401 / refresh_token_invalidated` across two hosts for ~9 days, while the
-> accounts themselves stayed healthy and a current `codex` read their usage
-> immediately. OpenAI's own guidance is that an `auth.json` is single-machine
-> and must not be shared across hosts, so **do not** copy OpenAI credentials
-> between machines; register the account on each host instead. The fix is to
-> stop holding the credential at all and read usage via `codex app-server`,
-> which owns its own auth — **that path now exists** (tier 1 above, #102);
-> retiring the stored credential entirely is tracked in #103 and #104. See the
-> 2026-08-15 supersession in
+> **Historical note.** Earlier versions stored an OpenAI access/refresh token
+> of their own and proactively renewed it ahead of expiry. OpenAI rotates the
+> refresh token on every renewal and supports exactly one `auth.json` per
+> machine, so any second copy — another host's database, or the Codex CLI's
+> own `auth.json` — took turns invalidating each other's copy on every renewal
+> (observed in practice: continuous `401 / refresh_token_invalidated` across
+> two hosts for ~9 days). That stored-credential path is gone (#104): this app
+> now only ever reads through `codex app-server` or a live `auth.json` bearer,
+> so there is no copy of the credential left for it to invalidate. Full
+> history in the 2026-08-15 supersession in
 > [`docs/spikes/2026-07-30-codex-usage-probe.md`](docs/spikes/2026-07-30-codex-usage-probe.md).
 
 ### Rolling a Token (revoke + re-mint)
@@ -406,9 +387,9 @@ against `/v1/messages`.
 │  OAuthPoller — one client per provider, one shared window model          │
 │    anthropic: POST /v1/messages (1-token ping) → rate-limit headers      │
 │               tokens are long-lived (~1 yr); no refresh dance needed     │
-│    openai:    GET /backend-api/wham/usage → rate_limit.{primary,         │
-│               secondary}_window; access tokens live ~10 days and are     │
-│               refreshed proactively via auth.openai.com/oauth/token      │
+│    openai:    codex app-server (preferred) or a live auth.json bearer →  │
+│               rate_limit.{primary,secondary}_window; no OpenAI token is  │
+│               stored or refreshed by this app (#104)                     │
 │    - Each account polled once per 10 min (staggered)                     │
 └────────────────────────────────┬─────────────────────────────────────────┘
                                  │ data drives
@@ -542,10 +523,18 @@ claude-monitor accounts export --output accounts.json
 claude-monitor accounts import accounts.json
 ```
 
-- **What's synced:** account identity (id, name, email, plan) and OAuth
-  credentials (access/refresh tokens, expiry, scopes, plan tier). Usage
+- **What's synced:** Anthropic account identity (id, name, email, plan) and
+  OAuth credentials (access/refresh tokens, expiry, scopes, plan tier). Usage
   history, rankings, and poll status are **not** synced — those stay local to
   each host's own polling.
+- **Codex/OpenAI accounts are host-local and excluded on purpose:** `export`
+  never emits one, and `import` skips (rather than errors on) any it finds in
+  a bundle from an older version. Codex usage is read via `codex app-server`
+  against a per-account `CODEX_HOME`, and OpenAI supports exactly one
+  `auth.json` per machine — shipping a copy of that credential to another host
+  only guarantees the two hosts take turns invalidating each other's copy.
+  Register a Codex account on each host instead: `claude-monitor codex add
+  --home <path>`.
 - **Idempotent, upsert-by-email:** `import` matches accounts by email
   (falling back to id when email is absent), creates any account it doesn't
   find locally, and updates the rest — except it **never regresses a newer
