@@ -25,7 +25,9 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#104**: Retire stored OpenAI OAuth tokens and exclude Codex accounts from accounts export
+- **#134**: Surface Codex identity drift as a distinct account state (not stale/failed reading)
+- **#133**: Add codex provision <label> to collapse home-create + login + register into one command
+- **#129**: Clipboard account transfer silently drops Codex accounts after #123 — and reports "Nothing to copy" on a Codex-only host
 
 ## PRs Awaiting Review
 
@@ -43,10 +45,11 @@ _None._
 
 Issues carrying `loom:curated`.
 
-- **#117**: Purge the 18 orphaned probe_snapshots rows #106 left behind (and audit named_limits) *(curated)*
-- **#116**: selftest writes ~14 lines into the user's real debug.log: flog.info from a pure mapper *(curated)*
-- **#115**: docs: `brew install codex` installs a stale 0.46.0 formula — the cask is the correct package *(curated)*
-- **#104**: Retire stored OpenAI OAuth tokens and exclude Codex accounts from accounts export *(curated)*
+- **#135**: Declarative intended Codex identity set: codex list/ranking.json should report 'absent', not just fewer rows *(curated)*
+- **#134**: Surface Codex identity drift as a distinct account state (not stale/failed reading) *(curated)*
+- **#133**: Add codex provision <label> to collapse home-create + login + register into one command *(curated)*
+- **#132**: codex list: enumerate all discoverable Codex homes, not just registered accounts *(curated)*
+- **#129**: Clipboard account transfer silently drops Codex accounts after #123 — and reports "Nothing to copy" on a Codex-only host *(curated)*
 - **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -55,7 +58,7 @@ _None._
 
 ## Epics
 
-_None._
+- **#130**: Multi-identity Codex needs a lifecycle: discovery, provisioning, drift, and a cross-host view
 
 ## Backlog Balance
 
@@ -64,10 +67,10 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 3 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 5 |
+| Curated | 6 |
 | Architect / Hermit proposals | 0 |
-| Active epics | 0 |
+| Active epics | 1 |
 <!-- guide:plan-body:end -->
