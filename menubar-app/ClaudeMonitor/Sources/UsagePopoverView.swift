@@ -1119,9 +1119,11 @@ struct SummaryRow: View {
     }
 
     private func colorForPercent(_ percent: Double) -> Color {
-        if percent > 95 { return Color(nsColor: .systemRed) }
-        if percent >= 90 { return Color(nsColor: .systemOrange) }
-        return .primary
+        switch PercentSeverity(percent: percent) {
+        case .critical: return Color(nsColor: .systemRed)
+        case .warning: return Color(nsColor: .systemOrange)
+        case .normal: return .primary
+        }
     }
 
     /// Fable/premium weekly allowance used, counting up to 100% like the

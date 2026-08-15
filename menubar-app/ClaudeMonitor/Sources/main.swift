@@ -275,12 +275,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let labelColor: NSColor = isDark ? .white : .textColor
 
         let valueColor: NSColor
-        if percent > 95 {
-            valueColor = .systemRed
-        } else if percent >= 90 {
-            valueColor = .systemOrange
-        } else {
-            valueColor = isDark ? .white : .black
+        switch PercentSeverity(percent: Double(percent)) {
+        case .critical: valueColor = .systemRed
+        case .warning: valueColor = .systemOrange
+        case .normal: valueColor = isDark ? .white : .black
         }
 
         let style = NSMutableParagraphStyle()
