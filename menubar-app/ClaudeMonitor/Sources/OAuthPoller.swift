@@ -31,6 +31,19 @@ enum TokenStatus: String {
     case missing
     case revoked
     case error
+    /// The Codex home this account is registered against is currently logged
+    /// in as a *different* identity (#146). Distinct from every other case:
+    /// not a transient poll failure (`.error`/`.revoked`), not `.missing` (a
+    /// credential exists — it just cannot be attributed), and never `.valid`,
+    /// because the numbers on this row stopped advancing the moment the home
+    /// drifted. Re-derived fresh on every poll rather than latched, so a
+    /// later poll that finds the identity restored — home re-registered, or
+    /// the original login restored — reports `.valid` again with no restart.
+    ///
+    /// Raw value is deliberately `"drift"`, matching `CodexCLI.driftLabel` —
+    /// `SelfTest` pins the two literals equal so the popover and
+    /// `codex list` can never name this condition two different ways.
+    case drifted = "drift"
 }
 
 struct CredentialStatus: Identifiable {
@@ -1196,14 +1209,24 @@ class OAuthPoller: ObservableObject {
                 // ambient home that never belonged to this account, still gets
                 // caught here rather than overwriting the row.
                 if codexHomeConflicts(with: credential, reportedEmail: snapshot.email) {
-                    noteCodexIdentityConflict(credential)
-                } else {
-                    writeSnapshotToDB(accountId: storedAccountId, snapshot: snapshot)
-                    updateCredentialLastPoll(credential, error: nil)
-                    updateCredentialStatus(credential, status: .valid, error: nil)
-                    await MainActor.run { self.lastError = nil }
+                    // Definitive for this poll cycle: the home answered, and it
+                    // answered as somebody else. Report the drift and stop —
+                    // falling through to tier 2/3 would either re-derive the
+                    // same conflict or, worse, let the "every tier exhausted"
+                    // path below bury it behind an unrelated "No access
+                    // token"/"revoked" state (#146).
+                    noteCodexIdentityConflict(
+                        credential,
+                        homeAccountId: CodexAuth.accountId(inHome: home.readableHome),
+                        homeEmail: snapshot.email
+                    )
                     return
                 }
+                writeSnapshotToDB(accountId: storedAccountId, snapshot: snapshot)
+                updateCredentialLastPoll(credential, error: nil)
+                updateCredentialStatus(credential, status: .valid, error: nil)
+                await MainActor.run { self.lastError = nil }
+                return
             } catch let error as CodexAppServerError {
                 noteCodexFallback(credential, error)
             } catch {
@@ -1219,8 +1242,16 @@ class OAuthPoller: ObservableObject {
         // to *this account's* home, not `CodexAuth.defaultAuthPath`.
         if home.allowsHomeRead,
            let live = try? CodexAuth.load(path: CodexAuth.authPath(inHome: home.readableHome)),
-           let storedAccountId = storedAccountId,
-           !codexHomeConflicts(with: credential, reportedAccountId: live.accountId) {
+           let storedAccountId = storedAccountId {
+            if codexHomeConflicts(with: credential, reportedAccountId: live.accountId) {
+                // Same belt-and-braces guard as tier 1, reached whenever tier 1
+                // itself didn't run (capability gap, no RPC) but the local
+                // `auth.json` still contradicts the registration. Reported here
+                // rather than left to fall through, for the same reason as
+                // tier 1's own conflict branch.
+                noteCodexIdentityConflict(credential, homeAccountId: live.accountId, homeEmail: nil)
+                return
+            }
             do {
                 let snapshot = try await openAIClient.fetchUsage(accessToken: live.accessToken)
                 writeSnapshotToDB(accountId: storedAccountId, snapshot: snapshot)
@@ -1563,14 +1594,69 @@ class OAuthPoller: ObservableObject {
         }
     }
 
-    private func noteCodexIdentityConflict(_ credential: OAuthCredential) {
+    /// Record that this credential's Codex home is currently logged in as a
+    /// **different** identity than the one it is registered against — the
+    /// user-visible drift state #146 introduced, replacing a signal that used
+    /// to be nothing but this log line.
+    ///
+    /// The log line itself stays deduped once per credential lifetime (a
+    /// steady drifted state would otherwise write the same `[INFO]` forever),
+    /// but the *status* below is set on every call — i.e. every poll that
+    /// finds the conflict still standing — so a later poll that finds it
+    /// resolved (home re-registered, or the original login restored) simply
+    /// never calls this again and the row reports `.valid` on its own, no
+    /// restart required.
+    ///
+    /// `homeAccountId`/`homeEmail` are whichever identity the calling tier
+    /// actually read; passed through `OAuthPoller.codexHomeDrift` — the same
+    /// comparison `CodexCLI`'s `driftStatus(for:reportedEmail:)` uses for
+    /// `codex list` — so the popover and the CLI describe one conflict with
+    /// one vocabulary, never two.
+    ///
+    /// Not private: exercised directly by SelfTest, which drives the full
+    /// conflict → `.drifted` → resolved → `.valid` sequence through this
+    /// method rather than spawning a real `codex` subprocess (#146).
+    func noteCodexIdentityConflict(
+        _ credential: OAuthCredential, homeAccountId: String?, homeEmail: String?
+    ) {
         guard let id = credential.id else { return }
         if loggedCodexIdentityConflict.insert(id).inserted {
             flog.info(
-                "codex app-server reports a different account than \(credential.label) — the Codex home it read belongs to another login, using the stored credential instead. Register this account's own home with `claude-monitor codex add --home <path>`.",
+                "codex app-server reports a different account than \(credential.label) — the Codex home it reads belongs to another login. Register this account's own home with `claude-monitor codex add --home <path>`, or run `claude-monitor codex provision <label>`.",
                 category: fcat
             )
         }
+
+        let registeredAccountId = credential.accountId ?? ""
+        let drift = Self.codexHomeDrift(
+            registeredAccountId: registeredAccountId,
+            registeredEmail: storedEmail(for: registeredAccountId),
+            homeAccountId: homeAccountId,
+            homeEmail: homeEmail
+        )
+        updateCredentialStatus(credential, status: .drifted, error: Self.driftDetailMessage(for: credential, drift: drift))
+    }
+
+    /// The hover/detail text for a drifted row: names the identity the home
+    /// now holds (an account id, truncated like every other identifier this
+    /// app prints — never an email, see `CodexCLI`'s own rule) and the exact
+    /// remediation command. Pure formatting so `SelfTest` can pin it without
+    /// a poll.
+    nonisolated static func driftDetailMessage(for credential: OAuthCredential, drift: CodexHomeDrift) -> String {
+        let home = credential.codexHome.map { " (\(redactHomePath($0)))" } ?? ""
+        let identity: String
+        switch drift {
+        case .drifted(let reportedAccountId):
+            identity = reportedAccountId.map { "\($0.prefix(8))…" } ?? "a different account"
+        case .stable:
+            // Reached only when the id-based comparison disagrees with the
+            // email-based gate that triggered this call in the first place
+            // (a stale `accounts.email`, not a different login) — a real but
+            // rare edge case. Naming no specific identity here is honest:
+            // `codexHomeDrift` itself found nothing conclusive.
+            identity = "a different account"
+        }
+        return "\(credential.label)'s Codex home\(home) is now logged in as \(identity), not the account this row is registered against. Register this account's own home with `claude-monitor codex add --home <path>`, or run `claude-monitor codex provision <label>`."
     }
 
     // MARK: - Import-Time Token Renewal
@@ -1734,23 +1820,29 @@ class OAuthPoller: ObservableObject {
 
     // MARK: - Credential Status Tracking
 
-    private func updateCredentialStatus(_ credential: OAuthCredential, status: TokenStatus, error: String?) {
-        Task { @MainActor in
-            if let credId = credential.id {
-                if let index = self.credentialStatuses.firstIndex(where: { $0.id == credId }) {
-                    self.credentialStatuses[index].status = status
-                    self.credentialStatuses[index].lastPoll = Date()
-                    self.credentialStatuses[index].lastError = error
-                } else {
-                    self.credentialStatuses.append(CredentialStatus(
-                        id: credId,
-                        label: credential.label,
-                        accountId: credential.accountId,
-                        status: status,
-                        lastPoll: Date(),
-                        lastError: error
-                    ))
-                }
+    // Not private: exercised directly by SelfTest, which drives the drifted ⇄
+    // valid transition (#146) through this exact method rather than
+    // reimplementing it. Previously wrapped its body in `Task { @MainActor in
+    // ... }`, which was a redundant hop — `OAuthPoller` is already
+    // `@MainActor`, so every caller (including this one) is already isolated
+    // — and, worse, made the mutation's completion untestable from
+    // synchronous code with no run loop to pump. Mutating `credentialStatuses`
+    // directly is both simpler and immediately observable.
+    func updateCredentialStatus(_ credential: OAuthCredential, status: TokenStatus, error: String?) {
+        if let credId = credential.id {
+            if let index = self.credentialStatuses.firstIndex(where: { $0.id == credId }) {
+                self.credentialStatuses[index].status = status
+                self.credentialStatuses[index].lastPoll = Date()
+                self.credentialStatuses[index].lastError = error
+            } else {
+                self.credentialStatuses.append(CredentialStatus(
+                    id: credId,
+                    label: credential.label,
+                    accountId: credential.accountId,
+                    status: status,
+                    lastPoll: Date(),
+                    lastError: error
+                ))
             }
         }
     }

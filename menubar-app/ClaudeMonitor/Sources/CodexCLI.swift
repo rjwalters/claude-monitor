@@ -412,7 +412,12 @@ enum CodexCLI {
 
     /// The status word for a home whose identity no longer matches its row.
     /// Shared by the row and the footnote so they cannot drift apart.
-    private static let driftLabel = "drift"
+    ///
+    /// Not `private`: `TokenStatus.drifted`'s raw value (`OAuthPoller.swift`)
+    /// is the literal `"drift"` too, and `SelfTest` pins the two constants
+    /// equal (#146) so `codex list` and the popover's drift badge can never
+    /// name this condition two different ways.
+    static let driftLabel = "drift"
 
     /// `~/.codex*` directories on disk that are not already covered by a
     /// registered account — pure filesystem discovery, no writes, no login.
