@@ -697,7 +697,7 @@ class UsageStore: ObservableObject {
                     accountName: acctName,
                     email: acctEmail,
                     plan: acctPlan,
-                    lastUpdated: parseDate(acctLastUpdated),
+                    lastUpdated: UsageRecord.parseISO(acctLastUpdated),
                     latestPercent: percent
                 )
                 loadedAccounts.append(account)
@@ -710,7 +710,7 @@ class UsageStore: ObservableObject {
                     var record = UsageRecord(
                         id: (usageRow[0] as? Int64) ?? 0,
                         accountId: accountId,
-                        timestamp: parseDate(usageRow[1] as? String) ?? Date(),
+                        timestamp: UsageRecord.parseISO(usageRow[1] as? String) ?? Date(),
                         primaryPercent: usageRow[2] as? Double,
                         sessionPercent: usageRow[3] as? Double,
                         weeklyAllPercent: usageRow[4] as? Double,
@@ -782,7 +782,7 @@ class UsageStore: ObservableObject {
 
             for row in stmt.bind(accountId, cutoffString) {
                 if let percent = row[1] as? Double,
-                   let date = parseDate(row[0] as? String) {
+                   let date = UsageRecord.parseISO(row[0] as? String) {
                     rawPoints.append((date, percent))
                 }
             }
@@ -855,7 +855,7 @@ class UsageStore: ObservableObject {
             var rawPoints: [FullUsageDataPoint] = []
 
             for row in stmt.bind(accountId, cutoffString) {
-                if let date = parseDate(row[0] as? String) {
+                if let date = UsageRecord.parseISO(row[0] as? String) {
                     rawPoints.append(FullUsageDataPoint(
                         timestamp: date,
                         sessionPercent: row[1] as? Double,
@@ -903,9 +903,9 @@ class UsageStore: ObservableObject {
     /// with no named limits (every Anthropic account today), which is what
     /// lets `UsageChartView` hide the overlay entirely rather than rendering
     /// an empty series.
-    // Reads only the immutable `dbPath` and calls `parseDate` (also
-    // `nonisolated`) — touches no @Published main-actor state, so it stays
-    // callable from the (synchronous, non-UI) selftest suite.
+    // Reads only the immutable `dbPath` and calls `UsageRecord.parseISO`
+    // (a static on a non-isolated struct) — touches no @Published main-actor
+    // state, so it stays callable from the (synchronous, non-UI) selftest suite.
     nonisolated func loadNamedLimitHistory(for accountId: String, daysBack: Int = 7) -> [String: [NamedLimitDataPoint]] {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
@@ -929,7 +929,7 @@ class UsageStore: ObservableObject {
             var result: [String: [NamedLimitDataPoint]] = [:]
             for row in stmt.bind(accountId, cutoffString) {
                 guard let limitName = row[0] as? String,
-                      let date = parseDate(row[1] as? String),
+                      let date = UsageRecord.parseISO(row[1] as? String),
                       let percent = row[2] as? Double else { continue }
                 result[limitName, default: []].append(NamedLimitDataPoint(timestamp: date, usedPercent: percent))
             }
@@ -975,7 +975,7 @@ class UsageStore: ObservableObject {
 
             for row in statement.bind(accountId, cutoffString) {
                 if let hourStr = row[0] as? String,
-                   let date = parseDate(hourStr) {
+                   let date = UsageRecord.parseISO(hourStr) {
                     let inputTokens = (row[1] as? Int64) ?? 0
                     let outputTokens = (row[2] as? Int64) ?? 0
                     let cacheCreationTokens = (row[3] as? Int64) ?? 0
@@ -1091,14 +1091,6 @@ class UsageStore: ObservableObject {
                 self.error = "Failed to clear account data: \(error.localizedDescription)"
             }
         }
-    }
-
-    // Pure function of its argument — touches no @Published main-actor state.
-    private nonisolated func parseDate(_ string: String?) -> Date? {
-        guard let string = string else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: string) ?? ISO8601DateFormatter().date(from: string)
     }
 
     /// Get a setting value from the database
