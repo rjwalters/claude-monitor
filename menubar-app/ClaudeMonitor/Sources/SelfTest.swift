@@ -81,6 +81,7 @@ enum SelfTest {
         testCodexIdentityDriftReporting()
         testCodexHomeResolution()
         testCodexHomeRegistrationEnumeration()
+        testCodexListDiscoversUnregisteredHomes()
         testCodexAppServerSpawnAgainstStub()
         testCodexPerAccountHomeReachesChild()
         testSchemaMigrationFromPreMigrationDatabase()
@@ -1422,6 +1423,103 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("codex home registration test threw: \(error)")
+        }
+    }
+
+    /// `codex list`'s disk-discovery step (#132): `~/.codex*` homes that
+    /// exist on disk but are not yet registered.
+    ///
+    /// `CodexCLI.discoverUnregisteredHomes` defaults to the process's real
+    /// `~`, which is why this test drives it with an injected scratch
+    /// `homeDir`/`ambientHome` instead — the default call path (the one
+    /// `codex list` actually uses) touches the real filesystem and stays
+    /// CLI-level-verified only, not selftest-coverable, exactly like
+    /// `CodexAuth.defaultAuthPath` (documented on that property).
+    private static func testCodexListDiscoversUnregisteredHomes() {
+        let scratchHome = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-discover-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: scratchHome) }
+        do {
+            let fm = FileManager.default
+            try fm.createDirectory(at: scratchHome, withIntermediateDirectories: true)
+
+            // A registered home (any path — deliberately outside the scratch
+            // "~" to prove a non-glob registered home is still excluded).
+            let registeredHome = "/tmp/selftest-discover-registered-\(UUID().uuidString)"
+            // Two on-disk candidates: one that will end up registered under a
+            // *different* path than where it physically lives (still counts
+            // as "known" via the registration, not the directory), one that
+            // stays unregistered, plus a home with no auth.json (edge case:
+            // exists on disk, nothing inside it) and a non-matching sibling
+            // directory that must be ignored, and a file (not a directory)
+            // named like a home that must also be ignored.
+            let unregisteredHome = scratchHome.appendingPathComponent(".codex-unregistered").path
+            let emptyHome = scratchHome.appendingPathComponent(".codex-empty").path
+            let ignoredDir = scratchHome.appendingPathComponent("not-codex-at-all").path
+            let ignoredFile = scratchHome.appendingPathComponent(".codex-not-a-directory").path
+
+            try fm.createDirectory(atPath: unregisteredHome, withIntermediateDirectories: true)
+            try fm.createDirectory(atPath: emptyHome, withIntermediateDirectories: true)
+            try fm.createDirectory(atPath: ignoredDir, withIntermediateDirectories: true)
+            try Data().write(to: URL(fileURLWithPath: ignoredFile))
+
+            let registered = [
+                OAuthPoller.CodexAccountRegistration(
+                    accountId: "user-registered", codexHome: registeredHome,
+                    plan: "pro", hasStoredToken: false, email: nil
+                )
+            ]
+
+            let discovered = CodexCLI.discoverUnregisteredHomes(
+                registered: registered,
+                homeDir: scratchHome.path,
+                ambientHome: "/tmp/selftest-discover-ambient-unused"
+            )
+
+            expectEqual(discovered, [emptyHome, unregisteredHome].sorted(),
+                        "only the on-disk .codex* directories are reported, sorted, minus the registered home")
+            expect(!discovered.contains(registeredHome),
+                   "a registered home (even outside ~/.codex*) is never reported as unregistered")
+            expect(!discovered.contains(ignoredDir),
+                   "a directory that doesn't start with .codex is never a candidate")
+            expect(!discovered.contains(ignoredFile),
+                   "a plain file named like a home is never a candidate — only directories")
+
+            // An account with no registered home (nil codexHome) reads the
+            // ambient default, so that resolved path must be excluded too —
+            // not just literally-registered ones.
+            let homelessRegistered = [
+                OAuthPoller.CodexAccountRegistration(
+                    accountId: "user-homeless", codexHome: nil, plan: nil,
+                    hasStoredToken: false, email: nil
+                )
+            ]
+            let ambientHome = scratchHome.appendingPathComponent(".codex-empty").path
+            let discoveredWithAmbientExcluded = CodexCLI.discoverUnregisteredHomes(
+                registered: homelessRegistered,
+                homeDir: scratchHome.path,
+                ambientHome: ambientHome
+            )
+            expect(!discoveredWithAmbientExcluded.contains(ambientHome),
+                   "a homeless account's ambient default home is excluded, not just explicit registrations")
+            expectEqual(discoveredWithAmbientExcluded, [unregisteredHome],
+                        "the remaining on-disk home is still reported once the ambient one is excluded")
+
+            // No homes on disk at all besides a registered one (edge case).
+            let onlyRegisteredDir = URL(fileURLWithPath: NSTemporaryDirectory())
+                .appendingPathComponent("claude-monitor-selftest-discover-empty-\(UUID().uuidString)")
+            try fm.createDirectory(at: onlyRegisteredDir, withIntermediateDirectories: true)
+            defer { try? fm.removeItem(at: onlyRegisteredDir) }
+            let noneDiscovered = CodexCLI.discoverUnregisteredHomes(
+                registered: registered,
+                homeDir: onlyRegisteredDir.path,
+                ambientHome: "/tmp/selftest-discover-ambient-unused"
+            )
+            expect(noneDiscovered.isEmpty,
+                   "no ~/.codex* entries on disk means nothing to discover")
+        } catch {
+            checks += 1
+            failures.append("codex list disk-discovery test threw: \(error)")
         }
     }
 

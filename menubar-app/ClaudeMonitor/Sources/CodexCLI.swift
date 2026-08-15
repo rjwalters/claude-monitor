@@ -362,9 +362,10 @@ enum CodexCLI {
         store.ensureDatabase()
         let poller = OAuthPoller(dbPath: storePath)
         let accounts = poller.codexAccounts()
+        let unregisteredHomes = discoverUnregisteredHomes(registered: accounts)
 
-        guard !accounts.isEmpty else {
-            print("No OpenAI (Codex) accounts registered. Add one with:")
+        guard !accounts.isEmpty || !unregisteredHomes.isEmpty else {
+            print("No OpenAI (Codex) accounts registered, and no ~/.codex* homes found on disk. Add one with:")
             print("  CODEX_HOME=~/.codex-<label> codex login --device-auth")
             print("  claude-monitor codex add --home ~/.codex-<label>")
             exit(0)
@@ -372,14 +373,30 @@ enum CodexCLI {
 
         Task {
             var sawDrift = false
-            print("ACCOUNT   PLAN        AUTH               CODEX_HOME")
-            for account in accounts {
-                let status = await authStatus(for: account)
-                if status.hasPrefix(driftLabel) { sawDrift = true }
-                let plan = (account.plan ?? "—").padded(to: 11)
-                let home = account.codexHome ?? "(default: $CODEX_HOME, else ~/.codex)"
-                print("\(account.accountId.prefix(8))… \(plan) \(status.padded(to: 18)) \(home)")
+            if !accounts.isEmpty {
+                print("ACCOUNT   PLAN        AUTH               CODEX_HOME")
+                for account in accounts {
+                    let status = await authStatus(for: account)
+                    if status.hasPrefix(driftLabel) { sawDrift = true }
+                    let plan = (account.plan ?? "—").padded(to: 11)
+                    let home = account.codexHome ?? "(default: $CODEX_HOME, else ~/.codex)"
+                    print("\(account.accountId.prefix(8))… \(plan) \(status.padded(to: 18)) \(home)")
+                }
+            } else {
+                print("No OpenAI (Codex) accounts registered.")
             }
+
+            if !unregisteredHomes.isEmpty {
+                print("")
+                print("Discovered on disk, not yet registered:")
+                print("AUTH               CODEX_HOME")
+                for home in unregisteredHomes {
+                    let status = await authStatus(forUnregisteredHome: home)
+                    print("\(status.padded(to: 18)) \(home)")
+                    print("  → claude-monitor codex add --home \(home)")
+                }
+            }
+
             print("")
             print("`needs login` → run: CODEX_HOME=<home> codex login --device-auth")
             if sawDrift {
@@ -397,6 +414,69 @@ enum CodexCLI {
     /// Shared by the row and the footnote so they cannot drift apart.
     private static let driftLabel = "drift"
 
+    /// `~/.codex*` directories on disk that are not already covered by a
+    /// registered account — pure filesystem discovery, no writes, no login.
+    ///
+    /// A registered account's own `codexHome` (which may live anywhere, not
+    /// just under `~/.codex*` — a custom `--home` path) is already visible via
+    /// the registered-accounts table above, so it is excluded here rather than
+    /// double-reported as "unregistered". A registered account with **no**
+    /// home (`codexHome == nil`) reads the ambient `$CODEX_HOME`/`~/.codex`,
+    /// so that resolved path is excluded too.
+    ///
+    /// `homeDir` and `ambientHome` default to the real values but are
+    /// injectable so `SelfTest` can exercise the discovery/dedup logic
+    /// against a scratch directory instead of the process's real `~` — this
+    /// function's default call path is not selftest-coverable (it touches
+    /// the real home directory), but the logic it wraps is.
+    // Not private: exercised directly by SelfTest, same pattern as
+    // `saveCodexHomeAccount`/`codexAccounts`.
+    static func discoverUnregisteredHomes(
+        registered: [OAuthPoller.CodexAccountRegistration],
+        homeDir: String = FileManager.default.homeDirectoryForCurrentUser.path,
+        ambientHome: String = ambientCodexHome()
+    ) -> [String] {
+        let fm = FileManager.default
+
+        var onDisk: Set<String> = []
+        if let entries = try? fm.contentsOfDirectory(atPath: homeDir) {
+            for entry in entries where entry.hasPrefix(".codex") {
+                let full = (homeDir as NSString).appendingPathComponent(entry)
+                var isDirectory: ObjCBool = false
+                guard fm.fileExists(atPath: full, isDirectory: &isDirectory),
+                      isDirectory.boolValue else { continue }
+                onDisk.insert(full)
+            }
+        }
+
+        var known: Set<String> = []
+        var sawAmbientAccount = false
+        for account in registered {
+            if let home = account.codexHome {
+                known.insert(OAuthPoller.normalizeCodexHome(home))
+            } else {
+                sawAmbientAccount = true
+            }
+        }
+        if sawAmbientAccount {
+            known.insert(ambientHome)
+        }
+
+        return onDisk.subtracting(known).sorted()
+    }
+
+    /// The home an account with no registered `codexHome` actually reads:
+    /// `$CODEX_HOME` if set (mirrors `CodexAuth.defaultAuthPath`), else
+    /// `~/.codex`.
+    static func ambientCodexHome() -> String {
+        if let env = ProcessInfo.processInfo.environment["CODEX_HOME"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !env.isEmpty {
+            return OAuthPoller.normalizeCodexHome(env)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex").path
+    }
+
     /// How one registered account's home currently reads.
     ///
     /// Login state comes from `account/read` and is keyed on `account == null`,
@@ -409,16 +489,39 @@ enum CodexCLI {
             let identity = try await CodexAppServerClient(codexHome: account.codexHome)
                 .fetchAccountIdentity()
             return driftStatus(for: account, reportedEmail: identity.email) ?? "logged in"
-        } catch let error as CodexAppServerError {
-            switch error {
-            case .notLoggedIn: return "needs login"
-            case .homeMissing: return "home missing"
-            case .binaryNotFound: return "unknown (no codex)"
-            case .methodUnsupported: return "unknown (old codex)"
-            default: return "unknown"
-            }
         } catch {
-            return "unknown"
+            return probeFailureStatus(for: error)
+        }
+    }
+
+    /// How a home discovered on disk — one no account is registered against —
+    /// currently reads.
+    ///
+    /// The same `account/read` probe as `authStatus(for:)`, minus the drift
+    /// comparison: an unregistered home has no row whose identity it could
+    /// contradict, so `logged in` is the whole answer. It is also why this
+    /// takes a plain path rather than a `CodexAccountRegistration` — there
+    /// isn't one.
+    private static func authStatus(forUnregisteredHome home: String) async -> String {
+        do {
+            _ = try await CodexAppServerClient(codexHome: home).fetchAccountIdentity()
+            return "logged in"
+        } catch {
+            return probeFailureStatus(for: error)
+        }
+    }
+
+    /// The status word for a failed `account/read` probe, shared by the
+    /// registered and discovered-on-disk paths so the two columns cannot
+    /// report the same condition differently.
+    private static func probeFailureStatus(for error: Error) -> String {
+        guard let error = error as? CodexAppServerError else { return "unknown" }
+        switch error {
+        case .notLoggedIn: return "needs login"
+        case .homeMissing: return "home missing"
+        case .binaryNotFound: return "unknown (no codex)"
+        case .methodUnsupported: return "unknown (old codex)"
+        default: return "unknown"
         }
     }
 
@@ -590,6 +693,13 @@ enum CodexCLI {
                     home itself. An account with no registered home reads the
                     ambient $CODEX_HOME (else ~/.codex) — which is fine as long
                     as it is the only OpenAI account on the host.
+
+                    Also scans ~/.codex* on disk for homes that exist but
+                    aren't registered yet — each is listed separately with its
+                    login state and the exact `codex add --home <path>` command
+                    to register it. Purely read-only: no usage.db write, no
+                    login or token access beyond the same `account/read`
+                    identity check used for registered accounts.
 
             import  Read Codex CLI's credential store — $CODEX_HOME/auth.json
                     when CODEX_HOME is set, otherwise ~/.codex/auth.json —
