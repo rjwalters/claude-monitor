@@ -158,13 +158,52 @@ launchd's minimal `PATH`, which contains neither Homebrew's nor npm's bin
 directory — hence the explicit list.) Set `CLAUDE_MONITOR_CODEX_BIN` to point at
 a specific install.
 
-Registering an account still needs a credential import, because the account row
-and its id come from `auth.json`. A ChatGPT credential is not a single pasteable
-string (it's an access token + refresh token + expiry), so it's **imported**
-from Codex CLI's own credential store rather than typed in:
+**Registering an account: one `CODEX_HOME` per account.** `codex login` writes a
+single `auth.json` per home directory, so **each login overwrites the previous
+account's credential** — which is why monitoring more than one Codex account
+never worked before. Give each account its own home and register it by that
+path:
 
 ```bash
-codex login                    # once, if you haven't already
+CODEX_HOME=~/.codex-work codex login --device-auth
+claude-monitor codex add --home ~/.codex-work
+```
+
+`--device-auth` prints a code you paste into a browser on any machine, so this
+works on a **headless Linux host** with no browser at all. Repeat for as many
+accounts as you have; each poll then spawns `codex` with that account's own
+`CODEX_HOME`, so one account's numbers can never land on another's row.
+
+`codex add` **reads, copies, and stores no token.** It reads exactly one field
+out of `<home>/auth.json` — the opaque `account_id` that keys the account row —
+and asks `codex` itself for the identity and usage. The credential stays where
+Codex CLI put it.
+
+```bash
+claude-monitor codex list
+# ACCOUNT   PLAN        AUTH           CODEX_HOME
+# user-3f2… pro         logged in      /Users/you/.codex-work
+# user-91a… plus        needs login    /Users/you/.codex-personal
+```
+
+`list` reports each home's live state: **logged in**, **needs login** (the home
+exists but `codex login` hasn't been run in it), **home missing** (the directory
+is gone — re-register), or **unknown** when `codex` itself is absent or too old.
+Both commands take `--db <path>` to work against a throwaway store.
+
+An account with **no** registered home reads the ambient `$CODEX_HOME` (else
+`~/.codex`), exactly as before — which is correct as long as it is the only
+OpenAI account on the host. Add a second OpenAI account and any account still
+lacking its own home stops using the ambient one (it can speak for only one of
+them, and nothing says which); register its home to bring it back.
+
+<details>
+<summary><b>Importing a credential instead (<code>codex import</code>)</b></summary>
+
+The original path still works, for hosts without a usable `codex` binary:
+
+```bash
+codex login
 claude-monitor codex import    # or: Add Account → "Import Codex Account"
 ```
 
@@ -173,6 +212,11 @@ The importer reads `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise
 credential is validated against the live usage endpoint before it's stored, and
 the account's email, plan, and OpenAI account id all come back in that same
 response — there's no separate profile call.
+
+Prefer `codex add`: a stored copy of the credential is what the rotation note
+below is about.
+
+</details>
 
 What differs from an Anthropic row once it's added:
 
@@ -347,6 +391,7 @@ against `/v1/messages`.
 │    - `claude setup-token` (single, paste-in)            [anthropic]      │
 │    - `.env` bulk import (ACCOUNT_EMAIL_N / ACCOUNT_KEY_N) [anthropic]    │
 │    - `claude-monitor codex import` (~/.codex/auth.json)   [openai]       │
+│    - `claude-monitor codex add --home <path>` (no token)  [openai]       │
 └────────────────────────────────┬─────────────────────────────────────────┘
                                  │ stored in
                                  ▼
@@ -708,7 +753,7 @@ claude-monitor/
 │       ├── OAuthPoller.swift       # Per-provider polling, token add/import/refresh
 │       ├── AnthropicAPI.swift      # Anthropic client (ping + rate-limit headers)
 │       ├── OpenAIAPI.swift         # OpenAI/Codex client (wham/usage + token refresh)
-│       ├── CodexCLI.swift          # `claude-monitor codex import` CLI surface
+│       ├── CodexCLI.swift          # `claude-monitor codex add|list|import` CLI surface
 │       ├── RateLimitWindow.swift   # Provider-agnostic window/snapshot model
 │       ├── UsageProviderClient.swift # UsageProviderClient protocol + credentials
 │       ├── SelfTest.swift          # `claude-monitor selftest` portable-core assertions
