@@ -1260,7 +1260,7 @@ class OAuthPoller: ObservableObject {
                 await MainActor.run { self.lastError = nil }
                 return
             } catch {
-                flog.warning("auth.json bearer read failed for \(credential.label): \(error.localizedDescription) — falling back to the stored credential", category: fcat)
+                flog.warning("auth.json bearer read failed for \(credential.label): \(error.localizedDescription) — every tier is now exhausted; no stored-credential fallback (#104)", category: fcat)
             }
         }
 
