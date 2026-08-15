@@ -666,7 +666,9 @@ struct UsageChartWindow: View {
         .alert("Clear History?", isPresented: $showClearConfirmation) {
             Button("Cancel", role: .cancel) { }
             Button("Clear", role: .destructive) {
-                store.clearAccountData(accountId: account.id)
+                // History only — the account and its credential stay, which is
+                // what this alert has always promised (#106).
+                store.clearAccountHistory(accountId: account.id)
                 // Close this window
                 if let window = ChartWindowController.windows[account.id] {
                     window.close()

@@ -385,6 +385,55 @@ class UsageStore: ObservableObject {
         // rows polling the same account independently (#45). Must run after
         // the email backfill above so a row healed there is eligible too.
         mergeDuplicateAccountsSharingEmail(db)
+
+        // Migration: delete credential rows whose account row is gone (#106).
+        // Pre-fix builds removed an account without its credential, stranding
+        // a plaintext token that no UI or export can reach (every one of them
+        // joins through `accounts`) — so it is never surfaced, rotated, or
+        // revoked. Must run *after* the merge above, which can itself delete
+        // an account row in the same pass.
+        purgeOrphanedCredentials(db)
+    }
+
+    /// Deletes `oauth_credentials` rows that reference an account which no
+    /// longer exists. Idempotent: a second run finds nothing left to delete.
+    ///
+    /// The declared `FOREIGN KEY (account_id) REFERENCES accounts(id)` does
+    /// not do this for us — SQLite defaults `PRAGMA foreign_keys` to OFF and
+    /// this app only ever sets `journal_mode`, so every FK in the schema is
+    /// documentation rather than enforcement.
+    ///
+    /// **The NULL/blank guard is load-bearing.** `account_id` is nullable, so
+    /// the obvious `LEFT JOIN accounts … WHERE a.id IS NULL` predicate also
+    /// matches rows that were never attached to an account — deleting those
+    /// would be an unrecoverable loss of live token material. `NOT EXISTS`
+    /// plus the explicit `IS NOT NULL` / non-blank test keeps them.
+    // Pure function of its `db` argument — touches no instance/class
+    // main-actor state, so it stays callable from the CLI/headless paths.
+    private nonisolated static func purgeOrphanedCredentials(_ db: Connection) {
+        // Counted before the delete because the SQLite wrapper here exposes no
+        // `sqlite3_changes`. Logged as a bare count — never an id, label,
+        // email, or token fragment.
+        let orphanPredicate = """
+            account_id IS NOT NULL
+              AND TRIM(account_id) != ''
+              AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = oauth_credentials.account_id)
+            """
+        do {
+            let count = try db.scalar(
+                "SELECT COUNT(*) FROM oauth_credentials WHERE \(orphanPredicate)") as? Int64 ?? 0
+            guard count > 0 else { return }
+            try db.run("DELETE FROM oauth_credentials WHERE \(orphanPredicate)")
+            FileLogger.shared.info(
+                "purgeOrphanedCredentials: purged \(count) orphaned credential row(s)",
+                category: "DB"
+            )
+        } catch {
+            FileLogger.shared.error(
+                "purgeOrphanedCredentials: purge failed: \(error)",
+                category: "DB"
+            )
+        }
     }
 
     /// Adds a column only when it isn't already there. `ALTER TABLE ... ADD
@@ -1071,25 +1120,90 @@ class UsageStore: ObservableObject {
         }
     }
 
-    func clearAccountData(accountId: String) {
+    /// Clears an account's recorded time series and nothing else — the
+    /// account row, its credential, and its settings pin all survive, so the
+    /// account keeps appearing in the popover and keeps polling.
+    ///
+    /// This is what the chart window's "Clear History?" affordance promises.
+    /// Before #106 it shared an implementation with account removal and so
+    /// silently deleted the `accounts` row too, leaving an `is_active = 1`
+    /// credential the poller kept using for an account that no longer existed.
+    func clearAccountHistory(accountId: String) {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
                 return
             }
 
             let db = try openDatabase(dbPath)
-
-            // Delete usage history for this account, then the account itself
+            // Every per-account time series the chart draws from: the usage
+            // points themselves, the raw probe archive behind them, and the
+            // provider-named limit series.
             try db.run("DELETE FROM usage_history WHERE account_id = ?", accountId)
-            try db.run("DELETE FROM accounts WHERE id = ?", accountId)
+            try db.run("DELETE FROM probe_snapshots WHERE account_id = ?", accountId)
+            try db.run("DELETE FROM named_limits WHERE account_id = ?", accountId)
 
             // Reload to reflect the change
             loadFromDatabase()
 
         } catch {
             DispatchQueue.main.async {
-                self.error = "Failed to clear account data: \(error.localizedDescription)"
+                self.error = "Failed to clear account history: \(error.localizedDescription)"
             }
+        }
+    }
+
+    /// Removes an account completely: its time series, its credential rows,
+    /// its settings pin, and finally the account row itself.
+    ///
+    /// Deleting the credential in the *same* operation is the fix for #106 —
+    /// a partial delete strands a plaintext OAuth token that nothing in the
+    /// app can see (every UI/export query joins through `accounts`), so it is
+    /// never rotated and never revoked.
+    func deleteAccount(accountId: String) {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return
+            }
+
+            let db = try openDatabase(dbPath)
+            try UsageStore.deleteAccountRows(db, accountId: accountId)
+
+            // Reload to reflect the change
+            loadFromDatabase()
+
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to remove account: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Deletes every row keyed to `accountId` across the schema, inside a
+    /// transaction so a mid-delete failure can't leave the exact half-applied
+    /// state this function exists to prevent (an orphaned credential). Mirrors
+    /// `mergeAccountRow`'s BEGIN/COMMIT-or-ROLLBACK shape.
+    // Pure function of its arguments — touches no instance/class main-actor
+    // state, matching `mergeAccountRow`, so the row-level work stays callable
+    // from non-UI contexts.
+    private nonisolated static func deleteAccountRows(_ db: Connection, accountId: String) throws {
+        do {
+            try db.execute("BEGIN")
+            try db.run("DELETE FROM usage_history WHERE account_id = ?", accountId)
+            try db.run("DELETE FROM probe_snapshots WHERE account_id = ?", accountId)
+            try db.run("DELETE FROM named_limits WHERE account_id = ?", accountId)
+            // The credential goes with the account. Deactivating it instead
+            // (what the popover used to do before calling this) leaves the
+            // token on disk forever.
+            try db.run("DELETE FROM oauth_credentials WHERE account_id = ?", accountId)
+            // Don't leave the user's "primary" pin dangling at a row that no
+            // longer exists, mirroring the merge path.
+            try db.run("DELETE FROM settings WHERE key = ? AND value = ?",
+                       primaryAccountSettingKey, accountId)
+            try db.run("DELETE FROM accounts WHERE id = ?", accountId)
+            try db.execute("COMMIT")
+        } catch {
+            try? db.execute("ROLLBACK")
+            throw error
         }
     }
 
