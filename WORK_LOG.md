@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #117** (closed): Purge the 18 orphaned probe_snapshots rows #106 left behind (and audit named_limits)
+- **PR #126**: fix: purge orphaned probe_snapshots/named_limits rows left by #106
 - **Issue #118** (closed): Three CodexAppServer/OAuthPoller robustness nits from the PR #111 review
 - **PR #127**: fix: distinguish account/read decode failures from null account, make reap's wait suspend
 - **Issue #104** (closed): Retire stored OpenAI OAuth tokens and exclude Codex accounts from accounts export
