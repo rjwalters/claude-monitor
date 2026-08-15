@@ -248,7 +248,7 @@ struct RollTokenView: View {
 // actions, notification handlers), which always run on the main thread —
 // @MainActor isolation matches actual usage rather than papering over it.
 @MainActor
-final class RollTokenWindowController {
+enum RollTokenWindowController {
     static var windows: [String: NSWindow] = [:]
 
     static func show(for account: Account, store: UsageStore, oauthPoller: OAuthPoller) {

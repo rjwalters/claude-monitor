@@ -1124,7 +1124,7 @@ struct UsageConsumedBox: View {
 // actions and view bodies, which always run on the main thread — @MainActor
 // isolation matches actual usage rather than papering over it.
 @MainActor
-class ChartWindowController {
+enum ChartWindowController {
     static var windows: [String: NSWindow] = [:]
 
     // Colors for other accounts
