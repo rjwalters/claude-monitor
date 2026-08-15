@@ -637,23 +637,43 @@ struct UsagePopoverView: View {
         return s.contains("ACCOUNT_EMAIL_") && s.contains("ACCOUNT_KEY_")
     }
 
-    /// Serialize active accounts (every provider — see `exportAccountsEnv`,
-    /// #67) into env format and put them on the clipboard so they can be
-    /// pasted into a Claude Monitor on another machine.
+    /// Serialize active, tokened accounts into env format and put them on the
+    /// clipboard so they can be pasted into a Claude Monitor on another
+    /// machine. Anthropic accounts always round-trip (#67); a Codex/OpenAI
+    /// account is host-local and never has a token to export (#123 nulls
+    /// `access_token`/`refresh_token` at migration), so it is left out and
+    /// counted in `excludedHostLocal` instead — surfaced below rather than
+    /// silently dropped.
     private func copyAccounts() {
-        // `exportAccountsEnv` now serializes every active provider (#67), so
-        // this nil branch only fires when the store is genuinely empty or
-        // every credential is inactive/tokenless — not, as before #67, merely
-        // because the only accounts present were Codex/OpenAI.
-        guard let (env, count) = oauthPoller.exportAccountsEnv() else {
+        // `exportAccountsEnv` returns nil only when there is truly nothing to
+        // report: the store is empty, or every credential is inactive for a
+        // reason unrelated to being host-local. A Codex-only host still gets
+        // a non-nil result (count 0, excludedHostLocal > 0) so its status
+        // message can name the reason instead of reading a bare, misleading
+        // "Nothing to copy" (a regression of #67 that #123 reintroduced).
+        guard let (env, count, excludedHostLocal) = oauthPoller.exportAccountsEnv() else {
             flashTransferStatus("Nothing to copy")
             return
         }
+
+        guard count > 0 else {
+            let plural = excludedHostLocal == 1 ? "account is" : "accounts are"
+            flashTransferStatus("Nothing to copy (\(excludedHostLocal) Codex \(plural) host-local — register with codex add --home)")
+            return
+        }
+
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(env, forType: .string)
         clipboardHasAccounts = true
-        flashTransferStatus("Copied \(count) account\(count == 1 ? "" : "s")")
+
+        let copiedNote = "Copied \(count) account\(count == 1 ? "" : "s")"
+        if excludedHostLocal > 0 {
+            let plural = excludedHostLocal == 1 ? "account" : "accounts"
+            flashTransferStatus("\(copiedNote) (\(excludedHostLocal) Codex \(plural) skipped — host-local)")
+        } else {
+            flashTransferStatus(copiedNote)
+        }
     }
 
     /// Import accounts from env-formatted text on the clipboard.

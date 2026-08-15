@@ -571,13 +571,14 @@ class OAuthPoller: ObservableObject {
 
     /// Serialize active accounts into ACCOUNT_EMAIL_N / ACCOUNT_KEY_N env
     /// format, the same base format the Bulk Import field and the account
-    /// list files accept. Returns nil if there are no exportable accounts (so
-    /// the caller can disable the Copy button). Order follows sort_order.
+    /// list files accept. Returns nil if there is nothing to report at all
+    /// (no exportable accounts and no excluded ones — so the caller can
+    /// disable the Copy button). Order follows sort_order.
     ///
-    /// **Every active provider round-trips (#67).** An Anthropic entry is
-    /// just `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N`, exactly as before this
-    /// format was extended. A non-Anthropic (OpenAI/Codex) entry additionally
-    /// carries:
+    /// **Every active, tokened provider round-trips (#67).** An Anthropic
+    /// entry is just `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N`, exactly as before
+    /// this format was extended. A non-Anthropic (OpenAI/Codex) entry
+    /// additionally carries:
     ///   - `ACCOUNT_PROVIDER_N` — the provider tag (e.g. `openai`)
     ///   - `ACCOUNT_REFRESH_N` — its refresh token, the credential the import
     ///     path actually needs long-term, since the access token in
@@ -593,10 +594,20 @@ class OAuthPoller: ObservableObject {
     /// token doesn't authenticate against the Anthropic API an old build
     /// assumes.
     ///
-    /// Returns the serialized env text alongside the number of accounts it
-    /// actually contains, so callers can report an accurate count rather than
-    /// re-deriving it from `store.accounts.count`.
-    func exportAccountsEnv() -> (env: String, count: Int)? {
+    /// **A non-Anthropic account with no stored token is host-local, not
+    /// exportable (#123).** #123 nulls `access_token`/`refresh_token` for
+    /// every `provider = 'openai'` row at migration — the app holds no
+    /// OpenAI credential — so a Codex account can never actually round-trip
+    /// through this format; it is counted in `excludedHostLocal` instead of
+    /// silently vanishing from the count (the #67 guarantee this doc comment
+    /// used to claim no longer holds for Codex/OpenAI specifically).
+    ///
+    /// Returns the serialized env text, the number of accounts it actually
+    /// contains, and the number of host-local (tokenless, non-Anthropic)
+    /// accounts left out of it, so callers can report an accurate count and
+    /// explain the gap rather than re-deriving either from
+    /// `store.accounts.count`.
+    func exportAccountsEnv() -> (env: String, count: Int, excludedHostLocal: Int)? {
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
         do {
             let db = try openDatabase(dbPath, readonly: true)
@@ -607,6 +618,10 @@ class OAuthPoller: ObservableObject {
             // query outright.
             let hasAcctProvider = tableColumns(db, "accounts").contains("provider")
             let hasTokenExpiry = tableColumns(db, "oauth_credentials").contains("token_expires_at")
+            // No `access_token IS NOT NULL` filter here (unlike before #123):
+            // a tokenless row still needs to be seen so a tokenless
+            // non-Anthropic one can be counted as host-local below, rather
+            // than disappearing from both the export and the count.
             let stmt = try db.prepare("""
                 SELECT COALESCE(a.email, a.account_name, c.label) AS email, c.access_token,
                        \(hasAcctProvider ? "a.provider" : "NULL") AS provider,
@@ -614,17 +629,25 @@ class OAuthPoller: ObservableObject {
                        \(hasTokenExpiry ? "c.token_expires_at" : "NULL") AS token_expires_at
                 FROM oauth_credentials c
                 JOIN accounts a ON a.id = c.account_id
-                WHERE c.is_active = 1 AND c.access_token IS NOT NULL
+                WHERE c.is_active = 1
                 ORDER BY a.sort_order, a.id
             """)
 
             var lines: [String] = []
             var n = 0
+            var excludedHostLocal = 0
             for row in stmt {
-                guard let token = row[1] as? String, !token.isEmpty else { continue }
+                let provider = AccountProvider(stored: row[2] as? String)
+                guard let token = row[1] as? String, !token.isEmpty else {
+                    // Tokenless: a host-local Codex/OpenAI row (#123) is
+                    // counted so the caller can explain the gap. A tokenless
+                    // Anthropic row is some other, unrelated inactive state —
+                    // silently skipped, exactly as before #123.
+                    if provider != .anthropic { excludedHostLocal += 1 }
+                    continue
+                }
                 n += 1
                 let email = (row[0] as? String) ?? "account-\(n)"
-                let provider = AccountProvider(stored: row[2] as? String)
                 lines.append("ACCOUNT_EMAIL_\(n)=\(email)")
                 lines.append("ACCOUNT_KEY_\(n)=\(token)")
                 if provider != .anthropic {
@@ -638,14 +661,14 @@ class OAuthPoller: ObservableObject {
                 }
             }
 
-            guard n > 0 else { return nil }
+            guard n > 0 || excludedHostLocal > 0 else { return nil }
 
             let header = """
                 # Claude Monitor accounts — \(n) account(s)
                 # Paste into the app (Add Account → Bulk Import) or save as ~/.claude-monitor/accounts.env
 
                 """
-            return (header + lines.joined(separator: "\n") + "\n", n)
+            return (header + lines.joined(separator: "\n") + "\n", n, excludedHostLocal)
         } catch {
             flog.error("exportAccountsEnv failed: \(error.localizedDescription)", category: fcat)
             return nil
