@@ -17,7 +17,7 @@ jobs:
   build-macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The macos-14 image's *default* Xcode is 15.x, whose Swift predates
       # language mode 6 and rejects Package.swift's `-swift-version 6`
@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.1
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install SQLite dev headers
         run: apt-get update && apt-get install -y libsqlite3-dev
