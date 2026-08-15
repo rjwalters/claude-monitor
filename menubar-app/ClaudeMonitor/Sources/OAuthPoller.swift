@@ -95,17 +95,6 @@ struct OAuthCredential {
         self.isActive = isActive
         self.codexHome = codexHome
     }
-
-    /// This credential in the provider-agnostic shape a `UsageProviderClient`
-    /// consumes. nil when there is no access token to present.
-    var providerCredentials: ProviderCredentials? {
-        guard let accessToken = accessToken else { return nil }
-        return ProviderCredentials(
-            accessToken: accessToken,
-            refreshToken: refreshToken,
-            expiresAt: tokenExpiresAt
-        )
-    }
 }
 
 /// Raised when a credential's access token is past expiry and could not be
