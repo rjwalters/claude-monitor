@@ -944,10 +944,6 @@ class OAuthPoller: ObservableObject {
         }
     }
 
-    var hasCredentials: Bool {
-        !loadActiveCredentials().isEmpty
-    }
-
     // MARK: - Token Rolling Support
 
     /// The active access token currently stored for an account, if any.

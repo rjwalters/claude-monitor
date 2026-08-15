@@ -35,19 +35,6 @@ struct PingResponse {
     /// Weekly utilization as percentage (0–100)
     var weeklyPercent: Double { (weeklyUtilization ?? 0) * 100 }
 
-    /// Whether this account is currently rate-limited
-    var isRateLimited: Bool { overallStatus == "rejected" }
-
-    /// Session reset as ISO 8601 string (for DB storage)
-    var sessionResetISO: String? {
-        sessionReset.map { ISO8601DateFormatter().string(from: $0) }
-    }
-
-    /// Weekly reset as ISO 8601 string (for DB storage)
-    var weeklyResetISO: String? {
-        weeklyReset.map { ISO8601DateFormatter().string(from: $0) }
-    }
-
     /// This ping expressed in the shared, provider-agnostic window model.
     ///
     /// A window is present only when the corresponding header family actually
