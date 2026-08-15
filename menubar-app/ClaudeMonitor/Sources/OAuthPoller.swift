@@ -133,6 +133,11 @@ struct EnvImportResult {
 class OAuthPoller: ObservableObject {
     private let apiClient = AnthropicAPIClient()
     private let openAIClient = OpenAIAPIClient()
+    /// Tier 1 of the OpenAI read ladder (see `pollOpenAI`): asks the locally
+    /// installed Codex CLI, so no OpenAI credential is read, stored, or
+    /// refreshed by this app. `codexHome: nil` means "whatever this process
+    /// inherited" — resolving a different home per account is issue #103.
+    private let codexAppServerClient = CodexAppServerClient()
     @Published var lastError: String?
     @Published var credentialStatuses: [CredentialStatus] = []
 
@@ -150,6 +155,11 @@ class OAuthPoller: ObservableObject {
     }
 
     /// The client that speaks a given provider's protocol.
+    ///
+    /// `.openai` resolves to the HTTP client, not `codexAppServerClient`: this
+    /// is the *credential-shaped* surface (`refreshCredentials` in particular),
+    /// and the app-server transport deliberately has no credential to refresh.
+    /// Transport selection for reads happens in `pollOpenAI`'s tier ladder.
     private func client(for provider: AccountProvider) -> UsageProviderClient {
         switch provider {
         case .anthropic: return apiClient
@@ -905,9 +915,78 @@ class OAuthPoller: ObservableObject {
         }
     }
 
+    /// Read one OpenAI/Codex account, preferring the transport that touches the
+    /// fewest credentials.
+    ///
+    /// OpenAI rotates the refresh token on every use and supports exactly one
+    /// `auth.json` per machine, so *any* copy this app keeps is a copy that will
+    /// eventually invalidate Codex CLI's — and vice versa. The ladder is ordered
+    /// by how little credential handling each rung needs:
+    ///
+    /// 1. **`codex app-server`** — the Codex CLI owns the credential entirely;
+    ///    we read nothing. Preferred whenever the binary resolves and the RPC
+    ///    answers.
+    /// 2. **`auth.json` at request time** — read the current bearer, use it once,
+    ///    never write it back and never refresh it. Removes the rotation race
+    ///    even without the RPC.
+    /// 3. **Stored credential** — today's exact behaviour, proactive refresh
+    ///    included. Last resort; issue #104 deletes it.
+    ///
+    /// A tier that is merely *unavailable* (no codex binary, codex too old, no
+    /// `auth.json`) never marks the account unhealthy — it falls through
+    /// silently. Only the last tier's own failure sets a status.
     private func pollOpenAI(_ credential: OAuthCredential) async throws {
+        // The account id is not on the app-server wire at all, so the stored one
+        // is what the higher tiers write against.
+        let storedAccountId = credential.accountId.flatMap { $0.isEmpty ? nil : $0 }
+
+        // MARK: Tier 1 — codex app-server (no credential touched)
+        if let storedAccountId = storedAccountId {
+            do {
+                let snapshot = try await codexAppServerClient.fetchUsage()
+                // The reading is only this account's if the local Codex login is
+                // this account. Verified after the fact rather than before it
+                // because `account/read` is the only place that identity exists.
+                if codexHomeConflicts(with: credential, reportedEmail: snapshot.email) {
+                    noteCodexIdentityConflict(credential)
+                } else {
+                    writeSnapshotToDB(accountId: storedAccountId, snapshot: snapshot)
+                    updateCredentialLastPoll(credential, error: nil)
+                    updateCredentialStatus(credential, status: .valid, error: nil)
+                    await MainActor.run { self.lastError = nil }
+                    return
+                }
+            } catch let error as CodexAppServerError {
+                noteCodexFallback(credential, error)
+            } catch {
+                flog.warning("codex app-server read failed for \(credential.label): \(error.localizedDescription) — falling back", category: fcat)
+            }
+        }
+
+        // MARK: Tier 2 — bearer read from auth.json at request time
+        //
+        // Read, used once, and dropped: never persisted, never refreshed. That
+        // alone removes the rotation race, so it is worth trying before the
+        // stored copy even when the RPC is unavailable.
+        if let live = try? CodexAuth.load(), let storedAccountId = storedAccountId,
+           !codexHomeConflicts(with: credential, reportedAccountId: live.accountId) {
+            do {
+                let snapshot = try await openAIClient.fetchUsage(accessToken: live.accessToken)
+                writeSnapshotToDB(accountId: storedAccountId, snapshot: snapshot)
+                updateCredentialLastPoll(credential, error: nil)
+                updateCredentialStatus(credential, status: .valid, error: nil)
+                await MainActor.run { self.lastError = nil }
+                return
+            } catch {
+                flog.warning("auth.json bearer read failed for \(credential.label): \(error.localizedDescription) — falling back to the stored credential", category: fcat)
+            }
+        }
+
+        // MARK: Tier 3 — stored credential (unchanged; removed by #104)
         guard let stored = credential.providerCredentials else {
-            updateCredentialStatus(credential, status: .missing, error: "No access token")
+            let reason = pendingCodexFailure(credential)?.localizedDescription ?? "No access token"
+            let status = pendingCodexFailure(credential)?.tokenStatus ?? .missing
+            updateCredentialStatus(credential, status: status, error: reason)
             throw AnthropicAPIError.unauthorized
         }
 
@@ -920,7 +999,7 @@ class OAuthPoller: ObservableObject {
 
         // Prefer the stored account_id; fall back to the one the response
         // carries so a credential imported before identification still lands.
-        let accountId = credential.accountId.flatMap { $0.isEmpty ? nil : $0 } ?? snapshot.accountKey
+        let accountId = storedAccountId ?? snapshot.accountKey
         guard !accountId.isEmpty else {
             flog.warning("Credential \(credential.label) has no account_id", category: fcat)
             return
@@ -942,6 +1021,105 @@ class OAuthPoller: ObservableObject {
 
         await MainActor.run {
             self.lastError = nil
+        }
+    }
+
+    // MARK: - Codex app-server fallback bookkeeping
+
+    /// The last tier-1 failure per credential, kept only so a *total* failure
+    /// (every tier down) can report the most actionable reason — "Codex home not
+    /// logged in" beats "No access token". Cleared implicitly: a later success
+    /// never reads it.
+    private var lastCodexFailure: [Int64: CodexAppServerError] = [:]
+    /// Capability gaps are logged once per credential, not once per poll: a host
+    /// without `codex` installed would otherwise write the same line every
+    /// interval, forever.
+    private var loggedCodexCapabilityGap: Set<Int64> = []
+
+    private func noteCodexFallback(_ credential: OAuthCredential, _ error: CodexAppServerError) {
+        guard let id = credential.id else { return }
+        lastCodexFailure[id] = error
+
+        if error.isCapabilityGap {
+            // Not an account failure — verified: codex 0.46.0 answers -32600
+            // identically for an unsupported method and a bogus one, so this
+            // signal can only ever mean "this transport is unavailable here".
+            if loggedCodexCapabilityGap.insert(id).inserted {
+                flog.info("codex app-server unavailable for \(credential.label): \(error.localizedDescription) — using the fallback path", category: fcat)
+            }
+        } else {
+            flog.warning("codex app-server: \(error.localizedDescription) — falling back for \(credential.label)", category: fcat)
+        }
+    }
+
+    private func pendingCodexFailure(_ credential: OAuthCredential) -> CodexAppServerError? {
+        credential.id.flatMap { lastCodexFailure[$0] }
+    }
+
+    // MARK: - Codex home identity guard
+
+    /// Credentials whose Codex home demonstrably belongs to someone else, logged
+    /// once rather than every poll.
+    private var loggedCodexIdentityConflict: Set<Int64> = []
+
+    /// True when the local Codex login demonstrably belongs to a **different**
+    /// account than this credential.
+    ///
+    /// Tiers 1 and 2 both read whichever `CODEX_HOME` this process inherited,
+    /// and that single home speaks for exactly one account. On a host with two
+    /// OpenAI accounts, attributing its reading to both would overwrite one
+    /// account's usage with a stranger's — a silent data corruption, since the
+    /// numbers look perfectly plausible. Resolving a *different* home per
+    /// account is issue #103; until it lands, a demonstrated conflict is enough
+    /// to leave this account on its own stored credential.
+    ///
+    /// Deliberately asymmetric: only a **contradiction** disqualifies a tier.
+    /// Absent identity on either side proves nothing, so the ordinary
+    /// single-account host — where neither the row nor the wire need carry an
+    /// email — keeps using the preferred transport.
+    private func codexHomeConflicts(with credential: OAuthCredential, reportedEmail: String?) -> Bool {
+        guard let accountId = credential.accountId, !accountId.isEmpty else { return false }
+        return Self.identitiesConflict(reportedEmail, storedEmail(for: accountId))
+    }
+
+    /// Same guard for tier 2, where `auth.json` carries an account id rather
+    /// than an email. Both sides are the ChatGPT `account_id`, so a mismatch is
+    /// as conclusive as the email one.
+    private func codexHomeConflicts(with credential: OAuthCredential, reportedAccountId: String?) -> Bool {
+        Self.identitiesConflict(reportedAccountId, credential.accountId)
+    }
+
+    /// Two identity strings that are both known and disagree. Pure function of
+    /// its arguments so the self-test can pin the asymmetry directly.
+    nonisolated static func identitiesConflict(_ lhs: String?, _ rhs: String?) -> Bool {
+        func normalized(_ value: String?) -> String? {
+            let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return (trimmed?.isEmpty == false) ? trimmed : nil
+        }
+        guard let lhs = normalized(lhs), let rhs = normalized(rhs) else { return false }
+        return lhs != rhs
+    }
+
+    /// The email recorded on an account row, used only to tell two OpenAI
+    /// accounts apart. Never logged.
+    private func storedEmail(for accountId: String) -> String? {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
+        do {
+            let db = try openDatabase(dbPath, readonly: true)
+            return try db.scalar("SELECT email FROM accounts WHERE id = ?", accountId) as? String
+        } catch {
+            flog.error("storedEmail failed: \(error.localizedDescription)", category: fcat)
+            return nil
+        }
+    }
+
+    private func noteCodexIdentityConflict(_ credential: OAuthCredential) {
+        guard let id = credential.id else { return }
+        if loggedCodexIdentityConflict.insert(id).inserted {
+            flog.info(
+                "codex app-server reports a different account than \(credential.label) — this host's CODEX_HOME belongs to another login, using the stored credential instead (per-account CODEX_HOME is issue #103)",
+                category: fcat
+            )
         }
     }
 

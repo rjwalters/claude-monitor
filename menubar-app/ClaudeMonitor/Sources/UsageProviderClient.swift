@@ -130,6 +130,13 @@ protocol UsageProviderClient: AnyObject, Sendable {
     var provider: AccountProvider { get }
 
     /// Fetch the current rate-limit state for a credential.
+    ///
+    /// A conformer whose **transport owns the credential** may ignore
+    /// `credentials` entirely, and that is a supported shape rather than a bug:
+    /// `CodexAppServerClient` shells out to the Codex CLI, which holds and
+    /// renews the OpenAI token itself, so there is nothing for this app to pass
+    /// in. Such a conformer must say so at its override, and should also expose
+    /// a method with the honest signature for callers that can use it.
     func fetchUsage(_ credentials: ProviderCredentials) async throws -> ProviderUsageSnapshot
 
     /// Determine which account a credential belongs to, ideally without
