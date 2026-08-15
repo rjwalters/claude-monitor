@@ -4,6 +4,12 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #159** (closed): Dedup pointing-hand cursor onHover into a single View modifier
+- **PR #163**: refactor: extract pointing-hand hover cursor into a View modifier
+- **Issue #156** (closed): Menubar status-item badge is not gated by staleness or drift
+- **PR #161**: fix: gate menubar badge percentage on staleness and credential drift
+- **Issue #157** (closed): Remove two dead-code items: RateLimitWindow.remainingPercent, RollTokenView's unused store param
+- **PR #160**: refactor: remove unused RateLimitWindow.remainingPercent and RollTokenView store param
 - **Issue #147** (closed): Adopt a re-logged-in Codex identity instead of freezing: the app should follow a codex login switch
 - **PR #158**: feat: adopt a re-logged-in Codex identity instead of freezing
 - **Issue #148** (closed): No row should present a stale figure as current: a cause-independent freshness guarantee
