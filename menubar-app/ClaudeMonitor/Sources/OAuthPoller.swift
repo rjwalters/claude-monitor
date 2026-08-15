@@ -302,6 +302,43 @@ class OAuthPoller: ObservableObject {
         return nativeId
     }
 
+    /// Which existing `provider = 'openai'` account row (if any) an identity
+    /// belongs to — the read half of re-attribution (#147). Same precedence
+    /// `resolveOpenAIAccountId` already uses for a fresh import (native id,
+    /// the stable key `codex add --home` registers by, then email), so an
+    /// automatic re-attribution and a manual `codex add --home` can never
+    /// disagree about which row an identity belongs to. Unlike
+    /// `resolveOpenAIAccountId`, this returns `nil` — not a guessed id —
+    /// when nothing matches, so the caller can tell "reuse this row" apart
+    /// from "nothing exists yet, mint one."
+    // Pure function of its arguments (plus the module-level `flog`) — touches
+    // no instance/class main-actor state.
+    nonisolated static func lookupOpenAIAccountId(nativeId: String?, email: String?, db: Connection) -> String? {
+        do {
+            if let nativeId, !nativeId.isEmpty {
+                if let id = try db.scalar(
+                    "SELECT id FROM accounts WHERE id = ? AND COALESCE(provider, 'anthropic') = 'openai'",
+                    nativeId
+                ) as? String, !id.isEmpty {
+                    return id
+                }
+            }
+            if let email, !email.isEmpty {
+                if let id = try db.scalar("""
+                    SELECT id FROM accounts
+                    WHERE email = ? AND COALESCE(provider, 'anthropic') = 'openai'
+                    ORDER BY last_updated DESC
+                    LIMIT 1
+                """, email) as? String, !id.isEmpty {
+                    return id
+                }
+            }
+        } catch {
+            flog.error("lookupOpenAIAccountId: \(error.localizedDescription)", category: fcat)
+        }
+        return nil
+    }
+
     /// Import the credential Codex CLI stores at `~/.codex/auth.json` (or
     /// `$CODEX_HOME/auth.json`). `path` overrides the location — the self-test
     /// and CLI pass an explicit scratch path rather than relying on a `HOME`
@@ -1200,10 +1237,11 @@ class OAuthPoller: ObservableObject {
 
         // MARK: Tier 1 — codex app-server (no credential touched)
         if let storedAccountId = storedAccountId, home.allowsHomeRead {
+            let client = CodexAppServerClient(codexHome: home.readableHome)
             do {
                 // A nil `codexHome` is the `.ambient` case — the client then
                 // falls back to `$CODEX_HOME`, else `~/.codex`, as before.
-                let snapshot = try await CodexAppServerClient(codexHome: home.readableHome).fetchUsage()
+                let snapshot = try await client.fetchUsage()
                 // Belt and braces on top of the per-account home: a registered
                 // home that has since been re-logged-in as somebody else, or an
                 // ambient home that never belonged to this account, still gets
@@ -1215,10 +1253,15 @@ class OAuthPoller: ObservableObject {
                     // same conflict or, worse, let the "every tier exhausted"
                     // path below bury it behind an unrelated "No access
                     // token"/"revoked" state (#146).
-                    noteCodexIdentityConflict(
-                        credential,
-                        homeAccountId: CodexAuth.accountId(inHome: home.readableHome),
-                        homeEmail: snapshot.email
+                    let homeAccountId = CodexAuth.accountId(inHome: home.readableHome)
+                    noteCodexIdentityConflict(credential, homeAccountId: homeAccountId, homeEmail: snapshot.email)
+                    // #147: the operator's `codex login` already expressed the
+                    // intent — follow it. The snapshot this tier already
+                    // fetched is the new identity's own reading, so it is
+                    // written immediately rather than waiting a cycle.
+                    adoptDriftedIdentity(
+                        homeAccountId: homeAccountId, homeEmail: snapshot.email,
+                        home: client.effectiveCodexHome, snapshot: snapshot
                     )
                     return
                 }
@@ -1250,6 +1293,15 @@ class OAuthPoller: ObservableObject {
                 // rather than left to fall through, for the same reason as
                 // tier 1's own conflict branch.
                 noteCodexIdentityConflict(credential, homeAccountId: live.accountId, homeEmail: nil)
+                // #147: same re-attribution as tier 1. No snapshot is in hand
+                // here (only the auth.json bearer was read, not used yet), so
+                // the adopted row picks up fresh numbers on its own next poll
+                // rather than triggering a second network round-trip inline.
+                adoptDriftedIdentity(
+                    homeAccountId: live.accountId, homeEmail: nil,
+                    home: (CodexAuth.authPath(inHome: home.readableHome) as NSString).deletingLastPathComponent,
+                    snapshot: nil
+                )
                 return
             }
             do {
@@ -1635,6 +1687,95 @@ class OAuthPoller: ObservableObject {
             homeEmail: homeEmail
         )
         updateCredentialStatus(credential, status: .drifted, error: Self.driftDetailMessage(for: credential, drift: drift))
+    }
+
+    // MARK: - Re-attribution: follow a codex login switch (#147)
+
+    /// Account ids already reported as adopted, logged once rather than
+    /// every poll that still finds the same drift standing.
+    private var loggedCodexAdoption: Set<String> = []
+
+    /// Re-attribute a drifted Codex home to the identity actually logged in
+    /// there, instead of leaving it frozen (#147): the operator's `codex
+    /// login` already expressed the intent, so the app follows it rather
+    /// than waiting for a second manual `codex add --home`.
+    ///
+    /// - An existing `provider = 'openai'` row for `homeAccountId`/
+    ///   `homeEmail` is repointed — `codex_home` becomes `home` and its
+    ///   credential is reactivated — so it is picked up by
+    ///   `loadActiveCredentials` and resumes polling on the very next cycle.
+    ///   This is "point that row at this home," never a copy: the row's
+    ///   history, id, and every other column are untouched.
+    /// - No existing row means one is registered here, in the exact shape
+    ///   `codex add --home`/`registerCodexHome` produces — the same
+    ///   `saveCodexHomeAccount` write path — so a manual and an automatic
+    ///   registration can never disagree about the row's shape. Converting a
+    ///   placeholder row (#135: `provider = openai`, `codex_home IS NULL`, no
+    ///   credential) is exactly the "existing row" branch above, since the
+    ///   email lookup does not require a credential to already exist — so
+    ///   logging into a placeholder's identity lands on that one row, not a
+    ///   second one.
+    ///
+    /// Deliberately keyed **only** by the identity the home itself just
+    /// reported (`homeAccountId`/`homeEmail`) — never by `credential`, the
+    /// *previous* tenant of this home. Every caller only reaches this
+    /// function after `codexHomeConflicts` has already established that the
+    /// reported identity disagrees with `credential`'s own, so the row this
+    /// resolves to can never be `credential`'s row — the #103 safety
+    /// property (never write one identity's usage onto another identity's
+    /// row) holds structurally, under any polling order, because this
+    /// function never has `credential`'s own account id in hand to write to.
+    ///
+    /// A cheap read-only check runs first so the overwhelmingly common case —
+    /// a *steady* drifted state, unchanged since the last poll that already
+    /// adopted it — costs one `SELECT`, not a repeated write or log line,
+    /// once the matched row already agrees with `home`.
+    ///
+    /// Not private: exercised directly by SelfTest, which drives the two
+    /// branches (adopt into an existing row / register a new one) and the
+    /// #103 non-overwrite property through this exact method rather than
+    /// spawning a real `codex` subprocess — same pattern as
+    /// `noteCodexIdentityConflict`.
+    func adoptDriftedIdentity(
+        homeAccountId: String?, homeEmail: String?, home: String, snapshot: ProviderUsageSnapshot?
+    ) {
+        let normalizedHome = Self.normalizeCodexHome(home)
+        let trimmedNativeId = homeAccountId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let nativeId = (trimmedNativeId?.isEmpty == false) ? trimmedNativeId : nil
+        let trimmedEmail = homeEmail?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let email = (trimmedEmail?.isEmpty == false) ? trimmedEmail : nil
+        // Nothing to key a row on — extremely unlikely (a conflict was only
+        // just raised from one of these two), but fail closed rather than
+        // mint an unattributable row.
+        guard nativeId != nil || email != nil else { return }
+        guard FileManager.default.fileExists(atPath: dbPath),
+              let db = try? openDatabase(dbPath, readonly: true) else { return }
+
+        let existingId = Self.lookupOpenAIAccountId(nativeId: nativeId, email: email, db: db)
+        if let existingId {
+            let currentHome = (try? db.scalar(
+                "SELECT codex_home FROM accounts WHERE id = ?", existingId
+            )) as? String
+            if currentHome.map(Self.normalizeCodexHome) == normalizedHome {
+                return  // already adopted — nothing has changed since the last poll
+            }
+        }
+
+        let accountId = existingId ?? nativeId ?? "openai-\(UUID().uuidString.lowercased())"
+        let isNewRow = existingId == nil
+
+        saveCodexHomeAccount(accountId: accountId, email: email, plan: snapshot?.plan, codexHome: normalizedHome)
+        if let snapshot {
+            writeSnapshotToDB(accountId: accountId, snapshot: snapshot)
+        }
+
+        if loggedCodexAdoption.insert(accountId).inserted {
+            let action = isNewRow ? "registered a new account for it" : "repointed the existing account"
+            flog.info(
+                "codex home re-attribution: \(redactHomePath(normalizedHome)) is now logged in as a different identity — \(action) (\(accountId.prefix(8))…). Its previous account keeps its history and no longer reads as current.",
+                category: fcat
+            )
+        }
     }
 
     /// The hover/detail text for a drifted row: names the identity the home

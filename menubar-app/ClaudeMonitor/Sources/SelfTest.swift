@@ -85,6 +85,11 @@ enum SelfTest {
         testCodexIdentityConflictSetsAndClearsDriftedState()
         testCodexHomeResolution()
         testCodexHomeRegistrationEnumeration()
+        testCodexAdoptionRepointsExistingRow()
+        testCodexAdoptionRegistersNewAccountWhenNoneExists()
+        testCodexAdoptionSkipsAlreadyAdoptedHome()
+        testCodexAdoptionIgnoresAnthropicRowsForEmailMatch()
+        testCodexAdoptionConvertsPlaceholderRowWithoutDuplicating()
         testCodexListDiscoversUnregisteredHomes()
         testCodexAppServerSpawnAgainstStub()
         testCodexPerAccountHomeReachesChild()
@@ -1662,6 +1667,259 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("codex home registration test threw: \(error)")
+            }
+        }
+    }
+
+    /// Builds a fixture `ProviderUsageSnapshot` for the adoption tests below —
+    /// only the fields `adoptDriftedIdentity` actually reads (`email`, `plan`,
+    /// one window's `usedPercent`) need to vary between fixtures.
+    private static func makeCodexSnapshot(accountKey: String, email: String?, plan: String?, usedPercent: Double) -> ProviderUsageSnapshot {
+        ProviderUsageSnapshot(
+            provider: .openai, accountKey: accountKey, httpStatus: 200,
+            rateLimit: RateLimitSnapshot(windows: [RateLimitWindow(usedPercent: usedPercent, durationSeconds: 604800)]),
+            email: email, plan: plan
+        )
+    }
+
+    /// #147, core scenario: a home registered to identity A gets `codex
+    /// login`'d as identity B, and B **already has an account row** (e.g.
+    /// from a prior explicit `codex add --home` elsewhere). The row must be
+    /// reused — repointed at this home — never duplicated, and identity A's
+    /// row must never receive B's numbers.
+    ///
+    /// Drives the real production methods (`noteCodexIdentityConflict`,
+    /// `adoptDriftedIdentity`) exactly as the two `pollOpenAI` call sites do,
+    /// rather than reimplementing the logic here — same pattern
+    /// `testCodexIdentityConflictSetsAndClearsDriftedState` already uses.
+    private static func testCodexAdoptionRepointsExistingRow() {
+        withSelfTestTempDir("adopt-existing") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+
+                let home = "/tmp/selftest-adopt-home-\(UUID().uuidString)"
+
+                // Identity A: registered against `home`.
+                poller.saveCodexHomeAccount(accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: home)
+                // Identity B: already has its own row, registered elsewhere.
+                poller.saveCodexHomeAccount(accountId: "user-bbb", email: "b@example.com", plan: "plus", codexHome: "/tmp/selftest-adopt-home-b-old")
+
+                let credentialA = OAuthCredential(
+                    id: 1, accountId: "user-aaa", provider: .openai, label: "a@example.com",
+                    source: "codex-home", accessToken: nil, refreshToken: nil, expiresAt: nil,
+                    subscriptionType: nil, rateLimitTier: nil, isActive: true, codexHome: home
+                )
+
+                // The home now answers as identity B — what tier 1/2 observes
+                // after `codex login` switched it, snapshot already in hand.
+                let snapshot = makeCodexSnapshot(accountKey: "user-bbb", email: "b@example.com", plan: "plus", usedPercent: 55)
+
+                poller.noteCodexIdentityConflict(credentialA, homeAccountId: "user-bbb", homeEmail: "b@example.com")
+                poller.adoptDriftedIdentity(homeAccountId: "user-bbb", homeEmail: "b@example.com", home: home, snapshot: snapshot)
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 2,
+                            "adoption reuses identity B's existing row — no third row appears")
+                expectEqual(try db.scalar("SELECT codex_home FROM accounts WHERE id = 'user-bbb'") as? String, home,
+                            "identity B's row is repointed at the home that now belongs to it")
+                expectEqual(try db.scalar("SELECT codex_home FROM accounts WHERE id = 'user-aaa'") as? String, home,
+                            "identity A's own row is untouched — same home path, so it keeps reporting drift")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'user-bbb'") as? Int64, 1,
+                            "repointing reuses B's existing credential row rather than adding a sibling")
+
+                // B's row is now live and pollable on the next cycle.
+                let credentials = poller.loadActiveCredentials()
+                expect(credentials.contains { $0.accountId == "user-bbb" && $0.codexHome == home },
+                       "identity B is picked up by the poll loop as soon as it is adopted")
+
+                // B's fresh reading landed on B's row, written immediately
+                // since the snapshot was already in hand (tier 1's case)...
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = 'user-bbb'") as? Int64, 1,
+                            "the snapshot already in hand is written immediately, not deferred a cycle")
+                // ...and NEVER on A's row — the #103 safety property.
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = 'user-aaa'") as? Int64, 0,
+                            "identity A's row is never written with B's numbers")
+
+                let aStatus = poller.credentialStatuses.first { $0.id == 1 }
+                expectEqual(aStatus?.status, TokenStatus.drifted,
+                            "identity A's row stops claiming to be current rather than being deleted")
+            } catch {
+                checks += 1
+                failures.append("codex adoption (existing row) test threw: \(error)")
+            }
+        }
+    }
+
+    /// #147: the home's new identity has **no** existing row at all — one is
+    /// registered on the spot, in the same shape `codex add --home` produces
+    /// (`saveCodexHomeAccount`, the same write path `registerCodexHome`
+    /// itself calls), so a manual and an automatic registration can never
+    /// disagree about the row's shape.
+    private static func testCodexAdoptionRegistersNewAccountWhenNoneExists() {
+        withSelfTestTempDir("adopt-new") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+
+                let home = "/tmp/selftest-adopt-new-home-\(UUID().uuidString)"
+                poller.saveCodexHomeAccount(accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: home)
+
+                let credentialA = OAuthCredential(
+                    id: 1, accountId: "user-aaa", provider: .openai, label: "a@example.com",
+                    source: "codex-home", accessToken: nil, refreshToken: nil, expiresAt: nil,
+                    subscriptionType: nil, rateLimitTier: nil, isActive: true, codexHome: home
+                )
+
+                let snapshot = makeCodexSnapshot(accountKey: "user-ccc", email: "c@example.com", plan: "team", usedPercent: 10)
+
+                poller.noteCodexIdentityConflict(credentialA, homeAccountId: "user-ccc", homeEmail: "c@example.com")
+                poller.adoptDriftedIdentity(homeAccountId: "user-ccc", homeEmail: "c@example.com", home: home, snapshot: snapshot)
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 2,
+                            "exactly one new row is created for the unknown identity")
+                expectEqual(try db.scalar("SELECT codex_home FROM accounts WHERE id = 'user-ccc'") as? String, home,
+                            "the new row is registered against the home it was actually read from")
+                expectEqual(try db.scalar("SELECT COALESCE(provider,'anthropic') FROM accounts WHERE id = 'user-ccc'") as? String, "openai",
+                            "the new row is an OpenAI account, same as a manual `codex add --home`")
+                expectEqual(try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'user-ccc'") as? String, nil,
+                            "no token is read, copied, or stored — same guarantee `codex add --home` makes")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = 'user-ccc'") as? Int64, 1,
+                            "the new row's own snapshot is written immediately")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = 'user-aaa'") as? Int64, 0,
+                            "identity A's row is never written with the new identity's numbers")
+            } catch {
+                checks += 1
+                failures.append("codex adoption (new row) test threw: \(error)")
+            }
+        }
+    }
+
+    /// #147: a steady drifted state — nothing has changed since the last
+    /// poll that already adopted this home — must not repeat the write (or
+    /// stomp a fresher reading the newly-adopted row picked up on its own
+    /// regular poll cycle in between).
+    private static func testCodexAdoptionSkipsAlreadyAdoptedHome() {
+        withSelfTestTempDir("adopt-idempotent") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+
+                let home = "/tmp/selftest-adopt-steady-home-\(UUID().uuidString)"
+                poller.saveCodexHomeAccount(accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: home)
+
+                let firstSnapshot = makeCodexSnapshot(accountKey: "user-bbb", email: "b@example.com", plan: "plus", usedPercent: 20)
+                poller.adoptDriftedIdentity(homeAccountId: "user-bbb", homeEmail: "b@example.com", home: home, snapshot: firstSnapshot)
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = 'user-bbb'") as? Int64, 1,
+                            "the first adoption writes the snapshot once")
+
+                // A later poll cycle for credential A finds the exact same
+                // conflict standing (nothing has changed) and calls adoption
+                // again, as `pollOpenAI` would every cycle.
+                let secondSnapshot = makeCodexSnapshot(accountKey: "user-bbb", email: "b@example.com", plan: "plus", usedPercent: 99)
+                poller.adoptDriftedIdentity(homeAccountId: "user-bbb", homeEmail: "b@example.com", home: home, snapshot: secondSnapshot)
+
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = 'user-bbb'") as? Int64, 1,
+                            "a steady drifted state is a no-op, not a repeated write — B's own poll cycle owns its data now")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'user-bbb'") as? Int64, 1,
+                            "no duplicate credential row is created on the repeated call either")
+            } catch {
+                checks += 1
+                failures.append("codex adoption (idempotent) test threw: \(error)")
+            }
+        }
+    }
+
+    /// #147 AC: Anthropic accounts are unaffected. A same-email Anthropic row
+    /// must never be matched (or repointed) by an OpenAI identity lookup —
+    /// `lookupOpenAIAccountId` is provider-scoped, same guard
+    /// `resolveOpenAIAccountId` and `AccountSync.importAccount` already apply.
+    private static func testCodexAdoptionIgnoresAnthropicRowsForEmailMatch() {
+        withSelfTestTempDir("adopt-anthropic") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+
+                let home = "/tmp/selftest-adopt-anthropic-home-\(UUID().uuidString)"
+                poller.saveCodexHomeAccount(accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: home)
+
+                // An Anthropic account that happens to share the reported
+                // email — must never be touched by this OpenAI-only path.
+                let now = ISO8601DateFormatter().string(from: Date())
+                try openDatabase(dbPath).run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('org-shared-email', 'shared@example.com', 'shared@example.com', 'Max', ?, 5, 'anthropic')
+                """, now)
+
+                let snapshot = makeCodexSnapshot(accountKey: "user-ddd", email: "shared@example.com", plan: "plus", usedPercent: 30)
+                poller.adoptDriftedIdentity(homeAccountId: "user-ddd", homeEmail: "shared@example.com", home: home, snapshot: snapshot)
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT codex_home FROM accounts WHERE id = 'org-shared-email'") as? String, nil,
+                            "the Anthropic row's codex_home is never set — it is not a match candidate")
+                expectEqual(try db.scalar("SELECT COALESCE(provider,'anthropic') FROM accounts WHERE id = 'org-shared-email'") as? String, "anthropic",
+                            "the Anthropic row's provider is untouched")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = 'org-shared-email'") as? Int64, 0,
+                            "the Anthropic row never receives the OpenAI identity's numbers")
+                // A fresh OpenAI row was minted instead of reusing the Anthropic one.
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = 'user-ddd'") as? Int64, 1,
+                            "the OpenAI identity gets its own row rather than being folded into the Anthropic one")
+            } catch {
+                checks += 1
+                failures.append("codex adoption (Anthropic unaffected) test threw: \(error)")
+            }
+        }
+    }
+
+    /// #147 AC: converting a #135-style placeholder row (`provider = openai`,
+    /// `codex_home IS NULL`, no credential row) by logging in produces one
+    /// row, not two. The email-based lookup `adoptDriftedIdentity` uses does
+    /// not require a credential to already exist, so a placeholder is just
+    /// the "existing row" branch — this pins that it stays one row even
+    /// though the placeholder was never created via `saveCodexHomeAccount`
+    /// (which always creates a credential row too).
+    private static func testCodexAdoptionConvertsPlaceholderRowWithoutDuplicating() {
+        withSelfTestTempDir("adopt-placeholder") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+
+                let home = "/tmp/selftest-adopt-placeholder-home-\(UUID().uuidString)"
+                poller.saveCodexHomeAccount(accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: home)
+
+                // A placeholder row: an account exists, but with no home and
+                // no credential — the #135 shape.
+                let now = ISO8601DateFormatter().string(from: Date())
+                try openDatabase(dbPath).run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-placeholder', 'p@example.com', 'p@example.com', NULL, ?, 6, 'openai')
+                """, now)
+
+                let db0 = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db0.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'user-placeholder'") as? Int64, 0,
+                            "the placeholder starts with no credential row at all")
+
+                let snapshot = makeCodexSnapshot(accountKey: "user-placeholder", email: "p@example.com", plan: "plus", usedPercent: 5)
+                poller.adoptDriftedIdentity(homeAccountId: nil, homeEmail: "p@example.com", home: home, snapshot: snapshot)
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts WHERE email = 'p@example.com'") as? Int64, 1,
+                            "logging into a placeholder's identity produces one row, not two")
+                expectEqual(try db.scalar("SELECT codex_home FROM accounts WHERE id = 'user-placeholder'") as? String, home,
+                            "the placeholder converts to a live, home-registered account")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'user-placeholder'") as? Int64, 1,
+                            "adoption backfills the credential row a placeholder never had")
+            } catch {
+                checks += 1
+                failures.append("codex adoption (placeholder conversion) test threw: \(error)")
             }
         }
     }
