@@ -931,12 +931,6 @@ struct UsageChartWindow: View {
         return .primary
     }
 
-    func formatTime(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        return formatter.string(from: date)
-    }
-
     func formatDateShort(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.dateFormat = "M/d"
