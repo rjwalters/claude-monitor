@@ -19,6 +19,33 @@ func formatInterval(_ seconds: TimeInterval) -> String {
     return "\(days) \(days == 1 ? "day" : "days")"
 }
 
+// MARK: - Hover cursor
+
+extension View {
+    /// Show the pointing-hand cursor while the pointer is over this view.
+    ///
+    /// Every clickable-but-not-a-system-button control in the popover (sortable
+    /// headers, the menu-bar pin, the chart button, the GitHub link) needs the
+    /// same `NSCursor.pointingHand.push()` / `NSCursor.pop()` pairing, so it
+    /// lives here once rather than being retyped at each call site — an
+    /// unbalanced push/pop leaks a cursor for the life of the app.
+    ///
+    /// - Parameter onExit: Optional extra work to run when the pointer leaves,
+    ///   after the cursor is popped. Main-actor-isolated, because the callers
+    ///   that need it are mutating view state.
+    @MainActor
+    func pointerCursorOnHover(onExit: (@MainActor () -> Void)? = nil) -> some View {
+        onHover { hovering in
+            if hovering {
+                NSCursor.pointingHand.push()
+            } else {
+                NSCursor.pop()
+                onExit?()
+            }
+        }
+    }
+}
+
 // MARK: - Column layout
 
 /// Centralized column widths so header + rows stay in lockstep.
@@ -472,14 +499,7 @@ struct UsagePopoverView: View {
                         .foregroundColor(.accentColor)
                     }
                     .buttonStyle(.plain)
-                    .onHover { hovering in
-                        if hovering {
-                            NSCursor.pointingHand.push()
-                        } else {
-                            NSCursor.pop()
-                            showGitHubLink = false
-                        }
-                    }
+                    .pointerCursorOnHover(onExit: { showGitHubLink = false })
                 } else {
                     Text("Claude Usage")
                         .font(.headline)
@@ -827,9 +847,7 @@ struct SortableHeader: View {
         .buttonStyle(.plain)
         .frame(width: width, alignment: alignment)
         .help(tooltip ?? "Sort by \(title)")
-        .onHover { hovering in
-            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-        }
+        .pointerCursorOnHover()
     }
 
     private func handleTap() {
@@ -1001,13 +1019,7 @@ struct SummaryRow: View {
                   : (isMenubarSelected
                      ? "Auto-selected (most available) — click to pin"
                      : "Click to show this account in the menu bar"))
-            .onHover { hovering in
-                if hovering {
-                    NSCursor.pointingHand.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
+            .pointerCursorOnHover()
 
             // Account name — inline-editable (double-click to rename)
             Group {
@@ -1107,13 +1119,7 @@ struct SummaryRow: View {
             .buttonStyle(.plain)
             .frame(width: SummaryColumns.chart)
             .help("Open usage history")
-            .onHover { hovering in
-                if hovering {
-                    NSCursor.pointingHand.push()
-                } else {
-                    NSCursor.pop()
-                }
-            }
+            .pointerCursorOnHover()
         }
         .font(.caption)
         .padding(.horizontal, SummaryColumns.horizontalPadding)
