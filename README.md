@@ -126,16 +126,84 @@ removed. Store these files with `chmod 600`; they contain live tokens.
 ### Adding an OpenAI (Codex) Account
 
 ChatGPT subscription accounts (Plus/Pro, the ones Codex CLI uses) are polled
-too. Their usage comes from a dedicated read-only endpoint —
-`GET https://chatgpt.com/backend-api/wham/usage`, the same one Codex CLI's own
-`/usage` command calls — so no inference request is burned to read it.
+too, and no inference request is burned to read their usage.
 
-A ChatGPT credential is not a single pasteable string (it's an access token +
-refresh token + expiry), so it's **imported** from Codex CLI's own credential
-store rather than typed in:
+**How the reading is taken.** There are three ways to ask, and the poller tries
+them in order, preferring whichever touches the fewest credentials:
+
+1. **`codex app-server`** (preferred). The app runs
+   `codex -s read-only -a untrusted app-server`, speaks JSON-RPC over its stdio,
+   and reads `account/rateLimits/read`. **Codex owns the credential end to end
+   — this app never reads, stores, or refreshes an OpenAI token on this path.**
+   Requires `codex` **0.147.0 or newer**: the method does not exist in 0.46.0
+   (the version Homebrew's formula lags at), which answers `-32600` instead.
+   Install the current CLI with `npm i -g @openai/codex`; it ships
+   `linux-x64` / `linux-arm64` binaries, so this works on headless Linux hosts
+   too.
+2. **`auth.json` at request time.** `GET https://chatgpt.com/backend-api/wham/usage`
+   — the same endpoint Codex CLI's own `/usage` command calls — with the bearer
+   read fresh out of `$CODEX_HOME/auth.json` for that one request. Never written
+   back, never refreshed.
+3. **The stored credential.** The original behaviour, refresh loop included
+   (see the rotation note below). Last resort.
+
+A tier that is merely *unavailable* — no `codex` on the host, a `codex` too old,
+no readable `auth.json` — falls through silently to the next one. Only a genuine
+failure of the last tier marks the account unhealthy.
+
+`codex` is located by absolute path, first hit wins: `$CLAUDE_MONITOR_CODEX_BIN`,
+then each `PATH` entry, then `/opt/homebrew/bin`, `/usr/local/bin`,
+`~/.local/bin`, `~/.npm-global/bin`. (A macOS app launched from Finder inherits
+launchd's minimal `PATH`, which contains neither Homebrew's nor npm's bin
+directory — hence the explicit list.) Set `CLAUDE_MONITOR_CODEX_BIN` to point at
+a specific install.
+
+**Registering an account: one `CODEX_HOME` per account.** `codex login` writes a
+single `auth.json` per home directory, so **each login overwrites the previous
+account's credential** — which is why monitoring more than one Codex account
+never worked before. Give each account its own home and register it by that
+path:
 
 ```bash
-codex login                    # once, if you haven't already
+CODEX_HOME=~/.codex-work codex login --device-auth
+claude-monitor codex add --home ~/.codex-work
+```
+
+`--device-auth` prints a code you paste into a browser on any machine, so this
+works on a **headless Linux host** with no browser at all. Repeat for as many
+accounts as you have; each poll then spawns `codex` with that account's own
+`CODEX_HOME`, so one account's numbers can never land on another's row.
+
+`codex add` **reads, copies, and stores no token.** It reads exactly one field
+out of `<home>/auth.json` — the opaque `account_id` that keys the account row —
+and asks `codex` itself for the identity and usage. The credential stays where
+Codex CLI put it.
+
+```bash
+claude-monitor codex list
+# ACCOUNT   PLAN        AUTH           CODEX_HOME
+# user-3f2… pro         logged in      /Users/you/.codex-work
+# user-91a… plus        needs login    /Users/you/.codex-personal
+```
+
+`list` reports each home's live state: **logged in**, **needs login** (the home
+exists but `codex login` hasn't been run in it), **home missing** (the directory
+is gone — re-register), or **unknown** when `codex` itself is absent or too old.
+Both commands take `--db <path>` to work against a throwaway store.
+
+An account with **no** registered home reads the ambient `$CODEX_HOME` (else
+`~/.codex`), exactly as before — which is correct as long as it is the only
+OpenAI account on the host. Add a second OpenAI account and any account still
+lacking its own home stops using the ambient one (it can speak for only one of
+them, and nothing says which); register its home to bring it back.
+
+<details>
+<summary><b>Importing a credential instead (<code>codex import</code>)</b></summary>
+
+The original path still works, for hosts without a usable `codex` binary:
+
+```bash
+codex login
 claude-monitor codex import    # or: Add Account → "Import Codex Account"
 ```
 
@@ -144,6 +212,11 @@ The importer reads `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise
 credential is validated against the live usage endpoint before it's stored, and
 the account's email, plan, and OpenAI account id all come back in that same
 response — there's no separate profile call.
+
+Prefer `codex add`: a stored copy of the credential is what the rotation note
+below is about.
+
+</details>
 
 What differs from an Anthropic row once it's added:
 
@@ -158,15 +231,21 @@ What differs from an Anthropic row once it's added:
   premium column is titled "Fable %" only when every account in the table
   is Anthropic; with any OpenAI row present it shows the neutral
   "Premium %".)
-- **Tokens expire, and are renewed for you.** An OpenAI access token lives
-  about 10 days. The poller renews it from the stored refresh token
+- **Tokens expire, and are renewed for you — on tier 3 only.** An OpenAI access
+  token lives about 10 days. When the reading comes from `codex app-server` or
+  from `auth.json`, no stored token is used and none is renewed. On the stored
+  credential path, the poller renews it from the stored refresh token
   *proactively* — 6 hours ahead of expiry, never waiting for a 401 — and the
   Token dot reports the outcome: green (healthy), **yellow** (renewal is
   failing but the current token still works; hover for the reason), **red**
   (expired and unrenewable — re-run `claude-monitor codex import`). A stale
   OpenAI account never fails silently.
 
-> **Note on refresh-token rotation.** OpenAI **does** rotate the refresh token
+> **Note on refresh-token rotation.** This applies to the **stored-credential
+> tier only**; on a host with `codex` 0.147.0+ installed and logged in, the
+> reading comes from `codex app-server` and none of the following happens.
+>
+> OpenAI **does** rotate the refresh token
 > on renewal (verified 2026-07-31). This app stores the new pair in its own
 > database and does **not** write back to `~/.codex/auth.json`, so two
 > consequences follow:
@@ -192,8 +271,9 @@ What differs from an Anthropic row once it's added:
 > and must not be shared across hosts, so **do not** copy OpenAI credentials
 > between machines; register the account on each host instead. The fix is to
 > stop holding the credential at all and read usage via `codex app-server`,
-> which owns its own auth — see #102, #103 and #104, and the 2026-08-15
-> supersession in
+> which owns its own auth — **that path now exists** (tier 1 above, #102);
+> retiring the stored credential entirely is tracked in #103 and #104. See the
+> 2026-08-15 supersession in
 > [`docs/spikes/2026-07-30-codex-usage-probe.md`](docs/spikes/2026-07-30-codex-usage-probe.md).
 
 ### Rolling a Token (revoke + re-mint)
@@ -311,6 +391,7 @@ against `/v1/messages`.
 │    - `claude setup-token` (single, paste-in)            [anthropic]      │
 │    - `.env` bulk import (ACCOUNT_EMAIL_N / ACCOUNT_KEY_N) [anthropic]    │
 │    - `claude-monitor codex import` (~/.codex/auth.json)   [openai]       │
+│    - `claude-monitor codex add --home <path>` (no token)  [openai]       │
 └────────────────────────────────┬─────────────────────────────────────────┘
                                  │ stored in
                                  ▼
@@ -672,7 +753,7 @@ claude-monitor/
 │       ├── OAuthPoller.swift       # Per-provider polling, token add/import/refresh
 │       ├── AnthropicAPI.swift      # Anthropic client (ping + rate-limit headers)
 │       ├── OpenAIAPI.swift         # OpenAI/Codex client (wham/usage + token refresh)
-│       ├── CodexCLI.swift          # `claude-monitor codex import` CLI surface
+│       ├── CodexCLI.swift          # `claude-monitor codex add|list|import` CLI surface
 │       ├── RateLimitWindow.swift   # Provider-agnostic window/snapshot model
 │       ├── UsageProviderClient.swift # UsageProviderClient protocol + credentials
 │       ├── SelfTest.swift          # `claude-monitor selftest` portable-core assertions

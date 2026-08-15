@@ -459,6 +459,62 @@ per-model sub-limits are first-class.
 Tracked in #102 (app-server client), #103 (per-account `CODEX_HOME`), #104
 (retire stored OpenAI tokens).
 
+### 4. Transport details verified while implementing #102 (2026-08-15)
+
+Captured on macOS 26.6.1 arm64 against **both** `codex-cli 0.46.0`
+(`/opt/homebrew/bin/codex`, the stale Homebrew build) and `codex-cli 0.147.0`.
+These are appended rather than folded in above, because several of them
+contradict what a textbook JSON-RPC client would assume.
+
+1. **The framing is newline-delimited JSON (JSONL), not LSP-style
+   `Content-Length:` headers.** One object per line on stdout.
+2. **Replies omit the `jsonrpc` member.** The literal `initialize` reply on
+   0.46.0 was `{"id":1,"result":{"userAgent":"codex_cli_rs/0.46.0 (…)"}}` — no
+   `"jsonrpc":"2.0"` key anywhere. A decoder that requires it rejects every
+   reply.
+3. **Server notifications carry no `id`** and must be skipped, not mistaken for
+   a reply — e.g.
+   `{"method":"remoteControl/status/changed","params":{"status":"disabled",…},"emittedAtMs":…}`
+   arrives unprompted right after `initialize` on 0.147.0.
+4. **`-32600 Invalid request` is indistinguishable from an unknown method.** On
+   0.46.0, `account/rateLimits/read`, `account/read`, and a deliberately bogus
+   `totally/bogus` all returned exactly
+   `{"error":{"code":-32600,"message":"Invalid request"},"id":N}`. A client must
+   read this as *capability absent → fall back*, never as *account unhealthy*.
+5. **An unauthenticated `CODEX_HOME` also produces `-32600`** — on 0.147.0 it
+   answers `account/read` cleanly with `{"account":null,"requiresOpenaiAuth":true}`
+   and *then* fails `account/rateLimits/read` with
+   `{"code":-32600,"message":"codex account authentication required to read rate limits"}`.
+   So (4) and (5) share a code and are disambiguated by `account/read`: a
+   non-null `account` means the home is fine, and only then can `-32600` mean
+   "this codex is too old".
+6. **`requiresOpenaiAuth` is `true` even on a logged-in home** — it is not a
+   "needs login" flag. `account == null` is the real signal, correcting the
+   reading of `{"account": null, "requiresOpenaiAuth": true}` implied above.
+7. **`account/read` carries no account id.** On 0.147.0 its result is exactly
+   `{"account":{"type","email","planType"},"requiresOpenaiAuth"}`. Identity for
+   the DB row must still come from `auth.json`'s `account_id`.
+8. **Closing the child's stdin makes `app-server` exit 0 on its own**, and it
+   writes nothing to stderr. That makes stdin-close the correct first step of
+   shutdown, ahead of SIGTERM/SIGKILL. Conversely, writing all requests and
+   closing stdin immediately truncates the session: the server exits before
+   answering the later ones, so stdin must stay open until the last reply lands.
+9. **`resetsAt` is unix epoch *seconds*** (10 digits observed) and
+   `windowDurationMins` is *minutes* — 10080 for the weekly window. `usedPercent`
+   arrives as an integer.
+10. **`rateLimitsByLimitId` repeats the top-level bucket** under its own
+    `limitId` key (`"codex"`), alongside genuine sub-limits such as
+    `codex_bengalfox` → `limitName: "GPT-5.3-Codex-Spark"`. The duplicate must be
+    skipped or it is counted twice.
+
+Two implementation hazards found the same day, recorded so they are not
+rediscovered: reading the stdout pipe into an `actor` via `Task { await … }`
+from the readability callback **reorders chunks** (unstructured tasks have no
+ordering guarantee) and intermittently corrupts the JSONL stream; and
+`Process.waitUntilExit()` spins a `CFRunLoop` on the calling thread, which hangs
+indefinitely when called from a Swift-concurrency pool thread even after the
+child has already exited. Polling `isRunning` is the portable alternative.
+
 ## References
 
 - Codex CLI: `codex-cli 0.146.0`, installed via `brew install --cask codex`

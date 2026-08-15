@@ -33,6 +33,14 @@ struct Account: Identifiable {
     let plan: String?
     let lastUpdated: Date?
     let latestPercent: Double?
+    /// This account's own `CODEX_HOME` (`provider == .openai` only), registered
+    /// by `claude-monitor codex add --home <path>`.
+    ///
+    /// **nil means "the ambient home"** — `$CODEX_HOME` if set, else `~/.codex`
+    /// — which is exactly the single-account behaviour every row had before
+    /// this column existed. Host-local by design: a home path is meaningless on
+    /// another machine, so `AccountSync` deliberately does not carry it (#103).
+    let codexHome: String?
 
     init(
         id: String,
@@ -41,7 +49,8 @@ struct Account: Identifiable {
         email: String?,
         plan: String?,
         lastUpdated: Date?,
-        latestPercent: Double?
+        latestPercent: Double?,
+        codexHome: String? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -50,6 +59,7 @@ struct Account: Identifiable {
         self.plan = plan
         self.lastUpdated = lastUpdated
         self.latestPercent = latestPercent
+        self.codexHome = codexHome
     }
 
     /// Returns the best display name for the account
@@ -261,7 +271,8 @@ class UsageStore: ObservableObject {
                 plan TEXT,
                 last_updated TEXT,
                 sort_order INTEGER DEFAULT 0,
-                provider TEXT NOT NULL DEFAULT 'anthropic'
+                provider TEXT NOT NULL DEFAULT 'anthropic',
+                codex_home TEXT
             );
             CREATE TABLE IF NOT EXISTS usage_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -361,6 +372,21 @@ class UsageStore: ObservableObject {
         addColumnIfMissing(db, table: "oauth_credentials",
                            column: "token_expires_at", definition: "TEXT")
 
+        // Migration (per-account Codex home, #103): which `CODEX_HOME` speaks
+        // for this account. Deliberately **nullable with no DEFAULT** — NULL
+        // means "the ambient home" (`$CODEX_HOME`, else `~/.codex`), so every
+        // pre-existing row keeps today's exact single-account behaviour with no
+        // user action, and `codex add --home` is the only thing that ever sets
+        // it.
+        //
+        // It lives on `accounts` rather than `oauth_credentials` because it is
+        // an identity property, not credential material: a home path holds no
+        // secret, but it *does* contain a username, so it must never be
+        // exported (`AccountSync`) or published (`ranking.json`). Both already
+        // use explicit column lists, which is what keeps this column host-local.
+        addColumnIfMissing(db, table: "accounts",
+                           column: "codex_home", definition: "TEXT")
+
         // Heal rows whose provider is absent/blank — a database edited by an
         // external tool, or one where an earlier ADD COLUMN raced.
         try? db.run("UPDATE accounts SET provider = ? WHERE provider IS NULL OR TRIM(provider) = ''",
@@ -385,6 +411,55 @@ class UsageStore: ObservableObject {
         // rows polling the same account independently (#45). Must run after
         // the email backfill above so a row healed there is eligible too.
         mergeDuplicateAccountsSharingEmail(db)
+
+        // Migration: delete credential rows whose account row is gone (#106).
+        // Pre-fix builds removed an account without its credential, stranding
+        // a plaintext token that no UI or export can reach (every one of them
+        // joins through `accounts`) — so it is never surfaced, rotated, or
+        // revoked. Must run *after* the merge above, which can itself delete
+        // an account row in the same pass.
+        purgeOrphanedCredentials(db)
+    }
+
+    /// Deletes `oauth_credentials` rows that reference an account which no
+    /// longer exists. Idempotent: a second run finds nothing left to delete.
+    ///
+    /// The declared `FOREIGN KEY (account_id) REFERENCES accounts(id)` does
+    /// not do this for us — SQLite defaults `PRAGMA foreign_keys` to OFF and
+    /// this app only ever sets `journal_mode`, so every FK in the schema is
+    /// documentation rather than enforcement.
+    ///
+    /// **The NULL/blank guard is load-bearing.** `account_id` is nullable, so
+    /// the obvious `LEFT JOIN accounts … WHERE a.id IS NULL` predicate also
+    /// matches rows that were never attached to an account — deleting those
+    /// would be an unrecoverable loss of live token material. `NOT EXISTS`
+    /// plus the explicit `IS NOT NULL` / non-blank test keeps them.
+    // Pure function of its `db` argument — touches no instance/class
+    // main-actor state, so it stays callable from the CLI/headless paths.
+    private nonisolated static func purgeOrphanedCredentials(_ db: Connection) {
+        // Counted before the delete because the SQLite wrapper here exposes no
+        // `sqlite3_changes`. Logged as a bare count — never an id, label,
+        // email, or token fragment.
+        let orphanPredicate = """
+            account_id IS NOT NULL
+              AND TRIM(account_id) != ''
+              AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = oauth_credentials.account_id)
+            """
+        do {
+            let count = try db.scalar(
+                "SELECT COUNT(*) FROM oauth_credentials WHERE \(orphanPredicate)") as? Int64 ?? 0
+            guard count > 0 else { return }
+            try db.run("DELETE FROM oauth_credentials WHERE \(orphanPredicate)")
+            FileLogger.shared.info(
+                "purgeOrphanedCredentials: purged \(count) orphaned credential row(s)",
+                category: "DB"
+            )
+        } catch {
+            FileLogger.shared.error(
+                "purgeOrphanedCredentials: purge failed: \(error)",
+                category: "DB"
+            )
+        }
     }
 
     /// Adds a column only when it isn't already there. `ALTER TABLE ... ADD
@@ -664,13 +739,18 @@ class UsageStore: ObservableObject {
             isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let nowString = isoFormatter.string(from: Date())
 
-            // Load accounts using raw SQL. `provider` is selected only when the
-            // column exists, so a database that hasn't been migrated yet (an
-            // external tool opened it first) still loads — every row then
-            // resolves to the .anthropic fallback.
-            let hasProvider = tableColumns(db, "accounts").contains("provider")
+            // Load accounts using raw SQL. `provider` and `codex_home` are
+            // selected only when the column exists, so a database that hasn't
+            // been migrated yet (an external tool opened it first) still loads —
+            // every row then resolves to the .anthropic fallback with no
+            // registered home.
+            let accountColumns = tableColumns(db, "accounts")
+            let hasProvider = accountColumns.contains("provider")
+            let hasCodexHome = accountColumns.contains("codex_home")
             let accountStmt = try db.prepare("""
-                SELECT id, account_name, email, plan, last_updated\(hasProvider ? ", provider" : "")
+                SELECT id, account_name, email, plan, last_updated,
+                       \(hasProvider ? "provider" : "NULL"),
+                       \(hasCodexHome ? "codex_home" : "NULL")
                 FROM accounts ORDER BY last_updated DESC
             """)
 
@@ -680,7 +760,8 @@ class UsageStore: ObservableObject {
                 let acctEmail = row[2] as? String
                 let acctPlan = row[3] as? String
                 let acctLastUpdated = row[4] as? String
-                let acctProvider = AccountProvider(stored: hasProvider ? row[5] as? String : nil)
+                let acctProvider = AccountProvider(stored: row[5] as? String)
+                let acctCodexHome = (row[6] as? String).flatMap { $0.isEmpty ? nil : $0 }
 
                 // Get latest percent from usage_history
                 var percent: Double? = nil
@@ -698,7 +779,8 @@ class UsageStore: ObservableObject {
                     email: acctEmail,
                     plan: acctPlan,
                     lastUpdated: UsageRecord.parseISO(acctLastUpdated),
-                    latestPercent: percent
+                    latestPercent: percent,
+                    codexHome: acctCodexHome
                 )
                 loadedAccounts.append(account)
 
@@ -1071,25 +1153,90 @@ class UsageStore: ObservableObject {
         }
     }
 
-    func clearAccountData(accountId: String) {
+    /// Clears an account's recorded time series and nothing else — the
+    /// account row, its credential, and its settings pin all survive, so the
+    /// account keeps appearing in the popover and keeps polling.
+    ///
+    /// This is what the chart window's "Clear History?" affordance promises.
+    /// Before #106 it shared an implementation with account removal and so
+    /// silently deleted the `accounts` row too, leaving an `is_active = 1`
+    /// credential the poller kept using for an account that no longer existed.
+    func clearAccountHistory(accountId: String) {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
                 return
             }
 
             let db = try openDatabase(dbPath)
-
-            // Delete usage history for this account, then the account itself
+            // Every per-account time series the chart draws from: the usage
+            // points themselves, the raw probe archive behind them, and the
+            // provider-named limit series.
             try db.run("DELETE FROM usage_history WHERE account_id = ?", accountId)
-            try db.run("DELETE FROM accounts WHERE id = ?", accountId)
+            try db.run("DELETE FROM probe_snapshots WHERE account_id = ?", accountId)
+            try db.run("DELETE FROM named_limits WHERE account_id = ?", accountId)
 
             // Reload to reflect the change
             loadFromDatabase()
 
         } catch {
             DispatchQueue.main.async {
-                self.error = "Failed to clear account data: \(error.localizedDescription)"
+                self.error = "Failed to clear account history: \(error.localizedDescription)"
             }
+        }
+    }
+
+    /// Removes an account completely: its time series, its credential rows,
+    /// its settings pin, and finally the account row itself.
+    ///
+    /// Deleting the credential in the *same* operation is the fix for #106 —
+    /// a partial delete strands a plaintext OAuth token that nothing in the
+    /// app can see (every UI/export query joins through `accounts`), so it is
+    /// never rotated and never revoked.
+    func deleteAccount(accountId: String) {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return
+            }
+
+            let db = try openDatabase(dbPath)
+            try UsageStore.deleteAccountRows(db, accountId: accountId)
+
+            // Reload to reflect the change
+            loadFromDatabase()
+
+        } catch {
+            DispatchQueue.main.async {
+                self.error = "Failed to remove account: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Deletes every row keyed to `accountId` across the schema, inside a
+    /// transaction so a mid-delete failure can't leave the exact half-applied
+    /// state this function exists to prevent (an orphaned credential). Mirrors
+    /// `mergeAccountRow`'s BEGIN/COMMIT-or-ROLLBACK shape.
+    // Pure function of its arguments — touches no instance/class main-actor
+    // state, matching `mergeAccountRow`, so the row-level work stays callable
+    // from non-UI contexts.
+    private nonisolated static func deleteAccountRows(_ db: Connection, accountId: String) throws {
+        do {
+            try db.execute("BEGIN")
+            try db.run("DELETE FROM usage_history WHERE account_id = ?", accountId)
+            try db.run("DELETE FROM probe_snapshots WHERE account_id = ?", accountId)
+            try db.run("DELETE FROM named_limits WHERE account_id = ?", accountId)
+            // The credential goes with the account. Deactivating it instead
+            // (what the popover used to do before calling this) leaves the
+            // token on disk forever.
+            try db.run("DELETE FROM oauth_credentials WHERE account_id = ?", accountId)
+            // Don't leave the user's "primary" pin dangling at a row that no
+            // longer exists, mirroring the merge path.
+            try db.run("DELETE FROM settings WHERE key = ? AND value = ?",
+                       primaryAccountSettingKey, accountId)
+            try db.run("DELETE FROM accounts WHERE id = ?", accountId)
+            try db.execute("COMMIT")
+        } catch {
+            try? db.execute("ROLLBACK")
+            throw error
         }
     }
 

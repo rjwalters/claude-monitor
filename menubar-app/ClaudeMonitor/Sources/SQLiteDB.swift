@@ -21,6 +21,26 @@ struct SQLiteError: Error, LocalizedError, CustomStringConvertible {
     var errorDescription: String? { description }
 }
 
+/// Every rung of the read-only open ladder in `Connection.init` failed. Carries
+/// the likely cause and a remedy rather than surfacing a bare
+/// `SQLite error 14: unable to open database file`, which tells a user nothing
+/// about what to do next (issue #105).
+struct SQLiteUnreadableError: Error, LocalizedError, CustomStringConvertible {
+    let path: String
+    /// The read-only probe failure that triggered the escalation.
+    let underlying: SQLiteError
+
+    var description: String {
+        "Cannot read the database at \(path) (\(underlying)). "
+            + "It is most likely in WAL mode with its -shm shared-index file missing, "
+            + "while the database file or its directory is not writable — so SQLite "
+            + "cannot recreate the -shm it needs. Make the file and its containing "
+            + "directory writable, or copy the database (together with any -wal file "
+            + "beside it) into a writable directory and retry there."
+    }
+    var errorDescription: String? { description }
+}
+
 // Tells sqlite3_bind_text/blob to copy the buffer before returning.
 private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
@@ -33,21 +53,129 @@ final class Connection {
         didSet { sqlite3_busy_timeout(handle, Int32(busyTimeout * 1000)) }
     }
 
+    /// Opens the database at `path`.
+    ///
+    /// `readonly` is a **lock-avoidance and safety hint, not a hard guarantee**
+    /// that this process will never write the file. Reading a WAL-mode database
+    /// requires its `-shm` shared index, and a `SQLITE_OPEN_READONLY` connection
+    /// cannot create one — so a perfectly healthy database whose `-shm` is
+    /// absent (the app is not running and checkpointed on close, or the file was
+    /// copied without its sidecars) fails with `SQLITE_CANTOPEN`. That refusal
+    /// lands on the *first statement*, not on the open, so it is detected with a
+    /// probe (issue #105).
+    ///
+    /// The ladder, in order:
+    /// 1. `SQLITE_OPEN_READONLY`, then probe with `PRAGMA schema_version`. The
+    ///    common case (app running, `-shm` present) stops here — lock-free and
+    ///    residue-free.
+    /// 2. On `SQLITE_CANTOPEN`, reopen `SQLITE_OPEN_READWRITE` — **without**
+    ///    `SQLITE_OPEN_CREATE`, so a typo'd path errors instead of silently
+    ///    conjuring an empty database. This creates the `-shm`, recovers any hot
+    ///    `-wal`, and reads *current* data.
+    /// 3. Only if that fails too (genuinely read-only file/directory/media),
+    ///    `file:…?immutable=1` — and only when no non-empty `-wal` sits beside
+    ///    the database. `immutable=1` ignores the WAL *silently*, so with WAL
+    ///    content present it would return stale rows with no error; for a
+    ///    credential-bearing export that is the worst available failure mode.
+    ///    A non-empty `-wal` therefore fails loudly instead.
+    ///
+    /// Nothing on any rung changes `journal_mode` or modifies a row. Rung 2 does
+    /// leave a `-shm`/`-wal` pair behind, exactly as the running app does.
     init(_ path: String, readonly: Bool = false) throws {
-        let flags = readonly
-            ? SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
-            : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
-        let rc = sqlite3_open_v2(path, &handle, flags, nil)
-        guard rc == SQLITE_OK else {
-            let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "unable to open database"
-            sqlite3_close_v2(handle)
-            handle = nil
-            throw SQLiteError(code: rc, message: message)
+        guard readonly else {
+            try open(path, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX)
+            return
         }
+
+        // Rung 1: plain read-only. An open failure here is a missing file or a
+        // permissions problem — report it as before rather than escalating.
+        try open(path, flags: SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX)
+        guard let probeFailure = Connection.probe(handle) else { return }
+        // Any other probe failure (corruption, not-a-database) is left to
+        // surface at the caller's own statement, exactly as it did before.
+        guard probeFailure.code == SQLITE_CANTOPEN else { return }
+        closeHandle()
+
+        // Rung 2: read-write, no CREATE.
+        if (try? open(path, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX)) != nil,
+           Connection.probe(handle) == nil {
+            return
+        }
+        closeHandle()
+
+        // Rung 3: immutable, gated on the absence of WAL content.
+        if !Connection.hasWALContent(besides: path) {
+            let uri = "file:\(Connection.percentEncodedURIPath(path))?immutable=1"
+            let immutableFlags = SQLITE_OPEN_READONLY | SQLITE_OPEN_URI | SQLITE_OPEN_FULLMUTEX
+            if (try? open(uri, flags: immutableFlags)) != nil, Connection.probe(handle) == nil {
+                return
+            }
+            closeHandle()
+        }
+
+        throw SQLiteUnreadableError(path: path, underlying: probeFailure)
     }
 
     deinit {
         sqlite3_close_v2(handle)
+    }
+
+    /// `sqlite3_open_v2` with the given flags, leaving `handle` nil on failure.
+    private func open(_ filename: String, flags: Int32) throws {
+        let rc = sqlite3_open_v2(filename, &handle, flags, nil)
+        guard rc == SQLITE_OK else {
+            let message = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "unable to open database"
+            closeHandle()
+            throw SQLiteError(code: rc, message: message)
+        }
+    }
+
+    private func closeHandle() {
+        sqlite3_close_v2(handle)
+        handle = nil
+    }
+
+    /// Runs the cheapest statement that actually touches the database, so a
+    /// missing `-shm` surfaces here instead of at the caller's first query.
+    /// Returns nil when the connection is usable.
+    ///
+    /// `PRAGMA schema_version` is the probe because it is measurably sufficient:
+    /// it returns `SQLITE_CANTOPEN` in the broken state. `BEGIN; COMMIT;` does
+    /// **not** — it returns `SQLITE_OK` and misses the condition entirely.
+    private static func probe(_ handle: OpaquePointer?) -> SQLiteError? {
+        var errMsg: UnsafeMutablePointer<CChar>?
+        let rc = sqlite3_exec(handle, "PRAGMA schema_version;", nil, nil, &errMsg)
+        defer { sqlite3_free(errMsg) }
+        guard rc != SQLITE_OK else { return nil }
+        let message = errMsg.map { String(cString: $0) }
+            ?? handle.map { String(cString: sqlite3_errmsg($0)) }
+            ?? "unable to open database"
+        return SQLiteError(code: rc, message: message)
+    }
+
+    /// True when a non-empty `<path>-wal` sits beside the database, i.e. there
+    /// is committed content that lives only in the write-ahead log. A missing
+    /// `-shm` does **not** imply an empty `-wal`: a crashed writer, or a `cp` of
+    /// the database together with its `-wal`, produces exactly that state, and
+    /// `immutable=1` would then silently drop every row in the log.
+    private static func hasWALContent(besides path: String) -> Bool {
+        let walPath = path + "-wal"
+        // No -wal beside the database at all: nothing for `immutable=1` to miss.
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: walPath) else {
+            return false
+        }
+        // A -wal that exists but whose size can't be read counts as content:
+        // erring toward an actionable error beats erring toward a stale read.
+        guard let size = (attributes[.size] as? NSNumber)?.int64Value else { return true }
+        return size > 0
+    }
+
+    /// Percent-encodes a filesystem path for a SQLite `file:` URI. `?`, `#`, `%`
+    /// and spaces are all legal in a macOS path and all significant in a URI.
+    private static func percentEncodedURIPath(_ path: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "/-._~")
+        return path.addingPercentEncoding(withAllowedCharacters: allowed) ?? path
     }
 
     fileprivate func lastError(_ code: Int32) -> SQLiteError {

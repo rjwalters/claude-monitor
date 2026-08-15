@@ -186,12 +186,21 @@ struct OpenAIUsageResponse: Decodable {
     /// "Capture wide, interpret narrow": fields OpenAI adds later are archived
     /// even before this app understands them.
     static func flatten(_ data: Data) -> [String: String] {
+        flatten(data, prefix: "")
+    }
+
+    /// Same redacting flatten, with every key prefixed — so a second transport
+    /// can archive more than one payload into a single `raw_data` map without
+    /// collisions (`codex app-server` archives both `account/read` and
+    /// `account/rateLimits/read`). Shared rather than reimplemented so there is
+    /// exactly one redaction rule set to keep correct.
+    static func flatten(_ data: Data, prefix: String) -> [String: String] {
         // Decoded through `JSONValue` rather than `JSONSerialization` so booleans
         // stay distinguishable from 0/1 without CoreFoundation type checks,
         // which don't exist on Linux.
         guard let root = try? JSONDecoder().decode(JSONValue.self, from: data) else { return [:] }
         var out: [String: String] = [:]
-        flattenValue(root, prefix: "", into: &out)
+        flattenValue(root, prefix: prefix, into: &out)
         return out
     }
 
@@ -233,13 +242,37 @@ struct OpenAIUsageResponse: Decodable {
 /// archiving. `JSONDecoder` keeps booleans and numbers distinct here, which
 /// `JSONSerialization` does not do portably (on Darwin both arrive as
 /// `NSNumber` and telling them apart needs CoreFoundation, which Linux lacks).
-indirect enum JSONValue: Decodable {
+///
+/// `Encodable` too, so a decoded subtree can be handed back out as standalone
+/// JSON — how `CodexAppServerClient` lifts a JSON-RPC reply's `result` member
+/// out of its envelope for the typed decoders and this flattener.
+indirect enum JSONValue: Codable {
     case null
     case bool(Bool)
     case number(Double)
     case string(String)
     case array([JSONValue])
     case object([String: JSONValue])
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null: try container.encodeNil()
+        case .bool(let value): try container.encode(value)
+        case .number(let value):
+            // Round-trip whole numbers as integers so a re-encoded epoch stays
+            // `1785967226`, not `1785967226.0` (which a strict consumer of the
+            // re-encoded payload could read differently).
+            if value == value.rounded(), abs(value) < 1e15 {
+                try container.encode(Int64(value))
+            } else {
+                try container.encode(value)
+            }
+        case .string(let value): try container.encode(value)
+        case .array(let values): try container.encode(values)
+        case .object(let values): try container.encode(values)
+        }
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -604,6 +637,38 @@ enum CodexAuth {
             // auth.json states no expiry; the access token's own `exp` claim does.
             expiresAt: OpenAIAPIClient.accessTokenExpiry(accessToken)
         )
+    }
+
+    /// The `auth.json` inside a specific `CODEX_HOME`, or `defaultAuthPath`
+    /// when no home is registered for the account (#103).
+    static func authPath(inHome home: String?) -> String {
+        guard let home = home?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !home.isEmpty else { return defaultAuthPath }
+        return (home as NSString).appendingPathComponent("auth.json")
+    }
+
+    /// **Only** `tokens.account_id` out of a home's `auth.json` — never a token.
+    ///
+    /// `codex add --home` needs a stable key for the account row, and
+    /// `account/read` carries no account id on any verified `app-server`
+    /// version (spike §4 item 7), so this one opaque identifier is the only
+    /// thing that can supply it. An opaque account id is not a credential: it
+    /// authenticates nothing, it is already what every existing OpenAI row is
+    /// keyed on, and it is what `ranking.json` publishes today.
+    ///
+    /// Deliberately **not** `load(path:)`: that returns the whole `Credential`
+    /// (tokens included) and throws `.noAccessToken` on a home that has been
+    /// created but not logged into. This returns nil for every "can't tell"
+    /// case instead, so registration can fall back to matching on email.
+    static func accountId(inHome home: String?) -> String? {
+        let path = authPath(inHome: home)
+        guard let data = FileManager.default.contents(atPath: path),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = root["tokens"] as? [String: Any],
+              let id = (tokens["account_id"] as? String)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !id.isEmpty else { return nil }
+        return id
     }
 
     /// Load and parse a credential file. `path` defaults to `defaultAuthPath`.
