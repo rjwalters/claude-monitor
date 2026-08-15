@@ -64,6 +64,19 @@ final class FileLogger: @unchecked Sendable {
         log(message, category: category, level: .error)
     }
 
+    /// Blocks until every write enqueued before this call has been written to
+    /// disk. Writes happen on the private serial `queue`, so a no-op task
+    /// submitted to that same queue only returns once everything ahead of it
+    /// has run.
+    ///
+    /// Test-only synchronization seam (see `SelfTest.testCodexSnapshotOfflinePathWritesNoLog`,
+    /// #116): proves a code path enqueued *no* write by flushing, then
+    /// comparing file size, without racing the background queue or padding
+    /// the user's real `debug.log` with a marker line just to observe it.
+    func sync() {
+        queue.sync {}
+    }
+
     enum Level: String {
         case info = "INFO"
         case warn = "WARN"
