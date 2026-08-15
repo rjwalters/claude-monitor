@@ -20,19 +20,27 @@ Conventions:
 
 | Spike | Question | Outcome |
 |-------|----------|---------|
-| [2026-07-30-codex-usage-probe.md](2026-07-30-codex-usage-probe.md) | Can a cheap authenticated probe read ChatGPT/Codex subscription usage and rate-limit windows? | **Yes.** `GET chatgpt.com/backend-api/wham/usage` with the Codex bearer token. |
+| [2026-07-30-codex-usage-probe.md](2026-07-30-codex-usage-probe.md) | Can a cheap authenticated probe read ChatGPT/Codex subscription usage and rate-limit windows? | **Yes**, but not the way the spike concluded — see the 2026-08-15 supersession. `codex app-server` is the supported surface; `GET wham/usage` is the fallback. |
 
 ### Reading the Codex probe write-up
 
-That document has two layers, and only the second is binding. It opens with
+That document has three layers, and only the last is binding. It opens with
 static analysis of the Codex CLI binary, which produced a plausible but
-**wrong** guess at the wire format. The later "Live verification
-(AUTHORITATIVE)" section records what a real request returned and corrects it —
-different field names, a different route, and the discovery that a session
-window may legitimately be absent.
+**wrong** guess at the wire format. The "Live verification (AUTHORITATIVE)"
+section records what a real request returned and corrects it — different field
+names, a different route, and the discovery that a session window may
+legitimately be absent.
 
-Design against the live-verification section. `OpenAIAPI.swift` and
-`RateLimitWindow.swift` both cite it.
+The **2026-08-15 supersession** at the end then reverses the spike's central
+*design* recommendation. The spike never ran a successful token refresh, so it
+could not tell that OpenAI rotates refresh tokens; it recommended storing and
+refreshing one anyway, and that shipped and broke — a stored copy and the Codex
+CLI's own `auth.json` invalidate each other in turn. The app should hold no
+OpenAI credential at all, and read usage over `codex app-server` instead.
+
+Design against the supersession section. `OpenAIAPI.swift` and
+`RateLimitWindow.swift` still cite the live-verification section, which remains
+correct as the fallback wire contract.
 
 `codex-usage-probe.sh` beside it is runnable: it prints only status codes and
 redacted field names, never token values.
