@@ -2631,8 +2631,21 @@ enum SelfTest {
             ) as? Int64, 0, "--db: migration registered no home on a non-OpenAI account")
 
             expectEqual(store.accounts.count, accountsBefore, "--db: account count unchanged by migration")
-            expect(store.accounts.allSatisfy { $0.provider == .anthropic },
-                   "--db: every pre-existing account backfilled to anthropic")
+            // #112: a real host DB can legitimately carry `openai` rows (any
+            // account registered since multi-provider support landed), so
+            // asserting everything backfilled to `anthropic` is over-strict
+            // and fails on exactly that host. The real migration invariant is
+            // that every account resolves to a *known* provider — nothing
+            // left NULL/empty/unrecognized. `AccountProvider(stored:)` maps
+            // unknown strings to `.anthropic` (see RateLimitWindow.swift), so
+            // decoding through it can't distinguish "stored anthropic" from
+            // "stored garbage" — read the raw column instead, same shape as
+            // the `stray` check below.
+            let unrecognized = try db.scalar(
+                "SELECT COUNT(*) FROM accounts WHERE provider IS NOT NULL AND TRIM(provider) != '' " +
+                "AND LOWER(TRIM(provider)) NOT IN ('anthropic', 'openai')"
+            ) as? Int64
+            expectEqual(unrecognized, 0, "--db: every account resolves to a known provider")
             for account in store.accounts {
                 expectEqual(headroomScore(store.latestUsage[account.id]),
                             scoresBefore[account.id] ?? nil,
