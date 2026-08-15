@@ -25,7 +25,8 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#146**: A drifted Codex row shows a healthy green dot while frozen — identity conflict only writes a log line
+- **#157**: Remove two dead-code items: RateLimitWindow.remainingPercent, RollTokenView's unused store param
+- **#156**: Menubar status-item badge is not gated by staleness or drift
 
 ## PRs Awaiting Review
 
@@ -43,13 +44,13 @@ _None._
 
 Issues carrying `loom:curated`.
 
-- **#146**: A drifted Codex row shows a healthy green dot while frozen — identity conflict only writes a log line *(curated)*
+- **#156**: Menubar status-item badge is not gated by staleness or drift *(curated)*
 - **#135**: Declarative intended Codex identity set: codex list/ranking.json should report 'absent', not just fewer rows *(curated)*
 - **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)*
 
 ## Proposed (Architect / Hermit)
 
-_None._
+- **#159**: Dedup pointing-hand cursor onHover into a single View modifier *(hermit)*
 
 ## Epics
 
@@ -62,10 +63,10 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 2 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 3 |
-| Architect / Hermit proposals | 0 |
+| Architect / Hermit proposals | 1 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->

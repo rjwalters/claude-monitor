@@ -4,6 +4,16 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #147** (closed): Adopt a re-logged-in Codex identity instead of freezing: the app should follow a codex login switch
+- **PR #158**: feat: adopt a re-logged-in Codex identity instead of freezing
+- **Issue #148** (closed): No row should present a stale figure as current: a cause-independent freshness guarantee
+- **PR #154**: feat: derive freshness thresholds from poll interval, gate stale rows
+- **Issue #150** (closed): Remove unused OpenAI response fields: userId, idToken
+- **PR #155**: chore: remove unread userId/idToken fields from OpenAI response structs
+- **Issue #151** (closed): chore: fix stale stored-credential log message in OAuthPoller tier-2 fallback
+- **PR #153**: fix: correct stale stored-credential fallback claim in tier-2 log line
+- **Issue #146** (closed): A drifted Codex row shows a healthy green dot while frozen — identity conflict only writes a log line
+- **PR #152**: fix: surface Codex identity drift as a distinct account state
 - **Issue #142** (closed): Simplify SelfTest.swift: extract shared temp-dir + stub-writer helper
 - **PR #144**: test: dedup temp-dir and writeStub boilerplate in SelfTest.swift
 - **Issue #132** (closed): codex list: enumerate all discoverable Codex homes, not just registered accounts
