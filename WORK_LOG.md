@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **PR #82**: refactor: convert static-only window controllers to enums
+- **Issue #81** (closed): Convert static-only window-controller classes to enums for consistency
 - **Issue #79** (closed): Remove unused formatResetTime function in UsagePopoverView.swift
 - **PR #78**: refactor: remove dead helpers and struct with zero call sites
 - **Issue #76** (closed): Remove dead code: unused helpers/struct in UsageStore, UsageChartView, UsagePopoverView
