@@ -85,6 +85,9 @@ enum SelfTest {
         testNamedLimitsRoundTrip()
         testOpenAIImportResolvesExistingAccountByEmail()
         testExportAccountsEnvIncludesAllProviders()
+        testExportAccountsEnvExcludesTokenlessCodexAccount()
+        testExportAccountsEnvCodexOnlyHostIsNotGenuinelyEmpty()
+        testExportAccountsEnvGenuinelyEmptyStoreReturnsNil()
         testParseAccountPairsBackwardCompatibleWithOldFormat()
         testParseAccountPairsRoundTripsOpenAIFields()
         testAccountSyncExcludesOpenAIAccounts()
@@ -1784,13 +1787,14 @@ enum SelfTest {
             """)
 
             let poller = OAuthPoller(dbPath: dbPath)
-            guard let (env, count) = poller.exportAccountsEnv() else {
+            guard let (env, count, excludedHostLocal) = poller.exportAccountsEnv() else {
                 checks += 1
                 failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
                 return
             }
 
             expectEqual(count, 3, "exported count covers every active, tokened row regardless of provider")
+            expectEqual(excludedHostLocal, 0, "a tokened Codex row (e.g. imported via clipboard) is not host-local-excluded")
             expect(env.contains("one@example.com"), "export includes the first Anthropic account")
             expect(env.contains("two@example.com"), "export includes the second Anthropic account")
             expect(env.contains("codex@example.com"), "export now includes the Codex/OpenAI account (#67)")
@@ -1804,6 +1808,127 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("exportAccountsEnv provider test threw: \(error)")
+        }
+    }
+
+    /// Mixed host, post-#123: a normally-polled Codex account has NO stored
+    /// token (`nullOutOpenAITokens` nulls it at migration), unlike the
+    /// clipboard-imported one above. `exportAccountsEnv` must still count the
+    /// Anthropic accounts normally *and* report the Codex account as
+    /// host-local-excluded rather than silently dropping it from both the
+    /// count and any explanation (issue #129).
+    private static func testExportAccountsEnvExcludesTokenlessCodexAccount() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('anthropic-1', 'Claude One', 'one@example.com', 'Max', '2026-01-01T00:00:00Z', 0, 'anthropic')
+            """)
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, codex_home, provider)
+                VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 1, '/home/codex', 'openai')
+            """)
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, access_token, is_active, created_at, updated_at, provider)
+                VALUES ('anthropic-1', 'anthropic-1', 'token-one', 1,
+                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'anthropic')
+            """)
+            // Mirrors what `nullOutOpenAITokens` (#123) leaves behind: an
+            // active, tokenless credential row for a registered Codex home.
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, access_token, refresh_token, is_active, created_at, updated_at, provider)
+                VALUES ('codex-1', 'codex-1', NULL, NULL, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+            """)
+
+            let poller = OAuthPoller(dbPath: dbPath)
+            guard let (env, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                checks += 1
+                failures.append("exportAccountsEnv returned nil for a mixed host with a tokenless Codex account")
+                return
+            }
+
+            expectEqual(count, 1, "only the tokened Anthropic account is exported")
+            expectEqual(excludedHostLocal, 1, "the tokenless Codex account is counted as host-local-excluded")
+            expect(env.contains("one@example.com"), "export still includes the Anthropic account")
+            expect(!env.contains("codex@example.com"), "the tokenless Codex account is not serialized (there is no token to export)")
+        } catch {
+            checks += 1
+            failures.append("exportAccountsEnv tokenless-Codex test threw: \(error)")
+        }
+    }
+
+    /// Codex-only host, post-#123: every active credential is a tokenless
+    /// Codex row. `exportAccountsEnv` must NOT return nil here — a nil result
+    /// is indistinguishable from a genuinely empty store, and `copyAccounts()`
+    /// would report the bare, misleading "Nothing to copy" that #67 already
+    /// fixed once (issue #129 is that regression coming back through #123).
+    private static func testExportAccountsEnvCodexOnlyHostIsNotGenuinelyEmpty() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, codex_home, provider)
+                VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 0, '/home/codex', 'openai')
+            """)
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, access_token, refresh_token, is_active, created_at, updated_at, provider)
+                VALUES ('codex-1', 'codex-1', NULL, NULL, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+            """)
+
+            let poller = OAuthPoller(dbPath: dbPath)
+            guard let (_, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                checks += 1
+                failures.append("exportAccountsEnv returned nil for a Codex-only host — it must report the exclusion instead")
+                return
+            }
+
+            expectEqual(count, 0, "a Codex-only host has nothing tokened to export")
+            expectEqual(excludedHostLocal, 1, "the sole Codex account is reported as host-local-excluded, not silently dropped")
+        } catch {
+            checks += 1
+            failures.append("exportAccountsEnv Codex-only-host test threw: \(error)")
+        }
+    }
+
+    /// A genuinely empty store (no accounts at all) must still return nil —
+    /// the excluded-count reporting above must not turn every empty store
+    /// into a false "N accounts are host-local" claim.
+    private static func testExportAccountsEnvGenuinelyEmptyStoreReturnsNil() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+
+            let poller = OAuthPoller(dbPath: dbPath)
+            expect(poller.exportAccountsEnv() == nil, "a genuinely empty store still reports nil, not a false exclusion")
+        } catch {
+            checks += 1
+            failures.append("exportAccountsEnv empty-store test threw: \(error)")
         }
     }
 
@@ -1873,7 +1998,7 @@ enum SelfTest {
             """)
 
             let poller = OAuthPoller(dbPath: dbPath)
-            guard let (env, _) = poller.exportAccountsEnv() else {
+            guard let (env, _, _) = poller.exportAccountsEnv() else {
                 checks += 1
                 failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
                 return
