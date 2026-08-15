@@ -73,6 +73,7 @@ enum SelfTest {
         testCodexVersionDiagnosticLogging()
         testCodexAppServerMapping()
         testCodexAppServerRedaction()
+        testCodexSnapshotOfflinePathWritesNoLog()
         testCodexBinaryResolution()
         testCodexHomeIdentityGuard()
         testCodexHomeResolution()
@@ -902,6 +903,41 @@ enum SelfTest {
             checks += 1
             failures.append("codex app-server redaction test threw: \(error)")
         }
+    }
+
+    /// Regression for #116: `flog.info` used to live inside `snapshot()`
+    /// itself, which runs during **offline** fixture decoding (this very
+    /// selftest) as much as during a live poll — so a plain `ClaudeMonitor
+    /// selftest` run wrote ~14 lines into the user's real `debug.log`. The fix
+    /// moved the log call into `fetchUsage()` (the caller that actually
+    /// performed a live poll), leaving `snapshot()` free of I/O.
+    ///
+    /// `FileLogger` writes on its own serial background queue, so a plain
+    /// before/after size check right after calling `snapshot()` would race
+    /// the write. `FileLogger.sync()` flushes that queue deterministically —
+    /// since it is FIFO, waiting on it proves anything `snapshot()` might
+    /// have enqueued has already landed (or, per this fix, was never
+    /// enqueued) — without padding the user's real `debug.log` with a marker
+    /// line just to observe it.
+    private static func testCodexSnapshotOfflinePathWritesNoLog() {
+        let logPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude-monitor/debug.log").path
+        FileLogger.shared.sync()
+        let before = FileManager.default.contents(atPath: logPath)?.count ?? 0
+
+        // Exercise the offline mapper exactly the way `testCodexAppServerMapping`
+        // / `testCodexAppServerRedaction` do — this is the path selftest drives,
+        // with no network, no credentials, and (per this fix) no live poll.
+        _ = try? CodexAppServerClient.snapshot(
+            accountResult: Data(codexAccountFixture.utf8),
+            rateLimitsResult: Data(codexRateLimitsFixture.utf8)
+        )
+
+        FileLogger.shared.sync()
+        let after = FileManager.default.contents(atPath: logPath)?.count ?? 0
+
+        expectEqual(after, before,
+                    "snapshot() must stay free of I/O — the offline selftest path must never write to debug.log")
     }
 
     /// A Finder-launched `.app` inherits launchd's minimal `PATH`, so

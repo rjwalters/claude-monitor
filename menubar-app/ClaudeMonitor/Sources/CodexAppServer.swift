@@ -605,10 +605,21 @@ final class CodexAppServerClient: Sendable {
         guard let rateLimitsLine = rateLimitsLine else {
             throw CodexAppServerError.protocolFailure("account/rateLimits/read returned nothing")
         }
-        return try Self.snapshot(
+        let usage = try Self.snapshot(
             accountResult: accountLine,
             rateLimitsResult: rateLimitsLine
         )
+        // Logged here — the caller that actually performed a live poll — rather
+        // than inside the pure `snapshot()` mapper. `snapshot()` also runs
+        // during offline `selftest` fixture decoding, and a test run must not
+        // write into the user's real debug.log (issue #116).
+        let session = usage.rateLimit.session.map { String(format: "%.0f%%", $0.usedPercent) } ?? "—"
+        let weekly = usage.rateLimit.weekly.map { String(format: "%.0f%%", $0.usedPercent) } ?? "—"
+        flog.info(
+            "codex app-server usage — session: \(session), weekly: \(weekly) (\(usage.rateLimit.overallStatus ?? "?"))",
+            category: fcat
+        )
+        return usage
     }
 
     /// Who this home is logged in as, without asking for usage.
@@ -676,13 +687,6 @@ final class CodexAppServerClient: Sendable {
         rawFields["overall_status"] = snapshot.overallStatus
         rawFields["session_status"] = snapshot.session?.status
         rawFields["weekly_status"] = snapshot.weekly?.status
-
-        let session = snapshot.session.map { String(format: "%.0f%%", $0.usedPercent) } ?? "—"
-        let weekly = snapshot.weekly.map { String(format: "%.0f%%", $0.usedPercent) } ?? "—"
-        flog.info(
-            "codex app-server usage — session: \(session), weekly: \(weekly) (\(snapshot.overallStatus ?? "?"))",
-            category: fcat
-        )
 
         return ProviderUsageSnapshot(
             provider: .openai,
