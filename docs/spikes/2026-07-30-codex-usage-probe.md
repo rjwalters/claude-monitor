@@ -235,7 +235,13 @@ and `Account` schema now — in particular:
   correct without that check — treat it as a strong hypothesis, not a
   verified contract.
 
-## Live verification (2026-07-30) — AUTHORITATIVE
+## Live verification (2026-07-30) — AUTHORITATIVE for the wire contract
+
+> **Partly superseded.** This section's *wire contract* is still correct and is
+> now the fallback path. Its *design* conclusion — store and refresh a
+> credential — was reversed on 2026-08-15; see
+> [Supersession (2026-08-15)](#supersession-2026-08-15--rotation-confirmed-app-server-is-the-supported-surface)
+> at the end of this document before designing against anything here.
 
 The operator judged a disposable account unnecessary: the probe is a
 **read-only GET** against the same endpoint Codex CLI's own `/usage` command
@@ -361,6 +367,97 @@ What this establishes, and what it doesn't:
   active 5h window (see finding 1) — worth re-probing when a session window is
   actually in use. Re-confirmed on 2026-07-30: still `null` on this Pro
   account, with a weekly `primary_window` at 14%.
+
+## Supersession (2026-08-15) — rotation confirmed; `app-server` is the supported surface
+
+Two of the "Still unverified" items above are now settled, and one of them
+inverts this spike's central design recommendation. **This section is
+authoritative where it disagrees with anything above it, including the
+2026-07-30 live verification.**
+
+### 1. OpenAI *does* rotate refresh tokens for this client
+
+The spike deliberately never ran a successful refresh exchange, so rotation
+stayed open here — and the recommendation above ("treat `refresh_token`-based
+renewal as mandatory infrastructure", store `refresh_token` +
+`token_expires_at`) was written without the answer, then built on and shipped.
+Rotation was confirmed shortly afterwards and is documented in the README's
+"Note on refresh-token rotation" (verified 2026-07-31); this section records
+what the *consequences* turned out to be in sustained multi-host use, which is
+what invalidates the design rather than the bare fact of rotation.
+
+Because the app kept its own copy of a rotating credential, its copy and the
+Codex CLI's own `$CODEX_HOME/auth.json` invalidated each other in turn.
+Observed in production: continuous `401 / refresh_token_invalidated` on every
+poll across two hosts for ~9 days, with every `provider: openai` row frozen —
+while the **accounts themselves were entirely healthy**. Running a current
+`codex` refreshed `auth.json` in place and returned live usage immediately.
+Only the stored snapshot was dead. The app was reporting its own staleness as
+an account failure.
+
+OpenAI states the constraint directly:
+
+> Use one `auth.json` per runner or per serialized workflow stream. Do not
+> share the same file across concurrent jobs or multiple machines.
+> — <https://learn.chatgpt.com/docs/auth/ci-cd-auth>
+
+The design conclusion therefore inverts: this app should **not** store,
+refresh, or sync an OpenAI credential at all. `accounts export` carrying one
+between machines is guaranteed to break the source host.
+
+### 2. `codex app-server` returns usage directly, with Codex owning the credential
+
+There is a supported surface that needs no credential handling from us at all.
+`codex -s read-only -a untrusted app-server` speaks JSON-RPC over stdio:
+
+```
+initialize → initialized (notification) → account/read → account/rateLimits/read
+```
+
+`account/read` returns account type, email and plan. `account/rateLimits/read`
+returns (values redacted):
+
+```jsonc
+{"rateLimits": {
+   "limitId": "codex",
+   "primary": {"usedPercent": <n>, "windowDurationMins": 10080, "resetsAt": <epoch>},
+   "secondary": null,
+   "credits": {"hasCredits": false, "unlimited": false, "balance": "<n>"},
+   "planType": "<plan>"},
+ "rateLimitsByLimitId": {"codex": {…},
+   "codex_bengalfox": {"limitName": "GPT-5.3-Codex-Spark", "primary": {…}}},
+ "rateLimitResetCredits": {"availableCount": 0, "credits": []}}
+```
+
+Note `windowDurationMins` here versus `limit_window_seconds` on the `wham`
+wire contract — same quantity, different unit and name.
+
+`CODEX_HOME` scopes this per account, which is also the answer to multi-account
+support: `codex login` writes one `auth.json` per home, so each login clobbers
+the previous account. An unauthenticated home answers `account/read` cleanly
+with `{"account": null, "requiresOpenaiAuth": true}` rather than failing, which
+gives a per-account "needs login" signal.
+
+### 3. Version constraint
+
+`account/rateLimits/read` does **not** exist in codex 0.46.0 — it returns
+`-32600 Invalid request`. Verified working on 0.147.0. Homebrew's formula lags
+well behind the npm `@openai/codex` channel, and `app-server` is marked
+`[experimental]` with method names that have already changed between versions,
+so a client must probe for capability rather than assume it.
+
+### What above is still binding
+
+The live-verification section's `wham/usage` contract is unchanged and remains
+correct — it is now the **fallback** path, to be called with a bearer token
+read from `auth.json` at request time and never stored. Both of its "genuinely
+new findings" also survive intact and are reinforced by the `app-server` shape:
+window kind must be derived from the window's duration rather than its
+position, a session window may legitimately be absent (`secondary: null`), and
+per-model sub-limits are first-class.
+
+Tracked in #102 (app-server client), #103 (per-account `CODEX_HOME`), #104
+(retire stored OpenAI tokens).
 
 ## References
 

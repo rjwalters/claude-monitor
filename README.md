@@ -181,6 +181,20 @@ What differs from an Anthropic row once it's added:
 >   `accounts export` → `accounts import` (see
 >   [Multi-host sync](#multi-host-sync)),
 >   or just re-run `codex import` there after a fresh `codex login`.
+>
+> **This re-sync loop does not converge, and is being replaced.** Each holder
+> of the credential — this app on host A, this app on host B, the Codex CLI on
+> each of them — invalidates the others when it renews, so re-syncing only
+> moves which one is about to break next. Observed in practice: continuous
+> `401 / refresh_token_invalidated` across two hosts for ~9 days, while the
+> accounts themselves stayed healthy and a current `codex` read their usage
+> immediately. OpenAI's own guidance is that an `auth.json` is single-machine
+> and must not be shared across hosts, so **do not** copy OpenAI credentials
+> between machines; register the account on each host instead. The fix is to
+> stop holding the credential at all and read usage via `codex app-server`,
+> which owns its own auth — see #102, #103 and #104, and the 2026-08-15
+> supersession in
+> [`docs/spikes/2026-07-30-codex-usage-probe.md`](docs/spikes/2026-07-30-codex-usage-probe.md).
 
 ### Rolling a Token (revoke + re-mint)
 
