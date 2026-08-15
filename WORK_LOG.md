@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #98** (closed): Remove dead RateLimitSnapshot.nextReset computed property
+- **PR #99**: refactor: remove dead RateLimitSnapshot.nextReset computed property
 - **Issue #94** (closed): Dedupe RankingExporter.normalizedISO parse body onto UsageRecord.parseISO
 - **PR #96**: refactor: delegate RankingExporter.normalizedISO to UsageRecord.parseISO
 - **Issue #83** (closed): Auditor Capability Request: no Swift toolchain or docker access on this host to validate claude-monitor builds
