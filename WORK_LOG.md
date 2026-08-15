@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **PR #86**: refactor: unify percent-severity color thresholds into shared PercentSeverity enum
+- **Issue #85** (closed): Remove duplicated percent-severity color logic (colorForPercent x2 + inline copy in main.swift)
 - **PR #82**: refactor: convert static-only window controllers to enums
 - **Issue #81** (closed): Convert static-only window-controller classes to enums for consistency
 - **Issue #79** (closed): Remove unused formatResetTime function in UsagePopoverView.swift
