@@ -639,6 +639,38 @@ enum CodexAuth {
         )
     }
 
+    /// The `auth.json` inside a specific `CODEX_HOME`, or `defaultAuthPath`
+    /// when no home is registered for the account (#103).
+    static func authPath(inHome home: String?) -> String {
+        guard let home = home?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !home.isEmpty else { return defaultAuthPath }
+        return (home as NSString).appendingPathComponent("auth.json")
+    }
+
+    /// **Only** `tokens.account_id` out of a home's `auth.json` — never a token.
+    ///
+    /// `codex add --home` needs a stable key for the account row, and
+    /// `account/read` carries no account id on any verified `app-server`
+    /// version (spike §4 item 7), so this one opaque identifier is the only
+    /// thing that can supply it. An opaque account id is not a credential: it
+    /// authenticates nothing, it is already what every existing OpenAI row is
+    /// keyed on, and it is what `ranking.json` publishes today.
+    ///
+    /// Deliberately **not** `load(path:)`: that returns the whole `Credential`
+    /// (tokens included) and throws `.noAccessToken` on a home that has been
+    /// created but not logged into. This returns nil for every "can't tell"
+    /// case instead, so registration can fall back to matching on email.
+    static func accountId(inHome home: String?) -> String? {
+        let path = authPath(inHome: home)
+        guard let data = FileManager.default.contents(atPath: path),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = root["tokens"] as? [String: Any],
+              let id = (tokens["account_id"] as? String)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              !id.isEmpty else { return nil }
+        return id
+    }
+
     /// Load and parse a credential file. `path` defaults to `defaultAuthPath`.
     static func load(path: String? = nil) throws -> Credential {
         let path = path ?? defaultAuthPath

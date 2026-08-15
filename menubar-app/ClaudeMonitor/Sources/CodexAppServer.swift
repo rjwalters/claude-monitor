@@ -61,6 +61,35 @@ import Darwin
 private let flog = FileLogger.shared
 private let fcat = "Codex"
 
+// MARK: - Path redaction
+
+/// A filesystem path with the user's home directory collapsed to `~`.
+///
+/// Every `CODEX_HOME` is under a home directory, and a home directory contains
+/// a **username** — so a raw path must never reach `debug.log`, an error string
+/// persisted to `oauth_credentials.last_error`, or anything archived. `~/.codex-b`
+/// is exactly as actionable as `/Users/alice/.codex-b` and carries no identity.
+///
+/// Both platform prefixes are handled explicitly rather than only
+/// `NSHomeDirectory()`, because a poll may be reasoning about a home under some
+/// path the process did not itself resolve.
+func redactHomePath(_ path: String) -> String {
+    let home = NSHomeDirectory()
+    if !home.isEmpty, path == home { return "~" }
+    if !home.isEmpty, path.hasPrefix(home + "/") {
+        return "~" + path.dropFirst(home.count)
+    }
+    // A path under some *other* account's home still names a user; collapse the
+    // whole `/Users/<name>` or `/home/<name>` prefix rather than echoing it.
+    for root in ["/Users/", "/home/"] {
+        guard path.hasPrefix(root) else { continue }
+        let rest = path.dropFirst(root.count)
+        guard let slash = rest.firstIndex(of: "/") else { return "~" }
+        return "~" + rest[slash...]
+    }
+    return path
+}
+
 // MARK: - Errors
 
 /// Why a `codex app-server` read could not be completed.
@@ -76,6 +105,11 @@ enum CodexAppServerError: Error, LocalizedError {
     case launchFailed(String)
     /// `account/read` reported `account: null` — this `CODEX_HOME` has no login.
     case notLoggedIn(String)
+    /// A **registered** `CODEX_HOME` no longer exists on disk (renamed, on an
+    /// unmounted volume, or removed). Distinct from `notLoggedIn`: there is
+    /// nothing to log in *to*, so the fix is to re-register the account rather
+    /// than to run `codex login`.
+    case homeMissing(String)
     /// The RPC answered `-32600`/`-32601` for a method this codex is too old to
     /// implement. Verified: 0.46.0 returns `-32600` for every unknown method.
     case methodUnsupported(String)
@@ -92,7 +126,11 @@ enum CodexAppServerError: Error, LocalizedError {
         case .launchFailed(let detail):
             return "Could not start codex app-server: \(detail)"
         case .notLoggedIn(let home):
-            return "Codex home not logged in (\(home)) — run `codex login`"
+            // Redacted: this string is logged and persisted to
+            // `oauth_credentials.last_error`, and a raw home path names a user.
+            return "Codex home not logged in (\(redactHomePath(home))) — run `CODEX_HOME=\(redactHomePath(home)) codex login --device-auth`"
+        case .homeMissing(let home):
+            return "Codex home \(redactHomePath(home)) does not exist — re-register with `claude-monitor codex add --home <path>`"
         case .methodUnsupported(let method):
             return "codex app-server does not implement \(method) — upgrade to codex 0.147.0 or newer"
         case .timedOut(let method):
@@ -109,7 +147,10 @@ enum CodexAppServerError: Error, LocalizedError {
         switch self {
         case .binaryNotFound, .methodUnsupported, .launchFailed:
             return true
-        case .notLoggedIn, .timedOut, .protocolFailure:
+        // `homeMissing` is emphatically *not* a capability gap: the transport
+        // works fine on this host, it is this account's registration that is
+        // broken, and silently falling through would hide that forever.
+        case .notLoggedIn, .homeMissing, .timedOut, .protocolFailure:
             return false
         }
     }
@@ -119,7 +160,7 @@ enum CodexAppServerError: Error, LocalizedError {
     var tokenStatus: TokenStatus {
         switch self {
         case .notLoggedIn: return .missing
-        case .binaryNotFound, .launchFailed, .methodUnsupported, .timedOut, .protocolFailure:
+        case .binaryNotFound, .launchFailed, .methodUnsupported, .homeMissing, .timedOut, .protocolFailure:
             return .error
         }
     }
@@ -304,6 +345,18 @@ private struct CodexRPCResult<T: Decodable>: Decodable {
     let result: T?
 }
 
+// MARK: - Identity
+
+/// Who a `CODEX_HOME` is logged in as, as reported by `account/read`.
+///
+/// **Carries no account id** — `account/read` has none on any verified version
+/// (spike §4 item 7). Registration keys the row on `auth.json`'s
+/// `tokens.account_id`, falling back to matching an existing row by email.
+struct CodexAccountIdentity: Sendable {
+    let email: String?
+    let planType: String?
+}
+
 // MARK: - Wire model
 
 /// `account/read` and `account/rateLimits/read` payloads.
@@ -456,8 +509,11 @@ final class CodexAppServerClient: Sendable {
     /// `CODEX_HOME` for the child. nil = whatever the app itself inherited
     /// (`$CODEX_HOME`, else `~/.codex`).
     ///
-    /// This is a *parameter*, not per-account resolution: choosing a different
-    /// home per account (and the schema/UI to store it) is issue #103.
+    /// One home speaks for exactly one ChatGPT login, so this is how an account
+    /// is told apart from its siblings: `OAuthPoller` builds a **new client per
+    /// account** from that account's `accounts.codex_home`, and correct
+    /// attribution becomes a property of the construction rather than something
+    /// detected after the fact (#103).
     let codexHome: String?
     let timeouts: Timeouts
     /// Environment consulted for binary resolution and inherited by the child.
@@ -492,11 +548,41 @@ final class CodexAppServerClient: Sendable {
     /// Honest signature: this transport needs **no credential**, which is the
     /// entire point of the issue behind it.
     func fetchUsage() async throws -> ProviderUsageSnapshot {
-        let (accountLine, rateLimitsLine) = try await handshake()
+        let (accountLine, rateLimitsLine) = try await handshake(includeRateLimits: true)
+        guard let rateLimitsLine = rateLimitsLine else {
+            throw CodexAppServerError.protocolFailure("account/rateLimits/read returned nothing")
+        }
         return try Self.snapshot(
             accountResult: accountLine,
             rateLimitsResult: rateLimitsLine
         )
+    }
+
+    /// Who this home is logged in as, without asking for usage.
+    ///
+    /// `codex add` and `codex list` need the login state and the plan/email of
+    /// one specific home, and nothing else — asking for rate limits too would
+    /// make registration fail on a `codex` too old to implement that method
+    /// (0.46.0 answers `-32600`) even though the home is perfectly usable.
+    ///
+    /// Throws `.notLoggedIn` when `account/read` reports `account: null` — the
+    /// real "needs login" signal, since `requiresOpenaiAuth` is `true` even on a
+    /// logged-in home.
+    func fetchAccountIdentity() async throws -> CodexAccountIdentity {
+        let (accountLine, _) = try await handshake(includeRateLimits: false)
+        // `handshake` swallows a `-32600` on account/read (an old codex) by
+        // returning nil, because the rate-limit call is normally the one that
+        // decides. There is no such call here, so name the capability gap.
+        guard let accountLine = accountLine else {
+            throw CodexAppServerError.methodUnsupported("account/read")
+        }
+        guard let decoded = try? CodexWire.decode(CodexWire.AccountRead.self, from: accountLine),
+              let account = decoded.account else {
+            // `handshake` already throws `.notLoggedIn` for `account: null`, so
+            // reaching here means the reply was undecodable rather than empty.
+            throw CodexAppServerError.protocolFailure("account/read reply carried no usable account")
+        }
+        return CodexAccountIdentity(email: account.email, planType: account.planType)
     }
 
     // MARK: Mapping (pure — exercised offline by selftest)
@@ -578,8 +664,17 @@ final class CodexAppServerClient: Sendable {
 
     /// Spawn, handshake, and reap. Returns the raw `result` payloads for
     /// `account/read` (nil when that method is unsupported) and
-    /// `account/rateLimits/read`.
-    private func handshake() async throws -> (account: Data?, rateLimits: Data) {
+    /// `account/rateLimits/read` (nil when `includeRateLimits` is false).
+    private func handshake(includeRateLimits: Bool) async throws -> (account: Data?, rateLimits: Data?) {
+        // A *registered* home that has vanished must say so in its own words.
+        // Without this, codex resolves the missing directory by creating or
+        // ignoring it and answers `account: null`, which would read as "needs
+        // login" and send the user off to run a login that isn't the fix.
+        if let codexHome = codexHome, !codexHome.isEmpty,
+           !FileManager.default.fileExists(atPath: codexHome) {
+            throw CodexAppServerError.homeMissing(codexHome)
+        }
+
         guard let binary = CodexBinary.resolve(environment: environment) else {
             throw CodexAppServerError.binaryNotFound
         }
@@ -662,6 +757,9 @@ final class CodexAppServerClient: Sendable {
         }
 
         // 4. account/rateLimits/read — the payload this whole path exists for.
+        //    Skipped entirely by the identity probe (`codex add` / `codex list`),
+        //    which only needs to know who this home is and whether it is logged in.
+        guard includeRateLimits else { return (accountResult, nil) }
         try Self.send(writer, ["jsonrpc": "2.0", "id": 3, "method": "account/rateLimits/read", "params": [:]])
         let rateLimits = try await awaitReply(
             id: 3, method: "account/rateLimits/read", stream: stream, process: process,

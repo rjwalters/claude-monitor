@@ -924,6 +924,196 @@ enum SelfTest {
                "the same rule guards tier 2, where auth.json carries an account id")
     }
 
+    /// Which `CODEX_HOME` may speak for one account — the decision that makes
+    /// correct attribution structural instead of something detected afterwards.
+    ///
+    /// **This is where the NULL-email hole the #111 Judge recorded is closed.**
+    /// The old guard compared emails, so an OpenAI row with `email IS NULL`
+    /// could still be handed the ambient home's numbers on a two-account host.
+    /// Resolution needs no identity on either side: it counts candidate
+    /// accounts, so the NULL-email row is exactly as protected as any other.
+    private static func testCodexHomeResolution() {
+        typealias Resolution = OAuthPoller.CodexHomeResolution
+
+        // A registered home is always its own account's, however many siblings
+        // exist — that is the whole point of registering it.
+        expectEqual(OAuthPoller.resolveCodexHome(registered: "/tmp/codex-a", openAIAccountCount: 1),
+                    Resolution.explicit("/tmp/codex-a"),
+                    "a registered home is used verbatim")
+        expectEqual(OAuthPoller.resolveCodexHome(registered: "/tmp/codex-a", openAIAccountCount: 4),
+                    Resolution.explicit("/tmp/codex-a"),
+                    "siblings do not make a registered home ambiguous")
+        expectEqual(OAuthPoller.resolveCodexHome(registered: "  /tmp/codex-b  ", openAIAccountCount: 2),
+                    Resolution.explicit("/tmp/codex-b"),
+                    "a registered home is trimmed before use")
+
+        // No registered home: safe only while nothing else could own the
+        // ambient one. This preserves today's single-account behaviour exactly.
+        expectEqual(OAuthPoller.resolveCodexHome(registered: nil, openAIAccountCount: 1),
+                    Resolution.ambient,
+                    "the only OpenAI account on the host may read the ambient home")
+        expectEqual(OAuthPoller.resolveCodexHome(registered: nil, openAIAccountCount: 0),
+                    Resolution.ambient,
+                    "a freshly imported account with no siblings still reads the ambient home")
+        expectEqual(OAuthPoller.resolveCodexHome(registered: "", openAIAccountCount: 1),
+                    Resolution.ambient,
+                    "an empty codex_home is absent, not a path")
+
+        // THE NULL-EMAIL CASE (#111 Judge). Nothing in this call carries an
+        // email, and the result is still "no home may speak for this account".
+        expectEqual(OAuthPoller.resolveCodexHome(registered: nil, openAIAccountCount: 2),
+                    Resolution.ambiguous,
+                    "a second OpenAI account makes the ambient home unattributable — with or without an email")
+        expect(!Resolution.ambiguous.allowsHomeRead,
+               "an ambiguous home disqualifies BOTH home-reading tiers, not just tier 1")
+        expect(Resolution.ambient.allowsHomeRead && Resolution.ambient.readableHome == nil,
+               "the ambient case reads with no explicit home — the client's own default")
+        expectEqual(Resolution.explicit("/tmp/codex-a").readableHome, "/tmp/codex-a",
+                    "an explicit home is what the client is constructed with")
+
+        // A home path names a user, so it must never reach a log line or a
+        // persisted error string verbatim.
+        expectEqual(redactHomePath(NSHomeDirectory() + "/.codex-work"), "~/.codex-work",
+                    "this user's home directory collapses to ~")
+        expectEqual(redactHomePath(NSHomeDirectory()), "~", "the bare home directory collapses to ~")
+        expectEqual(redactHomePath("/Users/someoneelse/.codex"), "~/.codex",
+                    "another macOS user's name is redacted too")
+        expectEqual(redactHomePath("/home/someoneelse/.codex-b"), "~/.codex-b",
+                    "another Linux user's name is redacted too")
+        expectEqual(redactHomePath("/opt/shared/codex"), "/opt/shared/codex",
+                    "a path outside any home directory is left legible")
+        let notLoggedIn = CodexAppServerError.notLoggedIn(NSHomeDirectory() + "/.codex-work")
+        expect(!(notLoggedIn.localizedDescription).contains(NSHomeDirectory()),
+               "the needs-login message — which is logged AND stored as last_error — carries no raw home path")
+
+        // A persistent "needs login" must log once, not once per poll, so the
+        // dedupe key discriminates the *kind* and never the payload path.
+        expectEqual(OAuthPoller.failureKind(.notLoggedIn("/tmp/a")),
+                    OAuthPoller.failureKind(.notLoggedIn("/tmp/b")),
+                    "the log-dedupe key is the failure kind, never the home path")
+        expect(OAuthPoller.failureKind(.notLoggedIn("/tmp/a")) != OAuthPoller.failureKind(.homeMissing("/tmp/a")),
+               "a change of state still logs — needs-login and home-missing are different kinds")
+        expect(!CodexAppServerError.homeMissing("/tmp/a").isCapabilityGap,
+               "a vanished home is this account's problem, not an absent transport — it must not fall through silently")
+        expectEqual(CodexAppServerError.notLoggedIn("/tmp/a").tokenStatus, TokenStatus.missing,
+                    "needs login surfaces as .missing, distinct from a request failure")
+        expectEqual(CodexAppServerError.homeMissing("/tmp/a").tokenStatus, TokenStatus.error,
+                    "a vanished home surfaces as .error, distinct from needs login")
+    }
+
+    /// **The load-bearing enumeration check.** `loadActiveCredentials` is the
+    /// only enumeration `pollAll` / `pollDue` use, and it filtered
+    /// `access_token IS NOT NULL`. An account registered by home alone — which
+    /// "registering never stores a token" requires — would otherwise register
+    /// fine, list fine, and then never poll.
+    ///
+    /// Also pins the non-leak invariants for the new column against the two
+    /// files this issue deliberately does not edit: an `accounts export` bundle
+    /// must not carry the home, and `ranking.json` must not publish it.
+    private static func testCodexHomeRegistrationEnumeration() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-codexhome-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            UsageStore(dbPath: dbPath).ensureDatabase()
+
+            let homeA = "/tmp/selftest-codex-home-a"
+            let homeB = "/tmp/selftest-codex-home-b"
+            let poller = OAuthPoller(dbPath: dbPath)
+
+            poller.saveCodexHomeAccount(
+                accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: homeA
+            )
+
+            var credentials = poller.loadActiveCredentials()
+            expectEqual(credentials.count, 1,
+                        "a token-free, home-registered account IS enumerated by the poll loop")
+            expectEqual(credentials.first?.accessToken, nil,
+                        "registration stored no access token")
+            expectEqual(credentials.first?.refreshToken, nil,
+                        "registration stored no refresh token either")
+            expectEqual(credentials.first?.codexHome, homeA,
+                        "the account's own home rides along with the credential")
+            expectEqual(credentials.first?.provider, AccountProvider.openai,
+                        "the registered account is an OpenAI account")
+            expectEqual(credentials.first?.source, "codex-home",
+                        "the row is tagged as home-registered rather than token-imported")
+
+            // Re-registering must update the row, never mint a sibling (#45).
+            poller.saveCodexHomeAccount(
+                accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: homeB
+            )
+            let db = try openDatabase(dbPath, readonly: true)
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 1,
+                        "re-registering a home does not create a duplicate account row")
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 1,
+                        "re-registering a home does not create a duplicate credential row")
+            expectEqual(try db.scalar("SELECT codex_home FROM accounts WHERE id = 'user-aaa'") as? String,
+                        homeB, "re-registering updates the stored home")
+
+            // A token-free OpenAI row with NO home is not resurrected into the
+            // poll set — there is nothing on this host for it to read.
+            let now = ISO8601DateFormatter().string(from: Date())
+            try openDatabase(dbPath).run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('user-homeless', 'h@example.com', 'h@example.com', 'pro', ?, 9, 'openai')
+            """, now)
+            try openDatabase(dbPath).run("""
+                INSERT INTO oauth_credentials (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                VALUES ('user-homeless', 'h@example.com', 'codex', 'openai', NULL, 1, ?, ?)
+            """, now, now)
+            // …while an ordinary stored-token account still enumerates exactly as before.
+            try openDatabase(dbPath).run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                VALUES ('org-anthropic', 'x@example.com', 'x@example.com', 'Max', ?, 10, 'anthropic')
+            """, now)
+            try openDatabase(dbPath).run("""
+                INSERT INTO oauth_credentials (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                VALUES ('org-anthropic', 'x@example.com', 'token', 'anthropic', 'sk-ant-oat01-selftest', 1, ?, ?)
+            """, now, now)
+
+            credentials = poller.loadActiveCredentials()
+            expectEqual(credentials.count, 2,
+                        "a token-free row with no registered home stays out of the poll set")
+            expect(credentials.contains { $0.accountId == "org-anthropic" && $0.accessToken != nil },
+                   "a stored-token account is enumerated exactly as before")
+            expect(credentials.contains { $0.accountId == "user-aaa" },
+                   "the home-registered account is still enumerated alongside it")
+            expect(credentials.allSatisfy { $0.provider == .anthropic || $0.codexHome != nil || $0.accessToken != nil },
+                   "nothing token-free and homeless slipped in")
+
+            // `codex list` sees the registration, token-free and all.
+            let listed = poller.codexAccounts()
+            expectEqual(listed.count, 2, "codex list shows every OpenAI account, registered or not")
+            let registered = listed.first { $0.accountId == "user-aaa" }
+            expectEqual(registered?.codexHome, homeB, "codex list reports the registered home")
+            expectEqual(registered?.hasStoredToken, false, "codex list reports that no token is stored")
+            expectEqual(listed.first { $0.accountId == "user-homeless" }?.codexHome, nil,
+                        "an account with no registered home lists as using the ambient default")
+
+            // A home path contains a username: it must stay host-local. Both
+            // files below are VERIFY-ONLY in this issue — they already use
+            // explicit column lists, and this is what pins that.
+            let bundle = try AccountSync.exportBundle(dbPath: dbPath)
+            let encoded = String(data: try JSONEncoder().encode(bundle), encoding: .utf8) ?? ""
+            expect(!encoded.contains(homeB) && !encoded.contains("codex_home"),
+                   "an accounts export bundle carries no codex_home — a home path is meaningless on another host")
+
+            let rankingPath = dir.appendingPathComponent("ranking.json").path
+            RankingExporter.exportNow(dbPath: dbPath, outputPath: rankingPath)
+            let ranking = String(data: FileManager.default.contents(atPath: rankingPath) ?? Data(),
+                                 encoding: .utf8) ?? ""
+            expect(!ranking.isEmpty, "ranking.json was written")
+            expect(!ranking.contains(homeB) && !ranking.contains("codex_home"),
+                   "ranking.json never publishes a home path")
+        } catch {
+            checks += 1
+            failures.append("codex home registration test threw: \(error)")
+        }
+    }
+
     /// Spawn / handshake / reap against a **stub** binary, so CI exercises the
     /// subprocess path on macOS and Linux without the real Codex CLI installed.
     ///
@@ -1034,6 +1224,143 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("codex app-server stub test threw: \(error)")
+        }
+    }
+
+    /// **The strongest available offline proof of the core behaviour**: a stub
+    /// `codex` that echoes its own `$CODEX_HOME` back into a marker file, so
+    /// two clients built from two different accounts' homes are shown to reach
+    /// the child's environment as two different values — on macOS *and* Linux
+    /// CI, with no real Codex CLI installed.
+    ///
+    /// A resolver unit test alone would not do: the whole failure mode this
+    /// issue exists to prevent is one account's home silently reaching the
+    /// other account's read.
+    private static func testCodexPerAccountHomeReachesChild() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-perhome-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+            func writeStub(_ name: String, _ body: String) throws -> String {
+                let path = dir.appendingPathComponent(name).path
+                try Data(body.utf8).write(to: URL(fileURLWithPath: path))
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+                return path
+            }
+
+            // Two homes that actually exist, as `codex login` would leave them.
+            let homeA = dir.appendingPathComponent("codex-home-a").path
+            let homeB = dir.appendingPathComponent("codex-home-b").path
+            for home in [homeA, homeB] {
+                try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+            }
+
+            let oneLine: (String) -> String = { $0.replacingOccurrences(of: "\n", with: "") }
+            let echoStub = try writeStub("codex-echo-home", """
+            #!/bin/sh
+            printf '%s' "$CODEX_HOME" > "$HOME_MARKER"
+            echo '{"id":1,"result":{"userAgent":"stub"}}'
+            echo '{"id":2,"result":\(oneLine(codexAccountFixture))}'
+            echo '{"id":3,"result":\(oneLine(codexRateLimitsFixture))}'
+            cat > /dev/null
+            """)
+
+            var timeouts = CodexAppServerClient.Timeouts()
+            timeouts.initialize = 10
+            timeouts.method = 10
+            timeouts.overall = 20
+
+            func readBack(home: String, marker: String) -> String? {
+                let client = CodexAppServerClient(
+                    codexHome: home,
+                    timeouts: timeouts,
+                    environment: [
+                        CodexBinary.overrideEnvKey: echoStub,
+                        "PATH": "/usr/bin:/bin",
+                        "HOME_MARKER": marker,
+                    ]
+                )
+                switch runBlocking({ try await client.fetchUsage() }) {
+                case .success:
+                    return (try? String(contentsOfFile: marker, encoding: .utf8))?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                case .failure(let error):
+                    checks += 1
+                    failures.append("per-account home handshake failed: \(error)")
+                    return nil
+                }
+            }
+
+            let markerA = dir.appendingPathComponent("seen-a").path
+            let markerB = dir.appendingPathComponent("seen-b").path
+            let seenA = readBack(home: homeA, marker: markerA)
+            let seenB = readBack(home: homeB, marker: markerB)
+
+            expectEqual(seenA, homeA,
+                        "account A's registered CODEX_HOME is what its child process actually sees")
+            expectEqual(seenB, homeB,
+                        "account B's registered CODEX_HOME is what its child process actually sees")
+            expect(seenA != seenB,
+                   "two accounts polled from two homes never share one home — the corruption this issue prevents")
+
+            // A registered home that no longer exists gets its own state, and
+            // is decided before anything is spawned.
+            let vanished = dir.appendingPathComponent("codex-home-gone").path
+            let goneClient = CodexAppServerClient(
+                codexHome: vanished,
+                timeouts: timeouts,
+                environment: [CodexBinary.overrideEnvKey: echoStub, "PATH": "/usr/bin:/bin",
+                              "HOME_MARKER": dir.appendingPathComponent("seen-gone").path]
+            )
+            switch runBlocking({ try await goneClient.fetchUsage() }) {
+            case .success:
+                checks += 1
+                failures.append("a registered home that does not exist must not appear to succeed")
+            case .failure(let error):
+                guard let codexError = error as? CodexAppServerError, case .homeMissing = codexError else {
+                    checks += 1
+                    failures.append("a vanished home must fail with .homeMissing, got \(error)")
+                    break
+                }
+                expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("seen-gone").path),
+                       "a vanished home is caught before a child is spawned at all")
+            }
+
+            // A home that exists but was never logged into: `account: null` is
+            // the real signal — `requiresOpenaiAuth` is true even when logged in.
+            let loggedOutStub = try writeStub("codex-logged-out", """
+            #!/bin/sh
+            echo '{"id":1,"result":{"userAgent":"stub"}}'
+            echo '{"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}'
+            echo '{"id":3,"error":{"code":-32600,"message":"Invalid request"}}'
+            cat > /dev/null
+            """)
+            let loggedOutClient = CodexAppServerClient(
+                codexHome: homeA,
+                timeouts: timeouts,
+                environment: [CodexBinary.overrideEnvKey: loggedOutStub, "PATH": "/usr/bin:/bin"]
+            )
+            switch runBlocking({ try await loggedOutClient.fetchUsage() }) {
+            case .success:
+                checks += 1
+                failures.append("an unauthenticated home must not appear to succeed")
+            case .failure(let error):
+                guard let codexError = error as? CodexAppServerError, case .notLoggedIn = codexError else {
+                    checks += 1
+                    failures.append("an unauthenticated home must surface as .notLoggedIn, got \(error)")
+                    break
+                }
+                expectEqual(codexError.tokenStatus, TokenStatus.missing,
+                            "needs login is its own health state, not a request failure")
+                expect(!codexError.isCapabilityGap,
+                       "needs login is an account state — it must not fall through silently as a capability gap")
+            }
+        } catch {
+            checks += 1
+            failures.append("per-account codex home test threw: \(error)")
         }
     }
 
@@ -2026,6 +2353,8 @@ enum SelfTest {
 
             expect(!tableColumns(legacy, "accounts").contains("provider"),
                    "fixture must start without the provider column")
+            expect(!tableColumns(legacy, "accounts").contains("codex_home"),
+                   "fixture must start without the codex_home column")
 
             // --- What launching the current build does. ---
             let store = UsageStore(dbPath: dbPath)
@@ -2034,6 +2363,12 @@ enum SelfTest {
             let db = try openDatabase(dbPath, readonly: true)
             expect(tableColumns(db, "accounts").contains("provider"),
                    "migration adds accounts.provider")
+            expect(tableColumns(db, "accounts").contains("codex_home"),
+                   "migration adds accounts.codex_home")
+            // Nullable with no DEFAULT: an existing row must keep meaning "the
+            // ambient home", which is exactly its pre-migration behaviour.
+            expect((try db.scalar("SELECT codex_home FROM accounts WHERE id = 'org-legacy'")) == nil,
+                   "an existing account is left with codex_home NULL — the ambient home, as before")
             let credColumns = tableColumns(db, "oauth_credentials")
             expect(credColumns.contains("provider"), "migration adds oauth_credentials.provider")
             expect(credColumns.contains("refresh_token"), "migration ensures oauth_credentials.refresh_token")
@@ -2283,6 +2618,14 @@ enum SelfTest {
             let credColumns = tableColumns(db, "oauth_credentials")
             expect(credColumns.contains("provider"), "--db: migration added oauth_credentials.provider")
             expect(credColumns.contains("token_expires_at"), "--db: migration added oauth_credentials.token_expires_at")
+            expect(tableColumns(db, "accounts").contains("codex_home"),
+                   "--db: migration added accounts.codex_home")
+            // Every pre-existing row keeps the ambient home. A real database
+            // may legitimately have registrations already, so this asserts that
+            // the migration itself invented none — count only, never a path.
+            expectEqual(try db.scalar(
+                "SELECT COUNT(*) FROM accounts WHERE codex_home IS NOT NULL AND COALESCE(provider, 'anthropic') != 'openai'"
+            ) as? Int64, 0, "--db: migration registered no home on a non-OpenAI account")
 
             expectEqual(store.accounts.count, accountsBefore, "--db: account count unchanged by migration")
             expect(store.accounts.allSatisfy { $0.provider == .anthropic },

@@ -33,6 +33,14 @@ struct Account: Identifiable {
     let plan: String?
     let lastUpdated: Date?
     let latestPercent: Double?
+    /// This account's own `CODEX_HOME` (`provider == .openai` only), registered
+    /// by `claude-monitor codex add --home <path>`.
+    ///
+    /// **nil means "the ambient home"** — `$CODEX_HOME` if set, else `~/.codex`
+    /// — which is exactly the single-account behaviour every row had before
+    /// this column existed. Host-local by design: a home path is meaningless on
+    /// another machine, so `AccountSync` deliberately does not carry it (#103).
+    let codexHome: String?
 
     init(
         id: String,
@@ -41,7 +49,8 @@ struct Account: Identifiable {
         email: String?,
         plan: String?,
         lastUpdated: Date?,
-        latestPercent: Double?
+        latestPercent: Double?,
+        codexHome: String? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -50,6 +59,7 @@ struct Account: Identifiable {
         self.plan = plan
         self.lastUpdated = lastUpdated
         self.latestPercent = latestPercent
+        self.codexHome = codexHome
     }
 
     /// Returns the best display name for the account
@@ -261,7 +271,8 @@ class UsageStore: ObservableObject {
                 plan TEXT,
                 last_updated TEXT,
                 sort_order INTEGER DEFAULT 0,
-                provider TEXT NOT NULL DEFAULT 'anthropic'
+                provider TEXT NOT NULL DEFAULT 'anthropic',
+                codex_home TEXT
             );
             CREATE TABLE IF NOT EXISTS usage_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -360,6 +371,21 @@ class UsageStore: ObservableObject {
         // must be refreshed before this instant (spike #26).
         addColumnIfMissing(db, table: "oauth_credentials",
                            column: "token_expires_at", definition: "TEXT")
+
+        // Migration (per-account Codex home, #103): which `CODEX_HOME` speaks
+        // for this account. Deliberately **nullable with no DEFAULT** — NULL
+        // means "the ambient home" (`$CODEX_HOME`, else `~/.codex`), so every
+        // pre-existing row keeps today's exact single-account behaviour with no
+        // user action, and `codex add --home` is the only thing that ever sets
+        // it.
+        //
+        // It lives on `accounts` rather than `oauth_credentials` because it is
+        // an identity property, not credential material: a home path holds no
+        // secret, but it *does* contain a username, so it must never be
+        // exported (`AccountSync`) or published (`ranking.json`). Both already
+        // use explicit column lists, which is what keeps this column host-local.
+        addColumnIfMissing(db, table: "accounts",
+                           column: "codex_home", definition: "TEXT")
 
         // Heal rows whose provider is absent/blank — a database edited by an
         // external tool, or one where an earlier ADD COLUMN raced.
@@ -713,13 +739,18 @@ class UsageStore: ObservableObject {
             isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             let nowString = isoFormatter.string(from: Date())
 
-            // Load accounts using raw SQL. `provider` is selected only when the
-            // column exists, so a database that hasn't been migrated yet (an
-            // external tool opened it first) still loads — every row then
-            // resolves to the .anthropic fallback.
-            let hasProvider = tableColumns(db, "accounts").contains("provider")
+            // Load accounts using raw SQL. `provider` and `codex_home` are
+            // selected only when the column exists, so a database that hasn't
+            // been migrated yet (an external tool opened it first) still loads —
+            // every row then resolves to the .anthropic fallback with no
+            // registered home.
+            let accountColumns = tableColumns(db, "accounts")
+            let hasProvider = accountColumns.contains("provider")
+            let hasCodexHome = accountColumns.contains("codex_home")
             let accountStmt = try db.prepare("""
-                SELECT id, account_name, email, plan, last_updated\(hasProvider ? ", provider" : "")
+                SELECT id, account_name, email, plan, last_updated,
+                       \(hasProvider ? "provider" : "NULL"),
+                       \(hasCodexHome ? "codex_home" : "NULL")
                 FROM accounts ORDER BY last_updated DESC
             """)
 
@@ -729,7 +760,8 @@ class UsageStore: ObservableObject {
                 let acctEmail = row[2] as? String
                 let acctPlan = row[3] as? String
                 let acctLastUpdated = row[4] as? String
-                let acctProvider = AccountProvider(stored: hasProvider ? row[5] as? String : nil)
+                let acctProvider = AccountProvider(stored: row[5] as? String)
+                let acctCodexHome = (row[6] as? String).flatMap { $0.isEmpty ? nil : $0 }
 
                 // Get latest percent from usage_history
                 var percent: Double? = nil
@@ -747,7 +779,8 @@ class UsageStore: ObservableObject {
                     email: acctEmail,
                     plan: acctPlan,
                     lastUpdated: UsageRecord.parseISO(acctLastUpdated),
-                    latestPercent: percent
+                    latestPercent: percent,
+                    codexHome: acctCodexHome
                 )
                 loadedAccounts.append(account)
 

@@ -60,6 +60,11 @@ struct OAuthCredential {
     let subscriptionType: String?
     let rateLimitTier: String?
     let isActive: Bool
+    /// The `accounts.codex_home` of the account this credential belongs to,
+    /// carried along so the poll loop can build this account's own
+    /// `CodexAppServerClient` without a second query. nil = no registered home
+    /// (the ambient `$CODEX_HOME`, else `~/.codex`).
+    let codexHome: String?
 
     init(
         id: Int64?,
@@ -73,7 +78,8 @@ struct OAuthCredential {
         tokenExpiresAt: Date? = nil,
         subscriptionType: String?,
         rateLimitTier: String?,
-        isActive: Bool
+        isActive: Bool,
+        codexHome: String? = nil
     ) {
         self.id = id
         self.accountId = accountId
@@ -87,6 +93,7 @@ struct OAuthCredential {
         self.subscriptionType = subscriptionType
         self.rateLimitTier = rateLimitTier
         self.isActive = isActive
+        self.codexHome = codexHome
     }
 
     /// This credential in the provider-agnostic shape a `UsageProviderClient`
@@ -133,11 +140,6 @@ struct EnvImportResult {
 class OAuthPoller: ObservableObject {
     private let apiClient = AnthropicAPIClient()
     private let openAIClient = OpenAIAPIClient()
-    /// Tier 1 of the OpenAI read ladder (see `pollOpenAI`): asks the locally
-    /// installed Codex CLI, so no OpenAI credential is read, stored, or
-    /// refreshed by this app. `codexHome: nil` means "whatever this process
-    /// inherited" — resolving a different home per account is issue #103.
-    private let codexAppServerClient = CodexAppServerClient()
     @Published var lastError: String?
     @Published var credentialStatuses: [CredentialStatus] = []
 
@@ -329,6 +331,213 @@ class OAuthPoller: ObservableObject {
             refreshToken: credential.refreshToken,
             expiresAt: credential.expiresAt
         )
+    }
+
+    // MARK: - Register a Codex home (per-account CODEX_HOME, #103)
+
+    /// One registered Codex account, for `claude-monitor codex list`.
+    ///
+    /// Deliberately carries **no email**: the CLI identifies accounts by the
+    /// truncated-id convention the rest of this surface uses.
+    struct CodexAccountRegistration {
+        let accountId: String
+        /// nil = no registered home (the ambient `$CODEX_HOME`, else `~/.codex`).
+        let codexHome: String?
+        let plan: String?
+        /// Whether a token is still stored for this account (tier 3). A
+        /// home-registered account has none, which is the point.
+        let hasStoredToken: Bool
+    }
+
+    /// Register an account by its `CODEX_HOME`, storing **no token**.
+    ///
+    /// The identity comes from two places, in order:
+    ///
+    /// 1. `<home>/auth.json`'s `tokens.account_id` — read via
+    ///    `CodexAuth.accountId(inHome:)`, which touches that one opaque field
+    ///    and never a token. `account/read` carries no account id on any
+    ///    verified `app-server` version, so this is the only source of a stable
+    ///    `user-…` key.
+    /// 2. The email `account/read` reports, matched against an existing
+    ///    `provider = 'openai'` row by `resolveOpenAIAccountId` — so a home
+    ///    registered for an account that already exists updates that row rather
+    ///    than minting a duplicate sibling (the #45 failure mode).
+    ///
+    /// Returns the account id it landed on, plus a non-fatal warning when the
+    /// home registered but its usage could not be read yet.
+    func registerCodexHome(_ rawHome: String) async -> (accountId: String?, error: String?) {
+        let home = Self.normalizeCodexHome(rawHome)
+        guard FileManager.default.fileExists(atPath: home) else {
+            return (nil, CodexAppServerError.homeMissing(home).localizedDescription)
+        }
+
+        // Read before the probe: an account id from auth.json lets registration
+        // still succeed on a codex too old to answer `account/read`.
+        let nativeId = CodexAuth.accountId(inHome: home)
+
+        let client = CodexAppServerClient(codexHome: home)
+        var identity: CodexAccountIdentity?
+        var snapshot: ProviderUsageSnapshot?
+        var warning: String?
+
+        do {
+            let usage = try await client.fetchUsage()
+            snapshot = usage
+            identity = CodexAccountIdentity(email: usage.email, planType: usage.plan)
+        } catch let error as CodexAppServerError {
+            switch error {
+            case .notLoggedIn, .homeMissing:
+                // The actionable states: there is nothing to register yet.
+                return (nil, error.localizedDescription)
+            case .methodUnsupported:
+                // A codex too old for `account/rateLimits/read` may still answer
+                // `account/read`; and even if it doesn't, auth.json's account id
+                // is enough to register a home the fallback tiers can use.
+                identity = try? await client.fetchAccountIdentity()
+                warning = error.localizedDescription
+            case .binaryNotFound, .launchFailed:
+                guard nativeId != nil else { return (nil, error.localizedDescription) }
+                warning = error.localizedDescription
+            case .timedOut, .protocolFailure:
+                return (nil, error.localizedDescription)
+            }
+        } catch {
+            return (nil, error.localizedDescription)
+        }
+
+        let email = identity?.email
+        var accountId = nativeId ?? ""
+        if FileManager.default.fileExists(atPath: dbPath),
+           let db = try? openDatabase(dbPath, readonly: true) {
+            accountId = Self.resolveOpenAIAccountId(email: email, nativeId: accountId, db: db)
+        }
+        if accountId.isEmpty {
+            // No `account_id` in auth.json and no existing row to match. Mint a
+            // local id, which is safe precisely because the email lookup above
+            // already ruled out a duplicate.
+            guard email?.isEmpty == false else {
+                return (nil, "Could not identify the account at \(home) — its auth.json carries no account_id and `account/read` reported no email. Run `CODEX_HOME=\(home) codex login --device-auth` and try again.")
+            }
+            accountId = "openai-\(UUID().uuidString.lowercased())"
+        }
+
+        // Deliberately optional: on a degraded registration (no codex binary,
+        // a codex too old) we learned no plan, and a placeholder would
+        // *overwrite* the real one an earlier read had already stored.
+        saveCodexHomeAccount(
+            accountId: accountId,
+            email: email,
+            plan: identity?.planType ?? snapshot?.plan,
+            codexHome: home
+        )
+
+        if let snapshot = snapshot {
+            writeSnapshotToDB(accountId: accountId, snapshot: snapshot)
+        }
+
+        // Never the home path: this line goes to debug.log.
+        flog.info("codex add: registered OpenAI account \(accountId.prefix(8))… against its own CODEX_HOME", category: fcat)
+        return (accountId, warning)
+    }
+
+    /// `~`-expansion plus trimming, so `codex list` echoes back a stable path
+    /// and two spellings of the same home don't register twice.
+    nonisolated static func normalizeCodexHome(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        return (trimmed as NSString).expandingTildeInPath
+    }
+
+    /// Upsert the account row **and** make sure the poll loop can see it.
+    ///
+    /// The credential row is the load-bearing half: `loadActiveCredentials` is
+    /// the only enumeration the poll loop uses, so an account with no row there
+    /// registers, lists, and then never updates. It is created token-free
+    /// (`access_token = NULL`, `source = 'codex-home'`) and an **existing** row's
+    /// token is never touched — re-registering a home on an account that still
+    /// has a stored credential must not destroy it (that removal is #104's).
+    // Not private: exercised directly by SelfTest, which drives the whole DB
+    // half of registration synchronously and offline (the subprocess half is
+    // covered by the stub-binary spawn test). Same pattern as
+    // `resolveOpenAIAccountId` and `parseAccountPairs`.
+    ///
+    /// `email` and `plan` are optional and merged with `COALESCE`: a
+    /// registration that could not learn them (an old or absent `codex`) must
+    /// never blank out values an earlier read already stored.
+    func saveCodexHomeAccount(
+        accountId: String, email: String?, plan: String?, codexHome: String
+    ) {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return }
+        do {
+            let db = try openDatabase(dbPath)
+            let now = ISO8601DateFormatter().string(from: Date())
+            let label = email ?? accountId
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider, codex_home)
+                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0), 'openai', ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    email = COALESCE(excluded.email, accounts.email),
+                    plan = COALESCE(excluded.plan, accounts.plan),
+                    last_updated = excluded.last_updated,
+                    provider = 'openai',
+                    codex_home = excluded.codex_home
+            """, accountId, label, email, plan, now, codexHome)
+
+            let existing = try db.scalar(
+                "SELECT id FROM oauth_credentials WHERE account_id = ? LIMIT 1", accountId
+            ) as? Int64
+
+            if let credId = existing {
+                try db.run("""
+                    UPDATE oauth_credentials SET provider = 'openai', is_active = 1, updated_at = ?
+                    WHERE id = ?
+                """, now, credId)
+            } else {
+                try db.run("""
+                    INSERT INTO oauth_credentials (
+                        account_id, label, source, provider,
+                        access_token, refresh_token, token_expires_at,
+                        is_active, created_at, updated_at
+                    ) VALUES (?, ?, 'codex-home', 'openai', NULL, NULL, NULL, 1, ?, ?)
+                """, accountId, label, now, now)
+            }
+        } catch {
+            flog.error("Failed to register codex home: \(error.localizedDescription)", category: fcat)
+        }
+    }
+
+    /// Every OpenAI account row, for `claude-monitor codex list`.
+    func codexAccounts() -> [CodexAccountRegistration] {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
+        do {
+            let db = try openDatabase(dbPath, readonly: true)
+            let accountColumns = tableColumns(db, "accounts")
+            guard accountColumns.contains("provider") else { return [] }
+            let hasCodexHome = accountColumns.contains("codex_home")
+            let stmt = try db.prepare("""
+                SELECT a.id, \(hasCodexHome ? "a.codex_home" : "NULL"), a.plan,
+                       (SELECT COUNT(*) FROM oauth_credentials c
+                         WHERE c.account_id = a.id AND c.access_token IS NOT NULL)
+                FROM accounts a
+                WHERE COALESCE(a.provider, 'anthropic') = 'openai'
+                ORDER BY a.sort_order, a.id
+            """)
+            var rows: [CodexAccountRegistration] = []
+            for row in stmt {
+                guard let id = row[0] as? String else { continue }
+                rows.append(CodexAccountRegistration(
+                    accountId: id,
+                    codexHome: (row[1] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                    plan: row[2] as? String,
+                    hasStoredToken: ((row[3] as? Int64) ?? 0) > 0
+                ))
+            }
+            return rows
+        } catch {
+            flog.error("codexAccounts failed: \(error.localizedDescription)", category: fcat)
+            return []
+        }
     }
 
     // MARK: - Import from .env File
@@ -660,26 +869,54 @@ class OAuthPoller: ObservableObject {
 
     // MARK: - Database Operations
 
+    /// Every credential the poll loop should visit this cycle.
+    ///
+    /// **This is the only enumeration `pollAll` / `pollDue` / `probeFableDue`
+    /// use**, so anything absent here silently never updates. Two shapes
+    /// qualify:
+    ///
+    /// 1. A row with a stored `access_token` — every account before #103.
+    /// 2. A **token-free** row whose account has a registered `codex_home`
+    ///    (`claude-monitor codex add --home`). Registering an account by its
+    ///    home deliberately never reads or stores a token, so its credential row
+    ///    carries `access_token = NULL` and `source = 'codex-home'`; without
+    ///    this clause it would register fine, list fine, and never poll.
+    ///
+    /// Clause 2 is written as narrowly as it can be — `provider = 'openai'` and
+    /// a non-NULL `codex_home` — rather than relaxing the token predicate for
+    /// all OpenAI rows, so a token-less row from any *other* source (e.g. an
+    /// `accounts import` bundle exported from a host that had a home) is not
+    /// resurrected into the poll set on a host where it has no home to read.
     func loadActiveCredentials() -> [OAuthCredential] {
         guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
         do {
             let db = try openDatabase(dbPath, readonly: true)
             var credentials: [OAuthCredential] = []
 
-            // The provider columns are selected only when present, so a
+            // The migrated columns are selected only when present, so a
             // database opened before the migration ran still loads (every row
-            // then resolves to the Anthropic fallback).
+            // then resolves to the Anthropic fallback with no registered home).
             let columns = tableColumns(db, "oauth_credentials")
             let hasProvider = columns.contains("provider")
             let hasTokenExpiry = columns.contains("token_expires_at")
+            let accountColumns = tableColumns(db, "accounts")
+            let hasCodexHome = accountColumns.contains("codex_home")
+            let accountProvider = accountColumns.contains("provider")
+                ? "COALESCE(a.provider, 'anthropic')" : "'anthropic'"
+            let homeRegistered = hasCodexHome
+                ? "(a.codex_home IS NOT NULL AND TRIM(a.codex_home) != '' AND \(accountProvider) = 'openai')"
+                : "0"
             let stmt = try db.prepare("""
-                SELECT id, account_id, label, source,
-                       access_token, refresh_token, expires_at,
-                       subscription_type, rate_limit_tier, is_active,
-                       \(hasProvider ? "provider" : "NULL"),
-                       \(hasTokenExpiry ? "token_expires_at" : "NULL")
-                FROM oauth_credentials
-                WHERE is_active = 1 AND access_token IS NOT NULL
+                SELECT c.id, c.account_id, c.label, c.source,
+                       c.access_token, c.refresh_token, c.expires_at,
+                       c.subscription_type, c.rate_limit_tier, c.is_active,
+                       \(hasProvider ? "c.provider" : "NULL"),
+                       \(hasTokenExpiry ? "c.token_expires_at" : "NULL"),
+                       \(hasCodexHome ? "a.codex_home" : "NULL")
+                FROM oauth_credentials c
+                LEFT JOIN accounts a ON a.id = c.account_id
+                WHERE c.is_active = 1
+                  AND (c.access_token IS NOT NULL OR \(homeRegistered))
             """)
 
             for row in stmt {
@@ -695,7 +932,8 @@ class OAuthPoller: ObservableObject {
                     tokenExpiresAt: UsageRecord.parseISO(row[11] as? String),
                     subscriptionType: row[7] as? String,
                     rateLimitTier: row[8] as? String,
-                    isActive: (row[9] as? Int64 ?? 1) == 1
+                    isActive: (row[9] as? Int64 ?? 1) == 1,
+                    codexHome: (row[12] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 ))
             }
 
@@ -940,13 +1178,21 @@ class OAuthPoller: ObservableObject {
         // is what the higher tiers write against.
         let storedAccountId = credential.accountId.flatMap { $0.isEmpty ? nil : $0 }
 
+        // Which Codex home — if any — is allowed to speak for this account.
+        // Resolved once, up front, and shared by both home-reading tiers.
+        let home = resolveCodexHome(for: credential)
+        if case .ambiguous = home { noteAmbiguousCodexHome(credential) }
+
         // MARK: Tier 1 — codex app-server (no credential touched)
-        if let storedAccountId = storedAccountId {
+        if let storedAccountId = storedAccountId, home.allowsHomeRead {
             do {
-                let snapshot = try await codexAppServerClient.fetchUsage()
-                // The reading is only this account's if the local Codex login is
-                // this account. Verified after the fact rather than before it
-                // because `account/read` is the only place that identity exists.
+                // A nil `codexHome` is the `.ambient` case — the client then
+                // falls back to `$CODEX_HOME`, else `~/.codex`, as before.
+                let snapshot = try await CodexAppServerClient(codexHome: home.readableHome).fetchUsage()
+                // Belt and braces on top of the per-account home: a registered
+                // home that has since been re-logged-in as somebody else, or an
+                // ambient home that never belonged to this account, still gets
+                // caught here rather than overwriting the row.
                 if codexHomeConflicts(with: credential, reportedEmail: snapshot.email) {
                     noteCodexIdentityConflict(credential)
                 } else {
@@ -967,8 +1213,11 @@ class OAuthPoller: ObservableObject {
         //
         // Read, used once, and dropped: never persisted, never refreshed. That
         // alone removes the rotation race, so it is worth trying before the
-        // stored copy even when the RPC is unavailable.
-        if let live = try? CodexAuth.load(), let storedAccountId = storedAccountId,
+        // stored copy even when the RPC is unavailable. The file read is scoped
+        // to *this account's* home, not `CodexAuth.defaultAuthPath`.
+        if home.allowsHomeRead,
+           let live = try? CodexAuth.load(path: CodexAuth.authPath(inHome: home.readableHome)),
+           let storedAccountId = storedAccountId,
            !codexHomeConflicts(with: credential, reportedAccountId: live.accountId) {
             do {
                 let snapshot = try await openAIClient.fetchUsage(accessToken: live.accessToken)
@@ -984,9 +1233,18 @@ class OAuthPoller: ObservableObject {
 
         // MARK: Tier 3 — stored credential (unchanged; removed by #104)
         guard let stored = credential.providerCredentials else {
-            let reason = pendingCodexFailure(credential)?.localizedDescription ?? "No access token"
-            let status = pendingCodexFailure(credential)?.tokenStatus ?? .missing
-            updateCredentialStatus(credential, status: status, error: reason)
+            // An account registered by home alone has no tier 3 to fall back to,
+            // so tier 1's failure *is* this account's health state. Reported and
+            // returned rather than rethrown: `pollWithRetry` would flatten an
+            // `unauthorized` throw to `.revoked`, burying "needs login" behind a
+            // state that suggests the wrong fix.
+            if let codexFailure = pendingCodexFailure(credential) {
+                let reason = codexFailure.localizedDescription
+                updateCredentialLastPoll(credential, error: reason)
+                updateCredentialStatus(credential, status: codexFailure.tokenStatus, error: reason)
+                return
+            }
+            updateCredentialStatus(credential, status: .missing, error: "No access token")
             throw AnthropicAPIError.unauthorized
         }
 
@@ -1036,6 +1294,17 @@ class OAuthPoller: ObservableObject {
     /// interval, forever.
     private var loggedCodexCapabilityGap: Set<Int64> = []
 
+    /// One log line per (credential, kind-of-failure), so a *persistent* state
+    /// is reported once rather than every poll. Keyed by kind rather than by
+    /// credential alone so a state change (needs login → logged in again → home
+    /// deleted) is still visible.
+    ///
+    /// This matters more with per-account homes than it did before: a
+    /// registered-but-unauthenticated home is now a legitimate, indefinite
+    /// steady state, not a transient. Deduping only capability gaps would write
+    /// the same `[WARN]` line every interval, forever.
+    private var loggedCodexFailureKind: Set<String> = []
+
     private func noteCodexFallback(_ credential: OAuthCredential, _ error: CodexAppServerError) {
         guard let id = credential.id else { return }
         lastCodexFailure[id] = error
@@ -1047,8 +1316,23 @@ class OAuthPoller: ObservableObject {
             if loggedCodexCapabilityGap.insert(id).inserted {
                 flog.info("codex app-server unavailable for \(credential.label): \(error.localizedDescription) — using the fallback path", category: fcat)
             }
-        } else {
+        } else if loggedCodexFailureKind.insert("\(id):\(Self.failureKind(error))").inserted {
             flog.warning("codex app-server: \(error.localizedDescription) — falling back for \(credential.label)", category: fcat)
+        }
+    }
+
+    /// A stable discriminator for the *kind* of failure, ignoring its payload
+    /// (which is a home path, and must not be part of a log-dedupe key any more
+    /// than it may be part of a log line).
+    nonisolated static func failureKind(_ error: CodexAppServerError) -> String {
+        switch error {
+        case .binaryNotFound: return "binaryNotFound"
+        case .launchFailed: return "launchFailed"
+        case .notLoggedIn: return "notLoggedIn"
+        case .homeMissing: return "homeMissing"
+        case .methodUnsupported: return "methodUnsupported"
+        case .timedOut: return "timedOut"
+        case .protocolFailure: return "protocolFailure"
         }
     }
 
@@ -1056,27 +1340,132 @@ class OAuthPoller: ObservableObject {
         credential.id.flatMap { lastCodexFailure[$0] }
     }
 
-    // MARK: - Codex home identity guard
+    // MARK: - Per-account Codex home resolution
+
+    /// Which `CODEX_HOME` — if any — may speak for one account.
+    ///
+    /// A single Codex home holds exactly one login, so attributing a home's
+    /// reading to the wrong account overwrites that account's usage with a
+    /// stranger's: plausible-looking numbers, silently wrong, and invisible to
+    /// tests and review. This type makes the three cases explicit rather than
+    /// leaving "which home?" implicit in the ambient environment.
+    enum CodexHomeResolution: Equatable {
+        /// The account's own registered `codex_home` (`codex add --home`).
+        /// Correct attribution is a property of the *construction* here: the
+        /// child is spawned against this account's home and can only ever
+        /// report this account.
+        case explicit(String)
+        /// No registered home, and no sibling the ambient home could belong to
+        /// instead — i.e. this is the only OpenAI account on the host. Exactly
+        /// today's single-account behaviour, preserved so an existing
+        /// installation needs no user action.
+        case ambient
+        /// No registered home, but there **are** other OpenAI accounts. The
+        /// ambient home belongs to at most one of them and nothing available
+        /// says which, so no home may speak for this account at all.
+        ///
+        /// This is what closes the hole the #111 Judge recorded: the old guard
+        /// compared emails, so a row with `email IS NULL` could still be handed
+        /// the ambient home's numbers. Ambiguity is now resolved by *counting
+        /// candidates*, which needs no identity on either side and therefore has
+        /// no NULL-email gap. The account falls through to its stored credential.
+        case ambiguous
+
+        /// The home the read tiers should be constructed with, or nil to mean
+        /// "the client's own ambient default".
+        var readableHome: String? {
+            switch self {
+            case .explicit(let home): return home
+            case .ambient, .ambiguous: return nil
+            }
+        }
+
+        /// Whether a home-reading tier may run at all. Distinguishes `.ambient`
+        /// (run, with the inherited home) from `.ambiguous` (do not run).
+        var allowsHomeRead: Bool {
+            if case .ambiguous = self { return false }
+            return true
+        }
+    }
+
+    /// The pure decision, split out so the self-test can pin every shape —
+    /// including the NULL-email one — with no database and no subprocess.
+    ///
+    /// `openAIAccountCount` is the number of `provider = 'openai'` account rows
+    /// on this host. One means the ambient home can only be this account's; more
+    /// than one means it cannot be attributed without proof.
+    nonisolated static func resolveCodexHome(
+        registered: String?, openAIAccountCount: Int
+    ) -> CodexHomeResolution {
+        if let registered = registered?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !registered.isEmpty {
+            return .explicit(registered)
+        }
+        return openAIAccountCount > 1 ? .ambiguous : .ambient
+    }
+
+    private func resolveCodexHome(for credential: OAuthCredential) -> CodexHomeResolution {
+        Self.resolveCodexHome(
+            registered: credential.codexHome,
+            openAIAccountCount: openAIAccountCount()
+        )
+    }
+
+    /// How many OpenAI account rows this database holds. Counted per poll (one
+    /// scalar against a database this cycle opens anyway) rather than cached, so
+    /// adding an account takes effect on the next cycle without a restart.
+    private func openAIAccountCount() -> Int {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return 0 }
+        do {
+            let db = try openDatabase(dbPath, readonly: true)
+            guard tableColumns(db, "accounts").contains("provider") else { return 0 }
+            let count = try db.scalar(
+                "SELECT COUNT(*) FROM accounts WHERE COALESCE(provider, 'anthropic') = 'openai'"
+            ) as? Int64
+            return Int(count ?? 0)
+        } catch {
+            flog.error("openAIAccountCount failed: \(error.localizedDescription)", category: fcat)
+            // Fail closed: an unknown count must not license the ambient home.
+            return 2
+        }
+    }
+
+    /// Accounts already told once that they need their own home registered.
+    private var loggedAmbiguousCodexHome: Set<Int64> = []
+
+    private func noteAmbiguousCodexHome(_ credential: OAuthCredential) {
+        guard let id = credential.id else { return }
+        if loggedAmbiguousCodexHome.insert(id).inserted {
+            flog.info(
+                "\(credential.label) has no registered CODEX_HOME and this host has more than one OpenAI account — the ambient home can speak for only one of them, so it is not used here. Register this account's own home with `claude-monitor codex add --home <path>`.",
+                category: fcat
+            )
+        }
+    }
+
+    // MARK: - Codex home identity guard (belt and braces)
 
     /// Credentials whose Codex home demonstrably belongs to someone else, logged
     /// once rather than every poll.
     private var loggedCodexIdentityConflict: Set<Int64> = []
 
-    /// True when the local Codex login demonstrably belongs to a **different**
-    /// account than this credential.
+    /// True when the Codex login just read demonstrably belongs to a
+    /// **different** account than this credential.
     ///
-    /// Tiers 1 and 2 both read whichever `CODEX_HOME` this process inherited,
-    /// and that single home speaks for exactly one account. On a host with two
-    /// OpenAI accounts, attributing its reading to both would overwrite one
-    /// account's usage with a stranger's — a silent data corruption, since the
-    /// numbers look perfectly plausible. Resolving a *different* home per
-    /// account is issue #103; until it lands, a demonstrated conflict is enough
-    /// to leave this account on its own stored credential.
+    /// Per-account homes make correct attribution structural, so this is no
+    /// longer the primary defence — it is **kept deliberately** as a second line
+    /// for the two cases resolution alone cannot see:
+    ///
+    /// - a `codex_home IS NULL` row reading the ambient home on a
+    ///   single-account host, where that ambient home may belong to a ChatGPT
+    ///   login this app has never registered;
+    /// - a **registered** home that has since been re-logged-in as a different
+    ///   account, which no amount of construction-time care can predict.
     ///
     /// Deliberately asymmetric: only a **contradiction** disqualifies a tier.
-    /// Absent identity on either side proves nothing, so the ordinary
-    /// single-account host — where neither the row nor the wire need carry an
-    /// email — keeps using the preferred transport.
+    /// Absent identity on either side proves nothing — which is precisely why it
+    /// could never close the NULL-email hole on its own, and why
+    /// `resolveCodexHome` (which needs no identity at all) does that instead.
     private func codexHomeConflicts(with credential: OAuthCredential, reportedEmail: String?) -> Bool {
         guard let accountId = credential.accountId, !accountId.isEmpty else { return false }
         return Self.identitiesConflict(reportedEmail, storedEmail(for: accountId))
@@ -1117,7 +1506,7 @@ class OAuthPoller: ObservableObject {
         guard let id = credential.id else { return }
         if loggedCodexIdentityConflict.insert(id).inserted {
             flog.info(
-                "codex app-server reports a different account than \(credential.label) — this host's CODEX_HOME belongs to another login, using the stored credential instead (per-account CODEX_HOME is issue #103)",
+                "codex app-server reports a different account than \(credential.label) — the Codex home it read belongs to another login, using the stored credential instead. Register this account's own home with `claude-monitor codex add --home <path>`.",
                 category: fcat
             )
         }
