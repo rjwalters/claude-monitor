@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **PR #88**: refactor: dedupe parseISO, colorForPercent, and b64url helpers
+- **Issue #87** (closed): Dedupe copy-pasted helpers: parseISO, colorForPercent, b64url
 - **PR #86**: refactor: unify percent-severity color thresholds into shared PercentSeverity enum
 - **Issue #85** (closed): Remove duplicated percent-severity color logic (colorForPercent x2 + inline copy in main.swift)
 - **PR #82**: refactor: convert static-only window controllers to enums
