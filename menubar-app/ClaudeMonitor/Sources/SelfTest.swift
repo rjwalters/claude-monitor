@@ -450,15 +450,19 @@ enum SelfTest {
         }
     }
 
+    /// Base64url-encodes a JSON fixture for building a synthetic JWT (no
+    /// padding, `+`/`/` swapped for `-`/`_` per RFC 7515 §2). Shared by the
+    /// OpenAI-token and Codex-auth fixture tests below.
+    private static func b64url(_ json: String) -> String {
+        Data(json.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
     /// OpenAI access tokens expire (~10 days) and `auth.json` states no expiry,
     /// so the token's own `exp` claim is the only source. Only `exp` is read.
     private static func testOpenAITokenExpiryParsing() {
-        func b64url(_ json: String) -> String {
-            Data(json.utf8).base64EncodedString()
-                .replacingOccurrences(of: "+", with: "-")
-                .replacingOccurrences(of: "/", with: "_")
-                .replacingOccurrences(of: "=", with: "")
-        }
         // A structurally-valid but entirely synthetic JWT — no real credential.
         let token = "\(b64url("{\"alg\":\"RS256\"}")).\(b64url("{\"exp\":1785967226,\"sub\":\"fixture\"}")).sig"
         expectEqual(OpenAIAPIClient.accessTokenExpiry(token),
@@ -508,12 +512,6 @@ enum SelfTest {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let authPath = dir.appendingPathComponent("auth.json").path
 
-            func b64url(_ json: String) -> String {
-                Data(json.utf8).base64EncodedString()
-                    .replacingOccurrences(of: "+", with: "-")
-                    .replacingOccurrences(of: "/", with: "_")
-                    .replacingOccurrences(of: "=", with: "")
-            }
             let fakeAccess = "\(b64url("{\"alg\":\"none\"}")).\(b64url("{\"exp\":1785967226}")).sig"
             let fixture = """
             {"OPENAI_API_KEY": null,

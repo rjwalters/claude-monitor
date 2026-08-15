@@ -308,7 +308,7 @@ struct UsageChartWindow: View {
                             Text("\(Int(sessionPercent))%")
                                 .font(.title2)
                                 .fontWeight(.bold)
-                                .foregroundColor(colorForPercent(sessionPercent))
+                                .foregroundColor(PercentSeverity(percent: sessionPercent).color)
                         }
                     }
                     if let weeklyPercent = latestWeeklyPercent {
@@ -319,7 +319,7 @@ struct UsageChartWindow: View {
                             Text("\(Int(weeklyPercent))%")
                                 .font(.title2)
                                 .fontWeight(.bold)
-                                .foregroundColor(colorForPercent(weeklyPercent))
+                                .foregroundColor(PercentSeverity(percent: weeklyPercent).color)
                         }
                     }
                 }
@@ -923,14 +923,6 @@ struct UsageChartWindow: View {
         if seconds < 60 { return "just now" }
         if seconds < 3600 { return "\(seconds / 60)m ago" }
         return "\(seconds / 3600)h ago"
-    }
-
-    func colorForPercent(_ percent: Double) -> Color {
-        switch PercentSeverity(percent: percent) {
-        case .critical: return Color(nsColor: .systemRed)
-        case .warning: return Color(nsColor: .systemOrange)
-        case .normal: return .primary
-        }
     }
 
     func formatDateShort(_ date: Date) -> String {
