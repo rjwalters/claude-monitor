@@ -1146,7 +1146,7 @@ struct SummaryRow: View {
     }
 
     private func openRollToken() {
-        RollTokenWindowController.show(for: account, store: store, oauthPoller: oauthPoller)
+        RollTokenWindowController.show(for: account, oauthPoller: oauthPoller)
     }
 
     private func togglePrimary() {

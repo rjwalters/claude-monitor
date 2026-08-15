@@ -10,7 +10,6 @@ import SwiftUI
 /// dead. See `TokenRoller` for why it works this way.
 struct RollTokenView: View {
     let account: Account
-    @ObservedObject var store: UsageStore
     @ObservedObject var oauthPoller: OAuthPoller
     var onClose: () -> Void
 
@@ -251,7 +250,7 @@ struct RollTokenView: View {
 enum RollTokenWindowController {
     static var windows: [String: NSWindow] = [:]
 
-    static func show(for account: Account, store: UsageStore, oauthPoller: OAuthPoller) {
+    static func show(for account: Account, oauthPoller: OAuthPoller) {
         // Dismiss the menu-bar popover first so the wizard doesn't open behind the
         // semitransient token table, then build the window after a short delay to
         // avoid the AppKit layout crash during popover dismissal (same guard the
@@ -263,11 +262,11 @@ enum RollTokenWindowController {
         let delay: TimeInterval = hadPopover ? 0.3 : 0
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             NSApp.activate(ignoringOtherApps: true)
-            present(for: account, store: store, oauthPoller: oauthPoller)
+            present(for: account, oauthPoller: oauthPoller)
         }
     }
 
-    private static func present(for account: Account, store: UsageStore, oauthPoller: OAuthPoller) {
+    private static func present(for account: Account, oauthPoller: OAuthPoller) {
         if let existing = windows[account.id] {
             existing.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -275,7 +274,7 @@ enum RollTokenWindowController {
         }
 
         var window: NSWindow!
-        let view = RollTokenView(account: account, store: store, oauthPoller: oauthPoller, onClose: {
+        let view = RollTokenView(account: account, oauthPoller: oauthPoller, onClose: {
             window?.close()
         })
         let hostingController = NSHostingController(rootView: view)
