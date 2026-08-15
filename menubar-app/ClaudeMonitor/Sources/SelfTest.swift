@@ -75,6 +75,8 @@ enum SelfTest {
         testCodexAppServerRedaction()
         testCodexSnapshotOfflinePathWritesNoLog()
         testCodexBinaryResolution()
+        testCodexProvisionArgParsing()
+        testCodexProvisionIdentityConflict()
         testCodexHomeIdentityGuard()
         testCodexHomeResolution()
         testCodexHomeRegistrationEnumeration()
@@ -988,6 +990,129 @@ enum SelfTest {
             checks += 1
             failures.append("codex binary resolution test threw: \(error)")
         }
+    }
+
+    /// `codex provision <label>` (#133) collapses home-create + login +
+    /// register into one command. The interactive `codex login --device-auth`
+    /// step itself has nothing to unit-test offline, but the argument
+    /// parsing that gates it does: `parseProvisionArgs` is a pure function
+    /// with no `exit()`, so every error path is exercised directly here
+    /// rather than by spawning the CLI as a subprocess. "codex binary
+    /// absent" — the other failure `runProvision` must surface clearly — is
+    /// the exact `CodexBinary.resolve` contract `testCodexBinaryResolution`
+    /// already covers (an override or PATH that resolves to nothing yields
+    /// `nil`, which `runProvision` turns into a fail-fast error before it
+    /// ever creates a CODEX_HOME directory).
+    private static func testCodexProvisionArgParsing() {
+        do {
+            let parsed = try CodexCLI.parseProvisionArgs(["work"])
+            expectEqual(parsed, CodexCLI.ProvisionArgs(label: "work", dbPath: nil),
+                        "a bare label parses with no --db")
+        } catch {
+            checks += 1
+            failures.append("parseProvisionArgs(['work']) unexpectedly threw: \(error)")
+        }
+
+        do {
+            let parsed = try CodexCLI.parseProvisionArgs(["work", "--db", "/tmp/scratch.db"])
+            expectEqual(parsed, CodexCLI.ProvisionArgs(label: "work", dbPath: "/tmp/scratch.db"),
+                        "--db is captured alongside the label")
+        } catch {
+            checks += 1
+            failures.append("parseProvisionArgs with --db unexpectedly threw: \(error)")
+        }
+
+        do {
+            let parsed = try CodexCLI.parseProvisionArgs(["  work  "])
+            expectEqual(parsed, CodexCLI.ProvisionArgs(label: "work", dbPath: nil),
+                        "surrounding whitespace on the label is trimmed")
+        } catch {
+            checks += 1
+            failures.append("parseProvisionArgs with whitespace unexpectedly threw: \(error)")
+        }
+
+        expectThrowsProvisionArgError(
+            [], .missingLabel, "no arguments at all — missing label"
+        )
+        expectThrowsProvisionArgError(
+            ["--db", "/tmp/scratch.db"], .missingLabel,
+            "only --db, no positional label"
+        )
+        expectThrowsProvisionArgError(
+            ["   "], .missingLabel, "a label that is only whitespace is treated as missing"
+        )
+        expectThrowsProvisionArgError(
+            ["work/agent"], .labelContainsSlash("work/agent"),
+            "a label with '/' could escape ~/.codex-<label> and must be rejected"
+        )
+        expectThrowsProvisionArgError(
+            ["--bogus"], .unknownOption("--bogus"), "an unrecognized flag is rejected"
+        )
+        expectThrowsProvisionArgError(
+            ["work", "extra"], .extraArgument("extra"),
+            "a second positional argument is rejected rather than silently ignored"
+        )
+        expectThrowsProvisionArgError(
+            ["work", "--db"], .missingValue("--db"), "--db with no following path"
+        )
+    }
+
+    private static func expectThrowsProvisionArgError(
+        _ args: [String], _ expected: CodexCLI.ProvisionArgError, _ label: String
+    ) {
+        do {
+            _ = try CodexCLI.parseProvisionArgs(args)
+            checks += 1
+            failures.append("parseProvisionArgs(\(args)) should have thrown \(expected) — \(label)")
+        } catch let error as CodexCLI.ProvisionArgError {
+            expectEqual(error, expected, label)
+        } catch {
+            checks += 1
+            failures.append("parseProvisionArgs(\(args)) threw the wrong error type: \(error) — \(label)")
+        }
+    }
+
+    /// `runProvision` must not silently repoint an already-registered
+    /// identity to a different one just because a fresh login landed on a
+    /// different account — the collision/idempotency edge cases from #133's
+    /// test plan. `provisionIdentityConflict` is the pure decision extracted
+    /// from that flow so it can be checked without spawning `codex`.
+    private static func testCodexProvisionIdentityConflict() {
+        expect(
+            CodexCLI.provisionIdentityConflict(
+                label: "work", home: "/tmp/.codex-work",
+                existingAccountId: nil, observedNativeId: nil
+            ) == nil,
+            "first-time provisioning of a fresh home — nothing registered yet, nothing observed"
+        )
+        expect(
+            CodexCLI.provisionIdentityConflict(
+                label: "work", home: "/tmp/.codex-work",
+                existingAccountId: nil, observedNativeId: "user-aaa"
+            ) == nil,
+            "a home with no prior registration has nothing to conflict with, however it's now logged in"
+        )
+        expect(
+            CodexCLI.provisionIdentityConflict(
+                label: "work", home: "/tmp/.codex-work",
+                existingAccountId: "user-aaa", observedNativeId: nil
+            ) == nil,
+            "auth.json carrying no account id yet proves nothing — do not block on it"
+        )
+        expect(
+            CodexCLI.provisionIdentityConflict(
+                label: "work", home: "/tmp/.codex-work",
+                existingAccountId: "user-aaa", observedNativeId: "user-aaa"
+            ) == nil,
+            "the idempotent re-run path: already registered, still the same identity — no conflict"
+        )
+        expect(
+            CodexCLI.provisionIdentityConflict(
+                label: "work", home: "/tmp/.codex-work",
+                existingAccountId: "user-aaa", observedNativeId: "user-bbb"
+            ) != nil,
+            "re-provisioning a label whose home is now logged in as a different account must fail, not silently repoint the registration"
+        )
     }
 
     /// Both new tiers read whichever `CODEX_HOME` this process inherited, and
