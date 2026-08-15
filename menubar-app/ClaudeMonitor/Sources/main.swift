@@ -126,6 +126,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         usageStore.ensureDatabase()
         flog.info("Database ready", category: "App")
 
+        // `usageStore` and `oauthPoller` are separate instances (see
+        // UsageStore.pollIntervalHint) — tell the store the actual poll
+        // cadence so its staleness threshold (#148) tracks the poller's,
+        // rather than silently drifting if `oauthPoller.pollInterval` is
+        // ever made configurable on macOS.
+        usageStore.pollIntervalHint = oauthPoller.pollInterval
+
         // Hide dock icon
         NSApp.setActivationPolicy(.accessory)
 

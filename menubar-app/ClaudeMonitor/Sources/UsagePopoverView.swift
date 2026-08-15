@@ -898,13 +898,31 @@ struct SummaryRow: View {
         return tokenStatus.rawValue
     }
 
+    /// True once this row's last successful reading is older than the
+    /// staleness threshold derived from the configured poll interval (#148)
+    /// — the cause-independent backstop. Fires the same way regardless of
+    /// *why* polling stopped working (a dead credential, a missing binary, a
+    /// subprocess that times out every cycle, or a cause nobody has
+    /// diagnosed yet), which is the entire point: `isDrifted` is a *known*
+    /// cause with its own more specific badge, but this is the guarantee
+    /// that catches everything else. Clears automatically the moment the
+    /// next poll succeeds — `dataAge` is recomputed from `usage.timestamp`
+    /// on every render, so there is nothing to reset.
+    private var isStale: Bool {
+        guard let age = dataAge else { return false }
+        return AccountFreshness.isStale(age: age, pollInterval: oauthPoller.pollInterval)
+    }
+
     /// The usage this row should actually display. A drifted account's last
     /// polled numbers are frozen — the identity behind them may already
     /// belong to someone else — so every percent/headroom cell renders "—"
     /// exactly as it does for an account with no data yet, rather than
-    /// presenting stale figures as current (#146).
+    /// presenting stale figures as current (#146). A merely stale account
+    /// (no known cause, just an old reading) gets the identical treatment
+    /// (#148): a frozen percentage is exactly what "stale" means, so it must
+    /// stop being presented as current too.
     private var displayUsage: UsageRecord? {
-        isDrifted ? nil : usage
+        (isDrifted || isStale) ? nil : usage
     }
 
     /// Data age in seconds (nil if no usage data)
@@ -913,19 +931,46 @@ struct SummaryRow: View {
         return -usage.timestamp.timeIntervalSinceNow
     }
 
-    /// Freshness dot color: green (<10 min), yellow (<30 min), red (>30 min)
+    /// Freshness dot color, thresholds derived from the configured poll
+    /// interval (#148) rather than hard-coded: green while within one poll
+    /// cycle, yellow while aging but not yet past the staleness threshold,
+    /// red once stale. At the default 600s interval this reproduces the
+    /// original 10 min / 30 min literals exactly.
     private var freshnessDotColor: Color {
         guard let age = dataAge else { return .gray }
-        if age < 10 * 60 { return .green }
-        if age < 30 * 60 { return .yellow }
+        let interval = oauthPoller.pollInterval
+        if age < interval { return .green }
+        if age < AccountFreshness.staleThreshold(pollInterval: interval) { return .yellow }
         return .red
     }
 
+    /// Tooltip for the freshness dot. A drifted row already has a
+    /// cause-specific explanation (`tokenStatusHelp`, sourced from
+    /// `OAuthPoller.driftDetailMessage`) — that takes precedence over the
+    /// generic message here, so the operator sees *why* once rather than two
+    /// competing explanations. Once genuinely stale, the label states an
+    /// explicit "as of <time>" rather than letting the row's silence imply
+    /// the number is still current.
     private var freshnessLabel: String {
         guard let age = dataAge else { return "No data" }
-        if age < 10 * 60 { return "Fresh (<10 min)" }
-        if age < 30 * 60 { return "Stale (\(Int(age / 60)) min)" }
-        return "Very stale (\(Int(age / 60)) min)"
+        if isDrifted { return tokenStatusHelp }
+        let interval = oauthPoller.pollInterval
+        if age < interval { return "Fresh (\(Int(age / 60)) min)" }
+        if age < AccountFreshness.staleThreshold(pollInterval: interval) {
+            return "Aging (\(Int(age / 60)) min) — as of \(asOfTimeString)"
+        }
+        return "Stale — as of \(asOfTimeString)"
+    }
+
+    /// Short local time string for the "as of <time>" freshness label, so a
+    /// stale row states when its figures were last true instead of implying
+    /// "now".
+    private var asOfTimeString: String {
+        guard let usage = usage else { return "unknown" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter.string(from: usage.timestamp)
     }
 
     /// True when this row is the one whose usage is shown in the menubar.

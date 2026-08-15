@@ -60,6 +60,7 @@ enum SelfTest {
         testNaturalSort()
         testSortedAccountsForPopoverTieBreak()
         testGatingResetOrdering()
+        testStalenessBackstop()
         testWindowKindDerivation()
         testSnapshotFromPositionalWindows()
         testMissingSessionWindow()
@@ -275,6 +276,107 @@ enum SelfTest {
         expectEqual(store.sortedAccountsForPopover.map { $0.displayName },
                     ["agent-3", "agent-1", "agent-2"],
                     "capped accounts order by time until they are usable again")
+    }
+
+    /// The cause-independent staleness backstop (#148): an account whose
+    /// `last_updated` has fallen far behind the configured poll interval must
+    /// be marked stale, must not win "most available" or menubar
+    /// auto-selection over a fresher alternative even while reporting a
+    /// lower (more available) percentage, and must recover the instant its
+    /// next poll succeeds — no restart, no per-provider or per-cause
+    /// special-casing.
+    private static func testStalenessBackstop() {
+        // `AccountFreshness` itself: the threshold is a multiple of the poll
+        // interval, so it scales with a slower configured interval instead
+        // of tripping on a single missed cycle.
+        expect(!AccountFreshness.isStale(age: 500, pollInterval: 600),
+               "well within one poll cycle is never stale")
+        expect(!AccountFreshness.isStale(age: 1700, pollInterval: 600),
+               "under 3x the poll interval is not yet stale")
+        expect(AccountFreshness.isStale(age: 1800, pollInterval: 600),
+               "at 3x the poll interval, a reading is stale")
+        expect(!AccountFreshness.isStale(age: 1800, pollInterval: 900),
+               "a slower configured interval raises the threshold — the identical age is not stale at 900s")
+        expect(!AccountFreshness.isStale(lastUpdated: nil, pollInterval: 600),
+               "never successfully polled is a distinct 'no data yet' state, not staleness")
+
+        let store = UsageStore(dbPath: ":memory:selftest-staleness")
+        store.pollIntervalHint = 600
+
+        let now = Date()
+        func usage(_ accountId: String, sessionPercent: Double) -> UsageRecord {
+            UsageRecord(
+                id: 1, accountId: accountId, timestamp: now,
+                primaryPercent: sessionPercent, sessionPercent: sessionPercent,
+                weeklyAllPercent: sessionPercent, weeklySONnetPercent: nil,
+                sessionReset: nil, weeklyReset: nil
+            )
+        }
+
+        let freshAccount = Account(
+            id: "fresh-acct", accountName: "fresh", email: nil, plan: "Max",
+            lastUpdated: now.addingTimeInterval(-120), latestPercent: nil
+        )
+        let staleAccount = Account(
+            id: "stale-acct", accountName: "stale", email: nil, plan: "Max",
+            lastUpdated: now.addingTimeInterval(-2 * 3600), latestPercent: nil
+        )
+        store.accounts = [staleAccount, freshAccount]
+        // The stale account reads a *lower* (more available) percentage than
+        // the fresh one — without staleness in the comparator, it would win
+        // "most available" purely on that frozen number.
+        store.latestUsage = [
+            staleAccount.id: usage(staleAccount.id, sessionPercent: 5),
+            freshAccount.id: usage(freshAccount.id, sessionPercent: 50),
+        ]
+
+        expect(store.isStale(staleAccount), "2h old at a 10-min poll interval is stale")
+        expect(!store.isStale(freshAccount), "updated 2 minutes ago is not stale")
+
+        expectEqual(store.sortedAccountsForPopover.map { $0.id }, [freshAccount.id, staleAccount.id],
+                    "a stale account must not rank ahead of a fresher one, even reading a lower percent")
+        expectEqual(store.effectivePrimaryAccountId, freshAccount.id,
+                    "menubar auto-selection must not pick a stale account over a fresh alternative")
+
+        // Recovery is automatic: once the stale account's next poll succeeds
+        // and `last_updated` advances, it is treated as fresh again with no
+        // restart and no other state to reset.
+        let recoveredAccount = Account(
+            id: staleAccount.id, accountName: staleAccount.accountName, email: nil, plan: "Max",
+            lastUpdated: now, latestPercent: nil
+        )
+        store.accounts = [recoveredAccount, freshAccount]
+        store.latestUsage[recoveredAccount.id] = usage(recoveredAccount.id, sessionPercent: 5)
+        expect(!store.isStale(recoveredAccount), "staleness clears the moment last_updated advances again")
+        expectEqual(store.sortedAccountsForPopover.map { $0.id }, [recoveredAccount.id, freshAccount.id],
+                    "once fresh again, the account competes on its actual (lower) percentage")
+
+        // A slower configured poll interval must not produce false staleness
+        // for an account that simply hasn't been polled again within a
+        // single (longer) cycle.
+        store.pollIntervalHint = 3600
+        let slowIntervalAccount = Account(
+            id: "slow-interval-acct", accountName: "slow", email: nil, plan: "Max",
+            lastUpdated: now.addingTimeInterval(-2700), latestPercent: nil
+        )
+        expect(!store.isStale(slowIntervalAccount),
+               "45 minutes old is not stale at a 1-hour poll interval, though it would be at the 10-min default")
+
+        // No behavior change to Anthropic-only fixtures: two fresh accounts
+        // (well within the poll interval) still order purely on usage
+        // percent, exactly as before this feature existed.
+        store.pollIntervalHint = 600
+        let anthropicA = Account(id: "a", accountName: "a", email: nil, plan: "Max",
+                                  lastUpdated: now, latestPercent: nil)
+        let anthropicB = Account(id: "b", accountName: "b", email: nil, plan: "Max",
+                                  lastUpdated: now, latestPercent: nil)
+        store.accounts = [anthropicA, anthropicB]
+        store.latestUsage = [
+            anthropicA.id: usage(anthropicA.id, sessionPercent: 80),
+            anthropicB.id: usage(anthropicB.id, sessionPercent: 20),
+        ]
+        expectEqual(store.sortedAccountsForPopover.map { $0.id }, [anthropicB.id, anthropicA.id],
+                    "two fresh accounts still order purely by usage percent, unaffected by staleness")
     }
 
     // MARK: - Window model
