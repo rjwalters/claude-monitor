@@ -1,0 +1,23 @@
+version: 2
+
+# Only `github-actions` is configured, deliberately.
+#
+# The Swift package has zero package dependencies (see Package.swift), and the
+# root package.json is an empty Loom workspace shim with no dependency blocks
+# and no lockfile — neither gives Dependabot anything to update. The repo's
+# entire third-party surface is the actions referenced by .github/workflows.
+#
+# Actions are grouped including majors: they are low-risk here and reviewing
+# each bump as its own PR is noise. If a risk-bearing action is added later
+# (one coupled to an external binary or service), give it its own PR via
+# `exclude-patterns` rather than widening this group.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: ["major", "minor", "patch"]
+    labels: ["tier:maintenance"]
