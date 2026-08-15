@@ -42,6 +42,8 @@ enum CodexCLI {
             runAdd(Array(args.dropFirst()))
         case "list":
             runList(Array(args.dropFirst()))
+        case "provision":
+            runProvision(Array(args.dropFirst()))
         case "--help", "-h", "help":
             printUsage()
             exit(0)
@@ -93,6 +95,229 @@ enum CodexCLI {
         let poller = OAuthPoller(dbPath: storePath)
 
         Task {
+            let result = await poller.registerCodexHome(resolvedHome)
+            guard let accountId = result.accountId else {
+                fail(result.error ?? "Registration failed")
+            }
+            print("Registered OpenAI account \(accountId.prefix(8))… at CODEX_HOME=\(resolvedHome)")
+            print("No token was read, copied, or stored — usage is read through `codex` itself.")
+            if let warning = result.error {
+                FileHandle.standardError.write(Data("Warning: \(warning)\n".utf8))
+            }
+            exportRanking(storePath)
+            exit(0)
+        }
+        dispatchMain()
+    }
+
+    // MARK: - codex provision
+
+    /// Parsed, validated arguments for `codex provision`. A plain value type
+    /// with no I/O so the self-test can exercise every error path without
+    /// spawning a process or touching `exit()`.
+    struct ProvisionArgs: Equatable {
+        let label: String
+        let dbPath: String?
+    }
+
+    /// Argument-parsing failures for `codex provision`, kept distinct from
+    /// the message string so the self-test can assert on the *kind* of
+    /// failure rather than fragile prose matching.
+    enum ProvisionArgError: Error, Equatable {
+        case missingLabel
+        case labelContainsSlash(String)
+        case unknownOption(String)
+        case extraArgument(String)
+        case missingValue(String)
+    }
+
+    /// Pure parser for `codex provision <label> [--db <path>]` — no I/O, no
+    /// `exit()`, no process spawn, so the self-test can drive every error
+    /// path (missing label, unknown option, a label that would escape
+    /// `~/.codex-<label>`) directly. `--help`/`-h` is handled by the caller,
+    /// same as `runAdd`/`runList`/`runImport`, since printing usage and
+    /// exiting isn't something a pure function should do.
+    static func parseProvisionArgs(_ args: [String]) throws -> ProvisionArgs {
+        var label: String?
+        var dbPath: String?
+
+        var i = 0
+        while i < args.count {
+            let arg = args[i]
+            switch arg {
+            case "--db":
+                guard i + 1 < args.count else { throw ProvisionArgError.missingValue("--db") }
+                dbPath = args[i + 1]
+                i += 1
+            default:
+                if arg.hasPrefix("-") {
+                    throw ProvisionArgError.unknownOption(arg)
+                } else if label == nil {
+                    label = arg
+                } else {
+                    throw ProvisionArgError.extraArgument(arg)
+                }
+            }
+            i += 1
+        }
+
+        guard let rawLabel = label?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawLabel.isEmpty else {
+            throw ProvisionArgError.missingLabel
+        }
+        // The label becomes the literal suffix of `~/.codex-<label>` — a '/'
+        // would escape that directory (e.g. "../../etc").
+        guard !rawLabel.contains("/") else {
+            throw ProvisionArgError.labelContainsSlash(rawLabel)
+        }
+        return ProvisionArgs(label: rawLabel, dbPath: dbPath)
+    }
+
+    private static func provisionArgErrorMessage(for error: Error) -> String {
+        switch error as? ProvisionArgError {
+        case .missingLabel:
+            return "codex provision requires a <label> (e.g. `codex provision work`)"
+        case .labelContainsSlash(let label):
+            return "<label> must not contain '/' — got '\(label)' (it becomes the suffix of ~/.codex-<label>)"
+        case .unknownOption(let opt):
+            return "Unknown option '\(opt)' (see --help)"
+        case .extraArgument(let arg):
+            return "Unexpected extra argument '\(arg)' — codex provision takes exactly one <label> (see --help)"
+        case .missingValue(let opt):
+            return "\(opt) requires a path"
+        case .none:
+            return "Invalid arguments (see --help)"
+        }
+    }
+
+    /// Whether provisioning `home` would silently repoint an
+    /// already-registered identity to a different one.
+    ///
+    /// `existingAccountId` is the account already registered against this
+    /// exact `CODEX_HOME` in the local DB, if any; `observedNativeId` is
+    /// `auth.json`'s `tokens.account_id` after the login step (fresh or
+    /// skipped because the home was already logged in). Returns a diagnostic
+    /// message only when **both** are known and disagree — nil covers every
+    /// other case: first-time provisioning of a fresh home, a home whose
+    /// `auth.json` carries no account id yet, and the idempotent re-run path
+    /// where the observed identity matches what was already registered.
+    static func provisionIdentityConflict(
+        label: String, home: String, existingAccountId: String?, observedNativeId: String?
+    ) -> String? {
+        guard let existingAccountId, let observedNativeId, existingAccountId != observedNativeId else {
+            return nil
+        }
+        return """
+            CODEX_HOME=\(home) (label '\(label)') is already registered to account \
+            \(existingAccountId.prefix(8))…, but is now logged in as a different account \
+            (\(observedNativeId.prefix(8))…). Log out and log back in with the identity you \
+            intended for '\(label)', or provision a different <label> for this login.
+            """
+    }
+
+    /// Runs `codex login --device-auth` against `home`, inheriting the
+    /// caller's stdio so the operator sees the device code and any prompts
+    /// directly — device-auth is inherently interactive, and this is the one
+    /// place `provision` orchestrates around it rather than automating it.
+    ///
+    /// Called from the `Task` in `runProvision`, which — because `CodexCLI`
+    /// is `@MainActor` and this closure inherits that isolation — runs on
+    /// the main thread, exactly where `Process.waitUntilExit()` must be
+    /// called (see CLAUDE.md: calling it off the main thread hangs).
+    private static func runDeviceAuthLogin(codexBin: String, home: String) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: codexBin)
+        process.arguments = ["login", "--device-auth"]
+        var env = ProcessInfo.processInfo.environment
+        env["CODEX_HOME"] = home
+        process.environment = env
+        process.standardInput = FileHandle.standardInput
+        process.standardOutput = FileHandle.standardOutput
+        process.standardError = FileHandle.standardError
+        do {
+            try process.run()
+        } catch {
+            fail("Could not launch `codex login --device-auth`: \(error.localizedDescription)")
+        }
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    /// Collapses "pick a home, log in, register it" into one command per
+    /// identity per host (#133, decomposed from #130).
+    ///
+    /// Reuses `OAuthPoller.registerCodexHome`/`normalizeCodexHome` for the
+    /// home-naming and registration steps — the same calls `codex add
+    /// --home` makes — rather than reimplementing either.
+    private static func runProvision(_ args: [String]) -> Never {
+        if args.contains("--help") || args.contains("-h") {
+            printUsage()
+            exit(0)
+        }
+
+        let parsed: ProvisionArgs
+        do {
+            parsed = try parseProvisionArgs(args)
+        } catch {
+            fail(provisionArgErrorMessage(for: error))
+        }
+
+        guard let codexBin = CodexBinary.resolve() else {
+            fail("Codex CLI not found — install `@openai/codex`, or set CLAUDE_MONITOR_CODEX_BIN (see --help)")
+        }
+
+        let storePath = parsed.dbPath
+        let label = parsed.label
+        let resolvedHome = OAuthPoller.normalizeCodexHome("~/.codex-\(label)")
+
+        // Idempotent by construction: `withIntermediateDirectories: true`
+        // does not throw when the directory already exists.
+        do {
+            try FileManager.default.createDirectory(
+                atPath: resolvedHome, withIntermediateDirectories: true
+            )
+        } catch {
+            fail("Could not create CODEX_HOME at \(resolvedHome): \(error.localizedDescription)")
+        }
+
+        let store = UsageStore(dbPath: storePath)
+        store.ensureDatabase()
+        let poller = OAuthPoller(dbPath: storePath)
+
+        Task {
+            let existingAccountId = poller.codexAccounts()
+                .first { $0.codexHome == resolvedHome }?.accountId
+
+            var alreadyLoggedIn = false
+            do {
+                _ = try await CodexAppServerClient(codexHome: resolvedHome).fetchAccountIdentity()
+                alreadyLoggedIn = true
+            } catch {
+                // Not logged in, an old/unresponsive codex, or a transient
+                // hiccup — attempt login rather than guess; logging in
+                // against an already-logged-in home is harmless.
+                alreadyLoggedIn = false
+            }
+
+            if alreadyLoggedIn {
+                print("CODEX_HOME=\(resolvedHome) is already logged in — skipping `codex login --device-auth`.")
+            } else {
+                print("Provisioning CODEX_HOME=\(resolvedHome) for label '\(label)'.")
+                print("Launching `codex login --device-auth` — follow the printed instructions to finish in a browser.")
+                let status = runDeviceAuthLogin(codexBin: codexBin, home: resolvedHome)
+                guard status == 0 else {
+                    fail("`codex login --device-auth` exited with status \(status) — provisioning aborted, nothing was registered")
+                }
+            }
+
+            let observedNativeId = CodexAuth.accountId(inHome: resolvedHome)
+            if let conflict = provisionIdentityConflict(
+                label: label, home: resolvedHome,
+                existingAccountId: existingAccountId, observedNativeId: observedNativeId
+            ) {
+                fail(conflict)
+            }
+
             let result = await poller.registerCodexHome(resolvedHome)
             guard let accountId = result.accountId else {
                 fail(result.error ?? "Registration failed")
@@ -264,9 +489,31 @@ enum CodexCLI {
             their usage is polled alongside Anthropic accounts.
 
             Usage:
+              claude-monitor codex provision <label> [--db <path>]
               claude-monitor codex add --home <path> [--db <path>]
               claude-monitor codex list [--db <path>]
               claude-monitor codex import [--auth <path>] [--db <path>]
+
+            provision  Collapse home-create + login + register into one
+                    command: creates (or reuses) ~/.codex-<label> as the
+                    CODEX_HOME for this identity, drives `codex login
+                    --device-auth` against it interactively, and on success
+                    registers it exactly as `add --home` does.
+
+                      claude-monitor codex provision work
+
+                    is equivalent to:
+
+                      CODEX_HOME=~/.codex-work codex login --device-auth
+                      claude-monitor codex add --home ~/.codex-work
+
+                    `--device-auth` prints a code to paste into a browser on
+                    any machine, so this works on a headless Linux host.
+                    Re-running for a label that is already logged in skips
+                    the login step and just re-registers (idempotent, no
+                    duplicate account). Fails if the home is already
+                    registered to a different account than the one now
+                    logged in there, or if `codex` itself can't be found.
 
             add     Register an account by its CODEX_HOME. **No token is read,
                     copied, or stored** — usage is read by asking the locally

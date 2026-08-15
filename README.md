@@ -182,13 +182,35 @@ a specific install.
 single `auth.json` per home directory, so **each login overwrites the previous
 account's credential** — which is why monitoring more than one Codex account
 never worked before. Give each account its own home and register it by that
-path:
+path. The one-command way:
+
+```bash
+claude-monitor codex provision work
+```
+
+`provision <label>` collapses "pick a home, log in, register it" into one
+step: it creates (or reuses, if already present) `~/.codex-<label>` as that
+identity's `CODEX_HOME`, drives `codex login --device-auth` against it
+interactively, and on success registers it exactly as `codex add --home`
+does — reusing the same registration code, not a parallel implementation.
+Re-running it for a label that's already logged in skips the login step and
+just re-registers (idempotent — it will not create a second account row), and
+it fails clearly, before touching anything, if `<label>` is missing or
+`codex` itself can't be found. If the home is already registered to one
+account but is now logged in as a *different* one, it fails rather than
+silently repointing the registration — log out and back in with the intended
+identity, or provision a different `<label>`.
+
+That one command is equivalent to the three manual steps it replaces:
 
 ```bash
 CODEX_HOME=~/.codex-work codex login --device-auth
 claude-monitor codex add --home ~/.codex-work
 ```
 
+Reach for the manual form when you want the steps decoupled — e.g. running
+`codex login --device-auth` on one machine and `codex add --home` on another
+that shares the same `CODEX_HOME` over a network filesystem. Either way,
 `--device-auth` prints a code you paste into a browser on any machine, so this
 works on a **headless Linux host** with no browser at all. Repeat for as many
 accounts as you have; each poll then spawns `codex` with that account's own
@@ -759,7 +781,7 @@ claude-monitor/
 │       ├── OAuthPoller.swift       # Per-provider polling, token add/import/refresh
 │       ├── AnthropicAPI.swift      # Anthropic client (ping + rate-limit headers)
 │       ├── OpenAIAPI.swift         # OpenAI/Codex client (wham/usage + token refresh)
-│       ├── CodexCLI.swift          # `claude-monitor codex add|list|import` CLI surface
+│       ├── CodexCLI.swift          # `claude-monitor codex provision|add|list|import` CLI surface
 │       ├── RateLimitWindow.swift   # Provider-agnostic window/snapshot model
 │       ├── UsageProviderClient.swift # UsageProviderClient protocol + credentials
 │       ├── SelfTest.swift          # `claude-monitor selftest` portable-core assertions
