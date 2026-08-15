@@ -606,7 +606,7 @@ struct UsagePopoverView: View {
                 }
             }
         } message: {
-            Text("This will deactivate the credential and remove usage data for \(accountToRemove?.displayName ?? "this account").")
+            Text("This will delete the stored credential and all usage data for \(accountToRemove?.displayName ?? "this account").")
         }
     }
 
@@ -616,12 +616,13 @@ struct UsagePopoverView: View {
         return "\(formatInterval(seconds)) ago"
     }
 
+    /// Removes the account and everything keyed to it — including its
+    /// credential rows, which `deleteAccount` deletes outright. The previous
+    /// `deactivateCredential` pass this used to make is gone with them: it
+    /// only flipped `is_active = 0` and left the plaintext token on disk
+    /// under an account row that was about to disappear (#106).
     private func removeAccount(_ account: Account) {
-        let credentials = oauthPoller.loadActiveCredentials()
-        for cred in credentials where cred.accountId == account.id {
-            oauthPoller.deactivateCredential(cred)
-        }
-        store.clearAccountData(accountId: account.id)
+        store.deleteAccount(accountId: account.id)
     }
 
     // MARK: - Copy / Paste Accounts

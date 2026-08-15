@@ -70,6 +70,8 @@ enum SelfTest {
         testParseAccountPairsRoundTripsOpenAIFields()
         testAccountSyncImportIsProviderScoped()
         testMergeDuplicateAccountsSharingEmail()
+        testAccountDeletionRemovesCredentials()
+        testPurgeOrphanedCredentialsMigration()
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
             testMigrationOfExistingDatabase(at: arguments[idx + 1])
@@ -1060,6 +1062,258 @@ enum SelfTest {
         }
     }
 
+    // MARK: - Account removal vs. history clear (#106)
+
+    /// Removing an account must take its credential with it. Before #106 the
+    /// removal path deleted only `usage_history` and `accounts`, stranding a
+    /// plaintext OAuth token under an account id nothing in the app could
+    /// reach — never surfaced, never rotated, never revoked.
+    ///
+    /// The same function also backed the chart window's "Clear History"
+    /// button, so that control silently deleted the account too. The two are
+    /// now separate operations and this test pins both halves: delete removes
+    /// everything, clear-history removes only the time series.
+    private static func testAccountDeletionRemovesCredentials() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            let doomedId = "acct-doomed"
+            let keptId = "acct-kept"
+            // A third account with no credential at all — deleting it must be
+            // a clean no-op on `oauth_credentials`, not an error.
+            let bareId = "acct-bare"
+
+            for (id, email) in [(doomedId, "doomed@example.com"),
+                                (keptId, "kept@example.com"),
+                                (bareId, "bare@example.com")] {
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES (?, ?, ?, 'Max', '2026-06-01T00:00:00Z', 'anthropic')
+                """, id, email, email)
+            }
+
+            for id in [doomedId, keptId] {
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
+                    VALUES (?, '2026-06-01T00:00:00Z', 12, 0)
+                """, id)
+                try db.run("""
+                    INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                    VALUES (?, '2026-06-01T00:00:00Z', 'haiku', 200, '{}')
+                """, id)
+                try db.run("""
+                    INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                    VALUES (?, '2026-06-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 42)
+                """, id)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, refresh_token,
+                         is_active, created_at, updated_at)
+                    VALUES (?, 'label', 'token', 'anthropic', 'token-value', 'refresh-value', 1,
+                            '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+                """, id)
+            }
+            // Two credentials share the doomed account id — both must go.
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, is_active,
+                     created_at, updated_at)
+                VALUES (?, 'second', 'token', 'anthropic', 'second-token-value', 0,
+                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+            """, doomedId)
+            // The user had pinned the account they are about to remove.
+            try db.run("INSERT INTO settings (key, value) VALUES ('primary_account_id', ?)", doomedId)
+
+            // --- Remove Account. ---
+            store.deleteAccount(accountId: doomedId)
+
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", doomedId) as? Int64, 0,
+                "removing an account deletes its accounts row")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ?",
+                              doomedId) as? Int64,
+                0, "removing an account deletes every one of its credential rows")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?",
+                              doomedId) as? Int64,
+                0, "removing an account deletes its usage_history rows")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = ?",
+                              doomedId) as? Int64,
+                0, "removing an account deletes its probe_snapshots rows")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = ?",
+                              doomedId) as? Int64,
+                0, "removing an account deletes its named_limits rows")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM settings WHERE key = 'primary_account_id'")
+                    as? Int64,
+                0, "removing the pinned account clears the primary-account pin")
+
+            // The detection query from the issue: no credential may reference
+            // a missing account after a delete.
+            expectEqual(try orphanedCredentialCount(db), 0,
+                        "an account delete leaves no orphaned credential rows")
+
+            // Deleting an account that never had a credential is a clean no-op.
+            store.deleteAccount(accountId: bareId)
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", bareId) as? Int64, 0,
+                "an account with no credential still deletes cleanly")
+            expectEqual(try orphanedCredentialCount(db), 0,
+                        "deleting a credential-less account leaves no orphans")
+
+            // The untouched account keeps everything.
+            expectEqual(
+                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?",
+                              keptId) as? String,
+                "token-value", "the other account's credential is untouched by the delete")
+
+            // --- Clear History (chart window). ---
+            store.clearAccountHistory(accountId: keptId)
+
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", keptId) as? Int64, 1,
+                "clearing history does NOT delete the accounts row")
+            expectEqual(
+                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?",
+                              keptId) as? String,
+                "token-value", "clearing history does NOT touch the credential")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?",
+                              keptId) as? Int64,
+                0, "clearing history empties usage_history")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = ?",
+                              keptId) as? Int64,
+                0, "clearing history empties the probe archive")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = ?",
+                              keptId) as? Int64,
+                0, "clearing history empties the named-limit series")
+            expectEqual(try orphanedCredentialCount(db), 0,
+                        "clearing history leaves no orphaned credential rows")
+        } catch {
+            checks += 1
+            failures.append("account deletion test threw: \(error)")
+        }
+    }
+
+    /// The healing migration for databases that already carry an orphan from a
+    /// pre-#106 build. Two properties matter as much as the purge itself:
+    /// credentials with a NULL (or blank) `account_id` must **survive** — the
+    /// column is nullable, and the obvious `LEFT JOIN accounts … WHERE a.id IS
+    /// NULL` predicate would silently destroy live token material — and a
+    /// second run must be a no-op.
+    private static func testPurgeOrphanedCredentialsMigration() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES ('live-account', 'live@example.com', 'live@example.com', 'Max',
+                        '2026-06-01T00:00:00Z', 'anthropic')
+            """)
+            // Belongs to a live account — must be left alone.
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, is_active,
+                     created_at, updated_at)
+                VALUES ('live-account', 'live', 'token', 'anthropic', 'live-token', 1,
+                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+            """)
+            // The orphan a pre-#106 removal left behind, token still populated.
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, refresh_token, is_active,
+                     created_at, updated_at)
+                VALUES ('gone-account', 'gone', 'token', 'anthropic', 'stranded-token',
+                        'stranded-refresh', 0, '2026-02-10T17:16:25Z', '2026-07-22T04:25:07Z')
+            """)
+            // Never attached to an account. `account_id` is nullable, so these
+            // are legitimate rows — the purge must not reach them.
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, is_active,
+                     created_at, updated_at)
+                VALUES (NULL, 'unattached', 'keychain', 'anthropic', 'null-account-token', 1,
+                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+            """)
+            try db.run("""
+                INSERT INTO oauth_credentials
+                    (account_id, label, source, provider, access_token, is_active,
+                     created_at, updated_at)
+                VALUES ('   ', 'blank', 'keychain', 'anthropic', 'blank-account-token', 1,
+                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+            """)
+
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 4,
+                        "the seeded database starts with four credential rows")
+
+            // --- What the next launch does. ---
+            store.ensureDatabase()
+
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'gone-account'")
+                    as? Int64,
+                0, "the migration purges the orphaned credential")
+            expectEqual(try orphanedCredentialCount(db), 0,
+                        "the detection query reports no orphans after the migration")
+            expectEqual(
+                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'live-account'")
+                    as? String,
+                "live-token", "a credential belonging to a live account is untouched")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IS NULL")
+                    as? Int64,
+                1, "a credential with account_id IS NULL survives the purge")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE TRIM(account_id) = ''")
+                    as? Int64,
+                1, "a credential with a blank account_id survives the purge")
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 3,
+                        "exactly one row — the orphan — is removed")
+
+            // Idempotent: re-running over the healed database changes nothing.
+            store.ensureDatabase()
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 3,
+                        "re-running the migration on a healed database is a no-op")
+        } catch {
+            checks += 1
+            failures.append("orphaned credential purge test threw: \(error)")
+        }
+    }
+
+    /// The issue's detection query, narrowed the same way the purge predicate
+    /// is: credential rows whose `account_id` *names* an account that isn't
+    /// there. A NULL or blank `account_id` is not an orphan — it was never
+    /// attached to an account — so those rows are excluded here and asserted
+    /// to survive separately by the callers above.
+    private static func orphanedCredentialCount(_ db: Connection) throws -> Int64 {
+        try db.scalar("""
+            SELECT COUNT(*) FROM oauth_credentials c
+            LEFT JOIN accounts a ON a.id = c.account_id
+            WHERE a.id IS NULL AND c.account_id IS NOT NULL AND TRIM(c.account_id) != ''
+        """) as? Int64 ?? -1
+    }
+
     // MARK: - Schema migration
 
     /// Builds a database with the *pre-#28* schema, populates it the way a real
@@ -1372,6 +1626,11 @@ enum SelfTest {
                 "SELECT COUNT(*) FROM accounts WHERE provider IS NULL OR TRIM(provider) = ''"
             ) as? Int64
             expectEqual(stray, 0, "--db: no account left without a provider")
+            // #106: the healing purge must have cleared any credential row
+            // stranded by a pre-fix account removal. Count only — a real
+            // database's ids, labels, emails, and tokens are never printed.
+            expectEqual(try orphanedCredentialCount(db), 0,
+                        "--db: no orphaned credential rows left after migration")
             print("selftest --db: migrated \(store.accounts.count) account(s) at \(path)")
         } catch {
             checks += 1
