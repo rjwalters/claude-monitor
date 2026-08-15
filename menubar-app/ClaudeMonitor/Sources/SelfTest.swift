@@ -400,7 +400,6 @@ enum SelfTest {
         // Kind-labelled sources get the bucket's nominal duration for free.
         let labelled = RateLimitWindow(kind: .weekly, usedPercent: 44)
         expectEqual(labelled.durationSeconds, 7 * 86400, "weekly nominal duration")
-        expectEqual(labelled.remainingPercent, 56, "remainingPercent")
         expect(!labelled.isExhausted, "44% weekly is not exhausted")
         expect(RateLimitWindow(kind: .weekly, usedPercent: 12, status: "rejected").isExhausted,
                "a rejected window is exhausted regardless of percent")

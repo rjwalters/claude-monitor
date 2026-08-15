@@ -169,9 +169,6 @@ struct RateLimitWindow: Equatable {
         return .other(seconds)
     }
 
-    /// Capacity left in this window, 0–100.
-    var remainingPercent: Double { max(0, 100 - usedPercent) }
-
     /// Whether this window is spent — either the provider says so outright or
     /// the usage figure is at the cap.
     var isExhausted: Bool { status == "rejected" || usedPercent >= 100 }
