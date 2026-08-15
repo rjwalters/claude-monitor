@@ -45,6 +45,13 @@ enum SelfTest {
                                 derived numbers are printed; identity fields are
                                 never echoed.
 
+                  --codex       Additionally run the real `codex app-server`
+                                handshake once against the installed Codex CLI
+                                and report the windows it maps to. OPT-IN: every
+                                other check is offline, so CI never needs codex
+                                installed. Only derived numbers are printed;
+                                identity fields are never echoed.
+
                 Exits 0 when every check passes, 1 otherwise.
                 """)
             exit(0)
@@ -61,6 +68,13 @@ enum SelfTest {
         testOpenAIRawFieldRedaction()
         testOpenAITokenExpiryParsing()
         testCodexAuthParsing()
+        testCodexAppServerFraming()
+        testCodexAppServerEnvelopeDecoding()
+        testCodexAppServerMapping()
+        testCodexAppServerRedaction()
+        testCodexBinaryResolution()
+        testCodexHomeIdentityGuard()
+        testCodexAppServerSpawnAgainstStub()
         testSchemaMigrationFromPreMigrationDatabase()
         testRankingExportCarriesProvider()
         testNamedLimitsRoundTrip()
@@ -79,6 +93,10 @@ enum SelfTest {
 
         if let idx = arguments.firstIndex(of: "--wire"), idx + 1 < arguments.count {
             testCapturedOpenAIWireBody(at: arguments[idx + 1])
+        }
+
+        if arguments.contains("--codex") {
+            testLiveCodexAppServer()
         }
 
         if failures.isEmpty {
@@ -552,6 +570,505 @@ enum SelfTest {
             checks += 1
             failures.append("Codex auth parsing test threw: \(error)")
         }
+    }
+
+    // MARK: - Codex app-server (JSON-RPC over stdio)
+
+    /// `account/rateLimits/read`'s `result` payload, captured from
+    /// `codex-cli 0.147.0` on 2026-08-15 with every usage figure and reset
+    /// instant replaced by fixture values. Shape is verbatim, including the
+    /// keys this client does not read (`individualLimit`,
+    /// `rateLimitReachedType`) so a decoder that got stricter would fail here.
+    private static let codexRateLimitsFixture = """
+    {"rateLimits":{"limitId":"codex","limitName":null,
+       "primary":{"usedPercent":37,"windowDurationMins":10080,"resetsAt":1785967226},
+       "secondary":null,
+       "credits":{"hasCredits":false,"unlimited":false,"balance":"0"},
+       "individualLimit":null,"spendControlReached":false,"planType":"pro",
+       "rateLimitReachedType":null},
+     "rateLimitsByLimitId":{
+       "codex":{"limitId":"codex","limitName":null,
+         "primary":{"usedPercent":37,"windowDurationMins":10080,"resetsAt":1785967226},
+         "secondary":null,
+         "credits":{"hasCredits":false,"unlimited":false,"balance":"0"},
+         "individualLimit":null,"spendControlReached":false,"planType":"pro",
+         "rateLimitReachedType":null},
+       "codex_bengalfox":{"limitId":"codex_bengalfox","limitName":"GPT-5.3-Codex-Spark",
+         "primary":{"usedPercent":62,"windowDurationMins":10080,"resetsAt":1785967226},
+         "secondary":null,"credits":null,"individualLimit":null,
+         "spendControlReached":null,"planType":"pro","rateLimitReachedType":null}},
+     "rateLimitResetCredits":{"availableCount":0,"credits":[]}}
+    """
+
+    /// `account/read`'s `result` payload, same capture. The email is a fixture
+    /// value and must never reach the archive — that assertion is the point of
+    /// `testCodexAppServerRedaction`.
+    private static let codexAccountFixture = """
+    {"account":{"type":"chatgpt","email":"fixture@example.com","planType":"pro"},
+     "requiresOpenaiAuth":true}
+    """
+
+    /// The transport is newline-delimited JSON, not `Content-Length`-framed, and
+    /// a pipe read boundary lands wherever the kernel puts it. Drive the framer
+    /// with the awkward chunkings explicitly.
+    private static func testCodexAppServerFraming() {
+        var framer = CodexLineFramer()
+
+        // A single object split mid-line across two reads.
+        expectEqual(framer.append(Data("{\"id\":1,\"resu".utf8)).count, 0,
+                    "a partial line yields nothing until its newline arrives")
+        let completed = framer.append(Data("lt\":{}}\n".utf8))
+        expectEqual(completed.count, 1, "the line completes on the chunk carrying its newline")
+        expectEqual(String(data: completed.first ?? Data(), encoding: .utf8),
+                    "{\"id\":1,\"result\":{}}", "the reassembled line is byte-exact")
+
+        // Two whole objects plus a partial third, all in one read.
+        let batch = framer.append(Data("{\"id\":2}\n{\"id\":3}\n{\"id\":4".utf8))
+        expectEqual(batch.count, 2, "one chunk can complete several lines")
+        expectEqual(String(data: batch.last ?? Data(), encoding: .utf8), "{\"id\":3}",
+                    "lines come back in arrival order")
+        expectEqual(framer.append(Data("}\n".utf8)).count, 1, "the held-back partial completes later")
+
+        // Blank lines are noise, not empty replies.
+        expectEqual(framer.append(Data("\n\n".utf8)).count, 0, "blank lines are dropped")
+
+        // A child that never emits a newline must not grow the buffer forever.
+        var overflowing = CodexLineFramer()
+        let megabyte = Data(repeating: 0x41, count: 1024 * 1024)
+        for _ in 0..<5 { _ = overflowing.append(megabyte) }
+        expect(overflowing.overflowed, "an unterminated line past the cap trips the overflow guard")
+        expectEqual(overflowing.append(Data("{\"id\":9}\n".utf8)).count, 0,
+                    "an overflowed framer stops accumulating rather than lying")
+    }
+
+    /// Two verified wire quirks a textbook JSON-RPC decoder gets wrong: replies
+    /// carry **no `jsonrpc` member**, and server notifications carry **no `id`**.
+    /// Plus the error classification, where `-32600` is deliberately *not* an
+    /// account failure.
+    private static func testCodexAppServerEnvelopeDecoding() {
+        func envelope(_ json: String) -> CodexRPCEnvelope? {
+            try? JSONDecoder().decode(CodexRPCEnvelope.self, from: Data(json.utf8))
+        }
+
+        // Verbatim initialize reply shape (0.147.0) — note the absent `jsonrpc`.
+        let reply = envelope("""
+        {"id":1,"result":{"userAgent":"codex_cli_rs/0.147.0","codexHome":"/x",
+         "platformFamily":"unix","platformOs":"macos"}}
+        """)
+        expectEqual(reply?.id, 1, "a reply with no jsonrpc member still decodes")
+        expect(reply?.error == nil, "a successful reply carries no error")
+
+        // Verbatim notification shape — no id, so it is not anybody's reply.
+        let notification = envelope("""
+        {"method":"remoteControl/status/changed","params":{"status":"disabled"},"emittedAtMs":1}
+        """)
+        expect(notification != nil, "an id-less notification decodes rather than failing the poll")
+        expect(notification?.id == nil, "a notification has no id and must never match a request")
+
+        let rpcError = envelope("{\"error\":{\"code\":-32600,\"message\":\"Invalid request\"},\"id\":3}")
+        expectEqual(rpcError?.id, 3, "an error reply is matched by id like any other")
+        expectEqual(rpcError?.error?.code, -32600, "the error code decodes")
+
+        // -32600 is what codex 0.46.0 returns for an unsupported method *and*
+        // for a bogus one — a capability gap, never an unhealthy account.
+        for code in [-32600, -32601] {
+            let classified = CodexAppServerClient.classify(
+                CodexRPCEnvelope.RPCError(code: code, message: "Invalid request"),
+                method: "account/rateLimits/read"
+            )
+            guard case .methodUnsupported = classified else {
+                checks += 1
+                failures.append("code \(code) must classify as methodUnsupported, got \(classified)")
+                continue
+            }
+            expect(classified.isCapabilityGap,
+                   "\(code) is a capability gap — fall back, do not mark the account unhealthy")
+        }
+
+        let unexpected = CodexAppServerClient.classify(
+            CodexRPCEnvelope.RPCError(code: -32000, message: "boom"), method: "account/read"
+        )
+        expect(!unexpected.isCapabilityGap, "an unrecognized RPC error is a real failure, not a gap")
+
+        // Status mapping for the degradations the poller has to distinguish.
+        expectEqual(CodexAppServerError.notLoggedIn("/x").tokenStatus, .missing,
+                    "a home with no login is 'missing', not 'error'")
+        expect(!CodexAppServerError.notLoggedIn("/x").isCapabilityGap,
+               "not-logged-in is actionable, so it survives to the status line")
+        expectEqual(CodexAppServerError.timedOut("account/read").tokenStatus, .error,
+                    "an RPC timeout is an error state")
+        expect(CodexAppServerError.binaryNotFound.isCapabilityGap,
+               "a missing codex binary is a capability gap")
+        expect(CodexAppServerError.binaryNotFound.errorDescription?
+                .contains("CLAUDE_MONITOR_CODEX_BIN") == true,
+               "the not-found message names the override that fixes it")
+    }
+
+    /// Fixture → `RateLimitSnapshot`. The load-bearing assertion is the unit
+    /// conversion: `windowDurationMins` is **minutes** while the shared model
+    /// takes **seconds**, and getting it wrong reclassifies a weekly window as
+    /// `.other(10080)` while every other check still passes.
+    private static func testCodexAppServerMapping() {
+        do {
+            let snapshot = try CodexAppServerClient.snapshot(
+                accountResult: Data(codexAccountFixture.utf8),
+                rateLimitsResult: Data(codexRateLimitsFixture.utf8)
+            )
+
+            expectEqual(snapshot.provider, .openai, "app-server readings are still the openai provider")
+            expectEqual(snapshot.accountKey, "",
+                        "account/read carries no account id — the caller keeps the stored one")
+            expectEqual(snapshot.email, "fixture@example.com", "identity comes from account/read")
+            expectEqual(snapshot.plan, "pro", "planType comes from account/read")
+
+            let windows = snapshot.rateLimit
+            expectEqual(windows.weekly?.usedPercent, 37, "primary usedPercent")
+            expectEqual(windows.weekly?.durationSeconds, 604800,
+                        "windowDurationMins is MINUTES — 10080 min must become 604800 s")
+            expectEqual(windows.weekly?.kind, .weekly,
+                        "10080 minutes files as weekly, not .other(10080)")
+            expectEqual(windows.weekly?.resetAt, Date(timeIntervalSince1970: 1785967226),
+                        "resetsAt is unix epoch seconds")
+            expect(windows.session == nil,
+                   "a null secondary leaves session nil (stored NULL), never a fabricated 0%")
+            expectEqual(windows.overallStatus, "allowed", "an unspent account is 'allowed'")
+            expectEqual(windows.headroomScore, 63, "headroom from a weekly-only reading")
+
+            // Per-model sub-limits, keyed by limitName; the entry duplicating
+            // the top-level limitId is skipped rather than double-counted.
+            expectEqual(windows.named["GPT-5.3-Codex-Spark"]?.usedPercent, 62,
+                        "rateLimitsByLimitId lands in the named sub-limit map")
+            expect(windows.named["codex"] == nil,
+                   "the entry duplicating the top-level limitId is not repeated as a sub-limit")
+
+            // A session-length secondary window classifies by its duration.
+            let withSession = codexRateLimitsFixture.replacingOccurrences(
+                of: "\"secondary\":null",
+                with: "\"secondary\":{\"usedPercent\":80,\"windowDurationMins\":300,\"resetsAt\":1785900000}"
+            )
+            let paired = try CodexAppServerClient.snapshot(
+                accountResult: nil, rateLimitsResult: Data(withSession.utf8)
+            )
+            expectEqual(paired.rateLimit.session?.durationSeconds, 18000,
+                        "a 300-minute window is 18000 s")
+            expectEqual(paired.rateLimit.session?.kind, .session,
+                        "18000 s is under sessionUpperBound, so it files as session")
+            expectEqual(paired.rateLimit.weekly?.usedPercent, 37, "the weekly window stays weekly")
+            expectEqual(paired.rateLimit.headroomScore, 20, "headroom uses the most-consumed window")
+            expect(paired.email == nil, "a skipped account/read simply yields no identity")
+
+            // Spend control is a hard stop even while the windows look healthy.
+            let capped = codexRateLimitsFixture.replacingOccurrences(
+                of: "\"spendControlReached\":false", with: "\"spendControlReached\":true"
+            )
+            let cappedSnapshot = try CodexAppServerClient.snapshot(
+                accountResult: nil, rateLimitsResult: Data(capped.utf8)
+            )
+            expectEqual(cappedSnapshot.rateLimit.overallStatus, "rejected",
+                        "spendControlReached maps to the shared 'rejected' status")
+            expect(cappedSnapshot.rateLimit.weekly?.isExhausted == true,
+                   "a rejected window reads as exhausted regardless of percent")
+
+            // A window at the cap is also 'rejected'.
+            let spent = codexRateLimitsFixture.replacingOccurrences(
+                of: "\"usedPercent\":37", with: "\"usedPercent\":100"
+            )
+            expectEqual(
+                try CodexAppServerClient.snapshot(
+                    accountResult: nil, rateLimitsResult: Data(spent.utf8)
+                ).rateLimit.overallStatus,
+                "rejected", "a window at 100% is 'rejected'"
+            )
+
+            // Defensive: a provider that switched to milliseconds must not yield
+            // a year-56000 date.
+            let millis = codexRateLimitsFixture.replacingOccurrences(
+                of: "\"resetsAt\":1785967226", with: "\"resetsAt\":1785967226000"
+            )
+            expectEqual(
+                try CodexAppServerClient.snapshot(
+                    accountResult: nil, rateLimitsResult: Data(millis.utf8)
+                ).rateLimit.weekly?.resetAt,
+                Date(timeIntervalSince1970: 1785967226),
+                "a millisecond resetsAt is detected rather than producing a far-future date"
+            )
+
+            // A reply with no windows at all is a failure, not a 0% reading.
+            var threw = false
+            do {
+                _ = try CodexAppServerClient.snapshot(
+                    accountResult: nil,
+                    rateLimitsResult: Data("{\"rateLimits\":{\"limitId\":\"codex\"}}".utf8)
+                )
+            } catch { threw = true }
+            expect(threw, "a reply with no windows must throw, never write a fabricated 0%")
+
+            threw = false
+            do {
+                _ = try CodexAppServerClient.snapshot(
+                    accountResult: nil, rateLimitsResult: Data("not json".utf8)
+                )
+            } catch { threw = true }
+            expect(threw, "an undecodable payload throws rather than crashing the poll")
+        } catch {
+            checks += 1
+            failures.append("codex app-server mapping threw: \(error)")
+        }
+    }
+
+    /// `account/read` volunteers an email. It must reach `accounts.email` (the
+    /// documented join key) and **never** the verbatim `usage_history.raw_data`
+    /// archive, which is dumped into logs far more freely — the same discipline
+    /// `testOpenAIRawFieldRedaction` enforces for the `wham` path, via the same
+    /// redactor rather than a second shallower one.
+    private static func testCodexAppServerRedaction() {
+        do {
+            let snapshot = try CodexAppServerClient.snapshot(
+                accountResult: Data(codexAccountFixture.utf8),
+                rateLimitsResult: Data(codexRateLimitsFixture.utf8)
+            )
+            let serialized = snapshot.rawFields.map { "\($0.key)=\($0.value)" }.joined(separator: "\n")
+
+            expect(!serialized.contains("fixture@example.com"),
+                   "the email account/read returns must never reach the archive")
+            expectEqual(snapshot.rawFields["account.account.email"], "[redacted]",
+                        "the redactor records the email's path as present but elided")
+            expectEqual(snapshot.email, "fixture@example.com",
+                        "the email still reaches accounts.email, the documented join key")
+
+            // Non-PII wire fields are archived verbatim, so a field Codex adds
+            // later is captured before this app interprets it.
+            expectEqual(snapshot.rawFields["rate_limits.rateLimits.primary.windowDurationMins"],
+                        "10080", "the raw wire unit is archived unconverted")
+            expectEqual(snapshot.rawFields["rate_limits.rateLimits.limitId"], "codex",
+                        "limitId is not PII and is archived")
+            expectEqual(snapshot.rawFields["rate_limits.rateLimitsByLimitId.codex_bengalfox.limitName"],
+                        "GPT-5.3-Codex-Spark", "sub-limit names survive redaction")
+            expectEqual(snapshot.rawFields["transport"], "codex-app-server",
+                        "the archive records which transport produced the row")
+            expectEqual(snapshot.rawFields["overall_status"], "allowed",
+                        "normalized status keys are archived for RankingExporter")
+        } catch {
+            checks += 1
+            failures.append("codex app-server redaction test threw: \(error)")
+        }
+    }
+
+    /// A Finder-launched `.app` inherits launchd's minimal `PATH`, so
+    /// `/usr/bin/env codex` resolves during development and fails in the bundle.
+    /// Resolution therefore walks an explicit candidate list and returns an
+    /// absolute path — asserted here against a scratch directory rather than
+    /// whatever happens to be installed on the build host.
+    private static func testCodexBinaryResolution() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-bin-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let stub = dir.appendingPathComponent("codex").path
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: URL(fileURLWithPath: stub))
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
+
+            expectEqual(CodexBinary.resolve(environment: ["PATH": dir.path]), stub,
+                        "a PATH entry resolves to an absolute codex path")
+
+            let nonExecutable = dir.appendingPathComponent("nested").path
+            try FileManager.default.createDirectory(atPath: nonExecutable, withIntermediateDirectories: true)
+            let plain = (nonExecutable as NSString).appendingPathComponent("codex")
+            try Data("not executable".utf8).write(to: URL(fileURLWithPath: plain))
+            // Not `== nil`: the absolute fallback list is also probed, and this
+            // build host may genuinely have codex installed. The assertion that
+            // matters is that the non-executable file is never chosen.
+            expect(CodexBinary.resolve(environment: ["PATH": nonExecutable]) != plain,
+                   "a present-but-not-executable codex is not a usable candidate")
+
+            expectEqual(
+                CodexBinary.resolve(environment: [CodexBinary.overrideEnvKey: stub, "PATH": "/nowhere"]),
+                stub, "CLAUDE_MONITOR_CODEX_BIN wins over PATH"
+            )
+            expect(
+                CodexBinary.resolve(environment: [
+                    CodexBinary.overrideEnvKey: dir.appendingPathComponent("absent").path,
+                    "PATH": dir.path,
+                ]) == nil,
+                "an override that does not resolve fails loudly rather than silently using PATH"
+            )
+        } catch {
+            checks += 1
+            failures.append("codex binary resolution test threw: \(error)")
+        }
+    }
+
+    /// Both new tiers read whichever `CODEX_HOME` this process inherited, and
+    /// that one home speaks for exactly one account. On a two-OpenAI-account
+    /// host, attributing its reading to both would overwrite one account's usage
+    /// with a stranger's — plausible-looking numbers, silently wrong. The guard
+    /// is deliberately asymmetric: only a *contradiction* disqualifies a tier,
+    /// so the ordinary single-account host (where identity may be absent on
+    /// either side) keeps using the preferred transport.
+    private static func testCodexHomeIdentityGuard() {
+        expect(OAuthPoller.identitiesConflict("a@example.com", "b@example.com"),
+               "two known, different identities conflict — do not attribute the reading")
+        expect(!OAuthPoller.identitiesConflict("a@example.com", "A@Example.com "),
+               "identity comparison is case- and whitespace-insensitive")
+        expect(!OAuthPoller.identitiesConflict(nil, "a@example.com"),
+               "an unknown reported identity proves nothing and must not block the tier")
+        expect(!OAuthPoller.identitiesConflict("a@example.com", nil),
+               "an account row with no email proves nothing either")
+        expect(!OAuthPoller.identitiesConflict("", "a@example.com"),
+               "an empty string is absent identity, not a conflicting one")
+        expect(!OAuthPoller.identitiesConflict(nil, nil),
+               "the single-account case, where neither side carries identity, still uses tier 1")
+        expect(OAuthPoller.identitiesConflict("user-aaa", "user-bbb"),
+               "the same rule guards tier 2, where auth.json carries an account id")
+    }
+
+    /// Spawn / handshake / reap against a **stub** binary, so CI exercises the
+    /// subprocess path on macOS and Linux without the real Codex CLI installed.
+    ///
+    /// The stub ends in `cat > /dev/null`, so it stays alive until this client
+    /// closes its stdin — reproducing the verified real behaviour (stdin close
+    /// makes `app-server` exit 0 on its own) and letting an `EXIT` trap prove
+    /// the child was actually reaped, not orphaned.
+    private static func testCodexAppServerSpawnAgainstStub() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-appserver-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+
+            func writeStub(_ name: String, _ body: String) throws -> String {
+                let path = dir.appendingPathComponent(name).path
+                try Data(body.utf8).write(to: URL(fileURLWithPath: path))
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+                return path
+            }
+
+            let reapedMarker = dir.appendingPathComponent("reaped").path
+            let oneLine: (String) -> String = { $0.replacingOccurrences(of: "\n", with: "") }
+
+            // Replies are emitted up front, out of the order they are requested,
+            // to prove matching is by `id` and that an early arrival is stashed
+            // rather than dropped.
+            let goodStub = try writeStub("codex", """
+            #!/bin/sh
+            trap 'echo reaped > "$MARKER"' EXIT
+            echo '{"id":1,"result":{"userAgent":"stub"}}'
+            echo '{"method":"remoteControl/status/changed","params":{},"emittedAtMs":1}'
+            echo '{"id":3,"result":\(oneLine(codexRateLimitsFixture))}'
+            echo '{"id":2,"result":\(oneLine(codexAccountFixture))}'
+            cat > /dev/null
+            """)
+
+            var timeouts = CodexAppServerClient.Timeouts()
+            timeouts.initialize = 10
+            timeouts.method = 10
+            timeouts.overall = 20
+
+            let client = CodexAppServerClient(
+                codexHome: dir.path,
+                timeouts: timeouts,
+                environment: [
+                    CodexBinary.overrideEnvKey: goodStub,
+                    "PATH": "/usr/bin:/bin",
+                    "MARKER": reapedMarker,
+                ]
+            )
+
+            switch runBlocking({ try await client.fetchUsage() }) {
+            case .success(let snapshot):
+                expectEqual(snapshot.rateLimit.weekly?.usedPercent, 37,
+                            "a spawned handshake produces the same mapping as the offline fixture")
+                expectEqual(snapshot.email, "fixture@example.com",
+                            "an out-of-order account/read reply is matched by id, not arrival order")
+            case .failure(let error):
+                checks += 1
+                failures.append("stub app-server handshake failed: \(error)")
+            }
+
+            expect(FileManager.default.fileExists(atPath: reapedMarker),
+                   "the child exits after its stdin is closed — no orphaned process survives the call")
+
+            // A stub that never replies must time out and still be reaped.
+            let silentMarker = dir.appendingPathComponent("silent-reaped").path
+            let silentStub = try writeStub("codex-silent", """
+            #!/bin/sh
+            trap 'echo reaped > "$MARKER"' EXIT
+            cat > /dev/null
+            """)
+
+            var shortTimeouts = CodexAppServerClient.Timeouts()
+            shortTimeouts.initialize = 1
+            shortTimeouts.method = 1
+            shortTimeouts.overall = 3
+
+            let silentClient = CodexAppServerClient(
+                codexHome: dir.path,
+                timeouts: shortTimeouts,
+                environment: [
+                    CodexBinary.overrideEnvKey: silentStub,
+                    "PATH": "/usr/bin:/bin",
+                    "MARKER": silentMarker,
+                ]
+            )
+
+            let started = Date()
+            switch runBlocking({ try await silentClient.fetchUsage() }) {
+            case .success:
+                checks += 1
+                failures.append("a silent app-server must time out, not appear to succeed")
+            case .failure(let error):
+                guard let codexError = error as? CodexAppServerError,
+                      case .timedOut = codexError else {
+                    checks += 1
+                    failures.append("a silent app-server must fail with .timedOut, got \(error)")
+                    break
+                }
+                expect(Date().timeIntervalSince(started) < 10,
+                       "the timeout is enforced rather than waiting on the child indefinitely")
+            }
+            expect(FileManager.default.fileExists(atPath: silentMarker),
+                   "a timed-out child is still reaped (stdin close → SIGTERM → SIGKILL)")
+        } catch {
+            checks += 1
+            failures.append("codex app-server stub test threw: \(error)")
+        }
+    }
+
+    /// Carries the result of an `async` call back to this synchronous,
+    /// single-threaded test runner.
+    ///
+    /// `@unchecked Sendable` with a named invariant: the box is written exactly
+    /// once by the detached task **before** `signal()` and read exactly once
+    /// after `wait()` returns, so the semaphore is the happens-before edge and
+    /// no two threads ever touch it concurrently.
+    private final class AsyncOutcomeBox: @unchecked Sendable {
+        var snapshot: ProviderUsageSnapshot?
+        var error: Error?
+    }
+
+    private struct SelfTestTimeout: Error, LocalizedError {
+        var errorDescription: String? { "the async operation did not finish inside the self-test budget" }
+    }
+
+    /// Run an async operation to completion from `main()`'s synchronous thread.
+    /// Safe because nothing in the operation needs the main actor; the bounded
+    /// wait means a hung subprocess fails the self-test instead of hanging CI.
+    private static func runBlocking(
+        _ operation: @escaping @Sendable () async throws -> ProviderUsageSnapshot
+    ) -> Result<ProviderUsageSnapshot, Error> {
+        let box = AsyncOutcomeBox()
+        let semaphore = DispatchSemaphore(value: 0)
+        Task.detached {
+            do { box.snapshot = try await operation() } catch { box.error = error }
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + 60) == .success else {
+            return .failure(SelfTestTimeout())
+        }
+        if let snapshot = box.snapshot { return .success(snapshot) }
+        return .failure(box.error ?? SelfTestTimeout())
     }
 
     // MARK: - Named limits (per-model sub-limits, #32)
@@ -1582,6 +2099,44 @@ enum SelfTest {
         } catch {
             checks += 1
             failures.append("ranking export test threw: \(error)")
+        }
+    }
+
+    /// `--codex`: run the real handshake against the installed Codex CLI once.
+    ///
+    /// Opt-in, exactly like `--db` and `--wire`: every other check in this suite
+    /// is offline, so CI never needs `codex` installed. This is the on-demand
+    /// way to re-verify the live wire contract after a Codex release — the
+    /// fixtures above are a 2026-08-15 capture and can drift.
+    ///
+    /// Prints only derived numbers. The email `account/read` returns is never
+    /// echoed; only whether one was present.
+    private static func testLiveCodexAppServer() {
+        let client = CodexAppServerClient()
+        guard client.isAvailable else {
+            checks += 1
+            failures.append("--codex: no codex binary found (set CLAUDE_MONITOR_CODEX_BIN)")
+            return
+        }
+
+        switch runBlocking({ try await client.fetchUsage() }) {
+        case .success(let snapshot):
+            let windows = snapshot.rateLimit
+            expect(!windows.isEmpty, "--codex: the live reading carried at least one window")
+            expect(snapshot.rawFields.values.allSatisfy { !$0.contains("@") },
+                   "--codex: no address-shaped value reached the archive")
+            let session = windows.session.map { "\(Int($0.usedPercent))%" } ?? "—"
+            let weekly = windows.weekly.map { "\(Int($0.usedPercent))%" } ?? "—"
+            print("""
+                selftest --codex: session \(session), weekly \(weekly) \
+                (\(windows.overallStatus ?? "?")), plan \(snapshot.plan ?? "?"), \
+                email present: \(snapshot.email != nil), \
+                weekly window: \(windows.weekly?.durationSeconds.map { "\(Int($0))s" } ?? "—"), \
+                sub-limits: \(windows.named.count), archived fields: \(snapshot.rawFields.count)
+                """)
+        case .failure(let error):
+            checks += 1
+            failures.append("--codex: live handshake failed: \(error.localizedDescription)")
         }
     }
 

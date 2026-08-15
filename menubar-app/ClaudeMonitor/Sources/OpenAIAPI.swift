@@ -186,12 +186,21 @@ struct OpenAIUsageResponse: Decodable {
     /// "Capture wide, interpret narrow": fields OpenAI adds later are archived
     /// even before this app understands them.
     static func flatten(_ data: Data) -> [String: String] {
+        flatten(data, prefix: "")
+    }
+
+    /// Same redacting flatten, with every key prefixed — so a second transport
+    /// can archive more than one payload into a single `raw_data` map without
+    /// collisions (`codex app-server` archives both `account/read` and
+    /// `account/rateLimits/read`). Shared rather than reimplemented so there is
+    /// exactly one redaction rule set to keep correct.
+    static func flatten(_ data: Data, prefix: String) -> [String: String] {
         // Decoded through `JSONValue` rather than `JSONSerialization` so booleans
         // stay distinguishable from 0/1 without CoreFoundation type checks,
         // which don't exist on Linux.
         guard let root = try? JSONDecoder().decode(JSONValue.self, from: data) else { return [:] }
         var out: [String: String] = [:]
-        flattenValue(root, prefix: "", into: &out)
+        flattenValue(root, prefix: prefix, into: &out)
         return out
     }
 
@@ -233,13 +242,37 @@ struct OpenAIUsageResponse: Decodable {
 /// archiving. `JSONDecoder` keeps booleans and numbers distinct here, which
 /// `JSONSerialization` does not do portably (on Darwin both arrive as
 /// `NSNumber` and telling them apart needs CoreFoundation, which Linux lacks).
-indirect enum JSONValue: Decodable {
+///
+/// `Encodable` too, so a decoded subtree can be handed back out as standalone
+/// JSON — how `CodexAppServerClient` lifts a JSON-RPC reply's `result` member
+/// out of its envelope for the typed decoders and this flattener.
+indirect enum JSONValue: Codable {
     case null
     case bool(Bool)
     case number(Double)
     case string(String)
     case array([JSONValue])
     case object([String: JSONValue])
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null: try container.encodeNil()
+        case .bool(let value): try container.encode(value)
+        case .number(let value):
+            // Round-trip whole numbers as integers so a re-encoded epoch stays
+            // `1785967226`, not `1785967226.0` (which a strict consumer of the
+            // re-encoded payload could read differently).
+            if value == value.rounded(), abs(value) < 1e15 {
+                try container.encode(Int64(value))
+            } else {
+                try container.encode(value)
+            }
+        case .string(let value): try container.encode(value)
+        case .array(let values): try container.encode(values)
+        case .object(let values): try container.encode(values)
+        }
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
