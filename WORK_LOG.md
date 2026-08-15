@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #142** (closed): Simplify SelfTest.swift: extract shared temp-dir + stub-writer helper
+- **PR #144**: test: dedup temp-dir and writeStub boilerplate in SelfTest.swift
 - **Issue #132** (closed): codex list: enumerate all discoverable Codex homes, not just registered accounts
 - **PR #140**: codex list: discover unregistered ~/.codex* homes on disk
 - **Issue #134** (closed): Surface Codex identity drift as a distinct account state (not stale/failed reading)
