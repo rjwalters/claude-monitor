@@ -903,9 +903,9 @@ class UsageStore: ObservableObject {
     /// with no named limits (every Anthropic account today), which is what
     /// lets `UsageChartView` hide the overlay entirely rather than rendering
     /// an empty series.
-    // Reads only the immutable `dbPath` and calls `parseDate` (also
-    // `nonisolated`) — touches no @Published main-actor state, so it stays
-    // callable from the (synchronous, non-UI) selftest suite.
+    // Reads only the immutable `dbPath` and calls `UsageRecord.parseISO`
+    // (a static on a non-isolated struct) — touches no @Published main-actor
+    // state, so it stays callable from the (synchronous, non-UI) selftest suite.
     nonisolated func loadNamedLimitHistory(for accountId: String, daysBack: Int = 7) -> [String: [NamedLimitDataPoint]] {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
