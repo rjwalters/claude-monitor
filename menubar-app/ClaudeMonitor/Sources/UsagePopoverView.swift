@@ -19,23 +19,6 @@ func formatInterval(_ seconds: TimeInterval) -> String {
     return "\(days) \(days == 1 ? "day" : "days")"
 }
 
-/// Format a reset time string for display.
-/// Handles both ISO 8601 timestamps (from API) and relative strings.
-func formatResetTime(_ str: String) -> String {
-    let isoFormatter = ISO8601DateFormatter()
-    isoFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    let date = isoFormatter.date(from: str) ?? ISO8601DateFormatter().date(from: str)
-
-    if let date = date {
-        let interval = date.timeIntervalSinceNow
-        if interval <= 0 { return "Reset" }
-        return "Resets in \(formatInterval(interval))"
-    }
-
-    // Already a relative string — return as-is
-    return str
-}
-
 // MARK: - Column layout
 
 /// Centralized column widths so header + rows stay in lockstep.

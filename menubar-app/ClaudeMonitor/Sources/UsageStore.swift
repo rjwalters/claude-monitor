@@ -197,25 +197,6 @@ struct TokenDataPoint: Identifiable {
     }
 }
 
-struct DailyTokenSummary: Identifiable {
-    let id = UUID()
-    let day: Date
-    let accountId: String?
-    let inputTokens: Int64
-    let outputTokens: Int64
-    let cacheCreationTokens: Int64
-    let cacheReadTokens: Int64
-    let messageCount: Int64
-
-    var totalTokens: Int64 {
-        inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens
-    }
-
-    var billableTokens: Int64 {
-        inputTokens + outputTokens + cacheCreationTokens
-    }
-}
-
 // `@Published`-driven state is only ever read/written from the main thread
 // today (SwiftUI views on macOS; a single Task-driven headless loop that
 // pumps via `dispatchMain()` on Linux) — @MainActor isolation matches actual
@@ -1018,66 +999,6 @@ class UsageStore: ObservableObject {
         }
     }
 
-    /// Load daily token summaries for an account
-    func loadDailyTokenSummary(for accountId: String, daysBack: Int = 7) -> [DailyTokenSummary] {
-        do {
-            guard FileManager.default.fileExists(atPath: dbPath) else {
-                return []
-            }
-
-            let db = try openDatabase(dbPath, readonly: true)
-
-            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let cutoffString = formatter.string(from: cutoffDate)
-
-            let sql = """
-                SELECT
-                    date(tu.timestamp) as day,
-                    SUM(tu.input_tokens) as input_tokens,
-                    SUM(tu.output_tokens) as output_tokens,
-                    SUM(tu.cache_creation_tokens) as cache_creation_tokens,
-                    SUM(tu.cache_read_tokens) as cache_read_tokens,
-                    COUNT(*) as message_count
-                FROM token_usage tu
-                JOIN token_sessions ts ON tu.session_id = ts.session_id
-                WHERE COALESCE(ts.override_account_id, ts.inferred_account_id) = ?
-                  AND tu.timestamp >= ?
-                GROUP BY day
-                ORDER BY day DESC
-            """
-
-            var summaries: [DailyTokenSummary] = []
-            let statement = try db.prepare(sql)
-
-            let dayFormatter = DateFormatter()
-            dayFormatter.dateFormat = "yyyy-MM-dd"
-            dayFormatter.timeZone = TimeZone(identifier: "UTC")
-
-            for row in statement.bind(accountId, cutoffString) {
-                if let dayStr = row[0] as? String,
-                   let date = dayFormatter.date(from: dayStr) {
-                    summaries.append(DailyTokenSummary(
-                        day: date,
-                        accountId: accountId,
-                        inputTokens: (row[1] as? Int64) ?? 0,
-                        outputTokens: (row[2] as? Int64) ?? 0,
-                        cacheCreationTokens: (row[3] as? Int64) ?? 0,
-                        cacheReadTokens: (row[4] as? Int64) ?? 0,
-                        messageCount: (row[5] as? Int64) ?? 0
-                    ))
-                }
-            }
-
-            return summaries
-
-        } catch {
-            print("Error loading daily token summary: \(error)")
-            return []
-        }
-    }
-
     /// Check if token data exists for an account
     func hasTokenData(for accountId: String) -> Bool {
         do {
@@ -1168,24 +1089,6 @@ class UsageStore: ObservableObject {
         } catch {
             DispatchQueue.main.async {
                 self.error = "Failed to clear account data: \(error.localizedDescription)"
-            }
-        }
-    }
-
-    func clearDatabase() {
-        do {
-            if FileManager.default.fileExists(atPath: dbPath) {
-                try FileManager.default.removeItem(atPath: dbPath)
-            }
-            DispatchQueue.main.async {
-                self.accounts = []
-                self.latestUsage = [:]
-                self.lastRefresh = nil
-                self.error = nil
-            }
-        } catch {
-            DispatchQueue.main.async {
-                self.error = "Failed to clear database: \(error.localizedDescription)"
             }
         }
     }
