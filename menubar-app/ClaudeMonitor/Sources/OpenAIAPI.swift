@@ -125,7 +125,6 @@ struct OpenAIUsageResponse: Decodable {
         }
     }
 
-    let userId: String?
     let accountId: String?
     let email: String?
     let planType: String?
@@ -304,7 +303,6 @@ indirect enum JSONValue: Codable {
 struct OpenAITokenRefreshResponse: Decodable {
     let accessToken: String?
     let refreshToken: String?
-    let idToken: String?
     /// Lifetime of the new access token in seconds, when stated.
     let expiresIn: Double?
 
