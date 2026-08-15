@@ -25,9 +25,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#134**: Surface Codex identity drift as a distinct account state (not stale/failed reading)
-- **#133**: Add codex provision <label> to collapse home-create + login + register into one command
-- **#129**: Clipboard account transfer silently drops Codex accounts after #123 — and reports "Nothing to copy" on a Codex-only host
+- **#146**: A drifted Codex row shows a healthy green dot while frozen — identity conflict only writes a log line
 
 ## PRs Awaiting Review
 
@@ -45,11 +43,8 @@ _None._
 
 Issues carrying `loom:curated`.
 
+- **#146**: A drifted Codex row shows a healthy green dot while frozen — identity conflict only writes a log line *(curated)*
 - **#135**: Declarative intended Codex identity set: codex list/ranking.json should report 'absent', not just fewer rows *(curated)*
-- **#134**: Surface Codex identity drift as a distinct account state (not stale/failed reading) *(curated)*
-- **#133**: Add codex provision <label> to collapse home-create + login + register into one command *(curated)*
-- **#132**: codex list: enumerate all discoverable Codex homes, not just registered accounts *(curated)*
-- **#129**: Clipboard account transfer silently drops Codex accounts after #123 — and reports "Nothing to copy" on a Codex-only host *(curated)*
 - **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -67,10 +62,10 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 3 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 6 |
+| Curated | 3 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 1 |
 <!-- guide:plan-body:end -->
