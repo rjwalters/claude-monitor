@@ -1307,6 +1307,139 @@ enum SelfTest {
             }
             expect(FileManager.default.fileExists(atPath: silentMarker),
                    "a timed-out child is still reaped (stdin close → SIGTERM → SIGKILL)")
+
+            // #118 item 2: a reply that doesn't decode as `CodexWire.AccountRead`
+            // at all (here, a bare JSON string instead of an object) must be
+            // distinguishable from a reply that decodes fine with an explicit
+            // `account: null`. Collapsing both into `.notLoggedIn` would misreport
+            // a wire/protocol regression as "needs login".
+            let malformedStub = try writeStub("codex-malformed-account", """
+            #!/bin/sh
+            trap 'echo reaped > "$MARKER"' EXIT
+            echo '{"id":1,"result":{"userAgent":"stub"}}'
+            echo '{"id":2,"result":"not-an-object"}'
+            cat > /dev/null
+            """)
+            let malformedClient = CodexAppServerClient(
+                codexHome: dir.path,
+                timeouts: timeouts,
+                environment: [
+                    CodexBinary.overrideEnvKey: malformedStub,
+                    "PATH": "/usr/bin:/bin",
+                    "MARKER": dir.appendingPathComponent("malformed-reaped").path,
+                ]
+            )
+            switch runBlocking({ try await malformedClient.fetchUsage() }) {
+            case .success:
+                checks += 1
+                failures.append("an undecodable account/read reply must not appear to succeed")
+            case .failure(let error):
+                guard let codexError = error as? CodexAppServerError, case .protocolFailure = codexError else {
+                    checks += 1
+                    failures.append("an undecodable account/read reply must fail with .protocolFailure, got \(error)")
+                    break
+                }
+            }
+
+            let nullAccountStub = try writeStub("codex-null-account", """
+            #!/bin/sh
+            trap 'echo reaped > "$MARKER"' EXIT
+            echo '{"id":1,"result":{"userAgent":"stub"}}'
+            echo '{"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}'
+            cat > /dev/null
+            """)
+            let nullAccountClient = CodexAppServerClient(
+                codexHome: dir.path,
+                timeouts: timeouts,
+                environment: [
+                    CodexBinary.overrideEnvKey: nullAccountStub,
+                    "PATH": "/usr/bin:/bin",
+                    "MARKER": dir.appendingPathComponent("null-account-reaped").path,
+                ]
+            )
+            switch runBlocking({ try await nullAccountClient.fetchUsage() }) {
+            case .success:
+                checks += 1
+                failures.append("a decoded-but-null account must not appear to succeed")
+            case .failure(let error):
+                guard let codexError = error as? CodexAppServerError, case .notLoggedIn = codexError else {
+                    checks += 1
+                    failures.append("a decoded-but-null account must fail with .notLoggedIn, got \(error)")
+                    break
+                }
+            }
+
+            // #118 item 3: a child that ignores SIGTERM must still be walked
+            // through the full stdin-close → SIGTERM → SIGKILL ladder rather than
+            // hanging — this is what originally caught the `waitUntilExit()`
+            // off-main-thread regression, and must keep passing after `reap`
+            // switched from a busy `usleep` poll to a suspending `Task.sleep` one.
+            let wedgedMarker = dir.appendingPathComponent("wedged-reaped").path
+            let wedgedStub = try writeStub("codex-wedged", """
+            #!/bin/sh
+            trap '' TERM
+            trap 'echo reaped > "$MARKER"' EXIT
+            while true; do sleep 0.05; done
+            """)
+
+            var wedgedTimeouts = CodexAppServerClient.Timeouts()
+            wedgedTimeouts.initialize = 1
+            wedgedTimeouts.method = 1
+            wedgedTimeouts.overall = 1
+            wedgedTimeouts.gracefulExit = 0.3
+            wedgedTimeouts.terminateGrace = 0.3
+
+            let wedgedClient = CodexAppServerClient(
+                codexHome: dir.path,
+                timeouts: wedgedTimeouts,
+                environment: [
+                    CodexBinary.overrideEnvKey: wedgedStub,
+                    "PATH": "/usr/bin:/bin",
+                    "MARKER": wedgedMarker,
+                ]
+            )
+
+            let wedgedStarted = Date()
+            switch runBlocking({ try await wedgedClient.fetchUsage() }) {
+            case .success:
+                checks += 1
+                failures.append("a wedged app-server must fail, not appear to succeed")
+            case .failure(let error):
+                guard let codexError = error as? CodexAppServerError, case .timedOut = codexError else {
+                    checks += 1
+                    failures.append("a wedged app-server must fail with .timedOut, got \(error)")
+                    break
+                }
+            }
+            // Bound: overall timeout (1s) plus the escalation ladder
+            // (gracefulExit 0.3 + terminateGrace 0.3 + up to 2s final wait) —
+            // generously capped well short of a real hang.
+            expect(Date().timeIntervalSince(wedgedStarted) < 8,
+                   "a SIGTERM-ignoring child is still force-killed and reaped, not hung on indefinitely")
+
+            // `trap ... EXIT` never fires on SIGKILL (it cannot be caught), so
+            // the marker file isn't a valid signal here — confirm no process
+            // survives via `pgrep` on the stub's own (unique, per-run) path
+            // instead. `waitUntilExit()` is safe on this call: `selftest` runs
+            // this whole suite synchronously on the main thread, never inside a
+            // Swift concurrency pool task — see the note on
+            // `CodexAppServerClient.waitForExit` for why that distinction matters.
+            let pgrepCheck = Process()
+            pgrepCheck.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            pgrepCheck.arguments = ["-f", wedgedStub]
+            let pgrepOutput = Pipe()
+            pgrepCheck.standardOutput = pgrepOutput
+            pgrepCheck.standardError = FileHandle.nullDevice
+            do {
+                try pgrepCheck.run()
+                pgrepCheck.waitUntilExit()
+                let leaked = pgrepOutput.fileHandleForReading.readDataToEndOfFile()
+                expect(leaked.isEmpty, "no orphaned wedged child survives the SIGKILL escalation")
+            } catch {
+                // `pgrep` itself is missing on this host (rare) — not this
+                // test's concern; the timeout/elapsed-time assertions above
+                // already cover the escalation ladder's correctness.
+            }
         } catch {
             checks += 1
             failures.append("codex app-server stub test threw: \(error)")

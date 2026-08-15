@@ -789,60 +789,89 @@ final class CodexAppServerClient: Sendable {
         }
 
         // Reaping runs on every exit path — success, throw, timeout, and task
-        // cancellation — because it is the `defer` of the frame that owns the
-        // process.
-        defer { Self.reap(process, stdin: stdinPipe.fileHandleForWriting, stdout: readHandle, timeouts: timeouts) }
+        // cancellation. It would normally be a `defer`, but `reap` now
+        // *suspends* rather than busy-blocks (see its doc comment), and Swift
+        // does not allow `await` inside a `defer` block. So the exchange is
+        // wrapped in a closure instead, and `reap` is explicitly awaited on
+        // both the success and failure paths below — still exactly once, on
+        // every exit, matching what the `defer` guaranteed.
+        let stdin = stdinPipe.fileHandleForWriting
+        // Captured as locals (rather than read from `self` inside the closure
+        // below) purely to keep the closure's capture list unambiguous — both
+        // are plain reads of immutable/computed state, not `self` methods.
+        let timeouts = timeouts
+        let effectiveCodexHome = effectiveCodexHome
+        let exchange: () async throws -> (account: Data?, rateLimits: Data?) = {
+            let overallDeadline = Date().addingTimeInterval(timeouts.overall)
+            let writer = stdin
 
-        let overallDeadline = Date().addingTimeInterval(timeouts.overall)
-        let writer = stdinPipe.fileHandleForWriting
+            // 1. initialize — `clientInfo{name,version}` is required.
+            try Self.send(writer, [
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": ["clientInfo": ["name": "claude-monitor", "version": AppVersion.current]],
+            ])
+            let initializeResult = try await self.awaitReply(
+                id: 1, method: "initialize", stream: stream, process: process,
+                deadline: Self.earliest(Date().addingTimeInterval(timeouts.initialize), overallDeadline)
+            )
+            Self.logResolvedBinaryVersionOnce(binaryPath: binary, initializeResult: initializeResult)
 
-        // 1. initialize — `clientInfo{name,version}` is required.
-        try Self.send(writer, [
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": ["clientInfo": ["name": "claude-monitor", "version": AppVersion.current]],
-        ])
-        let initializeResult = try await awaitReply(
-            id: 1, method: "initialize", stream: stream, process: process,
-            deadline: Self.earliest(Date().addingTimeInterval(timeouts.initialize), overallDeadline)
-        )
-        Self.logResolvedBinaryVersionOnce(binaryPath: binary, initializeResult: initializeResult)
+            // 2. initialized — a notification, so no id and no reply.
+            try Self.send(writer, ["jsonrpc": "2.0", "method": "initialized", "params": [:]])
 
-        // 2. initialized — a notification, so no id and no reply.
-        try Self.send(writer, ["jsonrpc": "2.0", "method": "initialized", "params": [:]])
+            // 3. account/read — the login probe, and where plan/email come from.
+            //    An old codex answers -32600 here too; that is a capability gap, so
+            //    carry on and let the rate-limit call make the final call.
+            var accountResult: Data?
+            try Self.send(writer, ["jsonrpc": "2.0", "id": 2, "method": "account/read", "params": [:]])
+            do {
+                accountResult = try await self.awaitReply(
+                    id: 2, method: "account/read", stream: stream, process: process,
+                    deadline: Self.earliest(Date().addingTimeInterval(timeouts.method), overallDeadline)
+                )
+                let decoded = accountResult.flatMap { try? CodexWire.decode(CodexWire.AccountRead.self, from: $0) }
+                // `decoded == nil` (the reply didn't decode at all — a
+                // wire/protocol problem) and `decoded!.account == nil` (a
+                // successfully-decoded, explicit `account: null`) are
+                // different conditions and must not collapse to the same
+                // outcome: the latter is the documented disambiguator for
+                // "not logged in", the former is a genuine protocol
+                // regression that would otherwise be misreported as one.
+                guard let decoded else {
+                    throw CodexAppServerError.protocolFailure("account/read reply did not decode")
+                }
+                if decoded.account == nil {
+                    // Verified: an unauthenticated home returns `account: null` here
+                    // and then -32600 on rate limits. Naming it now keeps that -32600
+                    // from being misread as "codex too old".
+                    throw CodexAppServerError.notLoggedIn(effectiveCodexHome)
+                }
+            } catch let error as CodexAppServerError {
+                guard case .methodUnsupported = error else { throw error }
+                accountResult = nil
+            }
 
-        // 3. account/read — the login probe, and where plan/email come from.
-        //    An old codex answers -32600 here too; that is a capability gap, so
-        //    carry on and let the rate-limit call make the final call.
-        var accountResult: Data?
-        try Self.send(writer, ["jsonrpc": "2.0", "id": 2, "method": "account/read", "params": [:]])
-        do {
-            accountResult = try await awaitReply(
-                id: 2, method: "account/read", stream: stream, process: process,
+            // 4. account/rateLimits/read — the payload this whole path exists for.
+            //    Skipped entirely by the identity probe (`codex add` / `codex list`),
+            //    which only needs to know who this home is and whether it is logged in.
+            guard includeRateLimits else { return (accountResult, nil) }
+            try Self.send(writer, ["jsonrpc": "2.0", "id": 3, "method": "account/rateLimits/read", "params": [:]])
+            let rateLimits = try await self.awaitReply(
+                id: 3, method: "account/rateLimits/read", stream: stream, process: process,
                 deadline: Self.earliest(Date().addingTimeInterval(timeouts.method), overallDeadline)
             )
-            let decoded = accountResult.flatMap { try? CodexWire.decode(CodexWire.AccountRead.self, from: $0) }
-            if decoded?.account == nil {
-                // Verified: an unauthenticated home returns `account: null` here
-                // and then -32600 on rate limits. Naming it now keeps that -32600
-                // from being misread as "codex too old".
-                throw CodexAppServerError.notLoggedIn(effectiveCodexHome)
-            }
-        } catch let error as CodexAppServerError {
-            guard case .methodUnsupported = error else { throw error }
-            accountResult = nil
+
+            return (accountResult, rateLimits)
         }
 
-        // 4. account/rateLimits/read — the payload this whole path exists for.
-        //    Skipped entirely by the identity probe (`codex add` / `codex list`),
-        //    which only needs to know who this home is and whether it is logged in.
-        guard includeRateLimits else { return (accountResult, nil) }
-        try Self.send(writer, ["jsonrpc": "2.0", "id": 3, "method": "account/rateLimits/read", "params": [:]])
-        let rateLimits = try await awaitReply(
-            id: 3, method: "account/rateLimits/read", stream: stream, process: process,
-            deadline: Self.earliest(Date().addingTimeInterval(timeouts.method), overallDeadline)
-        )
-
-        return (accountResult, rateLimits)
+        do {
+            let result = try await exchange()
+            await Self.reap(process, stdin: stdin, stdout: readHandle, timeouts: timeouts)
+            return result
+        } catch {
+            await Self.reap(process, stdin: stdin, stdout: readHandle, timeouts: timeouts)
+            throw error
+        }
     }
 
     private static func earliest(_ a: Date, _ b: Date) -> Date { a < b ? a : b }
@@ -938,23 +967,33 @@ final class CodexAppServerClient: Sendable {
     /// gone by the first `waitForExit`. Only a wedged child reaches the
     /// escalation, and even then this is bounded by
     /// `gracefulExit + terminateGrace + 2`.
-    private static func reap(_ process: Process, stdin: FileHandle, stdout: FileHandle, timeouts: Timeouts) {
+    private static func reap(_ process: Process, stdin: FileHandle, stdout: FileHandle, timeouts: Timeouts) async {
         stdout.readabilityHandler = nil
         try? stdin.close()
 
-        if !waitForExit(process, within: timeouts.gracefulExit) {
+        if await !waitForExit(process, within: timeouts.gracefulExit) {
             if process.isRunning { process.terminate() }
-            if !waitForExit(process, within: timeouts.terminateGrace) {
+            if await !waitForExit(process, within: timeouts.terminateGrace) {
                 if process.isRunning { kill(process.processIdentifier, SIGKILL) }
                 // SIGKILL cannot be refused; this only waits for Foundation's
                 // own monitor to observe the exit and reap the zombie.
-                _ = waitForExit(process, within: 2)
+                _ = await waitForExit(process, within: 2)
             }
         }
         try? stdout.close()
     }
 
     /// Poll `isRunning` until the child is gone; true if it exited in time.
+    ///
+    /// Suspends between polls with `Task.sleep` rather than blocking the
+    /// calling thread with `usleep`: a wedged child still costs up to
+    /// `gracefulExit + terminateGrace + 2` seconds of *wall-clock* wait (the
+    /// escalation ladder's bounds are unchanged), but that wait no longer pins
+    /// a Swift concurrency-pool thread for the duration — the thread is
+    /// returned to the pool between polls. `Task.sleep` can throw
+    /// `CancellationError`; that is swallowed with `try?` because reaping must
+    /// run to completion regardless of the caller's own cancellation state —
+    /// it is cleanup, not cancellable work.
     ///
     /// **`Process.waitUntilExit()` is deliberately not used.** On Darwin it
     /// spins a `CFRunLoop` on the *calling* thread, and this runs on a
@@ -963,11 +1002,11 @@ final class CodexAppServerClient: Sendable {
     /// (caught as an intermittent self-test hang; stack sampled). Foundation's
     /// own termination monitor reaps the child, so `isRunning == false` already
     /// means "no zombie left behind".
-    private static func waitForExit(_ process: Process, within seconds: TimeInterval) -> Bool {
+    private static func waitForExit(_ process: Process, within seconds: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while process.isRunning {
             if Date() >= deadline { return false }
-            usleep(10_000)
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
         return true
     }
