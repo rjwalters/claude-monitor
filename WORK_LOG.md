@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #132** (closed): codex list: enumerate all discoverable Codex homes, not just registered accounts
+- **PR #140**: codex list: discover unregistered ~/.codex* homes on disk
 - **Issue #134** (closed): Surface Codex identity drift as a distinct account state (not stale/failed reading)
 - **PR #138**: feat: report a re-logged-in Codex home as drift in `codex list`
 - **Issue #133** (closed): Add codex provision <label> to collapse home-create + login + register into one command
