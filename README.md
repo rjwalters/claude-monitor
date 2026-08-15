@@ -140,6 +140,23 @@ them in order, preferring whichever touches the fewest credentials:
    Install the current CLI with `npm i -g @openai/codex`; it ships
    `linux-x64` / `linux-arm64` binaries, so this works on headless Linux hosts
    too.
+
+   Homebrew ships **two** `codex` packages, and it's easy to end up on the
+   wrong one: `brew install codex` installs the **formula**, which is the
+   stale 0.46.0 build above. The current 0.147.0+ CLI is the **cask**. If
+   you're already on the formula, switch with:
+
+   ```bash
+   brew uninstall --formula codex && brew install --cask codex
+   ```
+
+   `brew uninstall --formula` may autoremove now-unused dependencies pulled in
+   only for the formula (observed: it took `ripgrep` with it on one host) —
+   reinstall anything you still want separately. The cask also does **not**
+   self-update in the background (`auto_updates` is `null` in its cask
+   definition, unlike a cask that manages its own updater) — `brew update`
+   alone won't pull in a new `codex` release, so re-running
+   `brew upgrade --cask codex` periodically is on you.
 2. **`auth.json` at request time.** `GET https://chatgpt.com/backend-api/wham/usage`
    — the same endpoint Codex CLI's own `/usage` command calls — with the bearer
    read fresh out of `$CODEX_HOME/auth.json` for that one request. Never written

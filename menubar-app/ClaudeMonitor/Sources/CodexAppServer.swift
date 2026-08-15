@@ -90,6 +90,29 @@ func redactHomePath(_ path: String) -> String {
     return path
 }
 
+// MARK: - Version diagnostics
+
+/// The `result` payload of an `initialize` reply — the only field the
+/// resolved-binary diagnostic log line needs.
+struct CodexInitializeResult: Decodable {
+    let userAgent: String?
+}
+
+/// Extracts the version string from an `initialize` reply's `result` payload
+/// (`userAgent`), or nil when the field is absent or the payload doesn't
+/// decode at all.
+///
+/// Verified shape on both tested releases: `{"userAgent":
+/// "codex_cli_rs/0.46.0", …}` and `{"userAgent": "codex_cli_rs/0.147.0",
+/// "codexHome": …, "platformFamily": …, "platformOs": …}` — see
+/// `docs/spikes/2026-07-30-codex-usage-probe.md`. Reading it back here means
+/// no separate `codex --version` subprocess is needed just to surface the
+/// version in the log. A free function (not private) so the self-test can
+/// exercise it directly against both verified wire shapes.
+func codexVersionFromInitializeResult(_ data: Data) -> String? {
+    (try? JSONDecoder().decode(CodexInitializeResult.self, from: data))?.userAgent
+}
+
 // MARK: - Errors
 
 /// Why a `codex app-server` read could not be completed.
@@ -219,6 +242,36 @@ enum CodexBinary {
             if fileManager.isExecutableFile(atPath: candidate) { return candidate }
         }
         return nil
+    }
+}
+
+/// Process-wide dedup for the resolved-binary diagnostic log line below.
+///
+/// `CodexAppServerClient` is constructed fresh per account on every poll (see
+/// `OAuthPoller`), so a per-instance "have I logged this already" flag would
+/// reset every cycle and defeat the point. This cache is keyed on the
+/// resolved path + reported version, so a poll cycle logs nothing when both
+/// are unchanged, and logs again only when the binary itself changes (a
+/// Homebrew formula→cask swap, an `npm i -g @openai/codex` upgrade, …).
+///
+/// `@unchecked Sendable` over an `NSLock`, matching `CodexLineStream`'s
+/// established pattern in this file for shared mutable state touched from
+/// concurrent call sites. Internal, not `private`, so the self-test can
+/// instantiate a scratch instance and exercise the dedup logic directly
+/// without touching (or being polluted by) `.shared`.
+final class CodexBinaryVersionLog: @unchecked Sendable {
+    static let shared = CodexBinaryVersionLog()
+    private let lock = NSLock()
+    private var lastLoggedKey: String?
+
+    /// Returns true (and records `key`) the first time this exact key is
+    /// seen; false on every repeat.
+    func shouldLog(_ key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard lastLoggedKey != key else { return false }
+        lastLoggedKey = key
+        return true
     }
 }
 
@@ -642,6 +695,24 @@ final class CodexAppServerClient: Sendable {
         )
     }
 
+    /// Diagnostic breadcrumb for the stale-Homebrew-formula failure mode
+    /// (issue #115): logs the resolved `codex` binary path and reported
+    /// version once per distinct (path, version) pair via
+    /// `CodexBinaryVersionLog`, not on every poll cycle. The path is always
+    /// redacted — it can be `~/.local/bin/codex` or `~/.npm-global/bin/codex`,
+    /// both username-bearing once `$HOME` is expanded — matching every other
+    /// path-bearing log line in this file.
+    ///
+    /// Never throws: a reply that fails to decode just yields "version
+    /// unknown" rather than aborting a handshake that otherwise succeeded.
+    private static func logResolvedBinaryVersionOnce(binaryPath: String, initializeResult: Data) {
+        let userAgent = codexVersionFromInitializeResult(initializeResult)
+        let redactedPath = redactHomePath(binaryPath)
+        let version = userAgent ?? "version unknown"
+        guard CodexBinaryVersionLog.shared.shouldLog("\(redactedPath)|\(version)") else { return }
+        flog.info("codex binary resolved: \(redactedPath) (\(version))", category: fcat)
+    }
+
     /// Classify an RPC error on `account/rateLimits/read`.
     ///
     /// `-32600`/`-32601` mean "this codex does not implement the method" —
@@ -726,10 +797,11 @@ final class CodexAppServerClient: Sendable {
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": ["clientInfo": ["name": "claude-monitor", "version": AppVersion.current]],
         ])
-        _ = try await awaitReply(
+        let initializeResult = try await awaitReply(
             id: 1, method: "initialize", stream: stream, process: process,
             deadline: Self.earliest(Date().addingTimeInterval(timeouts.initialize), overallDeadline)
         )
+        Self.logResolvedBinaryVersionOnce(binaryPath: binary, initializeResult: initializeResult)
 
         // 2. initialized — a notification, so no id and no reply.
         try Self.send(writer, ["jsonrpc": "2.0", "method": "initialized", "params": [:]])
