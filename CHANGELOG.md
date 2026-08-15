@@ -4,19 +4,109 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.19.0] - 2026-08-15
 
-### Changed
+### Summary
 
+Claude Monitor no longer stores an OpenAI credential. Codex usage is read by
+asking the Codex CLI itself over `codex app-server`, so the app holds no token
+to expire, rotate, or leak — and each Codex account can be polled from its own
+`CODEX_HOME`, which is the foundation for tracking more than one Codex identity.
+
+Note that this release ships the *mechanism*, not yet the ergonomics: homes are
+registered by hand with `codex add --home <path>`, and there is no discovery,
+drift reporting, or cross-host view of which identities a machine actually has.
+That tooling is tracked in #130 and lands in a following release.
+
+### Added
+
+- **Codex usage is read over `codex app-server`, with no stored credential.**
+  Polling an OpenAI/ChatGPT account now spawns `codex -s read-only -a untrusted
+  app-server` and speaks JSON-RPC over its stdio (`account/read`,
+  `account/rateLimits/read`), so the Codex CLI owns the credential and this app
+  reads only derived numbers. `pollOpenAI` is a three-tier ladder ordered by how
+  little credential handling each rung needs — app-server, then a bearer read
+  from `auth.json` at request time, then the legacy stored credential — and an
+  unavailable tier falls through silently rather than reporting an account as
+  unhealthy. Requires a recent Codex CLI; the method is absent in 0.46.0, which
+  answers `-32600` and simply causes a fall-through (#102, PR #111)
+- **Each Codex account polls from its own `CODEX_HOME`.** Accounts carry a
+  nullable `codex_home`, registered with `claude-monitor codex add --home
+  <path>` and inspectable with `codex list`. Because `codex login` writes one
+  `auth.json` per home, a per-account home is what allows several Codex
+  identities to coexist instead of each login clobbering the last. Homes are
+  host-local by design and are never exported or synced (#103, PR #114)
 - **Capped accounts sort by when they come back.** Accounts tied on headroom —
   in practice the block of exhausted accounts all reading 0% — now order by time
   until the reset that actually gates them: the weekly reset once the week is
   spent, the session reset otherwise. The same rule replaces the old
   session-reset-first tiebreak used for popover ordering and the auto-selected
-  menubar account.
+  menubar account (#54)
+
+### Changed
+
+- **Stored OpenAI tokens are retired, and Codex accounts are excluded from
+  account sync.** A migration nulls `access_token` / `refresh_token` on every
+  OpenAI credential row, the proactive OpenAI refresh path is gone, and
+  `accounts export` omits `provider: openai` accounts entirely — reporting how
+  many it excluded rather than dropping them silently. This closes a real
+  failure mode: OpenAI rotates the refresh token on every use, so a copy held by
+  this app, a copy on a second host, and the Codex CLI's own `auth.json` were
+  invalidating one another in turn, producing continuous
+  `401 / refresh_token_invalidated` while the accounts themselves were healthy.
+  An `auth.json` is single-machine per OpenAI's guidance; register a Codex
+  account on each host instead of copying one between them (#104, PR #123)
+- **Clipboard account transfer reports what it left behind.** With OpenAI tokens
+  retired, Codex accounts no longer appear in a clipboard payload. "Copy
+  Accounts" now names how many were excluded as host-local instead of quietly
+  copying fewer, and a Codex-only host gets an explanatory message rather than
+  "Nothing to copy" (#129, PR #137)
 - **`npm test` runs the self-test.** The script still claimed there was no test
   target and exited 0 unconditionally, which predates `selftest` — orchestration
-  gates that shell out to it now actually gate.
+  gates that shell out to it now actually gate
+
+### Fixed
+
+- **Removing an account deletes its credential.** `clearAccountData` deleted
+  usage history and the account row but never `oauth_credentials`,
+  `probe_snapshots`, or `named_limits`, and the declared foreign key was inert
+  because SQLite defaults `PRAGMA foreign_keys` to OFF. The function is now split
+  into `clearAccountHistory` (time series only) and `deleteAccount` (everything),
+  which also fixes "Clear History" having silently removed the account row too. A
+  migration purges credential rows already stranded by the old behavior, guarding
+  rows whose `account_id` is NULL (#106, PR #110) — and a follow-up extends the
+  same purge to orphaned `probe_snapshots` / `named_limits` rows (#117, PR #126)
+- **`accounts export` no longer fails on a cold WAL database.** Exports opened
+  the database read-only, which cannot create the `-shm` file a WAL database
+  needs, so a perfectly healthy database produced `SQLITE_CANTOPEN` whenever the
+  app was not running — precisely when an export is most likely to be run. Opens
+  now escalate read-only → read-write → `immutable=1`, the last gated on the
+  absence of a non-empty `-wal` so a stale read can never be returned silently.
+  `--db` also reports the path it was actually given (#105, PR #113)
+- **Codex client robustness.** A decode failure is distinguished from a
+  legitimately null account, so a protocol regression is no longer reported as a
+  not-logged-in home; and process reaping suspends rather than blocking a
+  cooperative-pool thread for the duration of its shutdown ladder (#118, PR #127)
+- **`selftest` no longer writes to the real debug log.** Logging fired from a
+  pure mapper, so an offline test run appended lines to
+  `~/.claude-monitor/debug.log` (#116, PR #125)
+- **`selftest --db` works on a host with a Codex account.** The
+  provider-backfill assertion required every pre-existing account to be
+  Anthropic, which no multi-provider host satisfies (#112, PR #121)
+- **Accurate exported-account count when copying accounts** (#63, PR #64)
+- **Guide's work-log scan excludes its own docs-maintenance PRs** (#60, PR #61)
+
+### Security
+
+- Example addresses in the natural-sort fixture and the token-filename
+  documentation replaced with placeholders
+
+### Build
+
+- **Swift 6 language mode adopted package-wide**, with narrowest-correct
+  concurrency annotations rather than a blanket suppression (#51, PR #53)
+- Dependabot configured for GitHub Actions, and `actions/checkout` updated
+  (PR #108, PR #109)
 
 ## [1.18.3] - 2026-08-02
 
