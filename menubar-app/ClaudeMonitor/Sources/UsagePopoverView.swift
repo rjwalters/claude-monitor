@@ -1111,18 +1111,10 @@ struct SummaryRow: View {
     private func percentText(_ value: Double?) -> some View {
         if let pct = value {
             Text("\(Int(pct))%")
-                .foregroundColor(colorForPercent(pct))
+                .foregroundColor(PercentSeverity(percent: pct).color)
         } else {
             Text("—")
                 .foregroundColor(.secondary)
-        }
-    }
-
-    private func colorForPercent(_ percent: Double) -> Color {
-        switch PercentSeverity(percent: percent) {
-        case .critical: return Color(nsColor: .systemRed)
-        case .warning: return Color(nsColor: .systemOrange)
-        case .normal: return .primary
         }
     }
 
@@ -1132,7 +1124,7 @@ struct SummaryRow: View {
     private var fableCell: some View {
         if let used = usage?.fablePercent {
             Text("\(Int(used.rounded()))%")
-                .foregroundColor(colorForPercent(used))
+                .foregroundColor(PercentSeverity(percent: used).color)
                 .help("Fable/premium weekly allowance used. At 100% the account switches to extra usage.")
         } else {
             Text("—")

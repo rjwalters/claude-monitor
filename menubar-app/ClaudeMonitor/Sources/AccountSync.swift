@@ -312,14 +312,8 @@ enum AccountSync {
     /// timestamp to compare against. False (incoming wins) when the local
     /// record has no timestamp but the incoming one does.
     private static func isLocalAuthoritative(_ existing: String?, incoming: String?) -> Bool {
-        guard let incoming = incoming, let incomingDate = parseISO(incoming) else { return true }
-        guard let existing = existing, let existingDate = parseISO(existing) else { return false }
+        guard let incoming = incoming, let incomingDate = UsageRecord.parseISO(incoming) else { return true }
+        guard let existing = existing, let existingDate = UsageRecord.parseISO(existing) else { return false }
         return existingDate >= incomingDate
-    }
-
-    private static func parseISO(_ string: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: string) ?? ISO8601DateFormatter().date(from: string)
     }
 }
