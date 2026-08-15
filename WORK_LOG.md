@@ -2,6 +2,12 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-08-15
+
+- **Issue #79** (closed): Remove unused formatResetTime function in UsagePopoverView.swift
+- **PR #78**: refactor: remove dead helpers and struct with zero call sites
+- **Issue #76** (closed): Remove dead code: unused helpers/struct in UsageStore, UsageChartView, UsagePopoverView
+
 ### 2026-08-06
 
 - **PR #72**: ci: add workflow_dispatch fallback trigger, document manual CI re-run
