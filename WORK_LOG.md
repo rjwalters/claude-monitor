@@ -4,6 +4,9 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #83** (closed): Auditor Capability Request: no Swift toolchain or docker access on this host to validate claude-monitor builds
+- **PR #93**: refactor: drop UsageStore.parseDate in favor of UsageRecord.parseISO
+- **Issue #91** (closed): Remove duplicate parseDate helper in UsageStore: delegate to UsageRecord.parseISO
 - **PR #88**: refactor: dedupe parseISO, colorForPercent, and b64url helpers
 - **Issue #87** (closed): Dedupe copy-pasted helpers: parseISO, colorForPercent, b64url
 - **PR #86**: refactor: unify percent-severity color thresholds into shared PercentSeverity enum
