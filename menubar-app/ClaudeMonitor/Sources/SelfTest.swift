@@ -70,6 +70,7 @@ enum SelfTest {
         testCodexAuthParsing()
         testCodexAppServerFraming()
         testCodexAppServerEnvelopeDecoding()
+        testCodexVersionDiagnosticLogging()
         testCodexAppServerMapping()
         testCodexAppServerRedaction()
         testCodexBinaryResolution()
@@ -706,6 +707,51 @@ enum SelfTest {
         expect(CodexAppServerError.binaryNotFound.errorDescription?
                 .contains("CLAUDE_MONITOR_CODEX_BIN") == true,
                "the not-found message names the override that fixes it")
+    }
+
+    /// The resolved-binary version diagnostic (issue #115): the `initialize`
+    /// reply's `result.userAgent` is read back — no separate `codex --version`
+    /// subprocess — and the dedup cache logs a given (path, version) pair only
+    /// once, not on every poll.
+    private static func testCodexVersionDiagnosticLogging() {
+        // Verbatim initialize result payloads (verified 0.46.0 and 0.147.0 —
+        // see docs/spikes/2026-07-30-codex-usage-probe.md).
+        expectEqual(
+            codexVersionFromInitializeResult(Data("""
+            {"userAgent":"codex_cli_rs/0.46.0"}
+            """.utf8)),
+            "codex_cli_rs/0.46.0",
+            "the stale-formula version decodes from a minimal 0.46.0-shaped reply"
+        )
+        expectEqual(
+            codexVersionFromInitializeResult(Data("""
+            {"userAgent":"codex_cli_rs/0.147.0","codexHome":"/x",
+             "platformFamily":"unix","platformOs":"macos"}
+            """.utf8)),
+            "codex_cli_rs/0.147.0",
+            "the current version decodes from the fuller 0.147.0-shaped reply, ignoring extra fields"
+        )
+        expect(
+            codexVersionFromInitializeResult(Data("{}".utf8)) == nil,
+            "a reply with no userAgent yields nil rather than a fabricated version"
+        )
+        expect(
+            codexVersionFromInitializeResult(Data("not json".utf8)) == nil,
+            "an undecodable payload yields nil rather than crashing the handshake"
+        )
+
+        // Dedup: log once per distinct (path, version) key, not every poll —
+        // a scratch instance, not `.shared`, so this doesn't interact with any
+        // other test or a real poll cycle.
+        let log = CodexBinaryVersionLog()
+        expect(log.shouldLog("~/.local/bin/codex|codex_cli_rs/0.147.0"),
+               "the first sighting of a path+version pair logs")
+        expect(!log.shouldLog("~/.local/bin/codex|codex_cli_rs/0.147.0"),
+               "an unchanged path+version pair does not log again — this is what keeps it to once per poll cycle, not once per line")
+        expect(log.shouldLog("~/.local/bin/codex|codex_cli_rs/0.46.0"),
+               "a version change at the same path logs again — e.g. a Homebrew formula→cask swap")
+        expect(log.shouldLog("~/.npm-global/bin/codex|codex_cli_rs/0.147.0"),
+               "a path change logs again even with the same version")
     }
 
     /// Fixture → `RateLimitSnapshot`. The load-bearing assertion is the unit
