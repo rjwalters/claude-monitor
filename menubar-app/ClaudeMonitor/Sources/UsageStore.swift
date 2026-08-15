@@ -197,10 +197,6 @@ struct TokenDataPoint: Identifiable {
     let cacheCreationTokens: Int64
     let cacheReadTokens: Int64
 
-    var totalTokens: Int64 {
-        inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens
-    }
-
     var billableTokens: Int64 {
         // Cache reads don't count toward quota
         inputTokens + outputTokens + cacheCreationTokens
