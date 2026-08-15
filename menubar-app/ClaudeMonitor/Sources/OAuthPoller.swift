@@ -323,6 +323,10 @@ class OAuthPoller: ObservableObject {
         /// Whether a token is still stored for this account (tier 3). A
         /// home-registered account has none, which is the point.
         let hasStoredToken: Bool
+        /// The email on the account row, carried **only** so a drift check can
+        /// compare it with what the home reports. `codex list` never prints
+        /// it — see the file comment on `CodexCLI`.
+        let email: String?
     }
 
     /// Register an account by its `CODEX_HOME`, storing **no token**.
@@ -494,7 +498,8 @@ class OAuthPoller: ObservableObject {
             let stmt = try db.prepare("""
                 SELECT a.id, \(hasCodexHome ? "a.codex_home" : "NULL"), a.plan,
                        (SELECT COUNT(*) FROM oauth_credentials c
-                         WHERE c.account_id = a.id AND c.access_token IS NOT NULL)
+                         WHERE c.account_id = a.id AND c.access_token IS NOT NULL),
+                       a.email
                 FROM accounts a
                 WHERE COALESCE(a.provider, 'anthropic') = 'openai'
                 ORDER BY a.sort_order, a.id
@@ -506,7 +511,8 @@ class OAuthPoller: ObservableObject {
                     accountId: id,
                     codexHome: (row[1] as? String).flatMap { $0.isEmpty ? nil : $0 },
                     plan: row[2] as? String,
-                    hasStoredToken: ((row[3] as? Int64) ?? 0) > 0
+                    hasStoredToken: ((row[3] as? Int64) ?? 0) > 0,
+                    email: (row[4] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 ))
             }
             return rows
@@ -1418,13 +1424,106 @@ class OAuthPoller: ObservableObject {
 
     /// Two identity strings that are both known and disagree. Pure function of
     /// its arguments so the self-test can pin the asymmetry directly.
+    ///
+    /// Now a thin reading of `compareIdentities` — **exactly** the same answer
+    /// for every input, which the self-test pins case by case. The attribution
+    /// gate this feeds is deliberately untouched: widening the comparison's
+    /// result was about letting `codex list` *name* a conflict, never about
+    /// moving the line at which the poller refuses to attribute a reading.
     nonisolated static func identitiesConflict(_ lhs: String?, _ rhs: String?) -> Bool {
+        if case .conflict = compareIdentities(reported: lhs, stored: rhs) { return true }
+        return false
+    }
+
+    /// What comparing a *reported* identity with a *stored* one actually
+    /// established — the same three-way answer `identitiesConflict` used to
+    /// collapse into a `Bool`.
+    ///
+    /// The distinction that matters is between `.match` and `.indeterminate`:
+    /// both mean "do not decline attribution", but only `.match` means the two
+    /// sides agree. Collapsing them is what made drift invisible.
+    enum CodexIdentityComparison: Equatable, Sendable {
+        /// At least one side carries no identity. Proves nothing in either
+        /// direction — the asymmetry the tiers rely on.
+        case indeterminate
+        /// Both sides known and equal.
+        case match
+        /// Both sides known and different. `reported` is the identity the home
+        /// currently holds, carried verbatim (trimmed, original case) so a
+        /// caller can display it.
+        case conflict(reported: String)
+    }
+
+    /// Compare an identity a Codex home currently reports with the one an
+    /// account carries. Pure function of its arguments — no IO, no database,
+    /// so the self-test drives it directly.
+    nonisolated static func compareIdentities(reported: String?, stored: String?) -> CodexIdentityComparison {
         func normalized(_ value: String?) -> String? {
             let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             return (trimmed?.isEmpty == false) ? trimmed : nil
         }
-        guard let lhs = normalized(lhs), let rhs = normalized(rhs) else { return false }
-        return lhs != rhs
+        guard let lhs = normalized(reported), let rhs = normalized(stored) else { return .indeterminate }
+        guard lhs != rhs else { return .match }
+        let verbatim = reported?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let verbatim = verbatim, !verbatim.isEmpty { return .conflict(reported: verbatim) }
+        return .conflict(reported: lhs)
+    }
+
+    /// Whether a *registered* Codex home still belongs to the account it was
+    /// registered against — the operator-visible reading of the same guard.
+    enum CodexHomeDrift: Equatable, Sendable {
+        /// Nothing contradicts the registration. Absent identity lands here
+        /// too: a home logged out after registration is "needs login", not
+        /// drift.
+        case stable
+        /// The home now holds a different identity than the account row.
+        /// `reportedAccountId` is the account id `auth.json` currently carries,
+        /// when it carries one — `nil` when the drift was proven by email
+        /// alone, because no caller of this may print an email.
+        case drifted(reportedAccountId: String?)
+    }
+
+    /// Has a registered home been re-logged-in as somebody else?
+    ///
+    /// Pure: the caller does the IO (reads `auth.json`'s `tokens.account_id`
+    /// and/or `account/read`'s email) and hands both observations in. Two
+    /// signals, in precedence order:
+    ///
+    /// 1. **Account id** — the stable key `codex add` registered the home by,
+    ///    and the only one that can be *named* in output. A locally minted id
+    ///    (`openai-<uuid>`, minted when `auth.json` carried no `account_id`)
+    ///    lives in a different namespace, so it is never compared — an
+    ///    unrelated string is not evidence of drift.
+    /// 2. **Email** — only consulted when the ids leave the question open. If
+    ///    the ids *agree*, a disagreeing email is a stale account row, not a
+    ///    different login, and reporting drift there would cry wolf.
+    ///
+    /// Same asymmetry as `identitiesConflict`: only a contradiction counts.
+    nonisolated static func codexHomeDrift(
+        registeredAccountId: String,
+        registeredEmail: String?,
+        homeAccountId: String?,
+        homeEmail: String?
+    ) -> CodexHomeDrift {
+        let comparableStoredId = isLocallyMintedAccountId(registeredAccountId) ? nil : registeredAccountId
+        switch compareIdentities(reported: homeAccountId, stored: comparableStoredId) {
+        case .conflict(let reported):
+            return .drifted(reportedAccountId: reported)
+        case .match:
+            return .stable
+        case .indeterminate:
+            if case .conflict = compareIdentities(reported: homeEmail, stored: registeredEmail) {
+                return .drifted(reportedAccountId: nil)
+            }
+            return .stable
+        }
+    }
+
+    /// An id this app minted for itself because the home's `auth.json` named
+    /// none (see `registerCodexHome`). It is not an OpenAI account id and must
+    /// never be compared with one.
+    nonisolated static func isLocallyMintedAccountId(_ accountId: String) -> Bool {
+        accountId.hasPrefix("openai-")
     }
 
     /// The email recorded on an account row, used only to tell two OpenAI

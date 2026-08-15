@@ -8,7 +8,10 @@ import Foundation
 ///   each login overwrites the previous account's credential unless the homes
 ///   are kept separate.
 /// - `codex list` shows every registered account, its home, and whether that
-///   home is currently logged in.
+///   home is currently logged in — including **drift**, a registered home that
+///   has since been logged in as a *different* account. That is the visible
+///   face of the poller's own identity guard (`OAuthPoller.codexHomeDrift`),
+///   whose refusal to attribute such a reading is otherwise silent.
 /// - `codex import` brings a credential in from Codex CLI's own store — the
 ///   original path, still supported.
 ///
@@ -143,28 +146,44 @@ enum CodexCLI {
         }
 
         Task {
-            print("ACCOUNT   PLAN        AUTH           CODEX_HOME")
+            var sawDrift = false
+            print("ACCOUNT   PLAN        AUTH               CODEX_HOME")
             for account in accounts {
-                let status = await authStatus(for: account.codexHome)
+                let status = await authStatus(for: account)
+                if status.hasPrefix(driftLabel) { sawDrift = true }
                 let plan = (account.plan ?? "—").padded(to: 11)
                 let home = account.codexHome ?? "(default: $CODEX_HOME, else ~/.codex)"
-                print("\(account.accountId.prefix(8))… \(plan) \(status.padded(to: 14)) \(home)")
+                print("\(account.accountId.prefix(8))… \(plan) \(status.padded(to: 18)) \(home)")
             }
             print("")
             print("`needs login` → run: CODEX_HOME=<home> codex login --device-auth")
+            if sawDrift {
+                print("`\(driftLabel)` → this CODEX_HOME is now logged in as a different account than the")
+                print("          row it is registered against, so its usage is not attributed to that")
+                print("          row. Either log the home back in as the original account, or re-run")
+                print("          `claude-monitor codex add --home <home>` to register it as its own.")
+            }
             exit(0)
         }
         dispatchMain()
     }
 
-    /// Whether one home is currently logged in, as `account/read` sees it.
+    /// The status word for a home whose identity no longer matches its row.
+    /// Shared by the row and the footnote so they cannot drift apart.
+    private static let driftLabel = "drift"
+
+    /// How one registered account's home currently reads.
     ///
-    /// Keyed on `account == null`, never on `requiresOpenaiAuth` — that flag is
-    /// `true` even on a logged-in home.
-    private static func authStatus(for home: String?) async -> String {
+    /// Login state comes from `account/read` and is keyed on `account == null`,
+    /// never on `requiresOpenaiAuth` — that flag is `true` even on a logged-in
+    /// home. A home that answers *is* logged in, so drift is only ever reported
+    /// in place of `logged in`: a logged-out home stays `needs login`, and a
+    /// deleted one stays `home missing`, neither of which is drift.
+    private static func authStatus(for account: OAuthPoller.CodexAccountRegistration) async -> String {
         do {
-            _ = try await CodexAppServerClient(codexHome: home).fetchAccountIdentity()
-            return "logged in"
+            let identity = try await CodexAppServerClient(codexHome: account.codexHome)
+                .fetchAccountIdentity()
+            return driftStatus(for: account, reportedEmail: identity.email) ?? "logged in"
         } catch let error as CodexAppServerError {
             switch error {
             case .notLoggedIn: return "needs login"
@@ -175,6 +194,40 @@ enum CodexCLI {
             }
         } catch {
             return "unknown"
+        }
+    }
+
+    /// The drift status for a logged-in home, or `nil` when nothing
+    /// contradicts the registration.
+    ///
+    /// Only a **registered** home is checked. An account with no home of its
+    /// own reads the ambient one, which the poller already declines to let
+    /// speak for it on a multi-account host (`resolveCodexHome` →
+    /// `.ambiguous`); calling that "drift" would report a mismatch between a
+    /// row and a home that was never claimed to be its own.
+    ///
+    /// The decision itself is `OAuthPoller.codexHomeDrift` — the same
+    /// comparison the poller's attribution gate reads, so what is printed here
+    /// and what the poller silently refuses to attribute cannot disagree. This
+    /// function only does the two reads and formats the answer; the account id
+    /// is truncated to 8 characters like every other identifier this CLI
+    /// prints, and an email is never printed.
+    private static func driftStatus(
+        for account: OAuthPoller.CodexAccountRegistration,
+        reportedEmail: String?
+    ) -> String? {
+        guard let home = account.codexHome else { return nil }
+        switch OAuthPoller.codexHomeDrift(
+            registeredAccountId: account.accountId,
+            registeredEmail: account.email,
+            homeAccountId: CodexAuth.accountId(inHome: home),
+            homeEmail: reportedEmail
+        ) {
+        case .stable:
+            return nil
+        case .drifted(let reportedAccountId):
+            guard let reported = reportedAccountId else { return driftLabel }
+            return "\(driftLabel) → \(reported.prefix(8))…"
         }
     }
 
