@@ -139,6 +139,41 @@ enum SelfTest {
         }
     }
 
+    // MARK: - Test fixtures
+
+    /// Creates a throwaway directory under `NSTemporaryDirectory()`, unique per
+    /// call via a UUID, and guarantees its removal (best-effort) once `body`
+    /// returns or throws — the boilerplate every filesystem-touching test in
+    /// this file previously repeated inline. `suffix`, when non-empty, is
+    /// spliced into the directory name (e.g. "codex" -> "claude-monitor-selftest-codex-<uuid>")
+    /// purely to make a stray leftover directory identifiable during manual
+    /// debugging; it has no effect on test behavior. The directory-creation
+    /// call is best-effort (`try?`, mirroring the cleanup `defer` below) rather
+    /// than `try`, because a throwing call here that isn't `body` itself would
+    /// violate `rethrows` — a fresh, unique temp path is not expected to fail
+    /// to create, and if it somehow did, `body`'s own filesystem calls into a
+    /// missing directory would still surface as a test failure.
+    private static func withSelfTestTempDir<T>(
+        _ suffix: String = "",
+        _ body: @MainActor (URL) throws -> T
+    ) rethrows -> T {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest\(suffix.isEmpty ? "" : "-\(suffix)")-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return try body(dir)
+    }
+
+    /// Writes an executable stub script named `name` inside `dir` with `body`
+    /// as its contents, chmod'd `0755` — shared by the Codex app-server tests
+    /// that spawn a fake `codex` binary instead of the real CLI.
+    private static func writeStub(in dir: URL, name: String, body: String) throws -> String {
+        let path = dir.appendingPathComponent(name).path
+        try Data(body.utf8).write(to: URL(fileURLWithPath: path))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+        return path
+    }
+
     // MARK: - Account name ordering
 
     /// Natural (hybrid lexical/numeric) ordering of account names. The rules
@@ -540,50 +575,48 @@ enum SelfTest {
     /// resolve to the real credential store regardless of a `HOME` override
     /// (issue #16).
     private static func testCodexAuthParsing() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-codex-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let authPath = dir.appendingPathComponent("auth.json").path
-
-            let fakeAccess = "\(b64url("{\"alg\":\"none\"}")).\(b64url("{\"exp\":1785967226}")).sig"
-            let fixture = """
-            {"OPENAI_API_KEY": null,
-             "tokens": {"id_token": "fixture-id", "access_token": "\(fakeAccess)",
-                        "refresh_token": "rt.fixture", "account_id": "acct-fixture"},
-             "last_refresh": "2026-07-30T00:00:00Z"}
-            """
-            try Data(fixture.utf8).write(to: URL(fileURLWithPath: authPath))
-
-            let credential = try CodexAuth.load(path: authPath)
-            expectEqual(credential.accessToken, fakeAccess, "access_token read from tokens{}")
-            expectEqual(credential.refreshToken, "rt.fixture", "refresh_token read from tokens{}")
-            expectEqual(credential.accountId, "acct-fixture", "account_id read from tokens{}")
-            expectEqual(credential.expiresAt, Date(timeIntervalSince1970: 1785967226),
-                        "expiry derived from the access token's exp claim")
-
-            // A file that isn't a Codex credential fails cleanly.
-            let bogusPath = dir.appendingPathComponent("bogus.json").path
-            try Data("{\"hello\":\"world\"}".utf8).write(to: URL(fileURLWithPath: bogusPath))
-            var threw = false
-            do { _ = try CodexAuth.load(path: bogusPath) } catch { threw = true }
-            expect(threw, "a file with no tokens{} object is rejected")
-
-            // A missing file reports the path rather than crashing.
-            threw = false
+        withSelfTestTempDir("codex") { dir in
             do {
-                _ = try CodexAuth.load(path: dir.appendingPathComponent("absent.json").path)
-            } catch { threw = true }
-            expect(threw, "a missing auth.json is an error, not a crash")
+                let authPath = dir.appendingPathComponent("auth.json").path
 
-            // $CODEX_HOME resolution is pure string work — assert the shape
-            // without mutating this process's environment.
-            expect(CodexAuth.defaultAuthPath.hasSuffix("auth.json"),
-                   "default Codex credential path ends in auth.json")
-        } catch {
-            checks += 1
-            failures.append("Codex auth parsing test threw: \(error)")
+                let fakeAccess = "\(b64url("{\"alg\":\"none\"}")).\(b64url("{\"exp\":1785967226}")).sig"
+                let fixture = """
+                {"OPENAI_API_KEY": null,
+                 "tokens": {"id_token": "fixture-id", "access_token": "\(fakeAccess)",
+                            "refresh_token": "rt.fixture", "account_id": "acct-fixture"},
+                 "last_refresh": "2026-07-30T00:00:00Z"}
+                """
+                try Data(fixture.utf8).write(to: URL(fileURLWithPath: authPath))
+
+                let credential = try CodexAuth.load(path: authPath)
+                expectEqual(credential.accessToken, fakeAccess, "access_token read from tokens{}")
+                expectEqual(credential.refreshToken, "rt.fixture", "refresh_token read from tokens{}")
+                expectEqual(credential.accountId, "acct-fixture", "account_id read from tokens{}")
+                expectEqual(credential.expiresAt, Date(timeIntervalSince1970: 1785967226),
+                            "expiry derived from the access token's exp claim")
+
+                // A file that isn't a Codex credential fails cleanly.
+                let bogusPath = dir.appendingPathComponent("bogus.json").path
+                try Data("{\"hello\":\"world\"}".utf8).write(to: URL(fileURLWithPath: bogusPath))
+                var threw = false
+                do { _ = try CodexAuth.load(path: bogusPath) } catch { threw = true }
+                expect(threw, "a file with no tokens{} object is rejected")
+
+                // A missing file reports the path rather than crashing.
+                threw = false
+                do {
+                    _ = try CodexAuth.load(path: dir.appendingPathComponent("absent.json").path)
+                } catch { threw = true }
+                expect(threw, "a missing auth.json is an error, not a crash")
+
+                // $CODEX_HOME resolution is pure string work — assert the shape
+                // without mutating this process's environment.
+                expect(CodexAuth.defaultAuthPath.hasSuffix("auth.json"),
+                       "default Codex credential path ends in auth.json")
+            } catch {
+                checks += 1
+                failures.append("Codex auth parsing test threw: \(error)")
+            }
         }
     }
 
@@ -955,42 +988,40 @@ enum SelfTest {
     /// absolute path — asserted here against a scratch directory rather than
     /// whatever happens to be installed on the build host.
     private static func testCodexBinaryResolution() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-bin-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let stub = dir.appendingPathComponent("codex").path
-            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: URL(fileURLWithPath: stub))
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
+        withSelfTestTempDir("bin") { dir in
+            do {
+                let stub = dir.appendingPathComponent("codex").path
+                try Data("#!/bin/sh\nexit 0\n".utf8).write(to: URL(fileURLWithPath: stub))
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stub)
 
-            expectEqual(CodexBinary.resolve(environment: ["PATH": dir.path]), stub,
-                        "a PATH entry resolves to an absolute codex path")
+                expectEqual(CodexBinary.resolve(environment: ["PATH": dir.path]), stub,
+                            "a PATH entry resolves to an absolute codex path")
 
-            let nonExecutable = dir.appendingPathComponent("nested").path
-            try FileManager.default.createDirectory(atPath: nonExecutable, withIntermediateDirectories: true)
-            let plain = (nonExecutable as NSString).appendingPathComponent("codex")
-            try Data("not executable".utf8).write(to: URL(fileURLWithPath: plain))
-            // Not `== nil`: the absolute fallback list is also probed, and this
-            // build host may genuinely have codex installed. The assertion that
-            // matters is that the non-executable file is never chosen.
-            expect(CodexBinary.resolve(environment: ["PATH": nonExecutable]) != plain,
-                   "a present-but-not-executable codex is not a usable candidate")
+                let nonExecutable = dir.appendingPathComponent("nested").path
+                try FileManager.default.createDirectory(atPath: nonExecutable, withIntermediateDirectories: true)
+                let plain = (nonExecutable as NSString).appendingPathComponent("codex")
+                try Data("not executable".utf8).write(to: URL(fileURLWithPath: plain))
+                // Not `== nil`: the absolute fallback list is also probed, and this
+                // build host may genuinely have codex installed. The assertion that
+                // matters is that the non-executable file is never chosen.
+                expect(CodexBinary.resolve(environment: ["PATH": nonExecutable]) != plain,
+                       "a present-but-not-executable codex is not a usable candidate")
 
-            expectEqual(
-                CodexBinary.resolve(environment: [CodexBinary.overrideEnvKey: stub, "PATH": "/nowhere"]),
-                stub, "CLAUDE_MONITOR_CODEX_BIN wins over PATH"
-            )
-            expect(
-                CodexBinary.resolve(environment: [
-                    CodexBinary.overrideEnvKey: dir.appendingPathComponent("absent").path,
-                    "PATH": dir.path,
-                ]) == nil,
-                "an override that does not resolve fails loudly rather than silently using PATH"
-            )
-        } catch {
-            checks += 1
-            failures.append("codex binary resolution test threw: \(error)")
+                expectEqual(
+                    CodexBinary.resolve(environment: [CodexBinary.overrideEnvKey: stub, "PATH": "/nowhere"]),
+                    stub, "CLAUDE_MONITOR_CODEX_BIN wins over PATH"
+                )
+                expect(
+                    CodexBinary.resolve(environment: [
+                        CodexBinary.overrideEnvKey: dir.appendingPathComponent("absent").path,
+                        "PATH": dir.path,
+                    ]) == nil,
+                    "an override that does not resolve fails loudly rather than silently using PATH"
+                )
+            } catch {
+                checks += 1
+                failures.append("codex binary resolution test threw: \(error)")
+            }
         }
     }
 
@@ -1323,106 +1354,104 @@ enum SelfTest {
     /// files this issue deliberately does not edit: an `accounts export` bundle
     /// must not carry the home, and `ranking.json` must not publish it.
     private static func testCodexHomeRegistrationEnumeration() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-codexhome-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
-            UsageStore(dbPath: dbPath).ensureDatabase()
+        withSelfTestTempDir("codexhome") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
 
-            let homeA = "/tmp/selftest-codex-home-a"
-            let homeB = "/tmp/selftest-codex-home-b"
-            let poller = OAuthPoller(dbPath: dbPath)
+                let homeA = "/tmp/selftest-codex-home-a"
+                let homeB = "/tmp/selftest-codex-home-b"
+                let poller = OAuthPoller(dbPath: dbPath)
 
-            poller.saveCodexHomeAccount(
-                accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: homeA
-            )
+                poller.saveCodexHomeAccount(
+                    accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: homeA
+                )
 
-            var credentials = poller.loadActiveCredentials()
-            expectEqual(credentials.count, 1,
-                        "a token-free, home-registered account IS enumerated by the poll loop")
-            expectEqual(credentials.first?.accessToken, nil,
-                        "registration stored no access token")
-            expectEqual(credentials.first?.refreshToken, nil,
-                        "registration stored no refresh token either")
-            expectEqual(credentials.first?.codexHome, homeA,
-                        "the account's own home rides along with the credential")
-            expectEqual(credentials.first?.provider, AccountProvider.openai,
-                        "the registered account is an OpenAI account")
-            expectEqual(credentials.first?.source, "codex-home",
-                        "the row is tagged as home-registered rather than token-imported")
+                var credentials = poller.loadActiveCredentials()
+                expectEqual(credentials.count, 1,
+                            "a token-free, home-registered account IS enumerated by the poll loop")
+                expectEqual(credentials.first?.accessToken, nil,
+                            "registration stored no access token")
+                expectEqual(credentials.first?.refreshToken, nil,
+                            "registration stored no refresh token either")
+                expectEqual(credentials.first?.codexHome, homeA,
+                            "the account's own home rides along with the credential")
+                expectEqual(credentials.first?.provider, AccountProvider.openai,
+                            "the registered account is an OpenAI account")
+                expectEqual(credentials.first?.source, "codex-home",
+                            "the row is tagged as home-registered rather than token-imported")
 
-            // Re-registering must update the row, never mint a sibling (#45).
-            poller.saveCodexHomeAccount(
-                accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: homeB
-            )
-            let db = try openDatabase(dbPath, readonly: true)
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 1,
-                        "re-registering a home does not create a duplicate account row")
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 1,
-                        "re-registering a home does not create a duplicate credential row")
-            expectEqual(try db.scalar("SELECT codex_home FROM accounts WHERE id = 'user-aaa'") as? String,
-                        homeB, "re-registering updates the stored home")
+                // Re-registering must update the row, never mint a sibling (#45).
+                poller.saveCodexHomeAccount(
+                    accountId: "user-aaa", email: "a@example.com", plan: "pro", codexHome: homeB
+                )
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 1,
+                            "re-registering a home does not create a duplicate account row")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 1,
+                            "re-registering a home does not create a duplicate credential row")
+                expectEqual(try db.scalar("SELECT codex_home FROM accounts WHERE id = 'user-aaa'") as? String,
+                            homeB, "re-registering updates the stored home")
 
-            // A token-free OpenAI row with NO home is not resurrected into the
-            // poll set — there is nothing on this host for it to read.
-            let now = ISO8601DateFormatter().string(from: Date())
-            try openDatabase(dbPath).run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('user-homeless', 'h@example.com', 'h@example.com', 'pro', ?, 9, 'openai')
-            """, now)
-            try openDatabase(dbPath).run("""
-                INSERT INTO oauth_credentials (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
-                VALUES ('user-homeless', 'h@example.com', 'codex', 'openai', NULL, 1, ?, ?)
-            """, now, now)
-            // …while an ordinary stored-token account still enumerates exactly as before.
-            try openDatabase(dbPath).run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('org-anthropic', 'x@example.com', 'x@example.com', 'Max', ?, 10, 'anthropic')
-            """, now)
-            try openDatabase(dbPath).run("""
-                INSERT INTO oauth_credentials (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
-                VALUES ('org-anthropic', 'x@example.com', 'token', 'anthropic', 'sk-ant-oat01-selftest', 1, ?, ?)
-            """, now, now)
+                // A token-free OpenAI row with NO home is not resurrected into the
+                // poll set — there is nothing on this host for it to read.
+                let now = ISO8601DateFormatter().string(from: Date())
+                try openDatabase(dbPath).run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-homeless', 'h@example.com', 'h@example.com', 'pro', ?, 9, 'openai')
+                """, now)
+                try openDatabase(dbPath).run("""
+                    INSERT INTO oauth_credentials (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                    VALUES ('user-homeless', 'h@example.com', 'codex', 'openai', NULL, 1, ?, ?)
+                """, now, now)
+                // …while an ordinary stored-token account still enumerates exactly as before.
+                try openDatabase(dbPath).run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('org-anthropic', 'x@example.com', 'x@example.com', 'Max', ?, 10, 'anthropic')
+                """, now)
+                try openDatabase(dbPath).run("""
+                    INSERT INTO oauth_credentials (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                    VALUES ('org-anthropic', 'x@example.com', 'token', 'anthropic', 'sk-ant-oat01-selftest', 1, ?, ?)
+                """, now, now)
 
-            credentials = poller.loadActiveCredentials()
-            expectEqual(credentials.count, 2,
-                        "a token-free row with no registered home stays out of the poll set")
-            expect(credentials.contains { $0.accountId == "org-anthropic" && $0.accessToken != nil },
-                   "a stored-token account is enumerated exactly as before")
-            expect(credentials.contains { $0.accountId == "user-aaa" },
-                   "the home-registered account is still enumerated alongside it")
-            expect(credentials.allSatisfy { $0.provider == .anthropic || $0.codexHome != nil || $0.accessToken != nil },
-                   "nothing token-free and homeless slipped in")
+                credentials = poller.loadActiveCredentials()
+                expectEqual(credentials.count, 2,
+                            "a token-free row with no registered home stays out of the poll set")
+                expect(credentials.contains { $0.accountId == "org-anthropic" && $0.accessToken != nil },
+                       "a stored-token account is enumerated exactly as before")
+                expect(credentials.contains { $0.accountId == "user-aaa" },
+                       "the home-registered account is still enumerated alongside it")
+                expect(credentials.allSatisfy { $0.provider == .anthropic || $0.codexHome != nil || $0.accessToken != nil },
+                       "nothing token-free and homeless slipped in")
 
-            // `codex list` sees the registration, token-free and all.
-            let listed = poller.codexAccounts()
-            expectEqual(listed.count, 2, "codex list shows every OpenAI account, registered or not")
-            let registered = listed.first { $0.accountId == "user-aaa" }
-            expectEqual(registered?.codexHome, homeB, "codex list reports the registered home")
-            expectEqual(registered?.hasStoredToken, false, "codex list reports that no token is stored")
-            expectEqual(listed.first { $0.accountId == "user-homeless" }?.codexHome, nil,
-                        "an account with no registered home lists as using the ambient default")
+                // `codex list` sees the registration, token-free and all.
+                let listed = poller.codexAccounts()
+                expectEqual(listed.count, 2, "codex list shows every OpenAI account, registered or not")
+                let registered = listed.first { $0.accountId == "user-aaa" }
+                expectEqual(registered?.codexHome, homeB, "codex list reports the registered home")
+                expectEqual(registered?.hasStoredToken, false, "codex list reports that no token is stored")
+                expectEqual(listed.first { $0.accountId == "user-homeless" }?.codexHome, nil,
+                            "an account with no registered home lists as using the ambient default")
 
-            // A home path contains a username: it must stay host-local. Both
-            // files below are VERIFY-ONLY in this issue — they already use
-            // explicit column lists, and this is what pins that.
-            let bundle = try AccountSync.exportBundle(dbPath: dbPath)
-            let encoded = String(data: try JSONEncoder().encode(bundle), encoding: .utf8) ?? ""
-            expect(!encoded.contains(homeB) && !encoded.contains("codex_home"),
-                   "an accounts export bundle carries no codex_home — a home path is meaningless on another host")
+                // A home path contains a username: it must stay host-local. Both
+                // files below are VERIFY-ONLY in this issue — they already use
+                // explicit column lists, and this is what pins that.
+                let bundle = try AccountSync.exportBundle(dbPath: dbPath)
+                let encoded = String(data: try JSONEncoder().encode(bundle), encoding: .utf8) ?? ""
+                expect(!encoded.contains(homeB) && !encoded.contains("codex_home"),
+                       "an accounts export bundle carries no codex_home — a home path is meaningless on another host")
 
-            let rankingPath = dir.appendingPathComponent("ranking.json").path
-            RankingExporter.exportNow(dbPath: dbPath, outputPath: rankingPath)
-            let ranking = String(data: FileManager.default.contents(atPath: rankingPath) ?? Data(),
-                                 encoding: .utf8) ?? ""
-            expect(!ranking.isEmpty, "ranking.json was written")
-            expect(!ranking.contains(homeB) && !ranking.contains("codex_home"),
-                   "ranking.json never publishes a home path")
-        } catch {
-            checks += 1
-            failures.append("codex home registration test threw: \(error)")
+                let rankingPath = dir.appendingPathComponent("ranking.json").path
+                RankingExporter.exportNow(dbPath: dbPath, outputPath: rankingPath)
+                let ranking = String(data: FileManager.default.contents(atPath: rankingPath) ?? Data(),
+                                     encoding: .utf8) ?? ""
+                expect(!ranking.isEmpty, "ranking.json was written")
+                expect(!ranking.contains(homeB) && !ranking.contains("codex_home"),
+                       "ranking.json never publishes a home path")
+            } catch {
+                checks += 1
+                failures.append("codex home registration test threw: \(error)")
+            }
         }
     }
 
@@ -1436,90 +1465,88 @@ enum SelfTest {
     /// CLI-level-verified only, not selftest-coverable, exactly like
     /// `CodexAuth.defaultAuthPath` (documented on that property).
     private static func testCodexListDiscoversUnregisteredHomes() {
-        let scratchHome = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-discover-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: scratchHome) }
-        do {
-            let fm = FileManager.default
-            try fm.createDirectory(at: scratchHome, withIntermediateDirectories: true)
+        withSelfTestTempDir("discover") { scratchHome in
+            do {
+                let fm = FileManager.default
 
-            // A registered home (any path — deliberately outside the scratch
-            // "~" to prove a non-glob registered home is still excluded).
-            let registeredHome = "/tmp/selftest-discover-registered-\(UUID().uuidString)"
-            // Two on-disk candidates: one that will end up registered under a
-            // *different* path than where it physically lives (still counts
-            // as "known" via the registration, not the directory), one that
-            // stays unregistered, plus a home with no auth.json (edge case:
-            // exists on disk, nothing inside it) and a non-matching sibling
-            // directory that must be ignored, and a file (not a directory)
-            // named like a home that must also be ignored.
-            let unregisteredHome = scratchHome.appendingPathComponent(".codex-unregistered").path
-            let emptyHome = scratchHome.appendingPathComponent(".codex-empty").path
-            let ignoredDir = scratchHome.appendingPathComponent("not-codex-at-all").path
-            let ignoredFile = scratchHome.appendingPathComponent(".codex-not-a-directory").path
+                // A registered home (any path — deliberately outside the scratch
+                // "~" to prove a non-glob registered home is still excluded).
+                let registeredHome = "/tmp/selftest-discover-registered-\(UUID().uuidString)"
+                // Two on-disk candidates: one that will end up registered under a
+                // *different* path than where it physically lives (still counts
+                // as "known" via the registration, not the directory), one that
+                // stays unregistered, plus a home with no auth.json (edge case:
+                // exists on disk, nothing inside it) and a non-matching sibling
+                // directory that must be ignored, and a file (not a directory)
+                // named like a home that must also be ignored.
+                let unregisteredHome = scratchHome.appendingPathComponent(".codex-unregistered").path
+                let emptyHome = scratchHome.appendingPathComponent(".codex-empty").path
+                let ignoredDir = scratchHome.appendingPathComponent("not-codex-at-all").path
+                let ignoredFile = scratchHome.appendingPathComponent(".codex-not-a-directory").path
 
-            try fm.createDirectory(atPath: unregisteredHome, withIntermediateDirectories: true)
-            try fm.createDirectory(atPath: emptyHome, withIntermediateDirectories: true)
-            try fm.createDirectory(atPath: ignoredDir, withIntermediateDirectories: true)
-            try Data().write(to: URL(fileURLWithPath: ignoredFile))
+                try fm.createDirectory(atPath: unregisteredHome, withIntermediateDirectories: true)
+                try fm.createDirectory(atPath: emptyHome, withIntermediateDirectories: true)
+                try fm.createDirectory(atPath: ignoredDir, withIntermediateDirectories: true)
+                try Data().write(to: URL(fileURLWithPath: ignoredFile))
 
-            let registered = [
-                OAuthPoller.CodexAccountRegistration(
-                    accountId: "user-registered", codexHome: registeredHome,
-                    plan: "pro", hasStoredToken: false, email: nil
+                let registered = [
+                    OAuthPoller.CodexAccountRegistration(
+                        accountId: "user-registered", codexHome: registeredHome,
+                        plan: "pro", hasStoredToken: false, email: nil
+                    )
+                ]
+
+                let discovered = CodexCLI.discoverUnregisteredHomes(
+                    registered: registered,
+                    homeDir: scratchHome.path,
+                    ambientHome: "/tmp/selftest-discover-ambient-unused"
                 )
-            ]
 
-            let discovered = CodexCLI.discoverUnregisteredHomes(
-                registered: registered,
-                homeDir: scratchHome.path,
-                ambientHome: "/tmp/selftest-discover-ambient-unused"
-            )
+                expectEqual(discovered, [emptyHome, unregisteredHome].sorted(),
+                            "only the on-disk .codex* directories are reported, sorted, minus the registered home")
+                expect(!discovered.contains(registeredHome),
+                       "a registered home (even outside ~/.codex*) is never reported as unregistered")
+                expect(!discovered.contains(ignoredDir),
+                       "a directory that doesn't start with .codex is never a candidate")
+                expect(!discovered.contains(ignoredFile),
+                       "a plain file named like a home is never a candidate — only directories")
 
-            expectEqual(discovered, [emptyHome, unregisteredHome].sorted(),
-                        "only the on-disk .codex* directories are reported, sorted, minus the registered home")
-            expect(!discovered.contains(registeredHome),
-                   "a registered home (even outside ~/.codex*) is never reported as unregistered")
-            expect(!discovered.contains(ignoredDir),
-                   "a directory that doesn't start with .codex is never a candidate")
-            expect(!discovered.contains(ignoredFile),
-                   "a plain file named like a home is never a candidate — only directories")
-
-            // An account with no registered home (nil codexHome) reads the
-            // ambient default, so that resolved path must be excluded too —
-            // not just literally-registered ones.
-            let homelessRegistered = [
-                OAuthPoller.CodexAccountRegistration(
-                    accountId: "user-homeless", codexHome: nil, plan: nil,
-                    hasStoredToken: false, email: nil
+                // An account with no registered home (nil codexHome) reads the
+                // ambient default, so that resolved path must be excluded too —
+                // not just literally-registered ones.
+                let homelessRegistered = [
+                    OAuthPoller.CodexAccountRegistration(
+                        accountId: "user-homeless", codexHome: nil, plan: nil,
+                        hasStoredToken: false, email: nil
+                    )
+                ]
+                let ambientHome = scratchHome.appendingPathComponent(".codex-empty").path
+                let discoveredWithAmbientExcluded = CodexCLI.discoverUnregisteredHomes(
+                    registered: homelessRegistered,
+                    homeDir: scratchHome.path,
+                    ambientHome: ambientHome
                 )
-            ]
-            let ambientHome = scratchHome.appendingPathComponent(".codex-empty").path
-            let discoveredWithAmbientExcluded = CodexCLI.discoverUnregisteredHomes(
-                registered: homelessRegistered,
-                homeDir: scratchHome.path,
-                ambientHome: ambientHome
-            )
-            expect(!discoveredWithAmbientExcluded.contains(ambientHome),
-                   "a homeless account's ambient default home is excluded, not just explicit registrations")
-            expectEqual(discoveredWithAmbientExcluded, [unregisteredHome],
-                        "the remaining on-disk home is still reported once the ambient one is excluded")
+                expect(!discoveredWithAmbientExcluded.contains(ambientHome),
+                       "a homeless account's ambient default home is excluded, not just explicit registrations")
+                expectEqual(discoveredWithAmbientExcluded, [unregisteredHome],
+                            "the remaining on-disk home is still reported once the ambient one is excluded")
 
-            // No homes on disk at all besides a registered one (edge case).
-            let onlyRegisteredDir = URL(fileURLWithPath: NSTemporaryDirectory())
-                .appendingPathComponent("claude-monitor-selftest-discover-empty-\(UUID().uuidString)")
-            try fm.createDirectory(at: onlyRegisteredDir, withIntermediateDirectories: true)
-            defer { try? fm.removeItem(at: onlyRegisteredDir) }
-            let noneDiscovered = CodexCLI.discoverUnregisteredHomes(
-                registered: registered,
-                homeDir: onlyRegisteredDir.path,
-                ambientHome: "/tmp/selftest-discover-ambient-unused"
-            )
-            expect(noneDiscovered.isEmpty,
-                   "no ~/.codex* entries on disk means nothing to discover")
-        } catch {
-            checks += 1
-            failures.append("codex list disk-discovery test threw: \(error)")
+                // No homes on disk at all besides a registered one (edge case).
+                let onlyRegisteredDir = URL(fileURLWithPath: NSTemporaryDirectory())
+                    .appendingPathComponent("claude-monitor-selftest-discover-empty-\(UUID().uuidString)")
+                try fm.createDirectory(at: onlyRegisteredDir, withIntermediateDirectories: true)
+                defer { try? fm.removeItem(at: onlyRegisteredDir) }
+                let noneDiscovered = CodexCLI.discoverUnregisteredHomes(
+                    registered: registered,
+                    homeDir: onlyRegisteredDir.path,
+                    ambientHome: "/tmp/selftest-discover-ambient-unused"
+                )
+                expect(noneDiscovered.isEmpty,
+                       "no ~/.codex* entries on disk means nothing to discover")
+            } catch {
+                checks += 1
+                failures.append("codex list disk-discovery test threw: \(error)")
+            }
         }
     }
 
@@ -1531,241 +1558,230 @@ enum SelfTest {
     /// makes `app-server` exit 0 on its own) and letting an `EXIT` trap prove
     /// the child was actually reaped, not orphaned.
     private static func testCodexAppServerSpawnAgainstStub() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-appserver-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-
-            func writeStub(_ name: String, _ body: String) throws -> String {
-                let path = dir.appendingPathComponent(name).path
-                try Data(body.utf8).write(to: URL(fileURLWithPath: path))
-                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
-                return path
-            }
-
-            let reapedMarker = dir.appendingPathComponent("reaped").path
-            let oneLine: (String) -> String = { $0.replacingOccurrences(of: "\n", with: "") }
-
-            // Replies are emitted up front, out of the order they are requested,
-            // to prove matching is by `id` and that an early arrival is stashed
-            // rather than dropped.
-            let goodStub = try writeStub("codex", """
-            #!/bin/sh
-            trap 'echo reaped > "$MARKER"' EXIT
-            echo '{"id":1,"result":{"userAgent":"stub"}}'
-            echo '{"method":"remoteControl/status/changed","params":{},"emittedAtMs":1}'
-            echo '{"id":3,"result":\(oneLine(codexRateLimitsFixture))}'
-            echo '{"id":2,"result":\(oneLine(codexAccountFixture))}'
-            cat > /dev/null
-            """)
-
-            var timeouts = CodexAppServerClient.Timeouts()
-            timeouts.initialize = 10
-            timeouts.method = 10
-            timeouts.overall = 20
-
-            let client = CodexAppServerClient(
-                codexHome: dir.path,
-                timeouts: timeouts,
-                environment: [
-                    CodexBinary.overrideEnvKey: goodStub,
-                    "PATH": "/usr/bin:/bin",
-                    "MARKER": reapedMarker,
-                ]
-            )
-
-            switch runBlocking({ try await client.fetchUsage() }) {
-            case .success(let snapshot):
-                expectEqual(snapshot.rateLimit.weekly?.usedPercent, 37,
-                            "a spawned handshake produces the same mapping as the offline fixture")
-                expectEqual(snapshot.email, "fixture@example.com",
-                            "an out-of-order account/read reply is matched by id, not arrival order")
-            case .failure(let error):
-                checks += 1
-                failures.append("stub app-server handshake failed: \(error)")
-            }
-
-            expect(FileManager.default.fileExists(atPath: reapedMarker),
-                   "the child exits after its stdin is closed — no orphaned process survives the call")
-
-            // A stub that never replies must time out and still be reaped.
-            let silentMarker = dir.appendingPathComponent("silent-reaped").path
-            let silentStub = try writeStub("codex-silent", """
-            #!/bin/sh
-            trap 'echo reaped > "$MARKER"' EXIT
-            cat > /dev/null
-            """)
-
-            var shortTimeouts = CodexAppServerClient.Timeouts()
-            shortTimeouts.initialize = 1
-            shortTimeouts.method = 1
-            shortTimeouts.overall = 3
-
-            let silentClient = CodexAppServerClient(
-                codexHome: dir.path,
-                timeouts: shortTimeouts,
-                environment: [
-                    CodexBinary.overrideEnvKey: silentStub,
-                    "PATH": "/usr/bin:/bin",
-                    "MARKER": silentMarker,
-                ]
-            )
-
-            let started = Date()
-            switch runBlocking({ try await silentClient.fetchUsage() }) {
-            case .success:
-                checks += 1
-                failures.append("a silent app-server must time out, not appear to succeed")
-            case .failure(let error):
-                guard let codexError = error as? CodexAppServerError,
-                      case .timedOut = codexError else {
-                    checks += 1
-                    failures.append("a silent app-server must fail with .timedOut, got \(error)")
-                    break
-                }
-                expect(Date().timeIntervalSince(started) < 10,
-                       "the timeout is enforced rather than waiting on the child indefinitely")
-            }
-            expect(FileManager.default.fileExists(atPath: silentMarker),
-                   "a timed-out child is still reaped (stdin close → SIGTERM → SIGKILL)")
-
-            // #118 item 2: a reply that doesn't decode as `CodexWire.AccountRead`
-            // at all (here, a bare JSON string instead of an object) must be
-            // distinguishable from a reply that decodes fine with an explicit
-            // `account: null`. Collapsing both into `.notLoggedIn` would misreport
-            // a wire/protocol regression as "needs login".
-            let malformedStub = try writeStub("codex-malformed-account", """
-            #!/bin/sh
-            trap 'echo reaped > "$MARKER"' EXIT
-            echo '{"id":1,"result":{"userAgent":"stub"}}'
-            echo '{"id":2,"result":"not-an-object"}'
-            cat > /dev/null
-            """)
-            let malformedClient = CodexAppServerClient(
-                codexHome: dir.path,
-                timeouts: timeouts,
-                environment: [
-                    CodexBinary.overrideEnvKey: malformedStub,
-                    "PATH": "/usr/bin:/bin",
-                    "MARKER": dir.appendingPathComponent("malformed-reaped").path,
-                ]
-            )
-            switch runBlocking({ try await malformedClient.fetchUsage() }) {
-            case .success:
-                checks += 1
-                failures.append("an undecodable account/read reply must not appear to succeed")
-            case .failure(let error):
-                guard let codexError = error as? CodexAppServerError, case .protocolFailure = codexError else {
-                    checks += 1
-                    failures.append("an undecodable account/read reply must fail with .protocolFailure, got \(error)")
-                    break
-                }
-            }
-
-            let nullAccountStub = try writeStub("codex-null-account", """
-            #!/bin/sh
-            trap 'echo reaped > "$MARKER"' EXIT
-            echo '{"id":1,"result":{"userAgent":"stub"}}'
-            echo '{"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}'
-            cat > /dev/null
-            """)
-            let nullAccountClient = CodexAppServerClient(
-                codexHome: dir.path,
-                timeouts: timeouts,
-                environment: [
-                    CodexBinary.overrideEnvKey: nullAccountStub,
-                    "PATH": "/usr/bin:/bin",
-                    "MARKER": dir.appendingPathComponent("null-account-reaped").path,
-                ]
-            )
-            switch runBlocking({ try await nullAccountClient.fetchUsage() }) {
-            case .success:
-                checks += 1
-                failures.append("a decoded-but-null account must not appear to succeed")
-            case .failure(let error):
-                guard let codexError = error as? CodexAppServerError, case .notLoggedIn = codexError else {
-                    checks += 1
-                    failures.append("a decoded-but-null account must fail with .notLoggedIn, got \(error)")
-                    break
-                }
-            }
-
-            // #118 item 3: a child that ignores SIGTERM must still be walked
-            // through the full stdin-close → SIGTERM → SIGKILL ladder rather than
-            // hanging — this is what originally caught the `waitUntilExit()`
-            // off-main-thread regression, and must keep passing after `reap`
-            // switched from a busy `usleep` poll to a suspending `Task.sleep` one.
-            let wedgedMarker = dir.appendingPathComponent("wedged-reaped").path
-            let wedgedStub = try writeStub("codex-wedged", """
-            #!/bin/sh
-            trap '' TERM
-            trap 'echo reaped > "$MARKER"' EXIT
-            while true; do sleep 0.05; done
-            """)
-
-            var wedgedTimeouts = CodexAppServerClient.Timeouts()
-            wedgedTimeouts.initialize = 1
-            wedgedTimeouts.method = 1
-            wedgedTimeouts.overall = 1
-            wedgedTimeouts.gracefulExit = 0.3
-            wedgedTimeouts.terminateGrace = 0.3
-
-            let wedgedClient = CodexAppServerClient(
-                codexHome: dir.path,
-                timeouts: wedgedTimeouts,
-                environment: [
-                    CodexBinary.overrideEnvKey: wedgedStub,
-                    "PATH": "/usr/bin:/bin",
-                    "MARKER": wedgedMarker,
-                ]
-            )
-
-            let wedgedStarted = Date()
-            switch runBlocking({ try await wedgedClient.fetchUsage() }) {
-            case .success:
-                checks += 1
-                failures.append("a wedged app-server must fail, not appear to succeed")
-            case .failure(let error):
-                guard let codexError = error as? CodexAppServerError, case .timedOut = codexError else {
-                    checks += 1
-                    failures.append("a wedged app-server must fail with .timedOut, got \(error)")
-                    break
-                }
-            }
-            // Bound: overall timeout (1s) plus the escalation ladder
-            // (gracefulExit 0.3 + terminateGrace 0.3 + up to 2s final wait) —
-            // generously capped well short of a real hang.
-            expect(Date().timeIntervalSince(wedgedStarted) < 8,
-                   "a SIGTERM-ignoring child is still force-killed and reaped, not hung on indefinitely")
-
-            // `trap ... EXIT` never fires on SIGKILL (it cannot be caught), so
-            // the marker file isn't a valid signal here — confirm no process
-            // survives via `pgrep` on the stub's own (unique, per-run) path
-            // instead. `waitUntilExit()` is safe on this call: `selftest` runs
-            // this whole suite synchronously on the main thread, never inside a
-            // Swift concurrency pool task — see the note on
-            // `CodexAppServerClient.waitForExit` for why that distinction matters.
-            let pgrepCheck = Process()
-            pgrepCheck.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-            pgrepCheck.arguments = ["-f", wedgedStub]
-            let pgrepOutput = Pipe()
-            pgrepCheck.standardOutput = pgrepOutput
-            pgrepCheck.standardError = FileHandle.nullDevice
+        withSelfTestTempDir("appserver") { dir in
             do {
-                try pgrepCheck.run()
-                pgrepCheck.waitUntilExit()
-                let leaked = pgrepOutput.fileHandleForReading.readDataToEndOfFile()
-                expect(leaked.isEmpty, "no orphaned wedged child survives the SIGKILL escalation")
+                let reapedMarker = dir.appendingPathComponent("reaped").path
+                let oneLine: (String) -> String = { $0.replacingOccurrences(of: "\n", with: "") }
+
+                // Replies are emitted up front, out of the order they are requested,
+                // to prove matching is by `id` and that an early arrival is stashed
+                // rather than dropped.
+                let goodStub = try writeStub(in: dir, name: "codex", body: """
+                #!/bin/sh
+                trap 'echo reaped > "$MARKER"' EXIT
+                echo '{"id":1,"result":{"userAgent":"stub"}}'
+                echo '{"method":"remoteControl/status/changed","params":{},"emittedAtMs":1}'
+                echo '{"id":3,"result":\(oneLine(codexRateLimitsFixture))}'
+                echo '{"id":2,"result":\(oneLine(codexAccountFixture))}'
+                cat > /dev/null
+                """)
+
+                var timeouts = CodexAppServerClient.Timeouts()
+                timeouts.initialize = 10
+                timeouts.method = 10
+                timeouts.overall = 20
+
+                let client = CodexAppServerClient(
+                    codexHome: dir.path,
+                    timeouts: timeouts,
+                    environment: [
+                        CodexBinary.overrideEnvKey: goodStub,
+                        "PATH": "/usr/bin:/bin",
+                        "MARKER": reapedMarker,
+                    ]
+                )
+
+                switch runBlocking({ try await client.fetchUsage() }) {
+                case .success(let snapshot):
+                    expectEqual(snapshot.rateLimit.weekly?.usedPercent, 37,
+                                "a spawned handshake produces the same mapping as the offline fixture")
+                    expectEqual(snapshot.email, "fixture@example.com",
+                                "an out-of-order account/read reply is matched by id, not arrival order")
+                case .failure(let error):
+                    checks += 1
+                    failures.append("stub app-server handshake failed: \(error)")
+                }
+
+                expect(FileManager.default.fileExists(atPath: reapedMarker),
+                       "the child exits after its stdin is closed — no orphaned process survives the call")
+
+                // A stub that never replies must time out and still be reaped.
+                let silentMarker = dir.appendingPathComponent("silent-reaped").path
+                let silentStub = try writeStub(in: dir, name: "codex-silent", body: """
+                #!/bin/sh
+                trap 'echo reaped > "$MARKER"' EXIT
+                cat > /dev/null
+                """)
+
+                var shortTimeouts = CodexAppServerClient.Timeouts()
+                shortTimeouts.initialize = 1
+                shortTimeouts.method = 1
+                shortTimeouts.overall = 3
+
+                let silentClient = CodexAppServerClient(
+                    codexHome: dir.path,
+                    timeouts: shortTimeouts,
+                    environment: [
+                        CodexBinary.overrideEnvKey: silentStub,
+                        "PATH": "/usr/bin:/bin",
+                        "MARKER": silentMarker,
+                    ]
+                )
+
+                let started = Date()
+                switch runBlocking({ try await silentClient.fetchUsage() }) {
+                case .success:
+                    checks += 1
+                    failures.append("a silent app-server must time out, not appear to succeed")
+                case .failure(let error):
+                    guard let codexError = error as? CodexAppServerError,
+                          case .timedOut = codexError else {
+                        checks += 1
+                        failures.append("a silent app-server must fail with .timedOut, got \(error)")
+                        break
+                    }
+                    expect(Date().timeIntervalSince(started) < 10,
+                           "the timeout is enforced rather than waiting on the child indefinitely")
+                }
+                expect(FileManager.default.fileExists(atPath: silentMarker),
+                       "a timed-out child is still reaped (stdin close → SIGTERM → SIGKILL)")
+
+                // #118 item 2: a reply that doesn't decode as `CodexWire.AccountRead`
+                // at all (here, a bare JSON string instead of an object) must be
+                // distinguishable from a reply that decodes fine with an explicit
+                // `account: null`. Collapsing both into `.notLoggedIn` would misreport
+                // a wire/protocol regression as "needs login".
+                let malformedStub = try writeStub(in: dir, name: "codex-malformed-account", body: """
+                #!/bin/sh
+                trap 'echo reaped > "$MARKER"' EXIT
+                echo '{"id":1,"result":{"userAgent":"stub"}}'
+                echo '{"id":2,"result":"not-an-object"}'
+                cat > /dev/null
+                """)
+                let malformedClient = CodexAppServerClient(
+                    codexHome: dir.path,
+                    timeouts: timeouts,
+                    environment: [
+                        CodexBinary.overrideEnvKey: malformedStub,
+                        "PATH": "/usr/bin:/bin",
+                        "MARKER": dir.appendingPathComponent("malformed-reaped").path,
+                    ]
+                )
+                switch runBlocking({ try await malformedClient.fetchUsage() }) {
+                case .success:
+                    checks += 1
+                    failures.append("an undecodable account/read reply must not appear to succeed")
+                case .failure(let error):
+                    guard let codexError = error as? CodexAppServerError, case .protocolFailure = codexError else {
+                        checks += 1
+                        failures.append("an undecodable account/read reply must fail with .protocolFailure, got \(error)")
+                        break
+                    }
+                }
+
+                let nullAccountStub = try writeStub(in: dir, name: "codex-null-account", body: """
+                #!/bin/sh
+                trap 'echo reaped > "$MARKER"' EXIT
+                echo '{"id":1,"result":{"userAgent":"stub"}}'
+                echo '{"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}'
+                cat > /dev/null
+                """)
+                let nullAccountClient = CodexAppServerClient(
+                    codexHome: dir.path,
+                    timeouts: timeouts,
+                    environment: [
+                        CodexBinary.overrideEnvKey: nullAccountStub,
+                        "PATH": "/usr/bin:/bin",
+                        "MARKER": dir.appendingPathComponent("null-account-reaped").path,
+                    ]
+                )
+                switch runBlocking({ try await nullAccountClient.fetchUsage() }) {
+                case .success:
+                    checks += 1
+                    failures.append("a decoded-but-null account must not appear to succeed")
+                case .failure(let error):
+                    guard let codexError = error as? CodexAppServerError, case .notLoggedIn = codexError else {
+                        checks += 1
+                        failures.append("a decoded-but-null account must fail with .notLoggedIn, got \(error)")
+                        break
+                    }
+                }
+
+                // #118 item 3: a child that ignores SIGTERM must still be walked
+                // through the full stdin-close → SIGTERM → SIGKILL ladder rather than
+                // hanging — this is what originally caught the `waitUntilExit()`
+                // off-main-thread regression, and must keep passing after `reap`
+                // switched from a busy `usleep` poll to a suspending `Task.sleep` one.
+                let wedgedMarker = dir.appendingPathComponent("wedged-reaped").path
+                let wedgedStub = try writeStub(in: dir, name: "codex-wedged", body: """
+                #!/bin/sh
+                trap '' TERM
+                trap 'echo reaped > "$MARKER"' EXIT
+                while true; do sleep 0.05; done
+                """)
+
+                var wedgedTimeouts = CodexAppServerClient.Timeouts()
+                wedgedTimeouts.initialize = 1
+                wedgedTimeouts.method = 1
+                wedgedTimeouts.overall = 1
+                wedgedTimeouts.gracefulExit = 0.3
+                wedgedTimeouts.terminateGrace = 0.3
+
+                let wedgedClient = CodexAppServerClient(
+                    codexHome: dir.path,
+                    timeouts: wedgedTimeouts,
+                    environment: [
+                        CodexBinary.overrideEnvKey: wedgedStub,
+                        "PATH": "/usr/bin:/bin",
+                        "MARKER": wedgedMarker,
+                    ]
+                )
+
+                let wedgedStarted = Date()
+                switch runBlocking({ try await wedgedClient.fetchUsage() }) {
+                case .success:
+                    checks += 1
+                    failures.append("a wedged app-server must fail, not appear to succeed")
+                case .failure(let error):
+                    guard let codexError = error as? CodexAppServerError, case .timedOut = codexError else {
+                        checks += 1
+                        failures.append("a wedged app-server must fail with .timedOut, got \(error)")
+                        break
+                    }
+                }
+                // Bound: overall timeout (1s) plus the escalation ladder
+                // (gracefulExit 0.3 + terminateGrace 0.3 + up to 2s final wait) —
+                // generously capped well short of a real hang.
+                expect(Date().timeIntervalSince(wedgedStarted) < 8,
+                       "a SIGTERM-ignoring child is still force-killed and reaped, not hung on indefinitely")
+
+                // `trap ... EXIT` never fires on SIGKILL (it cannot be caught), so
+                // the marker file isn't a valid signal here — confirm no process
+                // survives via `pgrep` on the stub's own (unique, per-run) path
+                // instead. `waitUntilExit()` is safe on this call: `selftest` runs
+                // this whole suite synchronously on the main thread, never inside a
+                // Swift concurrency pool task — see the note on
+                // `CodexAppServerClient.waitForExit` for why that distinction matters.
+                let pgrepCheck = Process()
+                pgrepCheck.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+                pgrepCheck.arguments = ["-f", wedgedStub]
+                let pgrepOutput = Pipe()
+                pgrepCheck.standardOutput = pgrepOutput
+                pgrepCheck.standardError = FileHandle.nullDevice
+                do {
+                    try pgrepCheck.run()
+                    pgrepCheck.waitUntilExit()
+                    let leaked = pgrepOutput.fileHandleForReading.readDataToEndOfFile()
+                    expect(leaked.isEmpty, "no orphaned wedged child survives the SIGKILL escalation")
+                } catch {
+                    // `pgrep` itself is missing on this host (rare) — not this
+                    // test's concern; the timeout/elapsed-time assertions above
+                    // already cover the escalation ladder's correctness.
+                }
             } catch {
-                // `pgrep` itself is missing on this host (rare) — not this
-                // test's concern; the timeout/elapsed-time assertions above
-                // already cover the escalation ladder's correctness.
+                checks += 1
+                failures.append("codex app-server stub test threw: \(error)")
             }
-        } catch {
-            checks += 1
-            failures.append("codex app-server stub test threw: \(error)")
         }
     }
 
@@ -1779,130 +1795,120 @@ enum SelfTest {
     /// issue exists to prevent is one account's home silently reaching the
     /// other account's read.
     private static func testCodexPerAccountHomeReachesChild() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-perhome-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
+        withSelfTestTempDir("perhome") { dir in
+            do {
+                // Two homes that actually exist, as `codex login` would leave them.
+                let homeA = dir.appendingPathComponent("codex-home-a").path
+                let homeB = dir.appendingPathComponent("codex-home-b").path
+                for home in [homeA, homeB] {
+                    try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
+                }
 
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let oneLine: (String) -> String = { $0.replacingOccurrences(of: "\n", with: "") }
+                let echoStub = try writeStub(in: dir, name: "codex-echo-home", body: """
+                #!/bin/sh
+                printf '%s' "$CODEX_HOME" > "$HOME_MARKER"
+                echo '{"id":1,"result":{"userAgent":"stub"}}'
+                echo '{"id":2,"result":\(oneLine(codexAccountFixture))}'
+                echo '{"id":3,"result":\(oneLine(codexRateLimitsFixture))}'
+                cat > /dev/null
+                """)
 
-            func writeStub(_ name: String, _ body: String) throws -> String {
-                let path = dir.appendingPathComponent(name).path
-                try Data(body.utf8).write(to: URL(fileURLWithPath: path))
-                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
-                return path
-            }
+                var timeouts = CodexAppServerClient.Timeouts()
+                timeouts.initialize = 10
+                timeouts.method = 10
+                timeouts.overall = 20
 
-            // Two homes that actually exist, as `codex login` would leave them.
-            let homeA = dir.appendingPathComponent("codex-home-a").path
-            let homeB = dir.appendingPathComponent("codex-home-b").path
-            for home in [homeA, homeB] {
-                try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: true)
-            }
+                @MainActor
+                func readBack(home: String, marker: String) -> String? {
+                    let client = CodexAppServerClient(
+                        codexHome: home,
+                        timeouts: timeouts,
+                        environment: [
+                            CodexBinary.overrideEnvKey: echoStub,
+                            "PATH": "/usr/bin:/bin",
+                            "HOME_MARKER": marker,
+                        ]
+                    )
+                    switch runBlocking({ try await client.fetchUsage() }) {
+                    case .success:
+                        return (try? String(contentsOfFile: marker, encoding: .utf8))?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                    case .failure(let error):
+                        checks += 1
+                        failures.append("per-account home handshake failed: \(error)")
+                        return nil
+                    }
+                }
 
-            let oneLine: (String) -> String = { $0.replacingOccurrences(of: "\n", with: "") }
-            let echoStub = try writeStub("codex-echo-home", """
-            #!/bin/sh
-            printf '%s' "$CODEX_HOME" > "$HOME_MARKER"
-            echo '{"id":1,"result":{"userAgent":"stub"}}'
-            echo '{"id":2,"result":\(oneLine(codexAccountFixture))}'
-            echo '{"id":3,"result":\(oneLine(codexRateLimitsFixture))}'
-            cat > /dev/null
-            """)
+                let markerA = dir.appendingPathComponent("seen-a").path
+                let markerB = dir.appendingPathComponent("seen-b").path
+                let seenA = readBack(home: homeA, marker: markerA)
+                let seenB = readBack(home: homeB, marker: markerB)
 
-            var timeouts = CodexAppServerClient.Timeouts()
-            timeouts.initialize = 10
-            timeouts.method = 10
-            timeouts.overall = 20
+                expectEqual(seenA, homeA,
+                            "account A's registered CODEX_HOME is what its child process actually sees")
+                expectEqual(seenB, homeB,
+                            "account B's registered CODEX_HOME is what its child process actually sees")
+                expect(seenA != seenB,
+                       "two accounts polled from two homes never share one home — the corruption this issue prevents")
 
-            func readBack(home: String, marker: String) -> String? {
-                let client = CodexAppServerClient(
-                    codexHome: home,
+                // A registered home that no longer exists gets its own state, and
+                // is decided before anything is spawned.
+                let vanished = dir.appendingPathComponent("codex-home-gone").path
+                let goneClient = CodexAppServerClient(
+                    codexHome: vanished,
                     timeouts: timeouts,
-                    environment: [
-                        CodexBinary.overrideEnvKey: echoStub,
-                        "PATH": "/usr/bin:/bin",
-                        "HOME_MARKER": marker,
-                    ]
+                    environment: [CodexBinary.overrideEnvKey: echoStub, "PATH": "/usr/bin:/bin",
+                                  "HOME_MARKER": dir.appendingPathComponent("seen-gone").path]
                 )
-                switch runBlocking({ try await client.fetchUsage() }) {
+                switch runBlocking({ try await goneClient.fetchUsage() }) {
                 case .success:
-                    return (try? String(contentsOfFile: marker, encoding: .utf8))?
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    checks += 1
+                    failures.append("a registered home that does not exist must not appear to succeed")
                 case .failure(let error):
-                    checks += 1
-                    failures.append("per-account home handshake failed: \(error)")
-                    return nil
+                    guard let codexError = error as? CodexAppServerError, case .homeMissing = codexError else {
+                        checks += 1
+                        failures.append("a vanished home must fail with .homeMissing, got \(error)")
+                        break
+                    }
+                    expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("seen-gone").path),
+                           "a vanished home is caught before a child is spawned at all")
                 }
-            }
 
-            let markerA = dir.appendingPathComponent("seen-a").path
-            let markerB = dir.appendingPathComponent("seen-b").path
-            let seenA = readBack(home: homeA, marker: markerA)
-            let seenB = readBack(home: homeB, marker: markerB)
-
-            expectEqual(seenA, homeA,
-                        "account A's registered CODEX_HOME is what its child process actually sees")
-            expectEqual(seenB, homeB,
-                        "account B's registered CODEX_HOME is what its child process actually sees")
-            expect(seenA != seenB,
-                   "two accounts polled from two homes never share one home — the corruption this issue prevents")
-
-            // A registered home that no longer exists gets its own state, and
-            // is decided before anything is spawned.
-            let vanished = dir.appendingPathComponent("codex-home-gone").path
-            let goneClient = CodexAppServerClient(
-                codexHome: vanished,
-                timeouts: timeouts,
-                environment: [CodexBinary.overrideEnvKey: echoStub, "PATH": "/usr/bin:/bin",
-                              "HOME_MARKER": dir.appendingPathComponent("seen-gone").path]
-            )
-            switch runBlocking({ try await goneClient.fetchUsage() }) {
-            case .success:
+                // A home that exists but was never logged into: `account: null` is
+                // the real signal — `requiresOpenaiAuth` is true even when logged in.
+                let loggedOutStub = try writeStub(in: dir, name: "codex-logged-out", body: """
+                #!/bin/sh
+                echo '{"id":1,"result":{"userAgent":"stub"}}'
+                echo '{"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}'
+                echo '{"id":3,"error":{"code":-32600,"message":"Invalid request"}}'
+                cat > /dev/null
+                """)
+                let loggedOutClient = CodexAppServerClient(
+                    codexHome: homeA,
+                    timeouts: timeouts,
+                    environment: [CodexBinary.overrideEnvKey: loggedOutStub, "PATH": "/usr/bin:/bin"]
+                )
+                switch runBlocking({ try await loggedOutClient.fetchUsage() }) {
+                case .success:
+                    checks += 1
+                    failures.append("an unauthenticated home must not appear to succeed")
+                case .failure(let error):
+                    guard let codexError = error as? CodexAppServerError, case .notLoggedIn = codexError else {
+                        checks += 1
+                        failures.append("an unauthenticated home must surface as .notLoggedIn, got \(error)")
+                        break
+                    }
+                    expectEqual(codexError.tokenStatus, TokenStatus.missing,
+                                "needs login is its own health state, not a request failure")
+                    expect(!codexError.isCapabilityGap,
+                           "needs login is an account state — it must not fall through silently as a capability gap")
+                }
+            } catch {
                 checks += 1
-                failures.append("a registered home that does not exist must not appear to succeed")
-            case .failure(let error):
-                guard let codexError = error as? CodexAppServerError, case .homeMissing = codexError else {
-                    checks += 1
-                    failures.append("a vanished home must fail with .homeMissing, got \(error)")
-                    break
-                }
-                expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("seen-gone").path),
-                       "a vanished home is caught before a child is spawned at all")
+                failures.append("per-account codex home test threw: \(error)")
             }
-
-            // A home that exists but was never logged into: `account: null` is
-            // the real signal — `requiresOpenaiAuth` is true even when logged in.
-            let loggedOutStub = try writeStub("codex-logged-out", """
-            #!/bin/sh
-            echo '{"id":1,"result":{"userAgent":"stub"}}'
-            echo '{"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}'
-            echo '{"id":3,"error":{"code":-32600,"message":"Invalid request"}}'
-            cat > /dev/null
-            """)
-            let loggedOutClient = CodexAppServerClient(
-                codexHome: homeA,
-                timeouts: timeouts,
-                environment: [CodexBinary.overrideEnvKey: loggedOutStub, "PATH": "/usr/bin:/bin"]
-            )
-            switch runBlocking({ try await loggedOutClient.fetchUsage() }) {
-            case .success:
-                checks += 1
-                failures.append("an unauthenticated home must not appear to succeed")
-            case .failure(let error):
-                guard let codexError = error as? CodexAppServerError, case .notLoggedIn = codexError else {
-                    checks += 1
-                    failures.append("an unauthenticated home must surface as .notLoggedIn, got \(error)")
-                    break
-                }
-                expectEqual(codexError.tokenStatus, TokenStatus.missing,
-                            "needs login is its own health state, not a request failure")
-                expect(!codexError.isCapabilityGap,
-                       "needs login is an account state — it must not fall through silently as a capability gap")
-            }
-        } catch {
-            checks += 1
-            failures.append("per-account codex home test threw: \(error)")
         }
     }
 
@@ -1949,49 +1955,47 @@ enum SelfTest {
     /// every poll), then reads it back via `loadNamedLimitHistory` and
     /// confirms `limit_name` / `used_percent` survive the round trip.
     private static func testNamedLimitsRoundTrip() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
 
-            let snapshot = try OpenAIAPIClient.snapshot(
-                from: Data(openAIUsageFixture.utf8), httpStatus: 200
-            )
-            let named = snapshot.rateLimit.named
-            expect(!named.isEmpty, "fixture must decode at least one named sub-limit")
+                let snapshot = try OpenAIAPIClient.snapshot(
+                    from: Data(openAIUsageFixture.utf8), httpStatus: 200
+                )
+                let named = snapshot.rateLimit.named
+                expect(!named.isEmpty, "fixture must decode at least one named sub-limit")
 
-            let db = try openDatabase(dbPath)
-            let now = ISO8601DateFormatter().string(from: Date())
-            UsageStore.insertNamedLimits(db, accountId: "acct-fixture", timestamp: now, named: named)
+                let db = try openDatabase(dbPath)
+                let now = ISO8601DateFormatter().string(from: Date())
+                UsageStore.insertNamedLimits(db, accountId: "acct-fixture", timestamp: now, named: named)
 
-            let history = store.loadNamedLimitHistory(for: "acct-fixture")
-            expectEqual(history.count, 1, "one series per distinct limit_name")
-            let series = history["GPT-5.3-Codex-Spark"]
-            expect(series != nil, "the fixture's limit_name is preserved verbatim as the series key")
-            expectEqual(series?.first?.usedPercent, 62,
-                        "used_percent round-trips through named_limits")
+                let history = store.loadNamedLimitHistory(for: "acct-fixture")
+                expectEqual(history.count, 1, "one series per distinct limit_name")
+                let series = history["GPT-5.3-Codex-Spark"]
+                expect(series != nil, "the fixture's limit_name is preserved verbatim as the series key")
+                expectEqual(series?.first?.usedPercent, 62,
+                            "used_percent round-trips through named_limits")
 
-            // An account with no named limits at all must read back empty —
-            // this is what lets the chart overlay stay hidden for every
-            // Anthropic account.
-            let emptyHistory = store.loadNamedLimitHistory(for: "acct-with-no-named-limits")
-            expect(emptyHistory.isEmpty, "an account with zero named_limits rows reads back an empty dictionary")
+                // An account with no named limits at all must read back empty —
+                // this is what lets the chart overlay stay hidden for every
+                // Anthropic account.
+                let emptyHistory = store.loadNamedLimitHistory(for: "acct-with-no-named-limits")
+                expect(emptyHistory.isEmpty, "an account with zero named_limits rows reads back an empty dictionary")
 
-            // Anthropic's ping response never populates `named` — confirm the
-            // write path is a true no-op for it, not merely untested.
-            UsageStore.insertNamedLimits(db, accountId: "acct-anthropic", timestamp: now, named: [:])
-            let anthropicCount = try db.scalar(
-                "SELECT COUNT(*) FROM named_limits WHERE account_id = 'acct-anthropic'"
-            ) as? Int64
-            expectEqual(anthropicCount, 0, "an empty named map writes zero named_limits rows")
-        } catch {
-            checks += 1
-            failures.append("named limits round-trip test threw: \(error)")
+                // Anthropic's ping response never populates `named` — confirm the
+                // write path is a true no-op for it, not merely untested.
+                UsageStore.insertNamedLimits(db, accountId: "acct-anthropic", timestamp: now, named: [:])
+                let anthropicCount = try db.scalar(
+                    "SELECT COUNT(*) FROM named_limits WHERE account_id = 'acct-anthropic'"
+                ) as? Int64
+                expectEqual(anthropicCount, 0, "an empty named map writes zero named_limits rows")
+            } catch {
+                checks += 1
+                failures.append("named limits round-trip test threw: \(error)")
+            }
         }
     }
 
@@ -2001,53 +2005,51 @@ enum SelfTest {
     /// the same email, not create a sibling keyed by OpenAI's native id —
     /// rows created before the native-id era carry a locally generated UUID.
     private static func testOpenAIImportResolvesExistingAccountByEmail() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES ('legacy-uuid-row', 'me@example.com', 'me@example.com', 'pro',
-                        '2026-01-01T00:00:00Z', 'openai')
-            """)
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES ('anthropic-row', 'me@example.com', 'me@example.com', 'Max',
-                        '2026-01-01T00:00:00Z', 'anthropic')
-            """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('legacy-uuid-row', 'me@example.com', 'me@example.com', 'pro',
+                            '2026-01-01T00:00:00Z', 'openai')
+                """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('anthropic-row', 'me@example.com', 'me@example.com', 'Max',
+                            '2026-01-01T00:00:00Z', 'anthropic')
+                """)
 
-            expectEqual(
-                OAuthPoller.resolveOpenAIAccountId(
-                    email: "me@example.com", nativeId: "user-native", db: db),
-                "legacy-uuid-row",
-                "an existing openai row with the same email wins over the native id")
-            expectEqual(
-                OAuthPoller.resolveOpenAIAccountId(
-                    email: "someone-else@example.com", nativeId: "user-native", db: db),
-                "user-native",
-                "an unknown email falls through to the native id")
-            expectEqual(
-                OAuthPoller.resolveOpenAIAccountId(
-                    email: nil, nativeId: "user-native", db: db),
-                "user-native",
-                "a missing email falls through to the native id")
+                expectEqual(
+                    OAuthPoller.resolveOpenAIAccountId(
+                        email: "me@example.com", nativeId: "user-native", db: db),
+                    "legacy-uuid-row",
+                    "an existing openai row with the same email wins over the native id")
+                expectEqual(
+                    OAuthPoller.resolveOpenAIAccountId(
+                        email: "someone-else@example.com", nativeId: "user-native", db: db),
+                    "user-native",
+                    "an unknown email falls through to the native id")
+                expectEqual(
+                    OAuthPoller.resolveOpenAIAccountId(
+                        email: nil, nativeId: "user-native", db: db),
+                    "user-native",
+                    "a missing email falls through to the native id")
 
-            // The anthropic row shares the email; matching is provider-scoped
-            // so a Claude and a ChatGPT account under one address never merge.
-            expect(
-                OAuthPoller.resolveOpenAIAccountId(
-                    email: "me@example.com", nativeId: "user-native", db: db) != "anthropic-row",
-                "resolution never lands on an anthropic row")
-        } catch {
-            checks += 1
-            failures.append("openai import account resolution test threw: \(error)")
+                // The anthropic row shares the email; matching is provider-scoped
+                // so a Claude and a ChatGPT account under one address never merge.
+                expect(
+                    OAuthPoller.resolveOpenAIAccountId(
+                        email: "me@example.com", nativeId: "user-native", db: db) != "anthropic-row",
+                    "resolution never lands on an anthropic row")
+            } catch {
+                checks += 1
+                failures.append("openai import account resolution test threw: \(error)")
+            }
         }
     }
 
@@ -2063,70 +2065,68 @@ enum SelfTest {
     /// while the Anthropic entries carry none of them (so an old-format,
     /// Anthropic-only export is byte-for-byte what it was before #67).
     private static func testExportAccountsEnvIncludesAllProviders() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('anthropic-1', 'Claude One', 'one@example.com', 'Max', '2026-01-01T00:00:00Z', 0, 'anthropic')
-            """)
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('anthropic-2', 'Claude Two', 'two@example.com', 'Pro', '2026-01-01T00:00:00Z', 1, 'anthropic')
-            """)
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 2, 'openai')
-            """)
-            for (accountId, token) in [
-                ("anthropic-1", "token-one"),
-                ("anthropic-2", "token-two"),
-            ] {
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('anthropic-1', 'Claude One', 'one@example.com', 'Max', '2026-01-01T00:00:00Z', 0, 'anthropic')
+                """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('anthropic-2', 'Claude Two', 'two@example.com', 'Pro', '2026-01-01T00:00:00Z', 1, 'anthropic')
+                """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 2, 'openai')
+                """)
+                for (accountId, token) in [
+                    ("anthropic-1", "token-one"),
+                    ("anthropic-2", "token-two"),
+                ] {
+                    try db.run("""
+                        INSERT INTO oauth_credentials
+                            (account_id, label, access_token, is_active, created_at, updated_at, provider)
+                        VALUES (?, ?, ?, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
+                                (SELECT provider FROM accounts WHERE id = ?))
+                    """, accountId, accountId, token, accountId)
+                }
                 try db.run("""
                     INSERT INTO oauth_credentials
-                        (account_id, label, access_token, is_active, created_at, updated_at, provider)
-                    VALUES (?, ?, ?, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z',
-                            (SELECT provider FROM accounts WHERE id = ?))
-                """, accountId, accountId, token, accountId)
-            }
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, access_token, refresh_token, token_expires_at,
-                     is_active, created_at, updated_at, provider)
-                VALUES ('codex-1', 'codex-1', 'token-codex', 'refresh-codex',
-                        '2026-08-15T00:00:00Z', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
-            """)
+                        (account_id, label, access_token, refresh_token, token_expires_at,
+                         is_active, created_at, updated_at, provider)
+                    VALUES ('codex-1', 'codex-1', 'token-codex', 'refresh-codex',
+                            '2026-08-15T00:00:00Z', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+                """)
 
-            let poller = OAuthPoller(dbPath: dbPath)
-            guard let (env, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                let poller = OAuthPoller(dbPath: dbPath)
+                guard let (env, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                    checks += 1
+                    failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
+                    return
+                }
+
+                expectEqual(count, 3, "exported count covers every active, tokened row regardless of provider")
+                expectEqual(excludedHostLocal, 0, "a tokened Codex row (e.g. imported via clipboard) is not host-local-excluded")
+                expect(env.contains("one@example.com"), "export includes the first Anthropic account")
+                expect(env.contains("two@example.com"), "export includes the second Anthropic account")
+                expect(env.contains("codex@example.com"), "export now includes the Codex/OpenAI account (#67)")
+                expect(env.contains("ACCOUNT_PROVIDER_3=openai"), "the OpenAI entry is tagged with its provider")
+                expect(env.contains("ACCOUNT_REFRESH_3=refresh-codex"), "the OpenAI entry carries its refresh token")
+                expect(env.contains("ACCOUNT_EXPIRES_3=2026-08-15T00:00:00Z"), "the OpenAI entry carries its access-token expiry")
+                expect(!env.contains("ACCOUNT_PROVIDER_1"), "an Anthropic entry emits no provider marker")
+                expect(!env.contains("ACCOUNT_PROVIDER_2"), "an Anthropic entry emits no provider marker")
+                expect(!env.contains("ACCOUNT_REFRESH_1") && !env.contains("ACCOUNT_REFRESH_2"),
+                       "an Anthropic entry emits no refresh-token key")
+            } catch {
                 checks += 1
-                failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
-                return
+                failures.append("exportAccountsEnv provider test threw: \(error)")
             }
-
-            expectEqual(count, 3, "exported count covers every active, tokened row regardless of provider")
-            expectEqual(excludedHostLocal, 0, "a tokened Codex row (e.g. imported via clipboard) is not host-local-excluded")
-            expect(env.contains("one@example.com"), "export includes the first Anthropic account")
-            expect(env.contains("two@example.com"), "export includes the second Anthropic account")
-            expect(env.contains("codex@example.com"), "export now includes the Codex/OpenAI account (#67)")
-            expect(env.contains("ACCOUNT_PROVIDER_3=openai"), "the OpenAI entry is tagged with its provider")
-            expect(env.contains("ACCOUNT_REFRESH_3=refresh-codex"), "the OpenAI entry carries its refresh token")
-            expect(env.contains("ACCOUNT_EXPIRES_3=2026-08-15T00:00:00Z"), "the OpenAI entry carries its access-token expiry")
-            expect(!env.contains("ACCOUNT_PROVIDER_1"), "an Anthropic entry emits no provider marker")
-            expect(!env.contains("ACCOUNT_PROVIDER_2"), "an Anthropic entry emits no provider marker")
-            expect(!env.contains("ACCOUNT_REFRESH_1") && !env.contains("ACCOUNT_REFRESH_2"),
-                   "an Anthropic entry emits no refresh-token key")
-        } catch {
-            checks += 1
-            failures.append("exportAccountsEnv provider test threw: \(error)")
         }
     }
 
@@ -2137,53 +2137,51 @@ enum SelfTest {
     /// host-local-excluded rather than silently dropping it from both the
     /// count and any explanation (issue #129).
     private static func testExportAccountsEnvExcludesTokenlessCodexAccount() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('anthropic-1', 'Claude One', 'one@example.com', 'Max', '2026-01-01T00:00:00Z', 0, 'anthropic')
-            """)
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, codex_home, provider)
-                VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 1, '/home/codex', 'openai')
-            """)
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, access_token, is_active, created_at, updated_at, provider)
-                VALUES ('anthropic-1', 'anthropic-1', 'token-one', 1,
-                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'anthropic')
-            """)
-            // Mirrors what `nullOutOpenAITokens` (#123) leaves behind: an
-            // active, tokenless credential row for a registered Codex home.
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, access_token, refresh_token, is_active, created_at, updated_at, provider)
-                VALUES ('codex-1', 'codex-1', NULL, NULL, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
-            """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('anthropic-1', 'Claude One', 'one@example.com', 'Max', '2026-01-01T00:00:00Z', 0, 'anthropic')
+                """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, codex_home, provider)
+                    VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 1, '/home/codex', 'openai')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, access_token, is_active, created_at, updated_at, provider)
+                    VALUES ('anthropic-1', 'anthropic-1', 'token-one', 1,
+                            '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'anthropic')
+                """)
+                // Mirrors what `nullOutOpenAITokens` (#123) leaves behind: an
+                // active, tokenless credential row for a registered Codex home.
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, access_token, refresh_token, is_active, created_at, updated_at, provider)
+                    VALUES ('codex-1', 'codex-1', NULL, NULL, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+                """)
 
-            let poller = OAuthPoller(dbPath: dbPath)
-            guard let (env, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                let poller = OAuthPoller(dbPath: dbPath)
+                guard let (env, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                    checks += 1
+                    failures.append("exportAccountsEnv returned nil for a mixed host with a tokenless Codex account")
+                    return
+                }
+
+                expectEqual(count, 1, "only the tokened Anthropic account is exported")
+                expectEqual(excludedHostLocal, 1, "the tokenless Codex account is counted as host-local-excluded")
+                expect(env.contains("one@example.com"), "export still includes the Anthropic account")
+                expect(!env.contains("codex@example.com"), "the tokenless Codex account is not serialized (there is no token to export)")
+            } catch {
                 checks += 1
-                failures.append("exportAccountsEnv returned nil for a mixed host with a tokenless Codex account")
-                return
+                failures.append("exportAccountsEnv tokenless-Codex test threw: \(error)")
             }
-
-            expectEqual(count, 1, "only the tokened Anthropic account is exported")
-            expectEqual(excludedHostLocal, 1, "the tokenless Codex account is counted as host-local-excluded")
-            expect(env.contains("one@example.com"), "export still includes the Anthropic account")
-            expect(!env.contains("codex@example.com"), "the tokenless Codex account is not serialized (there is no token to export)")
-        } catch {
-            checks += 1
-            failures.append("exportAccountsEnv tokenless-Codex test threw: \(error)")
         }
     }
 
@@ -2193,39 +2191,37 @@ enum SelfTest {
     /// would report the bare, misleading "Nothing to copy" that #67 already
     /// fixed once (issue #129 is that regression coming back through #123).
     private static func testExportAccountsEnvCodexOnlyHostIsNotGenuinelyEmpty() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, codex_home, provider)
-                VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 0, '/home/codex', 'openai')
-            """)
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, access_token, refresh_token, is_active, created_at, updated_at, provider)
-                VALUES ('codex-1', 'codex-1', NULL, NULL, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
-            """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, codex_home, provider)
+                    VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 0, '/home/codex', 'openai')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, access_token, refresh_token, is_active, created_at, updated_at, provider)
+                    VALUES ('codex-1', 'codex-1', NULL, NULL, 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+                """)
 
-            let poller = OAuthPoller(dbPath: dbPath)
-            guard let (_, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                let poller = OAuthPoller(dbPath: dbPath)
+                guard let (_, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                    checks += 1
+                    failures.append("exportAccountsEnv returned nil for a Codex-only host — it must report the exclusion instead")
+                    return
+                }
+
+                expectEqual(count, 0, "a Codex-only host has nothing tokened to export")
+                expectEqual(excludedHostLocal, 1, "the sole Codex account is reported as host-local-excluded, not silently dropped")
+            } catch {
                 checks += 1
-                failures.append("exportAccountsEnv returned nil for a Codex-only host — it must report the exclusion instead")
-                return
+                failures.append("exportAccountsEnv Codex-only-host test threw: \(error)")
             }
-
-            expectEqual(count, 0, "a Codex-only host has nothing tokened to export")
-            expectEqual(excludedHostLocal, 1, "the sole Codex account is reported as host-local-excluded, not silently dropped")
-        } catch {
-            checks += 1
-            failures.append("exportAccountsEnv Codex-only-host test threw: \(error)")
         }
     }
 
@@ -2233,11 +2229,7 @@ enum SelfTest {
     /// the excluded-count reporting above must not turn every empty store
     /// into a false "N accounts are host-local" claim.
     private static func testExportAccountsEnvGenuinelyEmptyStoreReturnsNil() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        withSelfTestTempDir { dir in
             let dbPath = dir.appendingPathComponent("usage.db").path
 
             let store = UsageStore(dbPath: dbPath)
@@ -2245,9 +2237,6 @@ enum SelfTest {
 
             let poller = OAuthPoller(dbPath: dbPath)
             expect(poller.exportAccountsEnv() == nil, "a genuinely empty store still reports nil, not a false exclusion")
-        } catch {
-            checks += 1
-            failures.append("exportAccountsEnv empty-store test threw: \(error)")
         }
     }
 
@@ -2284,69 +2273,67 @@ enum SelfTest {
     /// perturb parsing of the known ones — the graceful-degradation property
     /// an older build's parser relies on when it meets a still-newer format.
     private static func testParseAccountPairsRoundTripsOpenAIFields() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('anthropic-1', 'Claude One', 'one@example.com', 'Max', '2026-01-01T00:00:00Z', 0, 'anthropic')
-            """)
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 1, 'openai')
-            """)
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, access_token, is_active, created_at, updated_at, provider)
-                VALUES ('anthropic-1', 'anthropic-1', 'token-one', 1,
-                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'anthropic')
-            """)
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, access_token, refresh_token, token_expires_at,
-                     is_active, created_at, updated_at, provider)
-                VALUES ('codex-1', 'codex-1', 'token-codex', 'refresh-codex',
-                        '2026-08-15T00:00:00Z', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
-            """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('anthropic-1', 'Claude One', 'one@example.com', 'Max', '2026-01-01T00:00:00Z', 0, 'anthropic')
+                """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 1, 'openai')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, access_token, is_active, created_at, updated_at, provider)
+                    VALUES ('anthropic-1', 'anthropic-1', 'token-one', 1,
+                            '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'anthropic')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, access_token, refresh_token, token_expires_at,
+                         is_active, created_at, updated_at, provider)
+                    VALUES ('codex-1', 'codex-1', 'token-codex', 'refresh-codex',
+                            '2026-08-15T00:00:00Z', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+                """)
 
-            let poller = OAuthPoller(dbPath: dbPath)
-            guard let (env, _, _) = poller.exportAccountsEnv() else {
+                let poller = OAuthPoller(dbPath: dbPath)
+                guard let (env, _, _) = poller.exportAccountsEnv() else {
+                    checks += 1
+                    failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
+                    return
+                }
+
+                // A future key an older/newer build might add — must not disturb
+                // parsing of the keys this build understands.
+                let withUnknownKey = env + "\nACCOUNT_FOOBAR_1=surprise\n"
+                let parsed = poller.parseAccountPairs(withUnknownKey)
+                expectEqual(parsed.count, 2, "both entries parse despite the unrecognized key")
+
+                guard let anthropicEntry = parsed.first(where: { $0.email == "one@example.com" }),
+                      let openaiEntry = parsed.first(where: { $0.email == "codex@example.com" }) else {
+                    checks += 1
+                    failures.append("round-trip parse is missing an expected entry")
+                    return
+                }
+
+                expectEqual(anthropicEntry.provider, .anthropic, "the Anthropic entry round-trips as Anthropic")
+                expect(anthropicEntry.refreshToken == nil, "the Anthropic entry carries no refresh token")
+
+                expectEqual(openaiEntry.provider, .openai, "the OpenAI entry round-trips as OpenAI")
+                expectEqual(openaiEntry.token, "token-codex", "the OpenAI entry round-trips its access token")
+                expectEqual(openaiEntry.refreshToken, "refresh-codex", "the OpenAI entry round-trips its refresh token")
+                expectEqual(openaiEntry.tokenExpiresAt, UsageRecord.parseISO("2026-08-15T00:00:00Z"),
+                            "the OpenAI entry round-trips its access-token expiry")
+            } catch {
                 checks += 1
-                failures.append("exportAccountsEnv returned nil for a store with exportable accounts")
-                return
+                failures.append("parseAccountPairs OpenAI round-trip test threw: \(error)")
             }
-
-            // A future key an older/newer build might add — must not disturb
-            // parsing of the keys this build understands.
-            let withUnknownKey = env + "\nACCOUNT_FOOBAR_1=surprise\n"
-            let parsed = poller.parseAccountPairs(withUnknownKey)
-            expectEqual(parsed.count, 2, "both entries parse despite the unrecognized key")
-
-            guard let anthropicEntry = parsed.first(where: { $0.email == "one@example.com" }),
-                  let openaiEntry = parsed.first(where: { $0.email == "codex@example.com" }) else {
-                checks += 1
-                failures.append("round-trip parse is missing an expected entry")
-                return
-            }
-
-            expectEqual(anthropicEntry.provider, .anthropic, "the Anthropic entry round-trips as Anthropic")
-            expect(anthropicEntry.refreshToken == nil, "the Anthropic entry carries no refresh token")
-
-            expectEqual(openaiEntry.provider, .openai, "the OpenAI entry round-trips as OpenAI")
-            expectEqual(openaiEntry.token, "token-codex", "the OpenAI entry round-trips its access token")
-            expectEqual(openaiEntry.refreshToken, "refresh-codex", "the OpenAI entry round-trips its refresh token")
-            expectEqual(openaiEntry.tokenExpiresAt, UsageRecord.parseISO("2026-08-15T00:00:00Z"),
-                        "the OpenAI entry round-trips its access-token expiry")
-        } catch {
-            checks += 1
-            failures.append("parseAccountPairs OpenAI round-trip test threw: \(error)")
         }
     }
 
@@ -2361,107 +2348,105 @@ enum SelfTest {
     /// stronger guarantee than scoping (the entry is never touched at all),
     /// so this single test now covers both.
     private static func testAccountSyncExcludesOpenAIAccounts() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES ('claude-org-uuid', 'me@example.com', 'me@example.com', 'Max',
-                        '2026-01-01T00:00:00Z', 'anthropic')
-            """)
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, is_active,
-                     created_at, updated_at)
-                VALUES ('claude-org-uuid', 'me@example.com', 'token', 'anthropic',
-                        'sk-ant-claude-token', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
-            """)
-            // A live OpenAI account, present in the local database.
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES ('user-native-openai', 'me2@example.com', 'me2@example.com', 'pro',
-                        '2026-01-01T00:00:00Z', 'openai')
-            """)
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, refresh_token, is_active,
-                     created_at, updated_at)
-                VALUES ('user-native-openai', 'me2@example.com', 'codex', 'openai',
-                        'openai-access-token', 'openai-refresh-token', 1,
-                        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
-            """)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('claude-org-uuid', 'me@example.com', 'me@example.com', 'Max',
+                            '2026-01-01T00:00:00Z', 'anthropic')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active,
+                         created_at, updated_at)
+                    VALUES ('claude-org-uuid', 'me@example.com', 'token', 'anthropic',
+                            'sk-ant-claude-token', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+                """)
+                // A live OpenAI account, present in the local database.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('user-native-openai', 'me2@example.com', 'me2@example.com', 'pro',
+                            '2026-01-01T00:00:00Z', 'openai')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, refresh_token, is_active,
+                         created_at, updated_at)
+                    VALUES ('user-native-openai', 'me2@example.com', 'codex', 'openai',
+                            'openai-access-token', 'openai-refresh-token', 1,
+                            '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
+                """)
 
-            // --- Export excludes the OpenAI account entirely. ---
-            let exported = try AccountSync.exportBundle(dbPath: dbPath)
-            expectEqual(exported.accounts.count, 1, "export carries only the Anthropic account")
-            expectEqual(exported.accounts.first?.provider, "anthropic",
-                        "the one exported account is the Anthropic one")
-            expect(!exported.accounts.contains { $0.provider == "openai" },
-                   "no openai account appears in the export bundle")
+                // --- Export excludes the OpenAI account entirely. ---
+                let exported = try AccountSync.exportBundle(dbPath: dbPath)
+                expectEqual(exported.accounts.count, 1, "export carries only the Anthropic account")
+                expectEqual(exported.accounts.first?.provider, "anthropic",
+                            "the one exported account is the Anthropic one")
+                expect(!exported.accounts.contains { $0.provider == "openai" },
+                       "no openai account appears in the export bundle")
 
-            // --- Import skips an OpenAI entry from an older bundle, without error. ---
-            let bundle = AccountSync.ExportBundle(
-                formatVersion: AccountSync.formatVersion,
-                exportedAt: "2026-07-01T00:00:00Z",
-                sourceHost: "selftest",
-                accounts: [
-                    AccountSync.ExportedAccount(
-                        id: "user-native-openai-imported",
-                        provider: "openai",
-                        accountName: "me@example.com",
-                        email: "me@example.com",
-                        plan: "pro",
-                        lastUpdated: "2026-07-01T00:00:00Z",
-                        sortOrder: 0,
-                        credentials: [AccountSync.ExportedCredential(
-                            label: "me@example.com", source: "codex", provider: "openai",
-                            accessToken: "openai-access-token", refreshToken: "openai-refresh",
-                            expiresAt: nil, tokenExpiresAt: "2026-08-01T00:00:00Z",
-                            scopes: nil, subscriptionType: nil, rateLimitTier: nil,
-                            isActive: true, createdAt: nil, updatedAt: nil, tokenRolledAt: nil
-                        )]
-                    ),
-                    AccountSync.ExportedAccount(
-                        id: "claude-org-uuid-2",
-                        provider: "anthropic",
-                        accountName: "second@example.com",
-                        email: "second@example.com",
-                        plan: "Max",
-                        lastUpdated: "2026-07-01T00:00:00Z",
-                        sortOrder: 1,
-                        credentials: []
-                    ),
-                ]
-            )
-            let summary = try AccountSync.importBundle(bundle, dbPath: dbPath)
-            expectEqual(summary.excluded, 1, "the OpenAI entry is reported as excluded, not created/updated")
-            expectEqual(summary.created, 1, "the Anthropic entry in the same bundle still imports normally")
+                // --- Import skips an OpenAI entry from an older bundle, without error. ---
+                let bundle = AccountSync.ExportBundle(
+                    formatVersion: AccountSync.formatVersion,
+                    exportedAt: "2026-07-01T00:00:00Z",
+                    sourceHost: "selftest",
+                    accounts: [
+                        AccountSync.ExportedAccount(
+                            id: "user-native-openai-imported",
+                            provider: "openai",
+                            accountName: "me@example.com",
+                            email: "me@example.com",
+                            plan: "pro",
+                            lastUpdated: "2026-07-01T00:00:00Z",
+                            sortOrder: 0,
+                            credentials: [AccountSync.ExportedCredential(
+                                label: "me@example.com", source: "codex", provider: "openai",
+                                accessToken: "openai-access-token", refreshToken: "openai-refresh",
+                                expiresAt: nil, tokenExpiresAt: "2026-08-01T00:00:00Z",
+                                scopes: nil, subscriptionType: nil, rateLimitTier: nil,
+                                isActive: true, createdAt: nil, updatedAt: nil, tokenRolledAt: nil
+                            )]
+                        ),
+                        AccountSync.ExportedAccount(
+                            id: "claude-org-uuid-2",
+                            provider: "anthropic",
+                            accountName: "second@example.com",
+                            email: "second@example.com",
+                            plan: "Max",
+                            lastUpdated: "2026-07-01T00:00:00Z",
+                            sortOrder: 1,
+                            credentials: []
+                        ),
+                    ]
+                )
+                let summary = try AccountSync.importBundle(bundle, dbPath: dbPath)
+                expectEqual(summary.excluded, 1, "the OpenAI entry is reported as excluded, not created/updated")
+                expectEqual(summary.created, 1, "the Anthropic entry in the same bundle still imports normally")
 
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM accounts WHERE provider = 'openai'") as? Int64,
-                1, "importing a bundle with an OpenAI entry does not create a new OpenAI row")
-            expectEqual(
-                try db.scalar("SELECT id FROM accounts WHERE provider = 'openai'") as? String,
-                "user-native-openai", "the pre-existing OpenAI account is untouched by the import")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM accounts WHERE provider = 'openai'") as? Int64,
+                    1, "importing a bundle with an OpenAI entry does not create a new OpenAI row")
+                expectEqual(
+                    try db.scalar("SELECT id FROM accounts WHERE provider = 'openai'") as? String,
+                    "user-native-openai", "the pre-existing OpenAI account is untouched by the import")
 
-            let claudeProvider = try db.scalar(
-                "SELECT provider FROM accounts WHERE id = 'claude-org-uuid'") as? String
-            expectEqual(claudeProvider, "anthropic",
-                        "the Anthropic row sharing the email keeps its provider")
-            let claudeToken = try db.scalar(
-                "SELECT access_token FROM oauth_credentials WHERE account_id = 'claude-org-uuid'") as? String
-            expectEqual(claudeToken, "sk-ant-claude-token",
-                        "the Claude credential is not overwritten by the excluded OpenAI import")
-        } catch {
-            checks += 1
-            failures.append("account sync host-local exclusion test threw: \(error)")
+                let claudeProvider = try db.scalar(
+                    "SELECT provider FROM accounts WHERE id = 'claude-org-uuid'") as? String
+                expectEqual(claudeProvider, "anthropic",
+                            "the Anthropic row sharing the email keeps its provider")
+                let claudeToken = try db.scalar(
+                    "SELECT access_token FROM oauth_credentials WHERE account_id = 'claude-org-uuid'") as? String
+                expectEqual(claudeToken, "sk-ant-claude-token",
+                            "the Claude credential is not overwritten by the excluded OpenAI import")
+            } catch {
+                checks += 1
+                failures.append("account sync host-local exclusion test threw: \(error)")
+            }
         }
     }
 
@@ -2477,138 +2462,136 @@ enum SelfTest {
     /// sharing the same email is left untouched (provider-scoped), and a
     /// second run over the healed database is a no-op.
     private static func testMergeDuplicateAccountsSharingEmail() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            let legacyId = "BFA6C1F0-8C2A-4CB0-9A5E-000000000001" // canonical UUID shape
-            let nativeId = "user-native-oai"
+                let legacyId = "BFA6C1F0-8C2A-4CB0-9A5E-000000000001" // canonical UUID shape
+                let nativeId = "user-native-oai"
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES (?, 'me@example.com', 'me@example.com', 'pro', '2026-01-01T00:00:00Z', 'openai')
-            """, legacyId)
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES (?, 'me@example.com', 'me@example.com', 'pro', '2026-06-01T00:00:00Z', 'openai')
-            """, nativeId)
-            // Shares the email but a different provider — must survive untouched.
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES ('anthropic-row', 'me@example.com', 'me@example.com', 'Max',
-                        '2026-01-01T00:00:00Z', 'anthropic')
-            """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES (?, 'me@example.com', 'me@example.com', 'pro', '2026-01-01T00:00:00Z', 'openai')
+                """, legacyId)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES (?, 'me@example.com', 'me@example.com', 'pro', '2026-06-01T00:00:00Z', 'openai')
+                """, nativeId)
+                // Shares the email but a different provider — must survive untouched.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('anthropic-row', 'me@example.com', 'me@example.com', 'Max',
+                            '2026-01-01T00:00:00Z', 'anthropic')
+                """)
 
-            try db.run("""
-                INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
-                VALUES (?, '2026-01-01T00:00:00Z', 10, 0)
-            """, legacyId)
-            try db.run("""
-                INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
-                VALUES (?, '2026-06-01T00:00:00Z', 20, 0)
-            """, nativeId)
-            try db.run("""
-                INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
-                VALUES (?, '2026-01-01T00:00:00Z', 'haiku', 200, '{}')
-            """, legacyId)
-            // named_limits only exists for the legacy row — merge must carry it
-            // over even though the native row never had any.
-            try db.run("""
-                INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
-                VALUES (?, '2026-01-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 42)
-            """, legacyId)
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
+                    VALUES (?, '2026-01-01T00:00:00Z', 10, 0)
+                """, legacyId)
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
+                    VALUES (?, '2026-06-01T00:00:00Z', 20, 0)
+                """, nativeId)
+                try db.run("""
+                    INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                    VALUES (?, '2026-01-01T00:00:00Z', 'haiku', 200, '{}')
+                """, legacyId)
+                // named_limits only exists for the legacy row — merge must carry it
+                // over even though the native row never had any.
+                try db.run("""
+                    INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                    VALUES (?, '2026-01-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 42)
+                """, legacyId)
 
-            // The legacy row's credential was renewed more recently than the
-            // native row's — the merge must keep the legacy credential's
-            // token even though the *native* row is the id that survives.
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, is_active,
-                     created_at, updated_at, token_rolled_at)
-                VALUES (?, 'me@example.com', 'codex', 'openai', 'legacy-fresher-token', 1,
-                        '2026-01-01T00:00:00Z', '2026-06-20T00:00:00Z', '2026-06-20T00:00:00Z')
-            """, legacyId)
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, is_active,
-                     created_at, updated_at, token_rolled_at)
-                VALUES (?, 'me@example.com', 'codex', 'openai', 'native-stale-token', 1,
-                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', '2026-01-05T00:00:00Z')
-            """, nativeId)
+                // The legacy row's credential was renewed more recently than the
+                // native row's — the merge must keep the legacy credential's
+                // token even though the *native* row is the id that survives.
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active,
+                         created_at, updated_at, token_rolled_at)
+                    VALUES (?, 'me@example.com', 'codex', 'openai', 'legacy-fresher-token', 1,
+                            '2026-01-01T00:00:00Z', '2026-06-20T00:00:00Z', '2026-06-20T00:00:00Z')
+                """, legacyId)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active,
+                         created_at, updated_at, token_rolled_at)
+                    VALUES (?, 'me@example.com', 'codex', 'openai', 'native-stale-token', 1,
+                            '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z', '2026-01-05T00:00:00Z')
+                """, nativeId)
 
-            // The user had pinned the legacy row as their primary account.
-            try db.run("INSERT INTO settings (key, value) VALUES ('primary_account_id', ?)", legacyId)
+                // The user had pinned the legacy row as their primary account.
+                try db.run("INSERT INTO settings (key, value) VALUES ('primary_account_id', ?)", legacyId)
 
-            // --- What the next launch does. ---
-            store.ensureDatabase()
+                // --- What the next launch does. ---
+                store.ensureDatabase()
 
-            let openaiRows = try db.prepare(
-                "SELECT id FROM accounts WHERE email = 'me@example.com' AND provider = 'openai'"
-            ).map { $0[0] as? String }
-            expectEqual(openaiRows.count, 1, "the openai duplicate pair merges into one row")
-            expectEqual(openaiRows.first.flatMap { $0 } ?? "", nativeId,
-                        "the provider-native id survives over the locally generated UUID")
+                let openaiRows = try db.prepare(
+                    "SELECT id FROM accounts WHERE email = 'me@example.com' AND provider = 'openai'"
+                ).map { $0[0] as? String }
+                expectEqual(openaiRows.count, 1, "the openai duplicate pair merges into one row")
+                expectEqual(openaiRows.first.flatMap { $0 } ?? "", nativeId,
+                            "the provider-native id survives over the locally generated UUID")
 
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", legacyId) as? Int64, 0,
-                "the losing row is removed")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM accounts WHERE email = 'me@example.com'") as? Int64, 2,
-                "the anthropic row sharing the email is untouched (provider-scoped)")
-            expectEqual(
-                try db.scalar("SELECT provider FROM accounts WHERE id = 'anthropic-row'") as? String,
-                "anthropic", "the anthropic row keeps its provider")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", legacyId) as? Int64, 0,
+                    "the losing row is removed")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM accounts WHERE email = 'me@example.com'") as? Int64, 2,
+                    "the anthropic row sharing the email is untouched (provider-scoped)")
+                expectEqual(
+                    try db.scalar("SELECT provider FROM accounts WHERE id = 'anthropic-row'") as? String,
+                    "anthropic", "the anthropic row keeps its provider")
 
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", nativeId) as? Int64, 2,
-                "usage_history rows from both accounts land on the survivor")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = ?", nativeId) as? Int64, 1,
-                "probe_snapshots rows move onto the survivor")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = ?", nativeId) as? Int64, 1,
-                "named_limits rows move onto the survivor even though the survivor never had any")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?", nativeId) as? Int64, 2,
+                    "usage_history rows from both accounts land on the survivor")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = ?", nativeId) as? Int64, 1,
+                    "probe_snapshots rows move onto the survivor")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = ?", nativeId) as? Int64, 1,
+                    "named_limits rows move onto the survivor even though the survivor never had any")
 
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IN (?, ?)",
-                              nativeId, legacyId) as? Int64,
-                1, "exactly one credential survives the merge")
-            // `access_token` itself can't be the signal any more: both seeded
-            // credentials are `provider = 'openai'`, and the same
-            // `ensureDatabase()` call nulls OpenAI tokens right after this
-            // merge runs (#104). `token_rolled_at` survives that migration
-            // untouched, so it is what proves the *more recently renewed* row
-            // — not merely "a" row — is the one reassigned to the survivor.
-            expectEqual(
-                try db.scalar("SELECT token_rolled_at FROM oauth_credentials WHERE account_id = ?", nativeId) as? String,
-                "2026-06-20T00:00:00Z",
-                "the more recently renewed credential wins, reassigned to the survivor")
-            expectEqual(
-                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?", nativeId) as? String,
-                nil, "the surviving OpenAI credential's token is nulled by the same migration pass (#104)")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IN (?, ?)",
+                                  nativeId, legacyId) as? Int64,
+                    1, "exactly one credential survives the merge")
+                // `access_token` itself can't be the signal any more: both seeded
+                // credentials are `provider = 'openai'`, and the same
+                // `ensureDatabase()` call nulls OpenAI tokens right after this
+                // merge runs (#104). `token_rolled_at` survives that migration
+                // untouched, so it is what proves the *more recently renewed* row
+                // — not merely "a" row — is the one reassigned to the survivor.
+                expectEqual(
+                    try db.scalar("SELECT token_rolled_at FROM oauth_credentials WHERE account_id = ?", nativeId) as? String,
+                    "2026-06-20T00:00:00Z",
+                    "the more recently renewed credential wins, reassigned to the survivor")
+                expectEqual(
+                    try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?", nativeId) as? String,
+                    nil, "the surviving OpenAI credential's token is nulled by the same migration pass (#104)")
 
-            expectEqual(
-                try db.scalar("SELECT value FROM settings WHERE key = 'primary_account_id'") as? String,
-                nativeId, "the primary-account pin follows the merge to the survivor")
+                expectEqual(
+                    try db.scalar("SELECT value FROM settings WHERE key = 'primary_account_id'") as? String,
+                    nativeId, "the primary-account pin follows the merge to the survivor")
 
-            // Idempotent: re-running over an already-healed database changes nothing.
-            store.ensureDatabase()
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 2,
-                        "re-running the healed database doesn't merge or remove anything further")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IN (?, ?)",
-                              nativeId, legacyId) as? Int64,
-                1, "re-running doesn't touch the surviving credential")
-        } catch {
-            checks += 1
-            failures.append("duplicate account merge test threw: \(error)")
+                // Idempotent: re-running over an already-healed database changes nothing.
+                store.ensureDatabase()
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 2,
+                            "re-running the healed database doesn't merge or remove anything further")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IN (?, ?)",
+                                  nativeId, legacyId) as? Int64,
+                    1, "re-running doesn't touch the surviving credential")
+            } catch {
+                checks += 1
+                failures.append("duplicate account merge test threw: \(error)")
+            }
         }
     }
 
@@ -2624,137 +2607,135 @@ enum SelfTest {
     /// now separate operations and this test pins both halves: delete removes
     /// everything, clear-history removes only the time series.
     private static func testAccountDeletionRemovesCredentials() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            let doomedId = "acct-doomed"
-            let keptId = "acct-kept"
-            // A third account with no credential at all — deleting it must be
-            // a clean no-op on `oauth_credentials`, not an error.
-            let bareId = "acct-bare"
+                let doomedId = "acct-doomed"
+                let keptId = "acct-kept"
+                // A third account with no credential at all — deleting it must be
+                // a clean no-op on `oauth_credentials`, not an error.
+                let bareId = "acct-bare"
 
-            for (id, email) in [(doomedId, "doomed@example.com"),
-                                (keptId, "kept@example.com"),
-                                (bareId, "bare@example.com")] {
-                try db.run("""
-                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                    VALUES (?, ?, ?, 'Max', '2026-06-01T00:00:00Z', 'anthropic')
-                """, id, email, email)
-            }
+                for (id, email) in [(doomedId, "doomed@example.com"),
+                                    (keptId, "kept@example.com"),
+                                    (bareId, "bare@example.com")] {
+                    try db.run("""
+                        INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                        VALUES (?, ?, ?, 'Max', '2026-06-01T00:00:00Z', 'anthropic')
+                    """, id, email, email)
+                }
 
-            for id in [doomedId, keptId] {
-                try db.run("""
-                    INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
-                    VALUES (?, '2026-06-01T00:00:00Z', 12, 0)
-                """, id)
-                try db.run("""
-                    INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
-                    VALUES (?, '2026-06-01T00:00:00Z', 'haiku', 200, '{}')
-                """, id)
-                try db.run("""
-                    INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
-                    VALUES (?, '2026-06-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 42)
-                """, id)
+                for id in [doomedId, keptId] {
+                    try db.run("""
+                        INSERT INTO usage_history (account_id, timestamp, primary_percent, is_synthetic)
+                        VALUES (?, '2026-06-01T00:00:00Z', 12, 0)
+                    """, id)
+                    try db.run("""
+                        INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                        VALUES (?, '2026-06-01T00:00:00Z', 'haiku', 200, '{}')
+                    """, id)
+                    try db.run("""
+                        INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                        VALUES (?, '2026-06-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 42)
+                    """, id)
+                    try db.run("""
+                        INSERT INTO oauth_credentials
+                            (account_id, label, source, provider, access_token, refresh_token,
+                             is_active, created_at, updated_at)
+                        VALUES (?, 'label', 'token', 'anthropic', 'token-value', 'refresh-value', 1,
+                                '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+                    """, id)
+                }
+                // Two credentials share the doomed account id — both must go.
                 try db.run("""
                     INSERT INTO oauth_credentials
-                        (account_id, label, source, provider, access_token, refresh_token,
-                         is_active, created_at, updated_at)
-                    VALUES (?, 'label', 'token', 'anthropic', 'token-value', 'refresh-value', 1,
+                        (account_id, label, source, provider, access_token, is_active,
+                         created_at, updated_at)
+                    VALUES (?, 'second', 'token', 'anthropic', 'second-token-value', 0,
                             '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
-                """, id)
+                """, doomedId)
+                // The user had pinned the account they are about to remove.
+                try db.run("INSERT INTO settings (key, value) VALUES ('primary_account_id', ?)", doomedId)
+
+                // --- Remove Account. ---
+                store.deleteAccount(accountId: doomedId)
+
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", doomedId) as? Int64, 0,
+                    "removing an account deletes its accounts row")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ?",
+                                  doomedId) as? Int64,
+                    0, "removing an account deletes every one of its credential rows")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?",
+                                  doomedId) as? Int64,
+                    0, "removing an account deletes its usage_history rows")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = ?",
+                                  doomedId) as? Int64,
+                    0, "removing an account deletes its probe_snapshots rows")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = ?",
+                                  doomedId) as? Int64,
+                    0, "removing an account deletes its named_limits rows")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM settings WHERE key = 'primary_account_id'")
+                        as? Int64,
+                    0, "removing the pinned account clears the primary-account pin")
+
+                // The detection query from the issue: no credential may reference
+                // a missing account after a delete.
+                expectEqual(try orphanedCredentialCount(db), 0,
+                            "an account delete leaves no orphaned credential rows")
+
+                // Deleting an account that never had a credential is a clean no-op.
+                store.deleteAccount(accountId: bareId)
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", bareId) as? Int64, 0,
+                    "an account with no credential still deletes cleanly")
+                expectEqual(try orphanedCredentialCount(db), 0,
+                            "deleting a credential-less account leaves no orphans")
+
+                // The untouched account keeps everything.
+                expectEqual(
+                    try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?",
+                                  keptId) as? String,
+                    "token-value", "the other account's credential is untouched by the delete")
+
+                // --- Clear History (chart window). ---
+                store.clearAccountHistory(accountId: keptId)
+
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", keptId) as? Int64, 1,
+                    "clearing history does NOT delete the accounts row")
+                expectEqual(
+                    try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?",
+                                  keptId) as? String,
+                    "token-value", "clearing history does NOT touch the credential")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?",
+                                  keptId) as? Int64,
+                    0, "clearing history empties usage_history")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = ?",
+                                  keptId) as? Int64,
+                    0, "clearing history empties the probe archive")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = ?",
+                                  keptId) as? Int64,
+                    0, "clearing history empties the named-limit series")
+                expectEqual(try orphanedCredentialCount(db), 0,
+                            "clearing history leaves no orphaned credential rows")
+            } catch {
+                checks += 1
+                failures.append("account deletion test threw: \(error)")
             }
-            // Two credentials share the doomed account id — both must go.
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, is_active,
-                     created_at, updated_at)
-                VALUES (?, 'second', 'token', 'anthropic', 'second-token-value', 0,
-                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
-            """, doomedId)
-            // The user had pinned the account they are about to remove.
-            try db.run("INSERT INTO settings (key, value) VALUES ('primary_account_id', ?)", doomedId)
-
-            // --- Remove Account. ---
-            store.deleteAccount(accountId: doomedId)
-
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", doomedId) as? Int64, 0,
-                "removing an account deletes its accounts row")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ?",
-                              doomedId) as? Int64,
-                0, "removing an account deletes every one of its credential rows")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?",
-                              doomedId) as? Int64,
-                0, "removing an account deletes its usage_history rows")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = ?",
-                              doomedId) as? Int64,
-                0, "removing an account deletes its probe_snapshots rows")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = ?",
-                              doomedId) as? Int64,
-                0, "removing an account deletes its named_limits rows")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM settings WHERE key = 'primary_account_id'")
-                    as? Int64,
-                0, "removing the pinned account clears the primary-account pin")
-
-            // The detection query from the issue: no credential may reference
-            // a missing account after a delete.
-            expectEqual(try orphanedCredentialCount(db), 0,
-                        "an account delete leaves no orphaned credential rows")
-
-            // Deleting an account that never had a credential is a clean no-op.
-            store.deleteAccount(accountId: bareId)
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", bareId) as? Int64, 0,
-                "an account with no credential still deletes cleanly")
-            expectEqual(try orphanedCredentialCount(db), 0,
-                        "deleting a credential-less account leaves no orphans")
-
-            // The untouched account keeps everything.
-            expectEqual(
-                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?",
-                              keptId) as? String,
-                "token-value", "the other account's credential is untouched by the delete")
-
-            // --- Clear History (chart window). ---
-            store.clearAccountHistory(accountId: keptId)
-
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM accounts WHERE id = ?", keptId) as? Int64, 1,
-                "clearing history does NOT delete the accounts row")
-            expectEqual(
-                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = ?",
-                              keptId) as? String,
-                "token-value", "clearing history does NOT touch the credential")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM usage_history WHERE account_id = ?",
-                              keptId) as? Int64,
-                0, "clearing history empties usage_history")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = ?",
-                              keptId) as? Int64,
-                0, "clearing history empties the probe archive")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = ?",
-                              keptId) as? Int64,
-                0, "clearing history empties the named-limit series")
-            expectEqual(try orphanedCredentialCount(db), 0,
-                        "clearing history leaves no orphaned credential rows")
-        } catch {
-            checks += 1
-            failures.append("account deletion test threw: \(error)")
         }
     }
 
@@ -2765,89 +2746,87 @@ enum SelfTest {
     /// NULL` predicate would silently destroy live token material — and a
     /// second run must be a no-op.
     private static func testPurgeOrphanedCredentialsMigration() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES ('live-account', 'live@example.com', 'live@example.com', 'Max',
-                        '2026-06-01T00:00:00Z', 'anthropic')
-            """)
-            // Belongs to a live account — must be left alone.
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, is_active,
-                     created_at, updated_at)
-                VALUES ('live-account', 'live', 'token', 'anthropic', 'live-token', 1,
-                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
-            """)
-            // The orphan a pre-#106 removal left behind, token still populated.
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, refresh_token, is_active,
-                     created_at, updated_at)
-                VALUES ('gone-account', 'gone', 'token', 'anthropic', 'stranded-token',
-                        'stranded-refresh', 0, '2026-02-10T17:16:25Z', '2026-07-22T04:25:07Z')
-            """)
-            // Never attached to an account. `account_id` is nullable, so these
-            // are legitimate rows — the purge must not reach them.
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, is_active,
-                     created_at, updated_at)
-                VALUES (NULL, 'unattached', 'keychain', 'anthropic', 'null-account-token', 1,
-                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
-            """)
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, is_active,
-                     created_at, updated_at)
-                VALUES ('   ', 'blank', 'keychain', 'anthropic', 'blank-account-token', 1,
-                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
-            """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('live-account', 'live@example.com', 'live@example.com', 'Max',
+                            '2026-06-01T00:00:00Z', 'anthropic')
+                """)
+                // Belongs to a live account — must be left alone.
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active,
+                         created_at, updated_at)
+                    VALUES ('live-account', 'live', 'token', 'anthropic', 'live-token', 1,
+                            '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+                """)
+                // The orphan a pre-#106 removal left behind, token still populated.
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, refresh_token, is_active,
+                         created_at, updated_at)
+                    VALUES ('gone-account', 'gone', 'token', 'anthropic', 'stranded-token',
+                            'stranded-refresh', 0, '2026-02-10T17:16:25Z', '2026-07-22T04:25:07Z')
+                """)
+                // Never attached to an account. `account_id` is nullable, so these
+                // are legitimate rows — the purge must not reach them.
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active,
+                         created_at, updated_at)
+                    VALUES (NULL, 'unattached', 'keychain', 'anthropic', 'null-account-token', 1,
+                            '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active,
+                         created_at, updated_at)
+                    VALUES ('   ', 'blank', 'keychain', 'anthropic', 'blank-account-token', 1,
+                            '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+                """)
 
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 4,
-                        "the seeded database starts with four credential rows")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 4,
+                            "the seeded database starts with four credential rows")
 
-            // --- What the next launch does. ---
-            store.ensureDatabase()
+                // --- What the next launch does. ---
+                store.ensureDatabase()
 
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'gone-account'")
-                    as? Int64,
-                0, "the migration purges the orphaned credential")
-            expectEqual(try orphanedCredentialCount(db), 0,
-                        "the detection query reports no orphans after the migration")
-            expectEqual(
-                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'live-account'")
-                    as? String,
-                "live-token", "a credential belonging to a live account is untouched")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IS NULL")
-                    as? Int64,
-                1, "a credential with account_id IS NULL survives the purge")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE TRIM(account_id) = ''")
-                    as? Int64,
-                1, "a credential with a blank account_id survives the purge")
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 3,
-                        "exactly one row — the orphan — is removed")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = 'gone-account'")
+                        as? Int64,
+                    0, "the migration purges the orphaned credential")
+                expectEqual(try orphanedCredentialCount(db), 0,
+                            "the detection query reports no orphans after the migration")
+                expectEqual(
+                    try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'live-account'")
+                        as? String,
+                    "live-token", "a credential belonging to a live account is untouched")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id IS NULL")
+                        as? Int64,
+                    1, "a credential with account_id IS NULL survives the purge")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE TRIM(account_id) = ''")
+                        as? Int64,
+                    1, "a credential with a blank account_id survives the purge")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 3,
+                            "exactly one row — the orphan — is removed")
 
-            // Idempotent: re-running over the healed database changes nothing.
-            store.ensureDatabase()
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 3,
-                        "re-running the migration on a healed database is a no-op")
-        } catch {
-            checks += 1
-            failures.append("orphaned credential purge test threw: \(error)")
+                // Idempotent: re-running over the healed database changes nothing.
+                store.ensureDatabase()
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 3,
+                            "re-running the migration on a healed database is a no-op")
+            } catch {
+                checks += 1
+                failures.append("orphaned credential purge test threw: \(error)")
+            }
         }
     }
 
@@ -2860,82 +2839,80 @@ enum SelfTest {
     /// long-lived and never proactively refreshed, so there is nothing to
     /// clear there), and a second run must be a no-op.
     private static func testNullOutOpenAITokensMigration() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES ('claude-account', 'claude@example.com', 'claude@example.com', 'Max',
-                        '2026-06-01T00:00:00Z', 'anthropic')
-            """)
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, refresh_token, is_active,
-                     created_at, updated_at)
-                VALUES ('claude-account', 'claude@example.com', 'token', 'anthropic',
-                        'sk-ant-oat01-selftest', NULL, 1, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
-            """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('claude-account', 'claude@example.com', 'claude@example.com', 'Max',
+                            '2026-06-01T00:00:00Z', 'anthropic')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, refresh_token, is_active,
+                         created_at, updated_at)
+                    VALUES ('claude-account', 'claude@example.com', 'token', 'anthropic',
+                            'sk-ant-oat01-selftest', NULL, 1, '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+                """)
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES ('codex-account', 'codex@example.com', 'codex@example.com', 'pro',
-                        '2026-06-01T00:00:00Z', 'openai')
-            """)
-            // Pre-#104 row: exactly what a build before this migration left
-            // behind — a live access/refresh token pair stored for polling.
-            try db.run("""
-                INSERT INTO oauth_credentials
-                    (account_id, label, source, provider, access_token, refresh_token, is_active,
-                     created_at, updated_at)
-                VALUES ('codex-account', 'codex@example.com', 'codex', 'openai',
-                        'openai-access-selftest', 'openai-refresh-selftest', 1,
-                        '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
-            """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('codex-account', 'codex@example.com', 'codex@example.com', 'pro',
+                            '2026-06-01T00:00:00Z', 'openai')
+                """)
+                // Pre-#104 row: exactly what a build before this migration left
+                // behind — a live access/refresh token pair stored for polling.
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, refresh_token, is_active,
+                         created_at, updated_at)
+                    VALUES ('codex-account', 'codex@example.com', 'codex', 'openai',
+                            'openai-access-selftest', 'openai-refresh-selftest', 1,
+                            '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z')
+                """)
 
-            // --- What the next launch does. ---
-            store.ensureDatabase()
+                // --- What the next launch does. ---
+                store.ensureDatabase()
 
-            expectEqual(
-                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'codex-account'")
-                    as? String,
-                nil, "the migration clears the OpenAI access token")
-            expectEqual(
-                try db.scalar("SELECT refresh_token FROM oauth_credentials WHERE account_id = 'codex-account'")
-                    as? String,
-                nil, "the migration clears the OpenAI refresh token")
-            expectEqual(
-                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'claude-account'")
-                    as? String,
-                "sk-ant-oat01-selftest", "an Anthropic credential is untouched by the migration")
+                expectEqual(
+                    try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'codex-account'")
+                        as? String,
+                    nil, "the migration clears the OpenAI access token")
+                expectEqual(
+                    try db.scalar("SELECT refresh_token FROM oauth_credentials WHERE account_id = 'codex-account'")
+                        as? String,
+                    nil, "the migration clears the OpenAI refresh token")
+                expectEqual(
+                    try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'claude-account'")
+                        as? String,
+                    "sk-ant-oat01-selftest", "an Anthropic credential is untouched by the migration")
 
-            // Re-registering a token (e.g. `codex import`) must be nulled
-            // again on the very next launch — the migration runs unconditionally.
-            try db.run("""
-                UPDATE oauth_credentials SET access_token = ?, refresh_token = ?
-                WHERE account_id = 'codex-account'
-                """, "reimported-access", "reimported-refresh")
-            store.ensureDatabase()
-            expectEqual(
-                try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'codex-account'")
-                    as? String,
-                nil, "a freshly (re)written OpenAI token is cleared again on the next launch")
+                // Re-registering a token (e.g. `codex import`) must be nulled
+                // again on the very next launch — the migration runs unconditionally.
+                try db.run("""
+                    UPDATE oauth_credentials SET access_token = ?, refresh_token = ?
+                    WHERE account_id = 'codex-account'
+                    """, "reimported-access", "reimported-refresh")
+                store.ensureDatabase()
+                expectEqual(
+                    try db.scalar("SELECT access_token FROM oauth_credentials WHERE account_id = 'codex-account'")
+                        as? String,
+                    nil, "a freshly (re)written OpenAI token is cleared again on the next launch")
 
-            // Idempotent: re-running over an already-healed database changes nothing.
-            store.ensureDatabase()
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 2,
-                "re-running the migration on a healed database is a no-op")
-        } catch {
-            checks += 1
-            failures.append("null-out OpenAI tokens migration test threw: \(error)")
+                // Idempotent: re-running over an already-healed database changes nothing.
+                store.ensureDatabase()
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM oauth_credentials") as? Int64, 2,
+                    "re-running the migration on a healed database is a no-op")
+            } catch {
+                checks += 1
+                failures.append("null-out OpenAI tokens migration test threw: \(error)")
+            }
         }
     }
 
@@ -2971,98 +2948,96 @@ enum SelfTest {
     /// `testPurgeOrphanedCredentialsMigration`: a row with a NULL or blank
     /// `account_id` must survive, and a second run must be a no-op.
     private static func testPurgeOrphanedProbeAndNamedLimitsMigration() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
-            let db = try openDatabase(dbPath)
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
-                VALUES ('live-account', 'live@example.com', 'live@example.com', 'Max',
-                        '2026-06-01T00:00:00Z', 'anthropic')
-            """)
-            // Belongs to a live account — must be left alone.
-            try db.run("""
-                INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
-                VALUES ('live-account', '2026-06-01T00:00:00Z', 'haiku', 200, '{}')
-            """)
-            try db.run("""
-                INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
-                VALUES ('live-account', '2026-06-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 42)
-            """)
-            // The orphans a pre-#106 account removal left behind.
-            try db.run("""
-                INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
-                VALUES ('gone-account', '2026-02-10T17:16:25Z', 'haiku', 200, '{}')
-            """)
-            try db.run("""
-                INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
-                VALUES ('gone-account', '2026-02-10T17:16:25Z', 'GPT-5.3-Codex-Spark', 7)
-            """)
-            // Blank `account_id` — never attached to an account. Both tables
-            // declare `account_id TEXT NOT NULL`, which rejects NULL but not
-            // an empty string, so this is the guard that can actually fire.
-            try db.run("""
-                INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
-                VALUES ('   ', '2026-06-01T00:00:00Z', 'haiku', 200, '{}')
-            """)
-            try db.run("""
-                INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
-                VALUES ('   ', '2026-06-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 3)
-            """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('live-account', 'live@example.com', 'live@example.com', 'Max',
+                            '2026-06-01T00:00:00Z', 'anthropic')
+                """)
+                // Belongs to a live account — must be left alone.
+                try db.run("""
+                    INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                    VALUES ('live-account', '2026-06-01T00:00:00Z', 'haiku', 200, '{}')
+                """)
+                try db.run("""
+                    INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                    VALUES ('live-account', '2026-06-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 42)
+                """)
+                // The orphans a pre-#106 account removal left behind.
+                try db.run("""
+                    INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                    VALUES ('gone-account', '2026-02-10T17:16:25Z', 'haiku', 200, '{}')
+                """)
+                try db.run("""
+                    INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                    VALUES ('gone-account', '2026-02-10T17:16:25Z', 'GPT-5.3-Codex-Spark', 7)
+                """)
+                // Blank `account_id` — never attached to an account. Both tables
+                // declare `account_id TEXT NOT NULL`, which rejects NULL but not
+                // an empty string, so this is the guard that can actually fire.
+                try db.run("""
+                    INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                    VALUES ('   ', '2026-06-01T00:00:00Z', 'haiku', 200, '{}')
+                """)
+                try db.run("""
+                    INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                    VALUES ('   ', '2026-06-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 3)
+                """)
 
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM probe_snapshots") as? Int64, 3,
-                        "the seeded database starts with three probe_snapshots rows")
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM named_limits") as? Int64, 3,
-                        "the seeded database starts with three named_limits rows")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM probe_snapshots") as? Int64, 3,
+                            "the seeded database starts with three probe_snapshots rows")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM named_limits") as? Int64, 3,
+                            "the seeded database starts with three named_limits rows")
 
-            // --- What the next launch does. ---
-            store.ensureDatabase()
+                // --- What the next launch does. ---
+                store.ensureDatabase()
 
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = 'gone-account'")
-                    as? Int64,
-                0, "the migration purges the orphaned probe_snapshots row")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = 'gone-account'")
-                    as? Int64,
-                0, "the migration purges the orphaned named_limits row")
-            expectEqual(try orphanedAccountRowCount(db, table: "probe_snapshots"), 0,
-                        "the detection query reports no probe_snapshots orphans after the migration")
-            expectEqual(try orphanedAccountRowCount(db, table: "named_limits"), 0,
-                        "the detection query reports no named_limits orphans after the migration")
-            expectEqual(
-                try db.scalar("SELECT http_status FROM probe_snapshots WHERE account_id = 'live-account'")
-                    as? Int64,
-                200, "a row belonging to a live account is untouched")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE TRIM(account_id) = ''")
-                    as? Int64,
-                1, "a probe_snapshots row with a blank account_id survives the purge")
-            expectEqual(
-                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE TRIM(account_id) = ''")
-                    as? Int64,
-                1, "a named_limits row with a blank account_id survives the purge")
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM probe_snapshots") as? Int64, 2,
-                        "exactly one probe_snapshots row — the orphan — is removed")
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM named_limits") as? Int64, 2,
-                        "exactly one named_limits row — the orphan — is removed")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = 'gone-account'")
+                        as? Int64,
+                    0, "the migration purges the orphaned probe_snapshots row")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = 'gone-account'")
+                        as? Int64,
+                    0, "the migration purges the orphaned named_limits row")
+                expectEqual(try orphanedAccountRowCount(db, table: "probe_snapshots"), 0,
+                            "the detection query reports no probe_snapshots orphans after the migration")
+                expectEqual(try orphanedAccountRowCount(db, table: "named_limits"), 0,
+                            "the detection query reports no named_limits orphans after the migration")
+                expectEqual(
+                    try db.scalar("SELECT http_status FROM probe_snapshots WHERE account_id = 'live-account'")
+                        as? Int64,
+                    200, "a row belonging to a live account is untouched")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE TRIM(account_id) = ''")
+                        as? Int64,
+                    1, "a probe_snapshots row with a blank account_id survives the purge")
+                expectEqual(
+                    try db.scalar("SELECT COUNT(*) FROM named_limits WHERE TRIM(account_id) = ''")
+                        as? Int64,
+                    1, "a named_limits row with a blank account_id survives the purge")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM probe_snapshots") as? Int64, 2,
+                            "exactly one probe_snapshots row — the orphan — is removed")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM named_limits") as? Int64, 2,
+                            "exactly one named_limits row — the orphan — is removed")
 
-            // Idempotent: re-running over the healed database changes nothing.
-            store.ensureDatabase()
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM probe_snapshots") as? Int64, 2,
-                        "re-running the migration on a healed database is a no-op (probe_snapshots)")
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM named_limits") as? Int64, 2,
-                        "re-running the migration on a healed database is a no-op (named_limits)")
-        } catch {
-            checks += 1
-            failures.append("orphaned probe_snapshots/named_limits purge test threw: \(error)")
+                // Idempotent: re-running over the healed database changes nothing.
+                store.ensureDatabase()
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM probe_snapshots") as? Int64, 2,
+                            "re-running the migration on a healed database is a no-op (probe_snapshots)")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM named_limits") as? Int64, 2,
+                            "re-running the migration on a healed database is a no-op (named_limits)")
+            } catch {
+                checks += 1
+                failures.append("orphaned probe_snapshots/named_limits purge test threw: \(error)")
+            }
         }
     }
 
@@ -3078,89 +3053,87 @@ enum SelfTest {
     /// shaped to avoid: WAL content must be *recovered*, never ignored, and no
     /// read path may create a database that isn't there.
     private static func testReadOnlyOpenOfWALDatabaseWithoutSHM() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
-
-            // --- A WAL database, checkpointed and closed. ---
+        withSelfTestTempDir { dir in
             do {
-                let writer = try openDatabase(dbPath)
-                try writer.execute("PRAGMA journal_mode=WAL")
-                try writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
-                try writer.run("INSERT INTO t (id, v) VALUES (1, 'one')")
-                try writer.run("INSERT INTO t (id, v) VALUES (2, 'two')")
-                try writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            }
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            // The reported reproduction: `cp usage.db <dir>/` — the database
-            // alone, no sidecars, exactly what CLAUDE.md's migration-check
-            // workflow invites. A read-only connection cannot create the -shm a
-            // WAL-mode database needs, so before the fix this failed outright.
-            let coldPath = try copyDatabase(from: dbPath, into: dir, named: "cold", withWAL: false)
-            expect(!FileManager.default.fileExists(atPath: coldPath + "-shm"),
-                   "the copied fixture has no -shm (the #105 condition)")
-            expect(!FileManager.default.fileExists(atPath: coldPath + "-wal"),
-                   "the copied fixture has no -wal either")
+                // --- A WAL database, checkpointed and closed. ---
+                do {
+                    let writer = try openDatabase(dbPath)
+                    try writer.execute("PRAGMA journal_mode=WAL")
+                    try writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                    try writer.run("INSERT INTO t (id, v) VALUES (1, 'one')")
+                    try writer.run("INSERT INTO t (id, v) VALUES (2, 'two')")
+                    try writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                }
 
-            let readonly = try openDatabase(coldPath, readonly: true)
-            expectEqual(try readonly.scalar("SELECT COUNT(*) FROM t") as? Int64, 2,
-                        "a read-only open reads a WAL database with no -shm present")
-            expectEqual(try readonly.scalar("PRAGMA journal_mode") as? String, "wal",
-                        "the read-only open leaves journal_mode unchanged")
-            expectEqual(try readonly.scalar("SELECT v FROM t WHERE id = 2") as? String, "two",
-                        "no row was modified by the escalation")
+                // The reported reproduction: `cp usage.db <dir>/` — the database
+                // alone, no sidecars, exactly what CLAUDE.md's migration-check
+                // workflow invites. A read-only connection cannot create the -shm a
+                // WAL-mode database needs, so before the fix this failed outright.
+                let coldPath = try copyDatabase(from: dbPath, into: dir, named: "cold", withWAL: false)
+                expect(!FileManager.default.fileExists(atPath: coldPath + "-shm"),
+                       "the copied fixture has no -shm (the #105 condition)")
+                expect(!FileManager.default.fileExists(atPath: coldPath + "-wal"),
+                       "the copied fixture has no -wal either")
 
-            // --- A database copied with a hot -wal but no -shm. `immutable=1`
-            // silently drops the WAL here, so this asserts against the
-            // stale-data failure mode, not just against the open failing. ---
-            let live = try openDatabase(dbPath)
-            for i in 3...12 {
-                try live.run("INSERT INTO t (id, v) VALUES (?, ?)", i, "row-\(i)")
-            }
-            let hotPath = try withExtendedLifetime(live) {
-                try copyDatabase(from: dbPath, into: dir, named: "hot", withWAL: true)
-            }
-            let walBytes = FileManager.default.contents(atPath: hotPath + "-wal")?.count ?? 0
-            expect(walBytes > 0, "the copied fixture actually carries WAL content")
-            expect(!FileManager.default.fileExists(atPath: hotPath + "-shm"),
-                   "the hot-WAL fixture has no -shm")
-            let hotReader = try openDatabase(hotPath, readonly: true)
-            expectEqual(try hotReader.scalar("SELECT COUNT(*) FROM t") as? Int64, 12,
-                        "WAL content is recovered, not silently ignored, on a copy with no -shm")
+                let readonly = try openDatabase(coldPath, readonly: true)
+                expectEqual(try readonly.scalar("SELECT COUNT(*) FROM t") as? Int64, 2,
+                            "a read-only open reads a WAL database with no -shm present")
+                expectEqual(try readonly.scalar("PRAGMA journal_mode") as? String, "wal",
+                            "the read-only open leaves journal_mode unchanged")
+                expectEqual(try readonly.scalar("SELECT v FROM t WHERE id = 2") as? String, "two",
+                            "no row was modified by the escalation")
 
-            // --- A non-WAL database is unaffected. ---
-            let deletePath = dir.appendingPathComponent("delete-mode.db").path
-            do {
-                let writer = try openDatabase(deletePath)
-                try writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-                try writer.run("INSERT INTO t (id) VALUES (7)")
-            }
-            let deleteReader = try openDatabase(deletePath, readonly: true)
-            expectEqual(try deleteReader.scalar("SELECT COUNT(*) FROM t") as? Int64, 1,
-                        "a journal_mode=delete database still opens read-only")
+                // --- A database copied with a hot -wal but no -shm. `immutable=1`
+                // silently drops the WAL here, so this asserts against the
+                // stale-data failure mode, not just against the open failing. ---
+                let live = try openDatabase(dbPath)
+                for i in 3...12 {
+                    try live.run("INSERT INTO t (id, v) VALUES (?, ?)", i, "row-\(i)")
+                }
+                let hotPath = try withExtendedLifetime(live) {
+                    try copyDatabase(from: dbPath, into: dir, named: "hot", withWAL: true)
+                }
+                let walBytes = FileManager.default.contents(atPath: hotPath + "-wal")?.count ?? 0
+                expect(walBytes > 0, "the copied fixture actually carries WAL content")
+                expect(!FileManager.default.fileExists(atPath: hotPath + "-shm"),
+                       "the hot-WAL fixture has no -shm")
+                let hotReader = try openDatabase(hotPath, readonly: true)
+                expectEqual(try hotReader.scalar("SELECT COUNT(*) FROM t") as? Int64, 12,
+                            "WAL content is recovered, not silently ignored, on a copy with no -shm")
 
-            // --- No read path may create a database: a typo'd --db must error. ---
-            let typoPath = dir.appendingPathComponent("typo.db").path
-            var opened = true
-            do {
-                _ = try openDatabase(typoPath, readonly: true)
+                // --- A non-WAL database is unaffected. ---
+                let deletePath = dir.appendingPathComponent("delete-mode.db").path
+                do {
+                    let writer = try openDatabase(deletePath)
+                    try writer.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+                    try writer.run("INSERT INTO t (id) VALUES (7)")
+                }
+                let deleteReader = try openDatabase(deletePath, readonly: true)
+                expectEqual(try deleteReader.scalar("SELECT COUNT(*) FROM t") as? Int64, 1,
+                            "a journal_mode=delete database still opens read-only")
+
+                // --- No read path may create a database: a typo'd --db must error. ---
+                let typoPath = dir.appendingPathComponent("typo.db").path
+                var opened = true
+                do {
+                    _ = try openDatabase(typoPath, readonly: true)
+                } catch {
+                    opened = false
+                }
+                expect(!opened, "a read-only open of a missing database throws")
+                expect(!FileManager.default.fileExists(atPath: typoPath),
+                       "a read-only open never creates the database (no SQLITE_OPEN_CREATE)")
+
+                // --- The missing-database message names the path actually given. ---
+                let missing = AccountSync.SyncError.databaseMissing(typoPath).localizedDescription
+                expect(missing.contains(typoPath),
+                       "SyncError.databaseMissing reports the given path, got: \(missing)")
             } catch {
-                opened = false
+                checks += 1
+                failures.append("WAL read-only open test threw: \(error)")
             }
-            expect(!opened, "a read-only open of a missing database throws")
-            expect(!FileManager.default.fileExists(atPath: typoPath),
-                   "a read-only open never creates the database (no SQLITE_OPEN_CREATE)")
-
-            // --- The missing-database message names the path actually given. ---
-            let missing = AccountSync.SyncError.databaseMissing(typoPath).localizedDescription
-            expect(missing.contains(typoPath),
-                   "SyncError.databaseMissing reports the given path, got: \(missing)")
-        } catch {
-            checks += 1
-            failures.append("WAL read-only open test threw: \(error)")
         }
     }
 
@@ -3187,131 +3160,129 @@ enum SelfTest {
     /// that (a) the new columns exist, (b) existing rows were backfilled to
     /// `anthropic`, and (c) the account still loads and reads normally.
     private static func testSchemaMigrationFromPreMigrationDatabase() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
 
-            // --- The v1.17.0 schema, verbatim minus the new columns. ---
-            let legacy = try openDatabase(dbPath)
-            try legacy.execute("""
-                CREATE TABLE accounts (
-                    id TEXT PRIMARY KEY,
-                    account_name TEXT,
-                    email TEXT,
-                    plan TEXT,
-                    last_updated TEXT,
-                    sort_order INTEGER DEFAULT 0
-                );
-                CREATE TABLE usage_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    primary_percent REAL,
-                    session_percent REAL,
-                    weekly_all_percent REAL,
-                    weekly_sonnet_percent REAL,
-                    session_reset TEXT,
-                    weekly_reset TEXT,
-                    raw_data TEXT,
-                    is_synthetic INTEGER DEFAULT 0
-                );
-                CREATE TABLE oauth_credentials (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account_id TEXT,
-                    label TEXT NOT NULL,
-                    source TEXT DEFAULT 'keychain',
-                    keychain_service TEXT,
-                    keychain_account TEXT,
-                    access_token TEXT,
-                    refresh_token TEXT,
-                    expires_at INTEGER,
-                    scopes TEXT,
-                    subscription_type TEXT,
-                    rate_limit_tier TEXT,
-                    last_poll_at TEXT,
-                    last_error TEXT,
-                    is_active INTEGER DEFAULT 1,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-            """)
-            let now = ISO8601DateFormatter().string(from: Date())
-            // Backdate the reading: `loadFromDatabase` filters on
-            // `timestamp <= <now, with fractional seconds>`, and a row stamped
-            // in the same second sorts *after* that bound as a string.
-            let earlier = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-60))
-            try legacy.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order)
-                VALUES ('org-legacy', 'legacy@example.com', 'legacy@example.com', 'Max', ?, 0)
-            """, now)
-            try legacy.run("""
-                INSERT INTO usage_history
-                    (account_id, timestamp, primary_percent, session_percent,
-                     weekly_all_percent, weekly_sonnet_percent, is_synthetic)
-                VALUES ('org-legacy', ?, 40, 40, 12, 0, 0)
-            """, earlier)
-            try legacy.run("""
-                INSERT INTO oauth_credentials (account_id, label, source, access_token, is_active, created_at, updated_at)
-                VALUES ('org-legacy', 'legacy@example.com', 'token', 'sk-ant-oat01-selftest', 1, ?, ?)
-            """, now, now)
+                // --- The v1.17.0 schema, verbatim minus the new columns. ---
+                let legacy = try openDatabase(dbPath)
+                try legacy.execute("""
+                    CREATE TABLE accounts (
+                        id TEXT PRIMARY KEY,
+                        account_name TEXT,
+                        email TEXT,
+                        plan TEXT,
+                        last_updated TEXT,
+                        sort_order INTEGER DEFAULT 0
+                    );
+                    CREATE TABLE usage_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        account_id TEXT NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        primary_percent REAL,
+                        session_percent REAL,
+                        weekly_all_percent REAL,
+                        weekly_sonnet_percent REAL,
+                        session_reset TEXT,
+                        weekly_reset TEXT,
+                        raw_data TEXT,
+                        is_synthetic INTEGER DEFAULT 0
+                    );
+                    CREATE TABLE oauth_credentials (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        account_id TEXT,
+                        label TEXT NOT NULL,
+                        source TEXT DEFAULT 'keychain',
+                        keychain_service TEXT,
+                        keychain_account TEXT,
+                        access_token TEXT,
+                        refresh_token TEXT,
+                        expires_at INTEGER,
+                        scopes TEXT,
+                        subscription_type TEXT,
+                        rate_limit_tier TEXT,
+                        last_poll_at TEXT,
+                        last_error TEXT,
+                        is_active INTEGER DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                """)
+                let now = ISO8601DateFormatter().string(from: Date())
+                // Backdate the reading: `loadFromDatabase` filters on
+                // `timestamp <= <now, with fractional seconds>`, and a row stamped
+                // in the same second sorts *after* that bound as a string.
+                let earlier = ISO8601DateFormatter().string(from: Date().addingTimeInterval(-60))
+                try legacy.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order)
+                    VALUES ('org-legacy', 'legacy@example.com', 'legacy@example.com', 'Max', ?, 0)
+                """, now)
+                try legacy.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, is_synthetic)
+                    VALUES ('org-legacy', ?, 40, 40, 12, 0, 0)
+                """, earlier)
+                try legacy.run("""
+                    INSERT INTO oauth_credentials (account_id, label, source, access_token, is_active, created_at, updated_at)
+                    VALUES ('org-legacy', 'legacy@example.com', 'token', 'sk-ant-oat01-selftest', 1, ?, ?)
+                """, now, now)
 
-            expect(!tableColumns(legacy, "accounts").contains("provider"),
-                   "fixture must start without the provider column")
-            expect(!tableColumns(legacy, "accounts").contains("codex_home"),
-                   "fixture must start without the codex_home column")
+                expect(!tableColumns(legacy, "accounts").contains("provider"),
+                       "fixture must start without the provider column")
+                expect(!tableColumns(legacy, "accounts").contains("codex_home"),
+                       "fixture must start without the codex_home column")
 
-            // --- What launching the current build does. ---
-            let store = UsageStore(dbPath: dbPath)
-            store.ensureDatabase()
+                // --- What launching the current build does. ---
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
 
-            let db = try openDatabase(dbPath, readonly: true)
-            expect(tableColumns(db, "accounts").contains("provider"),
-                   "migration adds accounts.provider")
-            expect(tableColumns(db, "accounts").contains("codex_home"),
-                   "migration adds accounts.codex_home")
-            // Nullable with no DEFAULT: an existing row must keep meaning "the
-            // ambient home", which is exactly its pre-migration behaviour.
-            expect((try db.scalar("SELECT codex_home FROM accounts WHERE id = 'org-legacy'")) == nil,
-                   "an existing account is left with codex_home NULL — the ambient home, as before")
-            let credColumns = tableColumns(db, "oauth_credentials")
-            expect(credColumns.contains("provider"), "migration adds oauth_credentials.provider")
-            expect(credColumns.contains("refresh_token"), "migration ensures oauth_credentials.refresh_token")
-            expect(credColumns.contains("token_expires_at"), "migration adds oauth_credentials.token_expires_at")
-            expect(credColumns.contains("token_rolled_at"), "pre-existing token_rolled_at migration still runs")
+                let db = try openDatabase(dbPath, readonly: true)
+                expect(tableColumns(db, "accounts").contains("provider"),
+                       "migration adds accounts.provider")
+                expect(tableColumns(db, "accounts").contains("codex_home"),
+                       "migration adds accounts.codex_home")
+                // Nullable with no DEFAULT: an existing row must keep meaning "the
+                // ambient home", which is exactly its pre-migration behaviour.
+                expect((try db.scalar("SELECT codex_home FROM accounts WHERE id = 'org-legacy'")) == nil,
+                       "an existing account is left with codex_home NULL — the ambient home, as before")
+                let credColumns = tableColumns(db, "oauth_credentials")
+                expect(credColumns.contains("provider"), "migration adds oauth_credentials.provider")
+                expect(credColumns.contains("refresh_token"), "migration ensures oauth_credentials.refresh_token")
+                expect(credColumns.contains("token_expires_at"), "migration adds oauth_credentials.token_expires_at")
+                expect(credColumns.contains("token_rolled_at"), "pre-existing token_rolled_at migration still runs")
 
-            expectEqual(try db.scalar("SELECT provider FROM accounts WHERE id = 'org-legacy'") as? String,
-                        "anthropic", "existing account backfilled to anthropic")
-            expectEqual(try db.scalar("SELECT provider FROM oauth_credentials WHERE account_id = 'org-legacy'") as? String,
-                        "anthropic", "existing credential backfilled to anthropic")
-            expect((try db.scalar("SELECT token_expires_at FROM oauth_credentials WHERE account_id = 'org-legacy'")) == nil,
-                   "Anthropic credentials leave token_expires_at null")
+                expectEqual(try db.scalar("SELECT provider FROM accounts WHERE id = 'org-legacy'") as? String,
+                            "anthropic", "existing account backfilled to anthropic")
+                expectEqual(try db.scalar("SELECT provider FROM oauth_credentials WHERE account_id = 'org-legacy'") as? String,
+                            "anthropic", "existing credential backfilled to anthropic")
+                expect((try db.scalar("SELECT token_expires_at FROM oauth_credentials WHERE account_id = 'org-legacy'")) == nil,
+                       "Anthropic credentials leave token_expires_at null")
 
-            // The pre-migration account keeps working with no user action.
-            store.loadFromDatabase()
-            expectEqual(store.accounts.count, 1, "migrated account still loads")
-            expectEqual(store.accounts.first?.provider, .anthropic, "loaded account resolves to anthropic")
-            expectEqual(headroomScore(store.latestUsage["org-legacy"]), 60, "usage still reads through the window model")
+                // The pre-migration account keeps working with no user action.
+                store.loadFromDatabase()
+                expectEqual(store.accounts.count, 1, "migrated account still loads")
+                expectEqual(store.accounts.first?.provider, .anthropic, "loaded account resolves to anthropic")
+                expectEqual(headroomScore(store.latestUsage["org-legacy"]), 60, "usage still reads through the window model")
 
-            // Migration is idempotent — a second launch is a no-op, not an error.
-            UsageStore(dbPath: dbPath).ensureDatabase()
-            expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 1,
-                        "re-running the migration doesn't duplicate rows")
+                // Migration is idempotent — a second launch is a no-op, not an error.
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 1,
+                            "re-running the migration doesn't duplicate rows")
 
-            // Export/import round-trips the new columns.
-            let bundle = try AccountSync.exportBundle(dbPath: dbPath)
-            expectEqual(bundle.accounts.first?.provider, "anthropic", "export carries provider")
-            let reimportPath = dir.appendingPathComponent("usage-copy.db").path
-            try FileManager.default.copyItem(atPath: dbPath, toPath: reimportPath)
-            _ = try AccountSync.importBundle(bundle, dbPath: reimportPath)
-            let copy = try openDatabase(reimportPath, readonly: true)
-            expectEqual(try copy.scalar("SELECT provider FROM accounts WHERE id = 'org-legacy'") as? String,
-                        "anthropic", "import preserves provider")
-        } catch {
-            checks += 1
-            failures.append("schema migration test threw: \(error)")
+                // Export/import round-trips the new columns.
+                let bundle = try AccountSync.exportBundle(dbPath: dbPath)
+                expectEqual(bundle.accounts.first?.provider, "anthropic", "export carries provider")
+                let reimportPath = dir.appendingPathComponent("usage-copy.db").path
+                try FileManager.default.copyItem(atPath: dbPath, toPath: reimportPath)
+                _ = try AccountSync.importBundle(bundle, dbPath: reimportPath)
+                let copy = try openDatabase(reimportPath, readonly: true)
+                expectEqual(try copy.scalar("SELECT provider FROM accounts WHERE id = 'org-legacy'") as? String,
+                            "anthropic", "import preserves provider")
+            } catch {
+                checks += 1
+                failures.append("schema migration test threw: \(error)")
+            }
         }
     }
 
@@ -3376,86 +3347,84 @@ enum SelfTest {
     /// Runs against an explicit scratch database *and* an explicit scratch
     /// output path — never the `$HOME`-relative defaults.
     private static func testRankingExportCarriesProvider() {
-        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest-ranking-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: dir) }
-        do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let dbPath = dir.appendingPathComponent("usage.db").path
-            let outPath = dir.appendingPathComponent("ranking.json").path
+        withSelfTestTempDir("ranking") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let outPath = dir.appendingPathComponent("ranking.json").path
 
-            UsageStore(dbPath: dbPath).ensureDatabase()
-            let db = try openDatabase(dbPath)
-            let now = ISO8601DateFormatter().string(from: Date())
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let db = try openDatabase(dbPath)
+                let now = ISO8601DateFormatter().string(from: Date())
 
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('org-anthropic', 'a@example.com', 'a@example.com', 'Max', ?, 0, 'anthropic')
-            """, now)
-            try db.run("""
-                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
-                VALUES ('acct-openai', 'o@example.com', 'o@example.com', 'pro', ?, 1, 'openai')
-            """, now)
-            try db.run("""
-                INSERT INTO usage_history
-                    (account_id, timestamp, primary_percent, session_percent,
-                     weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
-                VALUES ('org-anthropic', ?, 40, 40, 12, 0,
-                        '{"overall_status":"allowed","session_status":"allowed","weekly_status":"allowed"}', 0)
-            """, now)
-            // The OpenAI shape: NULL session_percent, because the provider
-            // reported no session window at all.
-            try db.run("""
-                INSERT INTO usage_history
-                    (account_id, timestamp, primary_percent, session_percent,
-                     weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
-                VALUES ('acct-openai', ?, 14, NULL, 14, 0,
-                        '{"overall_status":"allowed","weekly_status":"allowed"}', 0)
-            """, now)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('org-anthropic', 'a@example.com', 'a@example.com', 'Max', ?, 0, 'anthropic')
+                """, now)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('acct-openai', 'o@example.com', 'o@example.com', 'pro', ?, 1, 'openai')
+                """, now)
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                    VALUES ('org-anthropic', ?, 40, 40, 12, 0,
+                            '{"overall_status":"allowed","session_status":"allowed","weekly_status":"allowed"}', 0)
+                """, now)
+                // The OpenAI shape: NULL session_percent, because the provider
+                // reported no session window at all.
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                    VALUES ('acct-openai', ?, 14, NULL, 14, 0,
+                            '{"overall_status":"allowed","weekly_status":"allowed"}', 0)
+                """, now)
 
-            RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+                RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
 
-            guard let data = FileManager.default.contents(atPath: outPath),
-                  let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let accounts = root["accounts"] as? [[String: Any]] else {
+                guard let data = FileManager.default.contents(atPath: outPath),
+                      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let accounts = root["accounts"] as? [[String: Any]] else {
+                    checks += 1
+                    failures.append("ranking export produced no readable accounts array")
+                    return
+                }
+
+                expectEqual(root["schema"] as? Int, RankingExporter.schemaVersion,
+                            "provider is additive — the schema version does not change")
+                expectEqual(accounts.count, 2, "both accounts exported")
+
+                let byEmail = Dictionary(uniqueKeysWithValues: accounts.compactMap { obj -> (String, [String: Any])? in
+                    guard let email = obj["email"] as? String else { return nil }
+                    return (email, obj)
+                })
+
+                expectEqual(byEmail["a@example.com"]?["provider"] as? String, "anthropic",
+                            "Anthropic account carries provider")
+                expectEqual(byEmail["o@example.com"]?["provider"] as? String, "openai",
+                            "OpenAI account carries provider")
+
+                // Every field an existing consumer already reads is unchanged.
+                expectEqual(byEmail["a@example.com"]?["status"] as? String, "available",
+                            "existing status field unaffected")
+                let anthropicUtil = byEmail["a@example.com"]?["utilization"] as? [String: Any]
+                expectEqual(anthropicUtil?["5h"] as? Double, 0.4, "Anthropic 5h utilization unchanged")
+                expectEqual(anthropicUtil?["7d"] as? Double, 0.12, "Anthropic 7d utilization unchanged")
+
+                let openaiUtil = byEmail["o@example.com"]?["utilization"] as? [String: Any]
+                expect(openaiUtil?["5h"] == nil,
+                       "a provider with no session window omits 5h rather than reporting 0.0")
+                expectEqual(openaiUtil?["7d"] as? Double, 0.14, "OpenAI weekly utilization exported")
+
+                // No secret ever reaches ranking.json.
+                let text = String(data: data, encoding: .utf8) ?? ""
+                expect(!text.contains("access_token") && !text.contains("refresh_token"),
+                       "ranking.json never carries credential material")
+            } catch {
                 checks += 1
-                failures.append("ranking export produced no readable accounts array")
-                return
+                failures.append("ranking export test threw: \(error)")
             }
-
-            expectEqual(root["schema"] as? Int, RankingExporter.schemaVersion,
-                        "provider is additive — the schema version does not change")
-            expectEqual(accounts.count, 2, "both accounts exported")
-
-            let byEmail = Dictionary(uniqueKeysWithValues: accounts.compactMap { obj -> (String, [String: Any])? in
-                guard let email = obj["email"] as? String else { return nil }
-                return (email, obj)
-            })
-
-            expectEqual(byEmail["a@example.com"]?["provider"] as? String, "anthropic",
-                        "Anthropic account carries provider")
-            expectEqual(byEmail["o@example.com"]?["provider"] as? String, "openai",
-                        "OpenAI account carries provider")
-
-            // Every field an existing consumer already reads is unchanged.
-            expectEqual(byEmail["a@example.com"]?["status"] as? String, "available",
-                        "existing status field unaffected")
-            let anthropicUtil = byEmail["a@example.com"]?["utilization"] as? [String: Any]
-            expectEqual(anthropicUtil?["5h"] as? Double, 0.4, "Anthropic 5h utilization unchanged")
-            expectEqual(anthropicUtil?["7d"] as? Double, 0.12, "Anthropic 7d utilization unchanged")
-
-            let openaiUtil = byEmail["o@example.com"]?["utilization"] as? [String: Any]
-            expect(openaiUtil?["5h"] == nil,
-                   "a provider with no session window omits 5h rather than reporting 0.0")
-            expectEqual(openaiUtil?["7d"] as? Double, 0.14, "OpenAI weekly utilization exported")
-
-            // No secret ever reaches ranking.json.
-            let text = String(data: data, encoding: .utf8) ?? ""
-            expect(!text.contains("access_token") && !text.contains("refresh_token"),
-                   "ranking.json never carries credential material")
-        } catch {
-            checks += 1
-            failures.append("ranking export test threw: \(error)")
         }
     }
 
