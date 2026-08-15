@@ -92,6 +92,7 @@ enum SelfTest {
         testAccountDeletionRemovesCredentials()
         testPurgeOrphanedCredentialsMigration()
         testNullOutOpenAITokensMigration()
+        testPurgeOrphanedProbeAndNamedLimitsMigration()
         testReadOnlyOpenOfWALDatabaseWithoutSHM()
 
         if let idx = arguments.firstIndex(of: "--db"), idx + 1 < arguments.count {
@@ -2374,6 +2375,120 @@ enum SelfTest {
         """) as? Int64 ?? -1
     }
 
+    /// The `probe_snapshots` / `named_limits` analog of `orphanedCredentialCount`
+    /// (#117): rows whose `account_id` *names* an account that isn't there,
+    /// with the same NULL/blank exclusion — a row with no `account_id` at all
+    /// was never attached to an account and is not an orphan.
+    private static func orphanedAccountRowCount(_ db: Connection, table: String) throws -> Int64 {
+        try db.scalar("""
+            SELECT COUNT(*) FROM \(table) t
+            LEFT JOIN accounts a ON a.id = t.account_id
+            WHERE a.id IS NULL AND t.account_id IS NOT NULL AND TRIM(t.account_id) != ''
+        """) as? Int64 ?? -1
+    }
+
+    /// The healing migration for `probe_snapshots` / `named_limits` rows a
+    /// pre-#106 account removal left stranded (#117 — #106 fixed the same
+    /// partial-delete bug for `oauth_credentials` but deliberately scoped
+    /// these two archive tables out). Mirrors
+    /// `testPurgeOrphanedCredentialsMigration`: a row with a NULL or blank
+    /// `account_id` must survive, and a second run must be a no-op.
+    private static func testPurgeOrphanedProbeAndNamedLimitsMigration() {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-monitor-selftest-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let dbPath = dir.appendingPathComponent("usage.db").path
+
+            let store = UsageStore(dbPath: dbPath)
+            store.ensureDatabase()
+            let db = try openDatabase(dbPath)
+
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                VALUES ('live-account', 'live@example.com', 'live@example.com', 'Max',
+                        '2026-06-01T00:00:00Z', 'anthropic')
+            """)
+            // Belongs to a live account — must be left alone.
+            try db.run("""
+                INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                VALUES ('live-account', '2026-06-01T00:00:00Z', 'haiku', 200, '{}')
+            """)
+            try db.run("""
+                INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                VALUES ('live-account', '2026-06-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 42)
+            """)
+            // The orphans a pre-#106 account removal left behind.
+            try db.run("""
+                INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                VALUES ('gone-account', '2026-02-10T17:16:25Z', 'haiku', 200, '{}')
+            """)
+            try db.run("""
+                INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                VALUES ('gone-account', '2026-02-10T17:16:25Z', 'GPT-5.3-Codex-Spark', 7)
+            """)
+            // Blank `account_id` — never attached to an account. Both tables
+            // declare `account_id TEXT NOT NULL`, which rejects NULL but not
+            // an empty string, so this is the guard that can actually fire.
+            try db.run("""
+                INSERT INTO probe_snapshots (account_id, timestamp, probe_model, http_status, headers)
+                VALUES ('   ', '2026-06-01T00:00:00Z', 'haiku', 200, '{}')
+            """)
+            try db.run("""
+                INSERT INTO named_limits (account_id, timestamp, limit_name, used_percent)
+                VALUES ('   ', '2026-06-01T00:00:00Z', 'GPT-5.3-Codex-Spark', 3)
+            """)
+
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM probe_snapshots") as? Int64, 3,
+                        "the seeded database starts with three probe_snapshots rows")
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM named_limits") as? Int64, 3,
+                        "the seeded database starts with three named_limits rows")
+
+            // --- What the next launch does. ---
+            store.ensureDatabase()
+
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE account_id = 'gone-account'")
+                    as? Int64,
+                0, "the migration purges the orphaned probe_snapshots row")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE account_id = 'gone-account'")
+                    as? Int64,
+                0, "the migration purges the orphaned named_limits row")
+            expectEqual(try orphanedAccountRowCount(db, table: "probe_snapshots"), 0,
+                        "the detection query reports no probe_snapshots orphans after the migration")
+            expectEqual(try orphanedAccountRowCount(db, table: "named_limits"), 0,
+                        "the detection query reports no named_limits orphans after the migration")
+            expectEqual(
+                try db.scalar("SELECT http_status FROM probe_snapshots WHERE account_id = 'live-account'")
+                    as? Int64,
+                200, "a row belonging to a live account is untouched")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM probe_snapshots WHERE TRIM(account_id) = ''")
+                    as? Int64,
+                1, "a probe_snapshots row with a blank account_id survives the purge")
+            expectEqual(
+                try db.scalar("SELECT COUNT(*) FROM named_limits WHERE TRIM(account_id) = ''")
+                    as? Int64,
+                1, "a named_limits row with a blank account_id survives the purge")
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM probe_snapshots") as? Int64, 2,
+                        "exactly one probe_snapshots row — the orphan — is removed")
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM named_limits") as? Int64, 2,
+                        "exactly one named_limits row — the orphan — is removed")
+
+            // Idempotent: re-running over the healed database changes nothing.
+            store.ensureDatabase()
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM probe_snapshots") as? Int64, 2,
+                        "re-running the migration on a healed database is a no-op (probe_snapshots)")
+            expectEqual(try db.scalar("SELECT COUNT(*) FROM named_limits") as? Int64, 2,
+                        "re-running the migration on a healed database is a no-op (named_limits)")
+        } catch {
+            checks += 1
+            failures.append("orphaned probe_snapshots/named_limits purge test threw: \(error)")
+        }
+    }
+
     // MARK: - Read-only opens of a WAL database
 
     /// Regression for #105: `accounts export` opens the database read-only, and
@@ -2872,6 +2987,13 @@ enum SelfTest {
             // database's ids, labels, emails, and tokens are never printed.
             expectEqual(try orphanedCredentialCount(db), 0,
                         "--db: no orphaned credential rows left after migration")
+            // #117: same check for the probe_snapshots/named_limits orphans
+            // #106 fixed the root cause of but deliberately left unpurged.
+            // Count only, same as above.
+            expectEqual(try orphanedAccountRowCount(db, table: "probe_snapshots"), 0,
+                        "--db: no orphaned probe_snapshots rows left after migration")
+            expectEqual(try orphanedAccountRowCount(db, table: "named_limits"), 0,
+                        "--db: no orphaned named_limits rows left after migration")
             print("selftest --db: migrated \(store.accounts.count) account(s) at \(path)")
         } catch {
             checks += 1

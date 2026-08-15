@@ -424,6 +424,15 @@ class UsageStore: ObservableObject {
         // any copy left over from before this change is a dead secret that
         // can only invalidate whichever other client refreshes next.
         nullOutOpenAITokens(db)
+
+        // Migration: delete probe_snapshots/named_limits rows whose account
+        // row is gone (#117). #106 fixed the same partial-delete bug for
+        // oauth_credentials — `deleteAccount` now takes these two archive
+        // tables with the account — but deliberately left the rows a pre-#106
+        // removal had already stranded unpurged. Must run after the merge
+        // above for the same reason `purgeOrphanedCredentials` does.
+        purgeOrphanedAccountRows(db, table: "probe_snapshots")
+        purgeOrphanedAccountRows(db, table: "named_limits")
     }
 
     /// Deletes `oauth_credentials` rows that reference an account which no
@@ -498,6 +507,49 @@ class UsageStore: ObservableObject {
         } catch {
             FileLogger.shared.error(
                 "nullOutOpenAITokens: migration failed: \(error)",
+                category: "DB"
+            )
+        }
+    }
+
+    /// Deletes rows from `probe_snapshots` or `named_limits` whose
+    /// `account_id` references an account that no longer exists (#117).
+    /// Shared by both call sites: same table shape, same orphan predicate.
+    /// Idempotent, like `purgeOrphanedCredentials`: a second run finds
+    /// nothing left to delete.
+    ///
+    /// Both tables declare `account_id TEXT NOT NULL`, unlike the nullable
+    /// `oauth_credentials.account_id` that made the NULL guard load-bearing
+    /// in #106 — so in practice `account_id IS NOT NULL` should never fire
+    /// here. It stays anyway, reusing the exact predicate #110 shipped for
+    /// `oauth_credentials`: matching it exactly is what makes the two purges
+    /// visibly consistent, and `NOT NULL` alone does not reject `''`, so the
+    /// blank-string half of the guard is not hypothetical.
+    // Pure function of its arguments — touches no instance/class main-actor
+    // state, matching `purgeOrphanedCredentials`, so it stays callable from
+    // the CLI/headless paths. `table` is always a literal at the call site
+    // above, never external input.
+    private nonisolated static func purgeOrphanedAccountRows(_ db: Connection, table: String) {
+        // Counted before the delete because the SQLite wrapper here exposes no
+        // `sqlite3_changes`. Logged as a bare count and table name — never an
+        // id, label, email, or token fragment.
+        let orphanPredicate = """
+            account_id IS NOT NULL
+              AND TRIM(account_id) != ''
+              AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = \(table).account_id)
+            """
+        do {
+            let count = try db.scalar(
+                "SELECT COUNT(*) FROM \(table) WHERE \(orphanPredicate)") as? Int64 ?? 0
+            guard count > 0 else { return }
+            try db.run("DELETE FROM \(table) WHERE \(orphanPredicate)")
+            FileLogger.shared.info(
+                "purgeOrphanedAccountRows: purged \(count) orphaned \(table) row(s)",
+                category: "DB"
+            )
+        } catch {
+            FileLogger.shared.error(
+                "purgeOrphanedAccountRows: purge of \(table) failed: \(error)",
                 category: "DB"
             )
         }
