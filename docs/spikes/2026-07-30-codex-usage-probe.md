@@ -235,7 +235,13 @@ and `Account` schema now — in particular:
   correct without that check — treat it as a strong hypothesis, not a
   verified contract.
 
-## Live verification (2026-07-30) — AUTHORITATIVE
+## Live verification (2026-07-30) — AUTHORITATIVE for the wire contract
+
+> **Partly superseded.** This section's *wire contract* is still correct and is
+> now the fallback path. Its *design* conclusion — store and refresh a
+> credential — was reversed on 2026-08-15; see
+> [Supersession (2026-08-15)](#supersession-2026-08-15--rotation-confirmed-app-server-is-the-supported-surface)
+> at the end of this document before designing against anything here.
 
 The operator judged a disposable account unnecessary: the probe is a
 **read-only GET** against the same endpoint Codex CLI's own `/usage` command
