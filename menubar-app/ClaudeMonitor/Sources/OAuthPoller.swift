@@ -313,8 +313,9 @@ class OAuthPoller: ObservableObject {
 
     /// One registered Codex account, for `claude-monitor codex list`.
     ///
-    /// Deliberately carries **no email**: the CLI identifies accounts by the
-    /// truncated-id convention the rest of this surface uses.
+    /// The CLI identifies accounts by the truncated-id convention the rest of
+    /// this surface uses — `email` below is carried for internal comparison
+    /// only and is never printed.
     struct CodexAccountRegistration {
         let accountId: String
         /// nil = no registered home (the ambient `$CODEX_HOME`, else `~/.codex`).
