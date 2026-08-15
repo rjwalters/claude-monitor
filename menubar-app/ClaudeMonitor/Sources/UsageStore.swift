@@ -217,6 +217,16 @@ class UsageStore: ObservableObject {
     /// Account chosen by the user to drive the menubar icon. `nil` = auto (most-available).
     @Published var primaryAccountId: String?
 
+    /// Poll interval used to derive the staleness threshold for ranking and
+    /// menubar auto-selection (#148). `UsageStore` and `OAuthPoller` are
+    /// separate instances wired together by their host (`AppDelegate` on
+    /// macOS, `HeadlessRunner` on Linux) — this is how the store learns the
+    /// actual poll cadence without holding a reference to the poller itself.
+    /// Defaults to `OAuthPoller.pollInterval`'s own default (600s / 10 min)
+    /// so a store used before that wiring happens (e.g. `SelfTest`) still
+    /// gets a sane threshold.
+    var pollIntervalHint: TimeInterval = 600
+
     /// Called when accounts change (e.g., reordering, primary selection) so the menubar can update
     var onAccountsChanged: (() -> Void)?
 
@@ -728,9 +738,25 @@ class UsageStore: ObservableObject {
         usage?.rateLimit.secondsUntilRecovery ?? .greatestFiniteMagnitude
     }
 
+    /// True when `account`'s last successful update is older than the
+    /// staleness threshold derived from `pollIntervalHint` — the
+    /// cause-independent backstop (#148). Feeds `sortedAccountsForPopover`
+    /// so a row that stopped advancing (for any reason — dead credential,
+    /// missing binary, identity drift, or something not yet diagnosed)
+    /// cannot silently rank as "most available" on a frozen percentage, and
+    /// so it cannot become the auto-selected menubar account over a fresher
+    /// alternative. Clears automatically the moment a poll succeeds and
+    /// `last_updated` advances again — no restart required.
+    func isStale(_ account: Account) -> Bool {
+        AccountFreshness.isStale(lastUpdated: account.lastUpdated, pollInterval: pollIntervalHint)
+    }
+
     /// Account ID currently driving the menubar icon. Falls back to the
     /// most-available account when the user hasn't pinned one (or pinned a
-    /// removed account).
+    /// removed account). An explicit user pin is respected even if that
+    /// account has since gone stale — this fallback only governs the
+    /// *automatic* choice, which `sortedAccountsForPopover` already excludes
+    /// stale accounts from where a fresher alternative exists.
     var effectivePrimaryAccountId: String? {
         if let pinned = primaryAccountId, accounts.contains(where: { $0.id == pinned }) {
             return pinned
@@ -748,12 +774,26 @@ class UsageStore: ObservableObject {
     /// Accounts sorted for popover display: most available (lowest usage) first.
     /// Reads through the shared window model, so an account whose provider
     /// reports only a weekly window is ranked on that window alone rather than
-    /// being credited with a fictitious 0% session.
+    /// being credited with a fictitious 0% session. A stale account (#148)
+    /// ranks after every fresh one regardless of its last reported
+    /// percentage — a frozen 12% is not a safe "most available"
+    /// recommendation — but two accounts of the same freshness still compare
+    /// on their actual figures, so this changes nothing when every account is
+    /// fresh (the common case, including every Anthropic-only fixture).
     var sortedAccountsForPopover: [Account] {
         let pairs = accounts.map { account in
             (account: account, usage: latestUsage[account.id])
         }
         let sorted = pairs.sorted { a, b in
+            // Cause-independent staleness backstop: a stale reading cannot
+            // win over a fresher alternative no matter what percentage it
+            // last reported, because that percentage is exactly what's no
+            // longer trustworthy. Only breaks the tie when the two sides
+            // differ in freshness.
+            let aStale = isStale(a.account)
+            let bStale = isStale(b.account)
+            if aStale != bStale { return !aStale }
+
             // An absent window contributes nothing (rather than a fabricated
             // 0%), so an OpenAI account reporting only a weekly figure ranks on
             // that figure. Unchanged for Anthropic rows, which always carry both.

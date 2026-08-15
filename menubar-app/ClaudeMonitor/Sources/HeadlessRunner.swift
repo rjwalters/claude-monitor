@@ -47,6 +47,10 @@ enum HeadlessRunner {
         if let pollInterval = pollInterval {
             poller.pollInterval = pollInterval
         }
+        // Tell the store the actual poll cadence so its staleness threshold
+        // (#148) scales with `--interval` instead of assuming the default —
+        // a slower configured interval must not produce false staleness.
+        store.pollIntervalHint = poller.pollInterval
 
         Task {
             await run(store: store, poller: poller, once: once)
