@@ -4,6 +4,12 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-15
 
+- **Issue #134** (closed): Surface Codex identity drift as a distinct account state (not stale/failed reading)
+- **PR #138**: feat: report a re-logged-in Codex home as drift in `codex list`
+- **Issue #133** (closed): Add codex provision <label> to collapse home-create + login + register into one command
+- **PR #139**: feat: add codex provision <label> to collapse home-create + login + register
+- **Issue #129** (closed): Clipboard account transfer silently drops Codex accounts after #123 — and reports "Nothing to copy" on a Codex-only host
+- **PR #137**: fix: report excluded Codex accounts in clipboard account transfer
 - **Issue #117** (closed): Purge the 18 orphaned probe_snapshots rows #106 left behind (and audit named_limits)
 - **PR #126**: fix: purge orphaned probe_snapshots/named_limits rows left by #106
 - **Issue #118** (closed): Three CodexAppServer/OAuthPoller robustness nits from the PR #111 review
