@@ -345,13 +345,7 @@ enum RankingExporter {
     /// formats this codebase writes (with and without fractional seconds). Returns
     /// `nil` for nil/empty/unparseable input so the key can be omitted.
     private static func normalizedISO(_ stored: String?) -> String? {
-        guard let stored = stored, !stored.isEmpty else { return nil }
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFraction.date(from: stored) ?? ISO8601DateFormatter().date(from: stored) {
-            return iso8601(date)
-        }
-        return nil
+        UsageRecord.parseISO(stored).map(iso8601)
     }
 
     /// Canonical ISO 8601 UTC string with no fractional seconds (e.g. `2026-01-01T00:00:00Z`).
