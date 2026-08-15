@@ -25,7 +25,7 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-_None._
+- **#104**: Retire stored OpenAI OAuth tokens and exclude Codex accounts from accounts export
 
 ## PRs Awaiting Review
 
@@ -43,6 +43,10 @@ _None._
 
 Issues carrying `loom:curated`.
 
+- **#117**: Purge the 18 orphaned probe_snapshots rows #106 left behind (and audit named_limits) *(curated)*
+- **#116**: selftest writes ~14 lines into the user's real debug.log: flog.info from a pure mapper *(curated)*
+- **#115**: docs: `brew install codex` installs a stale 0.46.0 formula — the cask is the correct package *(curated)*
+- **#104**: Retire stored OpenAI OAuth tokens and exclude Codex accounts from accounts export *(curated)*
 - **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -60,10 +64,10 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 0 |
+| In Progress (`loom:building`) | 1 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 1 |
+| Curated | 5 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
