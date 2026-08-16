@@ -185,12 +185,16 @@ func headroomScore(_ usage: UsageRecord?) -> Double? {
 /// with no `ACCOUNT_KEY_N`, see `OAuthPoller.exportAccountsEnv`) creates the
 /// placeholder row that makes the gap nameable.
 ///
-/// The first two conditions are the exact negation of
+/// The first two conditions negate the *shape* half of
 /// `loadActiveCredentials`'s admission test: an OpenAI row with **neither** a
 /// stored token **nor** a registered `codex_home` can never be polled on this
 /// host, whatever created it. That also catches an OpenAI account that arrived
 /// through an `accounts import` bundle from a host that had a home — which is
-/// right, since it is equally unpollable here.
+/// right, since it is equally unpollable here. They deliberately do *not*
+/// negate that test's `is_active = 1` gate: a provisioned-then-deactivated
+/// credential is a different condition from never having been provisioned, and
+/// absence must not claim it. See `storedTokenCountSQL` for the full rationale
+/// (#169).
 ///
 /// `hasLocalReading` is the conservative third condition, and it only ever
 /// *shrinks* the absent set: a row this host has actually taken a usage
@@ -214,6 +218,69 @@ func isAbsentCodexIdentity(
     hasLocalReading: Bool
 ) -> Bool {
     provider == .openai && !hasStoredToken && !hasCodexHome && !hasLocalReading
+}
+
+/// The `hasStoredToken` input to `isAbsentCodexIdentity`, spelled as SQL —
+/// **once** (#169).
+///
+/// Returns a scalar subquery counting the credential rows of a single account
+/// that still carry a usable token; callers either select it and test the
+/// returned count, or compare it inline (`… > 0`). `accountRef` is whatever
+/// expression names the account row's id in the *enclosing* query, because the
+/// call sites alias the `accounts` table differently (`accounts.id` in
+/// `UsageStore.loadFromDatabase` and `RankingExporter`, `a.id` in
+/// `OAuthPoller.codexAccounts()` and `OAuthPoller.openAIAccountCount()`). The
+/// `c` alias is confined to the subquery, so it never collides with an outer one.
+///
+/// `TRIM(...) != ''` is part of the predicate, not decoration: an empty-string
+/// token is not a token. It is unreachable through any current write path
+/// (`saveCredentialForAccount` and `addOpenAIAccount` both require a non-empty
+/// value, and #123's migration sets `access_token = NULL` rather than `''`), but
+/// a legacy cross-host import or a hand-edited database can produce one, and
+/// before this consolidation the four sites disagreed about it — which is
+/// precisely the disagreement `isAbsentCodexIdentity` exists to prevent.
+///
+/// Pass `credentialsTableExists: false` when `oauth_credentials` is absent (a
+/// database an external tool created before any migration ran). The fragment
+/// then degrades to the literal `0`, matching how every other absent-identity
+/// input degrades: a table this database does not have reads as "no evidence",
+/// which can only ever make a row look *less* absent, never falsely absent.
+///
+/// **`oauth_credentials.is_active` is deliberately NOT part of this predicate.**
+/// Including it was considered and rejected (#169):
+///
+/// 1. *Different question.* Absence answers "was this identity ever provisioned
+///    on this host?", not "will it poll on the next cycle?". A credential that
+///    was provisioned here and later deactivated is a different condition, and
+///    the remediation absence prints (`codex provision <label>`) is aimed at the
+///    other one. Staleness — not absence — is the surface that already reports a
+///    row that has stopped updating.
+/// 2. *It would not buy the exactness it appears to.* `isAbsentCodexIdentity`'s
+///    doc comment above claims its first two conditions negate
+///    `loadActiveCredentials`'s admission test. Adding `is_active` to the token
+///    half alone would not make that literally true, because that test also
+///    gates its *home-registered* clause on `c.is_active = 1`, while
+///    `hasCodexHome` here reads only `accounts.codex_home`. The claim is
+///    therefore stated in terms of the token/home shape, not `is_active`; see
+///    the qualification recorded there.
+/// 3. *It carries live risk for no reachable benefit.* `deactivateCredential`
+///    has no callers anywhere in the package (superseded by `deleteAccount`,
+///    #106), so `is_active = 0` alongside a stored token only arises from
+///    importing a pre-#106 database. Meanwhile `openAIAccountCount()` shares
+///    this fragment and **fails closed** on purpose — undercounting OpenAI
+///    accounts is what licenses the ambient home. Making that count depend on a
+///    column nothing writes would move a host toward `.ambient` on the strength
+///    of an unreachable state.
+///
+/// `SelfTest.testStoredTokenPredicateAgreesAcrossSurfaces` pins both halves of
+/// this decision.
+func storedTokenCountSQL(accountRef: String, credentialsTableExists: Bool = true) -> String {
+    guard credentialsTableExists else { return "0" }
+    return """
+        (SELECT COUNT(*) FROM oauth_credentials c
+          WHERE c.account_id = \(accountRef)
+            AND c.access_token IS NOT NULL AND TRIM(c.access_token) != '')
+        """
 }
 
 struct UsageDataPoint: Identifiable {
@@ -944,15 +1011,12 @@ class UsageStore: ObservableObject {
             let hasCodexHome = accountColumns.contains("codex_home")
             // Whether this row still has a usable stored token — the other half
             // of the absent-identity rule (`isAbsentCodexIdentity`). Counted in
-            // SQL so no token value is ever read into memory here.
+            // SQL so no token value is ever read into memory here, and spelled
+            // by the one shared fragment every consumer surface uses (#169).
             let hasCredentials = !tableColumns(db, "oauth_credentials").isEmpty
-            let storedTokenCount = hasCredentials
-                ? """
-                  (SELECT COUNT(*) FROM oauth_credentials c
-                    WHERE c.account_id = accounts.id
-                      AND c.access_token IS NOT NULL AND TRIM(c.access_token) != '')
-                  """
-                : "0"
+            let storedTokenCount = storedTokenCountSQL(
+                accountRef: "accounts.id", credentialsTableExists: hasCredentials
+            )
             // A missing table reads as "no evidence", which can only make a
             // row look less absent — never falsely absent.
             let localReading = tableColumns(db, "usage_history").isEmpty

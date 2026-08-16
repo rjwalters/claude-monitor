@@ -581,10 +581,17 @@ class OAuthPoller: ObservableObject {
             let accountColumns = tableColumns(db, "accounts")
             guard accountColumns.contains("provider") else { return [] }
             let hasCodexHome = accountColumns.contains("codex_home")
+            // One shared spelling of "has a usable stored token" (#169) — this
+            // site used to omit the `TRIM(...) != ''` guard the popover and
+            // `ranking.json` applied, so an empty-string token made `codex list`
+            // disagree with them about the very same account.
+            let storedTokenCount = storedTokenCountSQL(
+                accountRef: "a.id",
+                credentialsTableExists: !tableColumns(db, "oauth_credentials").isEmpty
+            )
             let stmt = try db.prepare("""
                 SELECT a.id, \(hasCodexHome ? "a.codex_home" : "NULL"), a.plan,
-                       (SELECT COUNT(*) FROM oauth_credentials c
-                         WHERE c.account_id = a.id AND c.access_token IS NOT NULL),
+                       \(storedTokenCount),
                        a.email, a.account_name,
                        EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = a.id)
                 FROM accounts a
@@ -1734,14 +1741,19 @@ class OAuthPoller: ObservableObject {
             let hasLocalReading = tableColumns(db, "usage_history").isEmpty
                 ? "1"
                 : "EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = a.id)"
+            // Same shared "has a usable stored token" fragment the three
+            // absent-identity consumer surfaces use (#169), so this count stays
+            // exactly the negation of "absent" by construction rather than by
+            // three hand-copied SQL fragments happening to agree.
+            let storedToken = storedTokenCountSQL(
+                accountRef: "a.id",
+                credentialsTableExists: !tableColumns(db, "oauth_credentials").isEmpty
+            )
             let count = try db.scalar("""
                 SELECT COUNT(*) FROM accounts a
                 WHERE COALESCE(a.provider, 'anthropic') = 'openai'
                   AND (\(homeRegistered)
-                       OR EXISTS (SELECT 1 FROM oauth_credentials c
-                                   WHERE c.account_id = a.id
-                                     AND c.access_token IS NOT NULL
-                                     AND TRIM(c.access_token) != '')
+                       OR \(storedToken) > 0
                        OR \(hasLocalReading))
             """) as? Int64
             return Int(count ?? 0)
