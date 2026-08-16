@@ -25,13 +25,13 @@ _None._
 
 Issues currently being built (`loom:building`).
 
-- **#135**: Declarative intended Codex identity set: codex list/ranking.json should report 'absent', not just fewer rows
+_None._
 
 ## PRs Awaiting Review
 
 PRs waiting on Judge (`loom:review-requested`).
 
-- **#166**: feat: report a declared-but-unprovisioned Codex identity as "absent"
+_None._
 
 ## Approved (Awaiting Merge)
 
@@ -43,7 +43,6 @@ _None._
 
 Issues carrying `loom:curated`.
 
-- **#135**: Declarative intended Codex identity set: codex list/ranking.json should report 'absent', not just fewer rows *(curated)*
 - **#55**: docs: README screenshots predate provider badges and the Premium % column *(curated)*
 
 ## Proposed (Architect / Hermit)
@@ -52,7 +51,7 @@ _None._
 
 ## Epics
 
-- **#130**: Multi-identity Codex needs a lifecycle: discovery, provisioning, drift, and a cross-host view
+_None._
 
 ## Backlog Balance
 
@@ -61,10 +60,10 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 0 |
 | Ready (`loom:issue`) | 0 |
-| In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 1 |
+| In Progress (`loom:building`) | 0 |
+| PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 2 |
+| Curated | 1 |
 | Architect / Hermit proposals | 0 |
-| Active epics | 1 |
+| Active epics | 0 |
 <!-- guide:plan-body:end -->
