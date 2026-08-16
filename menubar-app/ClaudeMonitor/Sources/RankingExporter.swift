@@ -163,13 +163,10 @@ enum RankingExporter {
             // column here does: a table this database doesn't have reads as
             // "no evidence", which can only ever make a row look *less*
             // absent — never falsely absent.
-            let storedTokenCount = tableColumns(db, "oauth_credentials").isEmpty
-                ? "0"
-                : """
-                  (SELECT COUNT(*) FROM oauth_credentials c
-                    WHERE c.account_id = accounts.id
-                      AND c.access_token IS NOT NULL AND TRIM(c.access_token) != '')
-                  """
+            let storedTokenCount = storedTokenCountSQL(
+                accountRef: "accounts.id",
+                credentialsTableExists: !tableColumns(db, "oauth_credentials").isEmpty
+            )
             let localReading = tableColumns(db, "usage_history").isEmpty
                 ? "1"
                 : "EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = accounts.id)"

@@ -108,6 +108,7 @@ enum SelfTest {
         testParseAccountPairsAcceptsKeylessCodexIdentity()
         testCodexHomeLabelDerivation()
         testDeclaredCodexIdentityIsAbsent()
+        testStoredTokenPredicateAgreesAcrossSurfaces()
         testProvisioningAbsentIdentityConvertsInPlace()
         testAbsentIdentityDoesNotMakeAmbientHomeAmbiguous()
         testOpenAIAccountCountIncludesLegacyRowWithUsageHistory()
@@ -3047,6 +3048,134 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("declared-identity test threw: \(error)")
+            }
+        }
+    }
+
+    /// #169: the `hasStoredToken` half of `isAbsentCodexIdentity` used to be
+    /// hand-copied into four SQL fragments that had drifted apart. They now all
+    /// come from `storedTokenCountSQL`, and this pins both the gap that closed
+    /// and the `is_active` decision that was deliberately *not* made.
+    ///
+    /// Neither edge case is reachable through a current write path (see
+    /// `storedTokenCountSQL`), which is exactly why they are worth a test: a
+    /// future write path must not be able to silently reintroduce a
+    /// disagreement between the popover, `codex list`, and `ranking.json`.
+    private static func testStoredTokenPredicateAgreesAcrossSurfaces() {
+        withSelfTestTempDir("stored-token-predicate") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+                let db = try openDatabase(dbPath)
+                let now = ISO8601DateFormatter().string(from: Date())
+
+                // Four homeless, reading-free OpenAI rows differing only in the
+                // shape of their stored credential.
+                func addAccount(_ id: String, _ email: String, order: Int) throws {
+                    try db.run("""
+                        INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                        VALUES (?, ?, ?, 'pro', NULL, ?, 'openai')
+                    """, id, id, email, Int64(order))
+                }
+                func addCredential(_ accountId: String, token: String?, isActive: Int64) throws {
+                    try db.run("""
+                        INSERT INTO oauth_credentials
+                            (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                        VALUES (?, ?, 'codex', 'openai', ?, ?, ?, ?)
+                    """, accountId, accountId, token, isActive, now, now)
+                }
+
+                // (a) The empty-string token: not a token, but before #169
+                // `codexAccounts()` alone read it as one.
+                try addAccount("openai-empty", "empty@example.com", order: 1)
+                try addCredential("openai-empty", token: "", isActive: 1)
+                // (b) A real token on a deactivated credential row.
+                try addAccount("openai-deactivated", "deactivated@example.com", order: 2)
+                try addCredential("openai-deactivated", token: "sk-selftest-deactivated", isActive: 0)
+                // Controls: the two states every host actually reaches.
+                try addAccount("openai-null", "null@example.com", order: 3)
+                try addCredential("openai-null", token: nil, isActive: 1)
+                try addAccount("openai-real", "real@example.com", order: 4)
+                try addCredential("openai-real", token: "sk-selftest-real", isActive: 1)
+
+                // Surface 1: the popover / menubar account model.
+                let store = UsageStore(dbPath: dbPath)
+                store.loadFromDatabase()
+                let storeAbsent = Dictionary(uniqueKeysWithValues:
+                    store.accounts.map { ($0.id, $0.isAbsent) })
+                // Surface 2: `claude-monitor codex list`.
+                let listAbsent = Dictionary(uniqueKeysWithValues:
+                    poller.codexAccounts().map { ($0.accountId, $0.isAbsent) })
+                // Surface 3: ranking.json.
+                let outPath = dir.appendingPathComponent("ranking.json").path
+                RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+                guard let data = FileManager.default.contents(atPath: outPath),
+                      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let exported = root["accounts"] as? [[String: Any]] else {
+                    checks += 1
+                    failures.append("stored-token predicate test produced no readable ranking.json")
+                    return
+                }
+                let rankingAbsent = Dictionary(uniqueKeysWithValues:
+                    exported.compactMap { obj -> (String, Bool)? in
+                        guard let email = obj["email"] as? String else { return nil }
+                        return (email, (obj["absent"] as? Bool) == true)
+                    })
+
+                @MainActor func expectAgreement(_ id: String, _ email: String, absent: Bool, _ why: String) {
+                    expectEqual(storeAbsent[id], absent, "popover: \(why)")
+                    expectEqual(listAbsent[id], absent, "codex list: \(why)")
+                    expectEqual(rankingAbsent[email], absent, "ranking.json: \(why)")
+                }
+
+                // The gap #169 closed: all three surfaces now read an
+                // empty-string token as no token at all.
+                expectAgreement("openai-empty", "empty@example.com", absent: true,
+                                "an empty-string token is not a token — the row is absent")
+                // The documented decision: `is_active` is NOT part of the
+                // predicate, so a deactivated-but-present token still counts as
+                // "provisioned here" everywhere.
+                expectAgreement("openai-deactivated", "deactivated@example.com", absent: false,
+                                "a deactivated credential is provisioned-then-disabled, never absent")
+                // Controls: currently-reachable states are unchanged.
+                expectAgreement("openai-null", "null@example.com", absent: true,
+                                "a NULL token with no home and no reading is the ordinary absent case")
+                expectAgreement("openai-real", "real@example.com", absent: false,
+                                "a real stored token is never absent")
+
+                // `openAIAccountCount()` shares the same fragment, so it stays
+                // the exact negation of absence — and, because `is_active` is
+                // excluded, the deactivated row still counts as a candidate
+                // owner of the ambient home rather than silently licensing it.
+                expectEqual(poller.openAIAccountCount(), 2,
+                            "openAIAccountCount() counts exactly the non-absent OpenAI rows")
+
+                // The one place `is_active` *does* still bite: the poll loop's
+                // admission gate. Pinning this is what makes the divergence
+                // documented on `storedTokenCountSQL` deliberate rather than an
+                // oversight — absence and pollability are different questions,
+                // and this is the row where they give different answers.
+                let polled = Set(poller.loadActiveCredentials().compactMap { $0.accountId })
+                expect(polled.contains("openai-real"),
+                       "a live stored token is polled, exactly as before")
+                expect(!polled.contains("openai-deactivated"),
+                       "a deactivated credential is never polled — yet it is not 'absent' either, "
+                       + "which is precisely why `is_active` is not part of the absence predicate")
+                expect(!polled.contains("openai-null"),
+                       "a token-free row with no registered home is not resurrected into the poll set")
+                // Deliberately pinned as-is: `loadActiveCredentials` tests only
+                // `access_token IS NOT NULL`, so an empty-string token is still
+                // admitted there. That is a pre-existing gap in *that* query's
+                // own predicate — a separate edge case from the absence
+                // predicate this test covers, and explicitly out of scope for
+                // #169. Asserted rather than ignored so that closing it shows up
+                // here as a deliberate change instead of passing unnoticed.
+                expect(polled.contains("openai-empty"),
+                       "known gap: loadActiveCredentials admits an empty-string token (separate from #169)")
+            } catch {
+                checks += 1
+                failures.append("stored-token predicate test threw: \(error)")
             }
         }
     }
