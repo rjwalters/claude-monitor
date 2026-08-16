@@ -68,26 +68,27 @@ enum CodexCLI {
 
         var i = 0
         while i < args.count {
-            switch args[i] {
-            case "--home":
-                guard i + 1 < args.count else { fail("--home requires a path") }
-                home = args[i + 1]
+            switch CLIArgs.matchCommon(args, i) {
+            case .db(let value):
+                dbPath = value
                 i += 1
-            case "--db":
-                guard i + 1 < args.count else { fail("--db requires a path") }
-                dbPath = args[i + 1]
-                i += 1
-            case "--help", "-h":
+            case .help:
                 printUsage()
                 exit(0)
-            default:
-                fail("Unknown option '\(args[i])' (see --help)")
+            case .notMatched:
+                switch args[i] {
+                case "--home":
+                    home = CLIArgs.requireValue(args, i, option: "--home")
+                    i += 1
+                default:
+                    CLIArgs.fail("Unknown option '\(args[i])' (see --help)")
+                }
             }
             i += 1
         }
 
         guard let rawHome = home else {
-            fail("codex add requires --home <path> (e.g. --home ~/.codex-work)")
+            CLIArgs.fail("codex add requires --home <path> (e.g. --home ~/.codex-work)")
         }
 
         // Frozen into immutable bindings before the Task: strict concurrency
@@ -103,7 +104,7 @@ enum CodexCLI {
         Task {
             let result = await poller.registerCodexHome(resolvedHome)
             guard let accountId = result.accountId else {
-                fail(result.error ?? "Registration failed")
+                CLIArgs.fail(result.error ?? "Registration failed")
             }
             print("Registered OpenAI account \(accountId.prefix(8))… at CODEX_HOME=\(resolvedHome)")
             print("No token was read, copied, or stored — usage is read through `codex` itself.")
@@ -243,7 +244,7 @@ enum CodexCLI {
         do {
             try process.run()
         } catch {
-            fail("Could not launch `codex login --device-auth`: \(error.localizedDescription)")
+            CLIArgs.fail("Could not launch `codex login --device-auth`: \(error.localizedDescription)")
         }
         process.waitUntilExit()
         return process.terminationStatus
@@ -265,11 +266,11 @@ enum CodexCLI {
         do {
             parsed = try parseProvisionArgs(args)
         } catch {
-            fail(provisionArgErrorMessage(for: error))
+            CLIArgs.fail(provisionArgErrorMessage(for: error))
         }
 
         guard let codexBin = CodexBinary.resolve() else {
-            fail("Codex CLI not found — install `@openai/codex`, or set CLAUDE_MONITOR_CODEX_BIN (see --help)")
+            CLIArgs.fail("Codex CLI not found — install `@openai/codex`, or set CLAUDE_MONITOR_CODEX_BIN (see --help)")
         }
 
         let storePath = parsed.dbPath
@@ -283,7 +284,7 @@ enum CodexCLI {
                 atPath: resolvedHome, withIntermediateDirectories: true
             )
         } catch {
-            fail("Could not create CODEX_HOME at \(resolvedHome): \(error.localizedDescription)")
+            CLIArgs.fail("Could not create CODEX_HOME at \(resolvedHome): \(error.localizedDescription)")
         }
 
         let store = UsageStore(dbPath: storePath)
@@ -312,7 +313,7 @@ enum CodexCLI {
                 print("Launching `codex login --device-auth` — follow the printed instructions to finish in a browser.")
                 let status = runDeviceAuthLogin(codexBin: codexBin, home: resolvedHome)
                 guard status == 0 else {
-                    fail("`codex login --device-auth` exited with status \(status) — provisioning aborted, nothing was registered")
+                    CLIArgs.fail("`codex login --device-auth` exited with status \(status) — provisioning aborted, nothing was registered")
                 }
             }
 
@@ -321,12 +322,12 @@ enum CodexCLI {
                 label: label, home: resolvedHome,
                 existingAccountId: existingAccountId, observedNativeId: observedNativeId
             ) {
-                fail(conflict)
+                CLIArgs.fail(conflict)
             }
 
             let result = await poller.registerCodexHome(resolvedHome)
             guard let accountId = result.accountId else {
-                fail(result.error ?? "Registration failed")
+                CLIArgs.fail(result.error ?? "Registration failed")
             }
             print("Registered OpenAI account \(accountId.prefix(8))… at CODEX_HOME=\(resolvedHome)")
             print("No token was read, copied, or stored — usage is read through `codex` itself.")
@@ -346,16 +347,15 @@ enum CodexCLI {
 
         var i = 0
         while i < args.count {
-            switch args[i] {
-            case "--db":
-                guard i + 1 < args.count else { fail("--db requires a path") }
-                dbPath = args[i + 1]
+            switch CLIArgs.matchCommon(args, i) {
+            case .db(let value):
+                dbPath = value
                 i += 1
-            case "--help", "-h":
+            case .help:
                 printUsage()
                 exit(0)
-            default:
-                fail("Unknown option '\(args[i])' (see --help)")
+            case .notMatched:
+                CLIArgs.fail("Unknown option '\(args[i])' (see --help)")
             }
             i += 1
         }
@@ -613,27 +613,28 @@ enum CodexCLI {
 
         var i = 0
         while i < args.count {
-            switch args[i] {
-            case "--auth":
-                guard i + 1 < args.count else { fail("--auth requires a path") }
-                authPath = args[i + 1]
+            switch CLIArgs.matchCommon(args, i) {
+            case .db(let value):
+                dbPath = value
                 i += 1
-            case "--db":
-                guard i + 1 < args.count else { fail("--db requires a path") }
-                dbPath = args[i + 1]
-                i += 1
-            case "--help", "-h":
+            case .help:
                 printUsage()
                 exit(0)
-            default:
-                fail("Unknown option '\(args[i])' (see --help)")
+            case .notMatched:
+                switch args[i] {
+                case "--auth":
+                    authPath = CLIArgs.requireValue(args, i, option: "--auth")
+                    i += 1
+                default:
+                    CLIArgs.fail("Unknown option '\(args[i])' (see --help)")
+                }
             }
             i += 1
         }
 
         let resolved = authPath ?? CodexAuth.defaultAuthPath
         guard FileManager.default.fileExists(atPath: resolved) else {
-            fail("No Codex credential at \(resolved) — run `codex login` first, or pass --auth <path>")
+            CLIArgs.fail("No Codex credential at \(resolved) — run `codex login` first, or pass --auth <path>")
         }
 
         // Freeze the parsed option into an immutable binding: everything the
@@ -656,7 +657,7 @@ enum CodexCLI {
         Task {
             let result = await poller.importCodexCredential(path: resolved)
             guard let accountId = result.accountId else {
-                fail(result.error ?? "Import failed")
+                CLIArgs.fail(result.error ?? "Import failed")
             }
             print("Imported OpenAI account \(accountId.prefix(8))… from \(resolved)")
             exportRanking(storePath)
@@ -678,11 +679,6 @@ enum CodexCLI {
         } else {
             RankingExporter.exportNow()
         }
-    }
-
-    private static func fail(_ message: String) -> Never {
-        FileHandle.standardError.write(Data("Error: \(message)\n".utf8))
-        exit(1)
     }
 
     private static func printUsage() {
