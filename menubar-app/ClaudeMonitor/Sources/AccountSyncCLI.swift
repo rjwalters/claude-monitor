@@ -35,22 +35,23 @@ enum AccountSyncCLI {
 
         var i = 0
         while i < args.count {
-            switch args[i] {
-            case "--output", "-o":
-                guard i + 1 < args.count else { fail("--output requires a path") }
-                outputPath = args[i + 1]
+            switch CLIArgs.matchCommon(args, i) {
+            case .db(let value):
+                dbPath = value
                 i += 1
-            case "--compact":
-                pretty = false
-            case "--db":
-                guard i + 1 < args.count else { fail("--db requires a path") }
-                dbPath = args[i + 1]
-                i += 1
-            case "--help", "-h":
+            case .help:
                 printUsage()
                 exit(0)
-            default:
-                fail("Unknown option '\(args[i])' (see --help)")
+            case .notMatched:
+                switch args[i] {
+                case "--output", "-o":
+                    outputPath = CLIArgs.requireValue(args, i, option: "--output")
+                    i += 1
+                case "--compact":
+                    pretty = false
+                default:
+                    CLIArgs.fail("Unknown option '\(args[i])' (see --help)")
+                }
             }
             i += 1
         }
@@ -82,7 +83,7 @@ enum AccountSyncCLI {
             }
             exit(0)
         } catch {
-            fail("Export failed: \(error.localizedDescription)")
+            CLIArgs.fail("Export failed: \(error.localizedDescription)")
         }
     }
 
@@ -95,28 +96,30 @@ enum AccountSyncCLI {
 
         var i = 0
         while i < args.count {
-            switch args[i] {
-            case "--dry-run":
-                dryRun = true
-            case "--db":
-                guard i + 1 < args.count else { fail("--db requires a path") }
-                dbPath = args[i + 1]
+            switch CLIArgs.matchCommon(args, i) {
+            case .db(let value):
+                dbPath = value
                 i += 1
-            case "--help", "-h":
+            case .help:
                 printUsage()
                 exit(0)
-            default:
-                if path == nil, !args[i].hasPrefix("-") || args[i] == "-" {
-                    path = args[i]
-                } else {
-                    fail("Unknown option '\(args[i])' (see --help)")
+            case .notMatched:
+                switch args[i] {
+                case "--dry-run":
+                    dryRun = true
+                default:
+                    if path == nil, !args[i].hasPrefix("-") || args[i] == "-" {
+                        path = args[i]
+                    } else {
+                        CLIArgs.fail("Unknown option '\(args[i])' (see --help)")
+                    }
                 }
             }
             i += 1
         }
 
         guard let path = path else {
-            fail("import requires a file path (or '-' for stdin)")
+            CLIArgs.fail("import requires a file path (or '-' for stdin)")
         }
 
         let data: Data
@@ -125,14 +128,14 @@ enum AccountSyncCLI {
                 ? FileHandle.standardInput.readDataToEndOfFile()
                 : try Data(contentsOf: URL(fileURLWithPath: path))
         } catch {
-            fail("Could not read '\(path)': \(error.localizedDescription)")
+            CLIArgs.fail("Could not read '\(path)': \(error.localizedDescription)")
         }
 
         let bundle: AccountSync.ExportBundle
         do {
             bundle = try JSONDecoder().decode(AccountSync.ExportBundle.self, from: data)
         } catch {
-            fail("Could not parse import file as an accounts bundle: \(error.localizedDescription)")
+            CLIArgs.fail("Could not parse import file as an accounts bundle: \(error.localizedDescription)")
         }
 
         if dryRun {
@@ -148,13 +151,8 @@ enum AccountSyncCLI {
             print("Done: \(summary.created) created, \(summary.updated) updated, \(summary.skipped) skipped (local record was newer or equal), \(summary.excluded) excluded (host-local Codex/OpenAI account).")
             exit(0)
         } catch {
-            fail("Import failed: \(error.localizedDescription)")
+            CLIArgs.fail("Import failed: \(error.localizedDescription)")
         }
-    }
-
-    private static func fail(_ message: String) -> Never {
-        FileHandle.standardError.write(Data("Error: \(message)\n".utf8))
-        exit(1)
     }
 
     private static func printUsage() {
