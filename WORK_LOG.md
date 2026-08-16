@@ -2,6 +2,12 @@
 
 Chronological record of merged PRs and closed issues, newest first. Maintained automatically by the Guide role.
 
+### 2026-08-16
+
+- **Issue #130** (closed): Multi-identity Codex needs a lifecycle: discovery, provisioning, drift, and a cross-host view
+- **Issue #135** (closed): Declarative intended Codex identity set: codex list/ranking.json should report 'absent', not just fewer rows
+- **PR #166**: feat: report a declared-but-unprovisioned Codex identity as "absent"
+
 ### 2026-08-15
 
 - **Issue #159** (closed): Dedup pointing-hand cursor onHover into a single View modifier
