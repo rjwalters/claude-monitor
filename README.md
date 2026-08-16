@@ -123,6 +123,23 @@ and **appends** any new emails), then imports the result. Loading is
 accounts already in the app that aren't listed are left untouched — nothing is
 removed. Store these files with `chmod 600`; they contain live tokens.
 
+**Tokens** in these lists are Anthropic-only. They may *also* carry keyless
+Codex **identity** entries — the intended-set declaration described in
+[Declaring which identities a host should have](#declaring-which-identities-a-host-should-have)
+— which is how you declare an intended set on a headless host with no popover
+to paste into:
+
+```env
+ACCOUNT_EMAIL_3=agent3@example.com
+ACCOUNT_PROVIDER_3=openai
+ACCOUNT_HOME_LABEL_3=agent3
+```
+
+No `ACCOUNT_KEY_3` — there is no credential to carry. On every launch this
+creates the placeholder if it isn't there and does nothing at all if it is
+(including after the identity has actually been provisioned), so it is safe to
+keep in a shared master list across the whole fleet.
+
 ### Adding an OpenAI (Codex) Account
 
 ChatGPT subscription accounts (Plus/Pro, the ones Codex CLI uses) are polled
@@ -227,13 +244,16 @@ claude-monitor codex list
 # user-3f2… pro         logged in          /Users/you/.codex-work
 # user-91a… plus        needs login        /Users/you/.codex-personal
 # user-77c… pro         drift → user-0d4…  /Users/you/.codex-spare
+# openai-b… —           absent             (not provisioned on this host)
+#   → claude-monitor codex provision agent3
 ```
 
 `list` reports each home's live state: **logged in**, **needs login** (the home
 exists but `codex login` hasn't been run in it), **home missing** (the directory
-is gone — re-register), **drift** (see below), or **unknown** when `codex`
-itself is absent or too old. Both commands take `--db <path>` to work against a
-throwaway store.
+is gone — re-register), **drift** (see below), **absent** (see
+[Declaring which identities a host should have](#declaring-which-identities-a-host-should-have)),
+or **unknown** when `codex` itself is absent or too old. Both commands take
+`--db <path>` to work against a throwaway store.
 
 **drift** means that home is now logged in as a *different* account than the row
 it was registered against — someone ran `codex login` in it again with another
@@ -252,7 +272,69 @@ An account with **no** registered home reads the ambient `$CODEX_HOME` (else
 `~/.codex`), exactly as before — which is correct as long as it is the only
 OpenAI account on the host. Add a second OpenAI account and any account still
 lacking its own home stops using the ambient one (it can speak for only one of
-them, and nothing says which); register its home to bring it back.
+them, and nothing says which); register its home to bring it back. (A merely
+*declared* identity — see immediately below — is not a second account for this
+purpose: it has no login here, so it never triggers that ambiguity.)
+
+#### Declaring which identities a host should have
+
+**Homes are host-local and are never synced.** `codex login` writes a
+credential into one `CODEX_HOME` on one machine; copying it elsewhere is
+explicitly a non-goal (see [Multi-Host Sync](#multi-host-sync) — OpenAI
+supports one `auth.json` per machine and rotates the refresh token on every
+use, so two hosts sharing a copy just invalidate each other). Every host must
+run `codex provision <label>` for itself, once per identity.
+
+That leaves a gap worth naming: with three Codex identities across a fleet,
+a host that was only ever provisioned with two looks *exactly* like a host
+that was supposed to have two. There is no missing row to notice — the
+identity simply isn't there.
+
+So the set of identities a host is *expected* to have travels on the account
+copy/paste you already use. **There is no config file and no new command.**
+
+1. On a host that has the identities, click **Copy** in the popover (or run
+   the equivalent export). Anthropic accounts travel with their token as
+   always; each Codex account travels as an **identity only** — its email, its
+   provider, and its home *label* (the `<label>` half of `~/.codex-<label>`),
+   with **no key**.
+2. On the host that should have them, click **Paste**. Each identity that
+   isn't already present becomes a placeholder: an account row with no
+   credential and no home. (On a headless host with no popover, put the same
+   keyless entries in `~/.claude-monitor/accounts.env` — see
+   [Master account list](#master-account-list-auto-loaded-at-launch).)
+
+**No credential of any kind crosses in either direction, and neither does a
+home path** (a path names a user; only the label you chose travels). This is
+purely a naming layer over data the app already had.
+
+A declared-but-unprovisioned identity is then visible everywhere, without you
+having to go looking:
+
+- **In the popover** — greyed, with an `absent` badge, and every percentage
+  blank. It is never auto-selected for the menu bar and never ranks as
+  "most available" on its empty reading.
+- **In `codex list`** — status `absent`, with the exact remediation beside it:
+  `→ claude-monitor codex provision agent3`.
+- **In `ranking.json`** — `"absent": true` alongside `"status": "blocked"`, so
+  an external load balancer excludes it whether or not it understands the new
+  key (see [Ranking Export](#ranking-export-rankingjson)).
+
+Run the printed `codex provision <label>` on that host and the placeholder
+**converts in place** into a real, polling account — same row, no duplicate,
+no cleanup step. Nothing else has to be told.
+
+Two things this deliberately does *not* do:
+
+- **Pasting never deletes a Codex account.** An identity-only entry says "this
+  host should have this identity"; it is not a claim that any identity missing
+  from the payload is unwanted. A host with an *extra* provisioned identity
+  keeps it, untouched and unflagged. (Anthropic entries keep their existing
+  replace semantics, since they carry a full credential.)
+- **Declaring an identity you already have changes nothing.** The paste
+  resolves onto the existing row and leaves its home and credential alone, so
+  pasting the same payload twice — or pasting it back onto the host it came
+  from — is a no-op.
 
 <details>
 <summary><b>Importing a credential instead (<code>codex import</code>)</b></summary>
@@ -587,8 +669,10 @@ claude-monitor accounts import accounts.json
   against a per-account `CODEX_HOME`, and OpenAI supports exactly one
   `auth.json` per machine — shipping a copy of that credential to another host
   only guarantees the two hosts take turns invalidating each other's copy.
-  Register a Codex account on each host instead: `claude-monitor codex add
-  --home <path>`.
+  Register a Codex account on each host instead: `claude-monitor codex
+  provision <label>`. To carry across *which identities a host should have*
+  (names only, still no credentials), use the popover's Copy/Paste — see
+  [Declaring which identities a host should have](#declaring-which-identities-a-host-should-have).
 - **Idempotent, upsert-by-email:** `import` matches accounts by email
   (falling back to id when email is absent), creates any account it doesn't
   find locally, and updates the rest — except it **never regresses a newer
@@ -639,6 +723,13 @@ atomically, so a reader never sees a partial document.
       "utilization": { "7d": 0.14 },      // note: no "5h" key — see below
       "resets":      { "7d": "…Z" },
       "updated_at":  "2026-07-30T17:58:00Z"
+    },
+    {
+      "email":       "agent3@example.com",
+      "provider":    "openai",
+      "status":      "blocked",           // never routable
+      "absent":      true                 // …because it isn't set up on this host
+      // no utilization / resets / updated_at: nothing has ever been read here
     }
   ]
 }
@@ -657,10 +748,23 @@ atomically, so a reader never sees a partial document.
   A missing key means **unknown**, not `0.0` — reading it as zero would make an
   account look like it has full session capacity. The same applies to
   `resets["5h"]`. (Anthropic accounts always report both windows.)
+- **`absent` is new and additive.** It appears **only** on an OpenAI identity
+  this host is expected to have but was never provisioned with (see
+  [Declaring which identities a host should have](#declaring-which-identities-a-host-should-have));
+  the key is omitted entirely for every other account, so nothing changes for a
+  consumer that has never heard of it. Such an account is emitted with
+  `"status": "blocked"` — an existing value that already means "do not route
+  work here" — and with **no** `utilization`, `resets`, or `updated_at`, since
+  nothing has ever been read for it locally. A consumer that ignores `absent`
+  therefore still excludes it correctly; one that reads it can tell "the
+  credential here is broken" (`blocked`) apart from "this host was never set up
+  for that identity" (`blocked` + `absent`), which is what makes a fleet-wide
+  "who is missing which account?" view possible at all. `schema` stays **1**.
 - Accounts with a `NULL` email are still excluded entirely; `email` remains the
   sole join key, and it is not unique across providers — one person's Anthropic
   and OpenAI accounts can share an address, distinguished by `provider`.
-- No credential material ever appears in this file.
+- No credential material ever appears in this file, and neither does a
+  `CODEX_HOME` path.
 
 ## Auto-Start on Login (Optional)
 

@@ -106,6 +106,10 @@ enum HeadlessRunner {
         }
         let parts = store.sortedAccountsForPopover.map { account -> String in
             let label = "[\(account.provider.shortCode)] \(account.displayName)"
+            // A declared-but-unprovisioned identity (#135) is named, not
+            // scored: a bare "?" here would read as "we failed to poll it",
+            // when in fact there is nothing on this host to poll.
+            if account.isAbsent { return "\(label): \(CodexCLI.absentLabel)" }
             // Read through the shared window model: an account whose provider
             // reports only a weekly window shows that figure rather than a
             // fabricated 0% session.

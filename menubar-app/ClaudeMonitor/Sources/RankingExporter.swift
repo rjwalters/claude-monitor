@@ -49,6 +49,27 @@ import Foundation
 /// — the live-verified Codex usage endpoint can report a weekly window and no
 /// session window at all. Consumers must treat a missing key as *unknown*, not
 /// as 0.0 (which would read as "full session capacity available").
+///
+/// ### `absent` (added in #135)
+///
+/// `"absent": true` marks an OpenAI identity this host is *expected* to have
+/// but was never provisioned with — a placeholder row created by pasting an
+/// identity-only transfer payload (see `OAuthPoller.declareCodexIdentity`).
+/// Codex homes are host-local by design (#104), so this is how a fleet-wide
+/// consumer can tell "this host is missing one of the three Codex identities"
+/// apart from "that identity does not exist anywhere".
+///
+/// It is **additive within schema 1** on the same reasoning as `provider`:
+/// - The key is **omitted entirely** for every normal account, so nothing
+///   changes for a consumer that has never heard of it.
+/// - An absent account is emitted with `"status": "blocked"` — an existing,
+///   already-understood value meaning "do not route work here" — and with no
+///   `utilization`/`resets`/`updated_at` keys at all. So a consumer that
+///   ignores `absent` still excludes it from its pool exactly as it excludes
+///   any other blocked account; it simply cannot say *why*.
+/// - A consumer that reads it can distinguish "credential is broken here"
+///   (`blocked`, no `absent`) from "never set up here" (`blocked` + `absent`),
+///   which is the whole point.
 enum RankingExporter {
     static let schemaVersion = 1
 
@@ -129,9 +150,32 @@ enum RankingExporter {
             // `provider` is selected only when the column exists, so an
             // unmigrated database still exports (every row then resolves to the
             // Anthropic fallback).
-            let hasProvider = tableColumns(db, "accounts").contains("provider")
+            let accountColumns = tableColumns(db, "accounts")
+            let hasProvider = accountColumns.contains("provider")
+            // `codex_home` is read as a **boolean** and never selected as a
+            // value: it names a user, so the path itself must not enter this
+            // file or even this process's memory here. Explicit column list,
+            // never `SELECT *` — that is what keeps it out (#103).
+            let homeRegistered = accountColumns.contains("codex_home")
+                ? "(codex_home IS NOT NULL AND TRIM(codex_home) != '')"
+                : "0"
+            // Both absent-identity inputs degrade the same way every other
+            // column here does: a table this database doesn't have reads as
+            // "no evidence", which can only ever make a row look *less*
+            // absent — never falsely absent.
+            let storedTokenCount = tableColumns(db, "oauth_credentials").isEmpty
+                ? "0"
+                : """
+                  (SELECT COUNT(*) FROM oauth_credentials c
+                    WHERE c.account_id = accounts.id
+                      AND c.access_token IS NOT NULL AND TRIM(c.access_token) != '')
+                  """
+            let localReading = tableColumns(db, "usage_history").isEmpty
+                ? "1"
+                : "EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = accounts.id)"
             let accountStmt = try db.prepare("""
-                SELECT id, email, plan\(hasProvider ? ", provider" : "")
+                SELECT id, email, plan\(hasProvider ? ", provider" : ", NULL"),
+                       \(homeRegistered), \(storedTokenCount), \(localReading)
                 FROM accounts ORDER BY sort_order ASC, last_updated DESC
             """)
 
@@ -142,9 +186,15 @@ enum RankingExporter {
                 guard let email = row[1] as? String, !email.isEmpty else { continue }
                 let plan = row[2] as? String
                 let provider = AccountProvider(stored: hasProvider ? row[3] as? String : nil)
+                let isAbsent = isAbsentCodexIdentity(
+                    provider: provider,
+                    hasStoredToken: ((row[5] as? Int64) ?? 0) > 0,
+                    hasCodexHome: ((row[4] as? Int64) ?? 0) != 0,
+                    hasLocalReading: ((row[6] as? Int64) ?? 0) != 0
+                )
 
                 if let obj = buildAccount(db: db, accountId: accountId, email: email,
-                                          plan: plan, provider: provider) {
+                                          plan: plan, provider: provider, isAbsent: isAbsent) {
                     accountObjects.append(obj)
                 }
             }
@@ -178,13 +228,24 @@ enum RankingExporter {
         accountId: String,
         email: String,
         plan: String?,
-        provider: AccountProvider
+        provider: AccountProvider,
+        isAbsent: Bool = false
     ) -> [String: Any]? {
         // `provider` is emitted unconditionally (never omitted) so a consumer
         // can rely on its presence rather than defaulting per-account; rows that
         // predate multi-provider support resolve to "anthropic".
         var obj: [String: Any] = ["email": email, "provider": provider.rawValue]
         if let plan = plan { obj["plan"] = plan }
+
+        // An absent identity (#135) stops here: it has no reading, and any
+        // utilization/reset/updated_at figure attached to it would be a
+        // fabrication. `blocked` keeps every existing consumer excluding it
+        // without understanding `absent`.
+        if isAbsent {
+            obj["absent"] = true
+            obj["status"] = "blocked"
+            return obj
+        }
 
         // Latest real (non-synthetic) usage reading for this account.
         var sessionPercent: Double?
