@@ -4,6 +4,12 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-16
 
+- **Issue #173** (closed): loadActiveCredentials admits an empty-string access_token (no TRIM guard)
+- **PR #174**: fix: reject empty-string access_token in loadActiveCredentials
+- **Issue #169** (closed): isAbsentCodexIdentity's three hasStoredToken SQL copies diverge (missing TRIM/is_active checks)
+- **PR #172**: refactor: factor the absent-identity stored-token predicate into one SQL helper
+- **Issue #168** (closed): openAIAccountCount excludes more than absent identities — narrows the #111 ambient-home ambiguity guard
+- **PR #171**: fix: count legacy usage_history rows in openAIAccountCount
 - **Issue #130** (closed): Multi-identity Codex needs a lifecycle: discovery, provisioning, drift, and a cross-host view
 - **Issue #135** (closed): Declarative intended Codex identity set: codex list/ranking.json should report 'absent', not just fewer rows
 - **PR #166**: feat: report a declared-but-unprovisioned Codex identity as "absent"
