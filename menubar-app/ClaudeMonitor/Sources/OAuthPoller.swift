@@ -131,6 +131,12 @@ struct EnvImportResult {
     /// this to scope its replace-semantics deletion to only the providers a
     /// paste actually described.
     var provider: AccountProvider = .anthropic
+    /// This entry carried no credential — it declared an identity this host is
+    /// expected to have (#135) rather than importing an account. Kept distinct
+    /// from a merely failed import so `pasteAccounts()` can exclude it from
+    /// replace semantics: a declaration says "this identity exists", never
+    /// "every other identity of this provider should be deleted".
+    var identityOnly: Bool = false
 }
 
 // `@Published`-driven state is only ever read/written from the main thread
@@ -378,6 +384,35 @@ class OAuthPoller: ObservableObject {
         /// compare it with what the home reports. `codex list` never prints
         /// it — see the file comment on `CodexCLI`.
         let email: String?
+        /// The display label on the account row (`accounts.account_name`).
+        /// For a declared-but-absent identity this is the `<label>` half of
+        /// `~/.codex-<label>` carried across by the transfer payload, which is
+        /// exactly the argument `codex provision <label>` wants. Never a path.
+        let accountName: String?
+        /// Whether this host has ever recorded a usage reading for this
+        /// account — the conservative guard in `isAbsentCodexIdentity`.
+        var hasLocalReading: Bool = false
+
+        /// This host is expected to have this identity but was never
+        /// provisioned with it (#135) — no stored token, no registered home,
+        /// and no reading ever taken here. Same rule the popover and
+        /// `ranking.json` apply (`isAbsentCodexIdentity`).
+        var isAbsent: Bool {
+            isAbsentCodexIdentity(
+                provider: .openai,
+                hasStoredToken: hasStoredToken,
+                hasCodexHome: codexHome != nil,
+                hasLocalReading: hasLocalReading
+            )
+        }
+
+        /// The `codex provision <label>` argument that would fill this gap, or
+        /// nil when the payload carried no label. Only ever a bare label — a
+        /// value containing a path separator is rejected rather than echoed,
+        /// since `provision` would reject it too.
+        var provisionLabel: String? {
+            OAuthPoller.codexHomeLabel(codexHome) ?? OAuthPoller.provisionLabelCandidate(accountName)
+        }
     }
 
     /// Register an account by its `CODEX_HOME`, storing **no token**.
@@ -550,7 +585,8 @@ class OAuthPoller: ObservableObject {
                 SELECT a.id, \(hasCodexHome ? "a.codex_home" : "NULL"), a.plan,
                        (SELECT COUNT(*) FROM oauth_credentials c
                          WHERE c.account_id = a.id AND c.access_token IS NOT NULL),
-                       a.email
+                       a.email, a.account_name,
+                       EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = a.id)
                 FROM accounts a
                 WHERE COALESCE(a.provider, 'anthropic') = 'openai'
                 ORDER BY a.sort_order, a.id
@@ -560,10 +596,14 @@ class OAuthPoller: ObservableObject {
                 guard let id = row[0] as? String else { continue }
                 rows.append(CodexAccountRegistration(
                     accountId: id,
-                    codexHome: (row[1] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                    codexHome: (row[1] as? String).flatMap {
+                        $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0
+                    },
                     plan: row[2] as? String,
                     hasStoredToken: ((row[3] as? Int64) ?? 0) > 0,
-                    email: (row[4] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    email: (row[4] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                    accountName: (row[5] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                    hasLocalReading: ((row[6] as? Int64) ?? 0) != 0
                 ))
             }
             return rows
@@ -605,25 +645,97 @@ class OAuthPoller: ObservableObject {
         var results: [EnvImportResult] = []
         for account in accounts {
             let error: String?
-            switch account.provider {
-            case .anthropic:
-                (_, error) = await addAccountWithToken(account.token, email: account.email)
-            case .openai:
+            var identityOnly = false
+            switch (account.provider, account.token) {
+            case (.anthropic, let token?):
+                (_, error) = await addAccountWithToken(token, email: account.email)
+            case (.openai, let token?):
                 (_, error) = await addOpenAIAccount(
-                    accessToken: account.token,
+                    accessToken: token,
                     refreshToken: account.refreshToken,
                     expiresAt: account.tokenExpiresAt
                 )
+            case (_, nil):
+                // A declared identity: no credential to validate, so nothing
+                // is fetched or authenticated — a placeholder row is created
+                // and `codex provision` fills it in later (#135).
+                identityOnly = true
+                (_, error) = declareCodexIdentity(email: account.email, homeLabel: account.homeLabel)
             }
             results.append(EnvImportResult(
                 email: account.email,
                 success: error == nil,
                 error: error,
-                provider: account.provider
+                provider: account.provider,
+                identityOnly: identityOnly
             ))
         }
 
         return results
+    }
+
+    // MARK: - Declared (absent) Codex identities (#135)
+
+    /// Record that this host is *expected* to have an OpenAI/Codex identity it
+    /// has not been provisioned with, as a placeholder `accounts` row:
+    /// `provider = 'openai'`, `codex_home = NULL`, and **no credential row at
+    /// all**. `isAbsentCodexIdentity` reads exactly that shape, so the row
+    /// surfaces as **absent** in `codex list`, the popover, and `ranking.json`
+    /// without any of them needing a new table or config file to consult.
+    ///
+    /// **Nothing here reads, stores, transfers, or logs a credential.** The
+    /// only inputs are an email address and an optional bare label; the row it
+    /// writes is pure bookkeeping over data the app already had.
+    ///
+    /// Idempotent and non-destructive in both directions:
+    /// - An existing `provider = 'openai'` row for this email is **left
+    ///   exactly as it is** — declaring an identity a host already has (the
+    ///   normal case when the same payload is pasted twice, or pasted on the
+    ///   host it was copied from) must never downgrade a working, polling
+    ///   account to a placeholder.
+    /// - The placeholder it does create is keyed by a locally minted
+    ///   `openai-<uuid>` id and carries the declared email, so a later
+    ///   `codex provision`/`codex add --home` for that identity resolves onto
+    ///   this same row via `resolveOpenAIAccountId`'s email match and
+    ///   *converts* it rather than creating a duplicate sibling.
+    ///
+    /// Returns the account id the declaration landed on (existing or new).
+    @discardableResult
+    func declareCodexIdentity(email: String, homeLabel: String?) -> (accountId: String?, error: String?) {
+        let email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !email.isEmpty else { return (nil, "Declared identity has no email") }
+        guard FileManager.default.fileExists(atPath: dbPath) else {
+            return (nil, "No database at the configured path")
+        }
+        do {
+            let db = try openDatabase(dbPath)
+            if let existing = Self.lookupOpenAIAccountId(nativeId: nil, email: email, db: db) {
+                // Already present — real or placeholder, either way untouched.
+                return (existing, nil)
+            }
+
+            let accountId = "openai-\(UUID().uuidString.lowercased())"
+            // `last_updated` stays NULL: this identity has never been read on
+            // this host, and a fabricated timestamp would read as a successful
+            // poll to every freshness/staleness surface.
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider, codex_home)
+                VALUES (?, ?, ?, NULL, NULL,
+                        COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0), 'openai', NULL)
+            """, accountId, homeLabel ?? email, email)
+
+            // Deliberately no oauth_credentials row: its absence *is* the
+            // absent state, and it is what keeps `loadActiveCredentials` from
+            // ever handing this row to the poll loop.
+            flog.info(
+                "declared an unprovisioned Codex identity \(accountId.prefix(8))… — run `claude-monitor codex provision <label>` on this host to fill it in",
+                category: fcat
+            )
+            return (accountId, nil)
+        } catch {
+            flog.error("declareCodexIdentity failed: \(error.localizedDescription)", category: fcat)
+            return (nil, "Could not record the declared identity: \(error.localizedDescription)")
+        }
     }
 
     /// Serialize active accounts into ACCOUNT_EMAIL_N / ACCOUNT_KEY_N env
@@ -651,62 +763,102 @@ class OAuthPoller: ObservableObject {
     /// token doesn't authenticate against the Anthropic API an old build
     /// assumes.
     ///
-    /// **A non-Anthropic account with no stored token is host-local, not
-    /// exportable (#123).** #123 nulls `access_token`/`refresh_token` for
-    /// every `provider = 'openai'` row at migration — the app holds no
-    /// OpenAI credential — so a Codex account can never actually round-trip
-    /// through this format; it is counted in `excludedHostLocal` instead of
-    /// silently vanishing from the count (the #67 guarantee this doc comment
-    /// used to claim no longer holds for Codex/OpenAI specifically).
+    /// **A non-Anthropic account with no stored token travels as an
+    /// *identity only* (#135).** #123 nulls `access_token`/`refresh_token` for
+    /// every `provider = 'openai'` row at migration — the app holds no OpenAI
+    /// credential — so a Codex account has no credential to carry, and #129
+    /// therefore left it out of the payload entirely. That made an identity
+    /// that was never provisioned on a host indistinguishable from one that
+    /// does not exist. Such a row is now emitted as:
+    ///   - `ACCOUNT_EMAIL_N` — the identity's address, the join key
+    ///   - `ACCOUNT_PROVIDER_N=openai`
+    ///   - `ACCOUNT_HOME_LABEL_N` — the `<label>` half of `~/.codex-<label>`,
+    ///     when the home follows that convention, so the receiving host can
+    ///     print the exact `codex provision <label>` that fills the gap
+    ///   - **no `ACCOUNT_KEY_N`** — there is no credential and never will be
     ///
-    /// Returns the serialized env text, the number of accounts it actually
-    /// contains, and the number of host-local (tokenless, non-Anthropic)
-    /// accounts left out of it, so callers can report an accurate count and
-    /// explain the gap rather than re-deriving either from
+    /// **#104's guarantee is untouched: labels cross machines, credentials
+    /// never do.** The home *path* is never emitted (it names a user); only
+    /// the label the operator chose is, and only when it can be derived from
+    /// the `~/.codex-<label>` convention. The receiving host creates a
+    /// placeholder account row (`OAuthPoller.declareCodexIdentity`) that
+    /// `codex list`, the popover, and `ranking.json` all report as **absent**.
+    ///
+    /// A keyless entry is additive in the same sense the #67 keys are: an
+    /// older build's `parseAccountPairs()` requires `ACCOUNT_KEY_N` and simply
+    /// skips the entry, creating nothing.
+    ///
+    /// Returns the serialized env text, the number of *credentialed* accounts
+    /// it contains, and the number of identity-only (tokenless, non-Anthropic)
+    /// entries alongside them, so callers can report an accurate count and
+    /// name the difference rather than re-deriving either from
     /// `store.accounts.count`.
-    func exportAccountsEnv() -> (env: String, count: Int, excludedHostLocal: Int)? {
+    func exportAccountsEnv() -> (env: String, count: Int, identityOnly: Int)? {
         guard FileManager.default.fileExists(atPath: dbPath) else { return nil }
         do {
             let db = try openDatabase(dbPath, readonly: true)
-            // `provider` (accounts) and `token_expires_at` (oauth_credentials)
-            // are migrated columns (#28) — select them only when present so a
-            // database opened before that migration ran still exports its
-            // (necessarily all-Anthropic) accounts instead of failing the
-            // query outright.
-            let hasAcctProvider = tableColumns(db, "accounts").contains("provider")
+            // `provider`/`codex_home` (accounts) and `token_expires_at`
+            // (oauth_credentials) are migrated columns (#28, #103) — select
+            // them only when present so a database opened before those
+            // migrations ran still exports its (necessarily all-Anthropic)
+            // accounts instead of failing the query outright.
+            let accountColumns = tableColumns(db, "accounts")
+            let hasAcctProvider = accountColumns.contains("provider")
+            let hasCodexHome = accountColumns.contains("codex_home")
             let hasTokenExpiry = tableColumns(db, "oauth_credentials").contains("token_expires_at")
             // No `access_token IS NOT NULL` filter here (unlike before #123):
             // a tokenless row still needs to be seen so a tokenless
-            // non-Anthropic one can be counted as host-local below, rather
+            // non-Anthropic one can be emitted identity-only below, rather
             // than disappearing from both the export and the count.
+            //
+            // Driven from `accounts` with a LEFT JOIN rather than from
+            // `oauth_credentials` inward (#135): a *declared* identity has no
+            // credential row at all, so an inner join would drop it and a
+            // declaration could never be propagated on to a third host. For
+            // Anthropic this changes nothing — a row with no active credential
+            // has no token, and a tokenless Anthropic entry is skipped below
+            // exactly as it always was.
             let stmt = try db.prepare("""
                 SELECT COALESCE(a.email, a.account_name, c.label) AS email, c.access_token,
                        \(hasAcctProvider ? "a.provider" : "NULL") AS provider,
                        c.refresh_token,
-                       \(hasTokenExpiry ? "c.token_expires_at" : "NULL") AS token_expires_at
-                FROM oauth_credentials c
-                JOIN accounts a ON a.id = c.account_id
-                WHERE c.is_active = 1
+                       \(hasTokenExpiry ? "c.token_expires_at" : "NULL") AS token_expires_at,
+                       \(hasCodexHome ? "a.codex_home" : "NULL") AS codex_home,
+                       a.account_name
+                FROM accounts a
+                LEFT JOIN oauth_credentials c ON c.account_id = a.id AND c.is_active = 1
                 ORDER BY a.sort_order, a.id
             """)
 
             var lines: [String] = []
             var n = 0
-            var excludedHostLocal = 0
+            var credentialed = 0
+            var identityOnly = 0
             for row in stmt {
                 let provider = AccountProvider(stored: row[2] as? String)
-                guard let token = row[1] as? String, !token.isEmpty else {
-                    // Tokenless: a host-local Codex/OpenAI row (#123) is
-                    // counted so the caller can explain the gap. A tokenless
-                    // Anthropic row is some other, unrelated inactive state —
-                    // silently skipped, exactly as before #123.
-                    if provider != .anthropic { excludedHostLocal += 1 }
+                let token = (row[1] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                if token == nil && provider == .anthropic {
+                    // A tokenless Anthropic row is some other, unrelated
+                    // inactive state — silently skipped, exactly as before.
                     continue
                 }
+                // An identity entry is nothing *but* a name, so a row with no
+                // usable one is not worth emitting: `account-N` would be a
+                // fabricated join key, and the receiving host would create a
+                // placeholder nobody can match to a real account.
+                let resolvedEmail = (row[0] as? String).flatMap {
+                    $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0
+                }
+                if token == nil && resolvedEmail == nil { continue }
                 n += 1
-                let email = (row[0] as? String) ?? "account-\(n)"
+                let email = resolvedEmail ?? "account-\(n)"
                 lines.append("ACCOUNT_EMAIL_\(n)=\(email)")
-                lines.append("ACCOUNT_KEY_\(n)=\(token)")
+                if let token = token {
+                    credentialed += 1
+                    lines.append("ACCOUNT_KEY_\(n)=\(token)")
+                } else {
+                    identityOnly += 1
+                }
                 if provider != .anthropic {
                     lines.append("ACCOUNT_PROVIDER_\(n)=\(provider.rawValue)")
                     if let refresh = row[3] as? String, !refresh.isEmpty {
@@ -715,40 +867,89 @@ class OAuthPoller: ObservableObject {
                     if let expiresISO = row[4] as? String, !expiresISO.isEmpty {
                         lines.append("ACCOUNT_EXPIRES_\(n)=\(expiresISO)")
                     }
+                    // Label only, never the path this was derived from.
+                    if let label = Self.codexHomeLabel(row[5] as? String)
+                        ?? Self.provisionLabelCandidate(row[6] as? String) {
+                        lines.append("ACCOUNT_HOME_LABEL_\(n)=\(label)")
+                    }
                 }
             }
 
-            guard n > 0 || excludedHostLocal > 0 else { return nil }
+            guard n > 0 else { return nil }
 
             let header = """
-                # Claude Monitor accounts — \(n) account(s)
+                # Claude Monitor accounts — \(credentialed) account(s)\
+                \(identityOnly > 0 ? " + \(identityOnly) Codex identity/identities (no credential)" : "")
                 # Paste into the app (Add Account → Bulk Import) or save as ~/.claude-monitor/accounts.env
 
                 """
-            return (header + lines.joined(separator: "\n") + "\n", n, excludedHostLocal)
+            return (header + lines.joined(separator: "\n") + "\n", credentialed, identityOnly)
         } catch {
             flog.error("exportAccountsEnv failed: \(error.localizedDescription)", category: fcat)
             return nil
         }
     }
 
+    /// The `<label>` half of a `~/.codex-<label>` home directory — the exact
+    /// argument `codex provision <label>` takes — or nil for any home that
+    /// doesn't follow that convention (the ambient `~/.codex`, or a custom
+    /// `--home` path somewhere else entirely).
+    ///
+    /// **Only the label ever leaves this function.** A home path contains a
+    /// username; the label is a name the operator chose, so it is the one part
+    /// of a home that is safe to put on a clipboard bound for another machine.
+    /// A label that would not survive `parseProvisionArgs` (empty, or
+    /// containing a path separator) is rejected rather than emitted.
+    nonisolated static func codexHomeLabel(_ home: String?) -> String? {
+        guard let home = home?.trimmingCharacters(in: .whitespacesAndNewlines), !home.isEmpty else {
+            return nil
+        }
+        let base = (home as NSString).lastPathComponent
+        guard base.hasPrefix(".codex-") else { return nil }
+        return provisionLabelCandidate(String(base.dropFirst(".codex-".count)))
+    }
+
+    /// A stored display name that is usable as a `codex provision <label>`
+    /// argument: non-empty, no path separator, and not an email address (a
+    /// row whose `account_name` is just its email carries no label at all).
+    nonisolated static func provisionLabelCandidate(_ raw: String?) -> String? {
+        guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty, !value.contains("/"), !looksLikeEmailAddress(value) else { return nil }
+        return value
+    }
+
     /// One parsed clipboard/env entry. `provider`/`refreshToken`/
     /// `tokenExpiresAt` are additive (#67): an old-format entry (no
     /// `ACCOUNT_PROVIDER_N` key) parses as `.anthropic` with no refresh
     /// token, exactly as every entry parsed before this format was extended.
+    ///
+    /// `token` is **optional** as of #135: a Codex identity travels with no
+    /// credential at all (`ACCOUNT_EMAIL_N` + `ACCOUNT_PROVIDER_N=openai`,
+    /// optionally `ACCOUNT_HOME_LABEL_N`, and no `ACCOUNT_KEY_N`). A keyless
+    /// *Anthropic* entry is still meaningless and is dropped at parse time, so
+    /// nil here always means "a declared identity", never "a token went
+    /// missing".
     // Not private: exercised directly by SelfTest (no network access needed
     // to verify parsing), same pattern as `resolveOpenAIAccountId` below.
     struct ParsedAccountEntry {
         let email: String
-        let token: String
+        let token: String?
         let provider: AccountProvider
         let refreshToken: String?
         let tokenExpiresAt: Date?
+        /// The `codex provision <label>` argument for a declared identity, when
+        /// the sending host could derive one. Never a path (#135).
+        let homeLabel: String?
     }
 
-    /// Parse env content into ordered entries from ACCOUNT_EMAIL_N /
-    /// ACCOUNT_KEY_N (plus the additive per-index provider/refresh/expiry
-    /// keys). Gaps in numbering are skipped; order follows the index N.
+    /// Parse env content into ordered entries from ACCOUNT_EMAIL_N (plus
+    /// ACCOUNT_KEY_N and the additive per-index provider/refresh/expiry/
+    /// home-label keys). Gaps in numbering are skipped; order follows the
+    /// index N.
+    ///
+    /// An entry with no `ACCOUNT_KEY_N` is kept **only** for a non-Anthropic
+    /// provider — that is a declared Codex identity (#135). Everything else
+    /// still requires the email/key pair it always did.
     func parseAccountPairs(_ content: String) -> [ParsedAccountEntry] {
         var env: [String: String] = [:]
         for line in content.components(separatedBy: .newlines) {
@@ -762,16 +963,21 @@ class OAuthPoller: ObservableObject {
 
         var pairs: [ParsedAccountEntry] = []
         for i in 1...99 {
-            guard let email = env["ACCOUNT_EMAIL_\(i)"],
-                  let token = env["ACCOUNT_KEY_\(i)"] else {
+            guard let email = env["ACCOUNT_EMAIL_\(i)"], !email.isEmpty else {
                 continue  // Skip gaps — files may have non-consecutive numbering
             }
             let provider = AccountProvider(stored: env["ACCOUNT_PROVIDER_\(i)"])
+            let token = env["ACCOUNT_KEY_\(i)"].flatMap { $0.isEmpty ? nil : $0 }
+            // Keyless is a declared identity, which only exists for a
+            // non-Anthropic provider. A keyless Anthropic entry is malformed
+            // input and is dropped exactly as it was before #135.
+            if token == nil && provider == .anthropic { continue }
             let refreshToken = env["ACCOUNT_REFRESH_\(i)"]
             let tokenExpiresAt = env["ACCOUNT_EXPIRES_\(i)"].flatMap { UsageRecord.parseISO($0) }
             pairs.append(ParsedAccountEntry(
                 email: email, token: token, provider: provider,
-                refreshToken: refreshToken, tokenExpiresAt: tokenExpiresAt
+                refreshToken: refreshToken, tokenExpiresAt: tokenExpiresAt,
+                homeLabel: Self.provisionLabelCandidate(env["ACCOUNT_HOME_LABEL_\(i)"])
             ))
         }
         return pairs
@@ -796,13 +1002,23 @@ class OAuthPoller: ObservableObject {
     /// and additively import each. Accounts already in the DB but absent from the
     /// merged list are left untouched — this never removes accounts.
     ///
-    /// Anthropic-only, unlike `importFromEnvString`: these are periodic
-    /// background files, not a one-shot clipboard/file paste, and the
-    /// `ACCOUNT_PROVIDER_N` key #67 adds is not expected to appear here. A
-    /// non-Anthropic entry (if one ever did appear) is imported via
-    /// `addAccountWithToken` same as before — it fails harmlessly (invalid
-    /// token against the Anthropic API), matching the pre-#67 behavior for
-    /// any account this format couldn't express.
+    /// **Tokened** entries here are Anthropic-only, unlike
+    /// `importFromEnvString`: these are periodic background files, not a
+    /// one-shot clipboard/file paste, and the `ACCOUNT_PROVIDER_N` key #67
+    /// adds is not expected to appear here. A tokened non-Anthropic entry (if
+    /// one ever did appear) is imported via `addAccountWithToken` same as
+    /// before — it fails harmlessly (invalid token against the Anthropic API),
+    /// matching the pre-#67 behavior for any account this format couldn't
+    /// express.
+    ///
+    /// **Keyless entries are declared Codex identities (#135)** and *are*
+    /// honored, because a headless Linux host has no popover to paste into —
+    /// these files are its only env-transfer surface, so excluding them would
+    /// make the intended set a macOS-only feature. That is safe on an
+    /// every-launch cadence for the same reason the rest of this function is:
+    /// `declareCodexIdentity` only ever *adds* a placeholder for an identity
+    /// that isn't there, and is a no-op once one exists — including after the
+    /// identity has been provisioned for real.
     @discardableResult
     func syncFromAccountFiles() async -> [EnvImportResult] {
         let fm = FileManager.default
@@ -835,7 +1051,23 @@ class OAuthPoller: ObservableObject {
         flog.info("syncFromAccountFiles: importing \(merged.count) merged account(s)", category: fcat)
         var results: [EnvImportResult] = []
         for pair in merged {
-            let (_, error) = await addAccountWithToken(pair.token, email: pair.email)
+            // A keyless entry is a declared Codex identity (#135). Honoring it
+            // here is what makes the intended set expressible on a **headless
+            // Linux host**, which has no popover to paste into — these two
+            // files are its only env-transfer surface. Safe on the every-launch
+            // cadence precisely because `declareCodexIdentity` is idempotent
+            // and non-destructive: it creates a placeholder the first time and
+            // is a no-op forever after, including once the identity has been
+            // provisioned for real.
+            guard let token = pair.token else {
+                let (_, error) = declareCodexIdentity(email: pair.email, homeLabel: pair.homeLabel)
+                results.append(EnvImportResult(
+                    email: pair.email, success: error == nil, error: error,
+                    provider: pair.provider, identityOnly: true
+                ))
+                continue
+            }
+            let (_, error) = await addAccountWithToken(token, email: pair.email)
             results.append(EnvImportResult(email: pair.email, success: error == nil, error: error))
         }
         return results
@@ -1462,17 +1694,43 @@ class OAuthPoller: ObservableObject {
         )
     }
 
-    /// How many OpenAI account rows this database holds. Counted per poll (one
-    /// scalar against a database this cycle opens anyway) rather than cached, so
-    /// adding an account takes effect on the next cycle without a restart.
-    private func openAIAccountCount() -> Int {
+    /// How many OpenAI accounts this host could plausibly be reading the
+    /// ambient home for. Counted per poll (one scalar against a database this
+    /// cycle opens anyway) rather than cached, so adding an account takes
+    /// effect on the next cycle without a restart.
+    ///
+    /// **Absent identities (#135) are excluded.** A placeholder row — declared
+    /// by a paste, never provisioned here, no stored token and no registered
+    /// home — has no login on this host at all, so the ambient home cannot be
+    /// its and it is not a candidate owner. Counting it would be worse than
+    /// useless: declaring the identities a host is *supposed* to have would
+    /// push its one genuinely-ambient account into `.ambiguous` and stop it
+    /// polling, i.e. the bookkeeping layer would break the thing it is
+    /// bookkeeping. The belt-and-braces identity guard
+    /// (`identitiesConflict`/`codexHomeDrift`) still catches an ambient home
+    /// that turns out to hold someone else's login, which is the case this
+    /// count was never able to decide on its own anyway.
+    // Not private: exercised directly by SelfTest, which pins that declaring
+    // an intended set never pushes a working single-account host into
+    // `.ambiguous`. Same pattern as `saveCodexHomeAccount`/`codexAccounts`.
+    func openAIAccountCount() -> Int {
         guard FileManager.default.fileExists(atPath: dbPath) else { return 0 }
         do {
             let db = try openDatabase(dbPath, readonly: true)
-            guard tableColumns(db, "accounts").contains("provider") else { return 0 }
-            let count = try db.scalar(
-                "SELECT COUNT(*) FROM accounts WHERE COALESCE(provider, 'anthropic') = 'openai'"
-            ) as? Int64
+            let accountColumns = tableColumns(db, "accounts")
+            guard accountColumns.contains("provider") else { return 0 }
+            let homeRegistered = accountColumns.contains("codex_home")
+                ? "(a.codex_home IS NOT NULL AND TRIM(a.codex_home) != '')"
+                : "0"
+            let count = try db.scalar("""
+                SELECT COUNT(*) FROM accounts a
+                WHERE COALESCE(a.provider, 'anthropic') = 'openai'
+                  AND (\(homeRegistered)
+                       OR EXISTS (SELECT 1 FROM oauth_credentials c
+                                   WHERE c.account_id = a.id
+                                     AND c.access_token IS NOT NULL
+                                     AND TRIM(c.access_token) != ''))
+            """) as? Int64
             return Int(count ?? 0)
         } catch {
             flog.error("openAIAccountCount failed: \(error.localizedDescription)", category: fcat)

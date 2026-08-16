@@ -96,6 +96,7 @@ enum SelfTest {
         testCodexPerAccountHomeReachesChild()
         testSchemaMigrationFromPreMigrationDatabase()
         testRankingExportCarriesProvider()
+        testRankingExportMarksAbsentIdentity()
         testNamedLimitsRoundTrip()
         testOpenAIImportResolvesExistingAccountByEmail()
         testExportAccountsEnvIncludesAllProviders()
@@ -104,6 +105,14 @@ enum SelfTest {
         testExportAccountsEnvGenuinelyEmptyStoreReturnsNil()
         testParseAccountPairsBackwardCompatibleWithOldFormat()
         testParseAccountPairsRoundTripsOpenAIFields()
+        testParseAccountPairsAcceptsKeylessCodexIdentity()
+        testCodexHomeLabelDerivation()
+        testDeclaredCodexIdentityIsAbsent()
+        testProvisioningAbsentIdentityConvertsInPlace()
+        testAbsentIdentityDoesNotMakeAmbientHomeAmbiguous()
+        testDeclaredIdentityRePropagates()
+        testHeadlessEnvFileCanDeclareIdentities()
+        testAbsentVocabularyIsDistinct()
         testAccountSyncExcludesOpenAIAccounts()
         testMergeDuplicateAccountsSharingEmail()
         testAccountDeletionRemovesCredentials()
@@ -1983,7 +1992,7 @@ enum SelfTest {
                 let registered = [
                     OAuthPoller.CodexAccountRegistration(
                         accountId: "user-registered", codexHome: registeredHome,
-                        plan: "pro", hasStoredToken: false, email: nil
+                        plan: "pro", hasStoredToken: false, email: nil, accountName: nil
                     )
                 ]
 
@@ -2002,13 +2011,14 @@ enum SelfTest {
                 expect(!discovered.contains(ignoredFile),
                        "a plain file named like a home is never a candidate — only directories")
 
-                // An account with no registered home (nil codexHome) reads the
-                // ambient default, so that resolved path must be excluded too —
-                // not just literally-registered ones.
+                // An account with no registered home (nil codexHome) but a
+                // stored token reads the ambient default, so that resolved
+                // path must be excluded too — not just literally-registered
+                // ones.
                 let homelessRegistered = [
                     OAuthPoller.CodexAccountRegistration(
                         accountId: "user-homeless", codexHome: nil, plan: nil,
-                        hasStoredToken: false, email: nil
+                        hasStoredToken: true, email: nil, accountName: nil
                     )
                 ]
                 let ambientHome = scratchHome.appendingPathComponent(".codex-empty").path
@@ -2021,6 +2031,29 @@ enum SelfTest {
                        "a homeless account's ambient default home is excluded, not just explicit registrations")
                 expectEqual(discoveredWithAmbientExcluded, [unregisteredHome],
                             "the remaining on-disk home is still reported once the ambient one is excluded")
+
+                // An **absent** identity (#135) is homeless *and* tokenless: it
+                // has never been provisioned here, so it reads no home at all.
+                // Letting it stand in for the ambient home would hide a
+                // genuinely unregistered ~/.codex from the very command whose
+                // job is to surface it.
+                let absentDeclared = [
+                    OAuthPoller.CodexAccountRegistration(
+                        accountId: "openai-declared", codexHome: nil, plan: nil,
+                        hasStoredToken: false, email: "declared@example.com", accountName: "agent-3"
+                    )
+                ]
+                expect(absentDeclared[0].isAbsent,
+                       "a homeless, tokenless OpenAI row is an absent identity")
+                expectEqual(absentDeclared[0].provisionLabel, "agent-3",
+                            "the declared label is what `codex provision` should be run with")
+                let discoveredDespiteAbsent = CodexCLI.discoverUnregisteredHomes(
+                    registered: absentDeclared,
+                    homeDir: scratchHome.path,
+                    ambientHome: ambientHome
+                )
+                expect(discoveredDespiteAbsent.contains(ambientHome),
+                       "an absent identity never suppresses discovery of the ambient home")
 
                 // No homes on disk at all besides a registered one (edge case).
                 let onlyRegisteredDir = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -2621,12 +2654,17 @@ enum SelfTest {
         }
     }
 
-    /// Mixed host, post-#123: a normally-polled Codex account has NO stored
-    /// token (`nullOutOpenAITokens` nulls it at migration), unlike the
-    /// clipboard-imported one above. `exportAccountsEnv` must still count the
-    /// Anthropic accounts normally *and* report the Codex account as
-    /// host-local-excluded rather than silently dropping it from both the
-    /// count and any explanation (issue #129).
+    /// Mixed host, post-#123/#135: a normally-polled Codex account has NO
+    /// stored token (`nullOutOpenAITokens` nulls it at migration), unlike the
+    /// clipboard-imported one above. It is therefore serialized **identity
+    /// only** — email + provider + the home *label*, and no `ACCOUNT_KEY_N` —
+    /// so the receiving host can name the identity it is missing (#135)
+    /// instead of the account vanishing from the payload entirely (#129's
+    /// counting-only compromise).
+    ///
+    /// The credential boundary (#104) is the load-bearing assertion here: the
+    /// home **path** must not appear anywhere in the payload (it names a
+    /// user), and no key/token material may either.
     private static func testExportAccountsEnvExcludesTokenlessCodexAccount() {
         withSelfTestTempDir { dir in
             do {
@@ -2642,7 +2680,8 @@ enum SelfTest {
                 """)
                 try db.run("""
                     INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, codex_home, provider)
-                    VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 1, '/home/codex', 'openai')
+                    VALUES ('codex-1', 'Codex One', 'codex@example.com', 'Plus', '2026-01-01T00:00:00Z', 1,
+                            '/home/alice/.codex-agent3', 'openai')
                 """)
                 try db.run("""
                     INSERT INTO oauth_credentials
@@ -2659,16 +2698,29 @@ enum SelfTest {
                 """)
 
                 let poller = OAuthPoller(dbPath: dbPath)
-                guard let (env, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                guard let (env, count, identityOnly) = poller.exportAccountsEnv() else {
                     checks += 1
                     failures.append("exportAccountsEnv returned nil for a mixed host with a tokenless Codex account")
                     return
                 }
 
-                expectEqual(count, 1, "only the tokened Anthropic account is exported")
-                expectEqual(excludedHostLocal, 1, "the tokenless Codex account is counted as host-local-excluded")
+                expectEqual(count, 1, "only the tokened Anthropic account counts as a credentialed export")
+                expectEqual(identityOnly, 1, "the tokenless Codex account is carried as an identity-only entry")
                 expect(env.contains("one@example.com"), "export still includes the Anthropic account")
-                expect(!env.contains("codex@example.com"), "the tokenless Codex account is not serialized (there is no token to export)")
+                expect(env.contains("ACCOUNT_EMAIL_2=codex@example.com"),
+                       "the Codex identity is now named in the payload rather than dropped (#135)")
+                expect(env.contains("ACCOUNT_PROVIDER_2=openai"), "the identity-only entry is tagged with its provider")
+                expect(env.contains("ACCOUNT_HOME_LABEL_2=agent3"),
+                       "the home's label travels so the receiving host can print `codex provision agent3`")
+                expect(!env.contains("ACCOUNT_KEY_2"),
+                       "an identity-only entry carries no key — there is no credential and never will be")
+
+                // #104's boundary, asserted literally: a label crosses machines,
+                // a path (which names a user) never does.
+                expect(!env.contains("/home/alice"), "no home path — not even a fragment of one — reaches the payload")
+                expect(!env.contains(".codex-agent3"), "the home directory name itself is never emitted, only the label")
+                expect(!env.contains("ACCOUNT_REFRESH_2") && !env.contains("ACCOUNT_EXPIRES_2"),
+                       "an identity-only entry carries no credential material of any kind")
             } catch {
                 checks += 1
                 failures.append("exportAccountsEnv tokenless-Codex test threw: \(error)")
@@ -2681,6 +2733,9 @@ enum SelfTest {
     /// is indistinguishable from a genuinely empty store, and `copyAccounts()`
     /// would report the bare, misleading "Nothing to copy" that #67 already
     /// fixed once (issue #129 is that regression coming back through #123).
+    /// As of #135 the payload is genuinely useful on such a host: it carries
+    /// every Codex identity by name so another host can be told which ones it
+    /// is supposed to have.
     private static func testExportAccountsEnvCodexOnlyHostIsNotGenuinelyEmpty() {
         withSelfTestTempDir { dir in
             do {
@@ -2701,14 +2756,17 @@ enum SelfTest {
                 """)
 
                 let poller = OAuthPoller(dbPath: dbPath)
-                guard let (_, count, excludedHostLocal) = poller.exportAccountsEnv() else {
+                guard let (env, count, identityOnly) = poller.exportAccountsEnv() else {
                     checks += 1
-                    failures.append("exportAccountsEnv returned nil for a Codex-only host — it must report the exclusion instead")
+                    failures.append("exportAccountsEnv returned nil for a Codex-only host — it must carry the identity instead")
                     return
                 }
 
-                expectEqual(count, 0, "a Codex-only host has nothing tokened to export")
-                expectEqual(excludedHostLocal, 1, "the sole Codex account is reported as host-local-excluded, not silently dropped")
+                expectEqual(count, 0, "a Codex-only host has no credential to export")
+                expectEqual(identityOnly, 1, "the sole Codex account travels as an identity, not silently dropped")
+                expect(env.contains("ACCOUNT_EMAIL_1=codex@example.com"),
+                       "a Codex-only payload still names its identity")
+                expect(!env.contains("ACCOUNT_KEY_"), "…and carries no key of any kind")
             } catch {
                 checks += 1
                 failures.append("exportAccountsEnv Codex-only-host test threw: \(error)")
@@ -2826,6 +2884,376 @@ enum SelfTest {
                 failures.append("parseAccountPairs OpenAI round-trip test threw: \(error)")
             }
         }
+    }
+
+    // MARK: - Declared (absent) Codex identities (#135)
+
+    /// The parse half of the identity-only transfer format: a keyless
+    /// `openai` entry is a *declaration*, a keyless Anthropic entry is still
+    /// malformed input, and an old-format payload is unaffected either way.
+    private static func testParseAccountPairsAcceptsKeylessCodexIdentity() {
+        let poller = OAuthPoller(dbPath: "/nonexistent/does-not-matter-for-parsing.db")
+        let payload = """
+            # Claude Monitor accounts — 1 account(s) + 2 Codex identity/identities (no credential)
+            ACCOUNT_EMAIL_1=one@example.com
+            ACCOUNT_KEY_1=token-one
+            ACCOUNT_EMAIL_2=agent3@example.com
+            ACCOUNT_PROVIDER_2=openai
+            ACCOUNT_HOME_LABEL_2=agent3
+            ACCOUNT_EMAIL_3=agent4@example.com
+            ACCOUNT_PROVIDER_3=openai
+            ACCOUNT_EMAIL_4=broken@example.com
+            """
+        let parsed = poller.parseAccountPairs(payload)
+
+        expectEqual(parsed.count, 3, "the credentialed entry and both declarations parse; the keyless Anthropic one does not")
+        expect(!parsed.contains { $0.email == "broken@example.com" },
+               "a keyless entry with no provider marker is still dropped, exactly as before #135")
+
+        guard let credentialed = parsed.first(where: { $0.email == "one@example.com" }),
+              let labelled = parsed.first(where: { $0.email == "agent3@example.com" }),
+              let unlabelled = parsed.first(where: { $0.email == "agent4@example.com" }) else {
+            checks += 1
+            failures.append("keyless-identity parse is missing an expected entry")
+            return
+        }
+
+        expectEqual(credentialed.token, "token-one", "the credentialed entry is untouched")
+        expect(credentialed.homeLabel == nil, "an Anthropic entry carries no home label")
+
+        expect(labelled.token == nil, "a declared identity parses with no token")
+        expectEqual(labelled.provider, .openai, "a declared identity is provider-tagged")
+        expectEqual(labelled.homeLabel, "agent3", "the home label round-trips")
+
+        expect(unlabelled.token == nil, "a declared identity with no label still parses")
+        expect(unlabelled.homeLabel == nil, "…and reports no label rather than inventing one")
+
+        // The label is a `codex provision <label>` argument: anything that
+        // wouldn't survive `parseProvisionArgs` is rejected, not echoed.
+        let hostile = poller.parseAccountPairs("""
+            ACCOUNT_EMAIL_1=x@example.com
+            ACCOUNT_PROVIDER_1=openai
+            ACCOUNT_HOME_LABEL_1=../../etc
+            """)
+        expectEqual(hostile.count, 1, "the entry still parses")
+        expect(hostile[0].homeLabel == nil, "a label containing a path separator is rejected, never echoed")
+    }
+
+    /// `codexHomeLabel` derives a `codex provision` argument from a home path
+    /// and **never** leaks the path. This is #104's boundary expressed as a
+    /// pure function: a label crosses machines, a home path (which names a
+    /// user) does not.
+    private static func testCodexHomeLabelDerivation() {
+        expectEqual(OAuthPoller.codexHomeLabel("/Users/alice/.codex-work"), "work",
+                    "the label is the suffix after `.codex-`")
+        expectEqual(OAuthPoller.codexHomeLabel("/home/bob/.codex-agent-10/"), "agent-10",
+                    "a trailing separator doesn't change the label")
+        expect(OAuthPoller.codexHomeLabel("/Users/alice/.codex") == nil,
+               "the ambient home has no label — it names no particular identity")
+        expect(OAuthPoller.codexHomeLabel("/opt/somewhere/custom-home") == nil,
+               "a home that doesn't follow the convention yields no label rather than a guess")
+        expect(OAuthPoller.codexHomeLabel(nil) == nil, "no home, no label")
+        expect(OAuthPoller.codexHomeLabel("   ") == nil, "a blank home is not a label")
+        expect(OAuthPoller.codexHomeLabel("/Users/alice/.codex-") == nil,
+               "an empty label is rejected — `codex provision` would reject it too")
+    }
+
+    /// The paste half: `declareCodexIdentity` writes the placeholder shape the
+    /// operator ruling specified — `provider = openai`, `codex_home = NULL`,
+    /// **no credential row** — and that shape reads as absent everywhere.
+    ///
+    /// Also covers the two edge cases the issue's test plan calls out:
+    /// declaring an identity the host already has must not downgrade it, and a
+    /// registered identity the payload never mentioned (an "extra") must be
+    /// left entirely alone — neither deleted nor misreported as absent.
+    private static func testDeclaredCodexIdentityIsAbsent() {
+        withSelfTestTempDir("declare") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+
+                // An "extra": already provisioned here, not named by any paste.
+                let extraHome = "/tmp/selftest-declare-extra-\(UUID().uuidString)"
+                poller.saveCodexHomeAccount(
+                    accountId: "user-extra", email: "extra@example.com", plan: "pro", codexHome: extraHome
+                )
+
+                let (declaredId, declareError) = poller.declareCodexIdentity(
+                    email: "agent3@example.com", homeLabel: "agent3"
+                )
+                expect(declareError == nil, "declaring an identity succeeds with no network and no credential")
+                guard let declaredId = declaredId else {
+                    checks += 1
+                    failures.append("declareCodexIdentity returned no account id")
+                    return
+                }
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts WHERE email = 'agent3@example.com'") as? Int64, 1,
+                            "exactly one placeholder row is created")
+                expectEqual(try db.scalar("SELECT provider FROM accounts WHERE id = ?", declaredId) as? String, "openai",
+                            "the placeholder is an OpenAI row")
+                expect(try db.scalar("SELECT codex_home FROM accounts WHERE id = ?", declaredId) == nil,
+                       "codex_home stays NULL — a home is host-local and is never carried over")
+                expect(try db.scalar("SELECT last_updated FROM accounts WHERE id = ?", declaredId) == nil,
+                       "last_updated stays NULL — nothing has ever been polled for this identity here")
+                expectEqual(try db.scalar("SELECT account_name FROM accounts WHERE id = ?", declaredId) as? String, "agent3",
+                            "the declared label becomes the display name, so `codex list` can print the provision command")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ?", declaredId) as? Int64, 0,
+                            "no credential row of any kind is created — its absence *is* the absent state")
+
+                // Read back through the enumerations each surface actually uses.
+                let registrations = poller.codexAccounts()
+                guard let declaredRow = registrations.first(where: { $0.accountId == declaredId }),
+                      let extraRow = registrations.first(where: { $0.accountId == "user-extra" }) else {
+                    checks += 1
+                    failures.append("codexAccounts() is missing a row the test just wrote")
+                    return
+                }
+                expect(declaredRow.isAbsent, "the declared identity reads as absent")
+                expectEqual(declaredRow.provisionLabel, "agent3", "…and names the exact `codex provision` argument")
+                expect(!extraRow.isAbsent,
+                       "an 'extra' — registered here, never named by the paste — is not absent and is not touched")
+
+                expect(!poller.loadActiveCredentials().contains { $0.accountId == declaredId },
+                       "an absent identity is never handed to the poll loop")
+
+                let store = UsageStore(dbPath: dbPath)
+                store.loadFromDatabase()
+                expect(store.accounts.first { $0.id == declaredId }?.isAbsent == true,
+                       "the popover's own account model reports it absent")
+                expect(store.accounts.first { $0.id == "user-extra" }?.isAbsent == false,
+                       "…and reports the provisioned account as present")
+                expect(store.effectivePrimaryAccountId != declaredId,
+                       "an absent identity never becomes the menubar account, despite having no usage to rank badly")
+                expect(store.sortedAccountsForPopover.last?.id == declaredId,
+                       "an absent identity sorts after every real account rather than winning on an empty reading")
+
+                // Idempotence + non-destructiveness: re-declaring an identity
+                // this host already has must leave the real row exactly as it
+                // was, never downgrade it to a placeholder.
+                let (reDeclared, reError) = poller.declareCodexIdentity(email: "extra@example.com", homeLabel: "extra")
+                expect(reError == nil, "re-declaring an identity the host already has is not an error")
+                expectEqual(reDeclared, "user-extra", "…it resolves onto the existing row")
+                expectEqual(try openDatabase(dbPath, readonly: true)
+                                .scalar("SELECT codex_home FROM accounts WHERE id = 'user-extra'") as? String,
+                            extraHome,
+                            "…and leaves that row's registered home untouched")
+                expectEqual(try openDatabase(dbPath, readonly: true)
+                                .scalar("SELECT COUNT(*) FROM accounts") as? Int64, 2,
+                            "no duplicate row is created by the second declaration")
+            } catch {
+                checks += 1
+                failures.append("declared-identity test threw: \(error)")
+            }
+        }
+    }
+
+    /// Provisioning an absent identity converts the placeholder into a real
+    /// polling account **in place** — the acceptance criterion that it must
+    /// not leave a duplicate row behind.
+    ///
+    /// Drives the exact two calls `registerCodexHome` makes after it has
+    /// spoken to `codex` (`resolveOpenAIAccountId` to pick the row, then
+    /// `saveCodexHomeAccount` to write it), so the conversion is covered
+    /// without spawning a subprocess or needing a real login.
+    private static func testProvisioningAbsentIdentityConvertsInPlace() {
+        withSelfTestTempDir("provision-absent") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+
+                guard let placeholderId = poller.declareCodexIdentity(
+                    email: "agent3@example.com", homeLabel: "agent3"
+                ).accountId else {
+                    checks += 1
+                    failures.append("could not declare the identity to be provisioned")
+                    return
+                }
+
+                // What `registerCodexHome` does once `codex` has answered: the
+                // native id is unknown here (auth.json may carry none), so the
+                // email match is what has to find the placeholder.
+                let resolved = OAuthPoller.resolveOpenAIAccountId(
+                    email: "agent3@example.com", nativeId: "user-native-agent3",
+                    db: try openDatabase(dbPath, readonly: true)
+                )
+                expectEqual(resolved, placeholderId,
+                            "registration resolves onto the placeholder by email rather than minting a sibling")
+
+                let home = "/tmp/selftest-provision-absent-\(UUID().uuidString)/.codex-agent3"
+                poller.saveCodexHomeAccount(
+                    accountId: resolved, email: "agent3@example.com", plan: "pro", codexHome: home
+                )
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 1,
+                            "provisioning converts the placeholder — it does not add a second row")
+                expectEqual(try db.scalar("SELECT codex_home FROM accounts WHERE id = ?", placeholderId) as? String, home,
+                            "the converted row now owns its CODEX_HOME")
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM oauth_credentials WHERE account_id = ?", placeholderId) as? Int64, 1,
+                            "registration backfills the token-free credential row the poll loop enumerates")
+
+                let registrations = poller.codexAccounts()
+                expect(registrations.first?.isAbsent == false,
+                       "the identity stops reporting as absent the moment it is provisioned")
+                expectEqual(registrations.first?.provisionLabel, "agent3",
+                            "the provisioned row's label now comes from its own home path")
+                expect(poller.loadActiveCredentials().contains { $0.accountId == placeholderId },
+                       "…and starts being polled, with no restart or bookkeeping step")
+            } catch {
+                checks += 1
+                failures.append("absent-identity provisioning test threw: \(error)")
+            }
+        }
+    }
+
+    /// Declaring the identities a host is *supposed* to have must not break
+    /// the one it actually has. `openAIAccountCount` feeds `resolveCodexHome`,
+    /// which refuses to let the ambient home speak for any account once two or
+    /// more OpenAI accounts exist — so counting placeholders would silently
+    /// stop a working single-account host from polling at all.
+    private static func testAbsentIdentityDoesNotMakeAmbientHomeAmbiguous() {
+        withSelfTestTempDir("ambient-vs-absent") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+                let db = try openDatabase(dbPath)
+
+                // One genuinely ambient OpenAI account: no home of its own, but
+                // a stored token, so it is a real candidate owner of ~/.codex.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-ambient', 'ambient@example.com', 'ambient@example.com', 'pro',
+                            '2026-01-01T00:00:00Z', 0, 'openai')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, access_token, is_active, created_at, updated_at, provider)
+                    VALUES ('user-ambient', 'user-ambient', 'token-ambient', 1,
+                            '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+                """)
+
+                expectEqual(poller.openAIAccountCount(), 1, "one real OpenAI account is counted")
+                expectEqual(OAuthPoller.resolveCodexHome(registered: nil, openAIAccountCount: poller.openAIAccountCount()),
+                            .ambient, "…so the ambient home may still speak for it")
+
+                poller.declareCodexIdentity(email: "agent3@example.com", homeLabel: "agent3")
+                poller.declareCodexIdentity(email: "agent4@example.com", homeLabel: "agent4")
+
+                expectEqual(poller.openAIAccountCount(), 1,
+                            "declared-but-unprovisioned identities are not candidate owners of the ambient home")
+                expectEqual(OAuthPoller.resolveCodexHome(registered: nil, openAIAccountCount: poller.openAIAccountCount()),
+                            .ambient, "…so declaring an intended set never stops the real account from polling")
+
+                // A second *provisioned* account is a real candidate, and still
+                // makes the ambient home ambiguous exactly as it did before.
+                poller.saveCodexHomeAccount(
+                    accountId: "user-second", email: "second@example.com", plan: "pro",
+                    codexHome: "/tmp/selftest-ambient-second-\(UUID().uuidString)"
+                )
+                expectEqual(poller.openAIAccountCount(), 2, "a provisioned sibling is counted")
+                expectEqual(OAuthPoller.resolveCodexHome(registered: nil, openAIAccountCount: poller.openAIAccountCount()),
+                            .ambiguous, "…and the #111 ambiguity guard is unchanged")
+            } catch {
+                checks += 1
+                failures.append("absent-vs-ambient test threw: \(error)")
+            }
+        }
+    }
+
+    /// A declaration must be able to travel on: the host you paste onto is
+    /// often the one you propagate from next (declare once on a laptop, push
+    /// to N workers). A placeholder has no credential row at all, so the
+    /// export has to be driven from `accounts` outward — an inner join on
+    /// `oauth_credentials` would silently drop it.
+    private static func testDeclaredIdentityRePropagates() {
+        withSelfTestTempDir("re-propagate") { dir in
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            UsageStore(dbPath: dbPath).ensureDatabase()
+            let poller = OAuthPoller(dbPath: dbPath)
+
+            poller.declareCodexIdentity(email: "agent3@example.com", homeLabel: "agent3")
+
+            guard let (env, count, identityOnly) = poller.exportAccountsEnv() else {
+                checks += 1
+                failures.append("a host holding only a declared identity exported nothing at all")
+                return
+            }
+            expectEqual(count, 0, "a placeholder is not a credentialed account")
+            expectEqual(identityOnly, 1, "…it is an identity, and it survives the round trip")
+            expect(env.contains("ACCOUNT_EMAIL_1=agent3@example.com"), "the identity is named")
+            expect(env.contains("ACCOUNT_PROVIDER_1=openai"), "…tagged with its provider")
+            expect(env.contains("ACCOUNT_HOME_LABEL_1=agent3"),
+                   "…and still carries the label, which lives on the row rather than in a home path")
+            expect(!env.contains("ACCOUNT_KEY_"), "…with no key, on this hop as on the last one")
+
+            // And it parses back out as the same declaration, so a third host
+            // ends up with exactly what the first one described.
+            let reparsed = poller.parseAccountPairs(env)
+            expectEqual(reparsed.count, 1, "the re-exported payload parses")
+            expect(reparsed.first?.token == nil, "…still keyless")
+            expectEqual(reparsed.first?.homeLabel, "agent3", "…still labelled")
+        }
+    }
+
+    /// The intended set must be expressible with no GUI: a headless Linux host
+    /// has no popover to paste into, so `~/.claude-monitor/accounts.env` is
+    /// its only env-transfer surface. Drives `parseAccountPairs` →
+    /// `declareCodexIdentity` — the exact pair `syncFromAccountFiles` runs for
+    /// a keyless entry — against a scratch store, twice, to pin that the
+    /// every-launch cadence is idempotent.
+    private static func testHeadlessEnvFileCanDeclareIdentities() {
+        withSelfTestTempDir("headless-declare") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+
+                let accountsEnv = """
+                    ACCOUNT_EMAIL_1=agent3@example.com
+                    ACCOUNT_PROVIDER_1=openai
+                    ACCOUNT_HOME_LABEL_1=agent3
+                    """
+                for pass in 1...2 {
+                    for entry in poller.parseAccountPairs(accountsEnv) where entry.token == nil {
+                        let (_, error) = poller.declareCodexIdentity(
+                            email: entry.email, homeLabel: entry.homeLabel
+                        )
+                        expect(error == nil, "declaring from an env file succeeds on pass \(pass)")
+                    }
+                }
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM accounts") as? Int64, 1,
+                            "re-reading the same account list every launch never duplicates the placeholder")
+                expectEqual(poller.codexAccounts().first?.isAbsent, true,
+                            "the declaration is visible to `codex list` with no GUI involved")
+            } catch {
+                checks += 1
+                failures.append("headless declaration test threw: \(error)")
+            }
+        }
+    }
+
+    /// `absent` must be its own word in `codex list`, distinct from every
+    /// other status that column can print — the same "one condition, one
+    /// vocabulary" guarantee `testDriftVocabularySharedWithCodexList` pins for
+    /// `drift`. The popover's badge renders `CodexCLI.absentLabel` itself
+    /// rather than a second literal, so there is exactly one spelling.
+    private static func testAbsentVocabularyIsDistinct() {
+        expectEqual(CodexCLI.absentLabel, "absent", "the absent status word is stable")
+        let otherStatusWords = [
+            CodexCLI.driftLabel, "logged in", "needs login", "home missing", "unknown",
+        ]
+        expect(!otherStatusWords.contains(CodexCLI.absentLabel),
+               "`absent` never collides with another status word `codex list` can print")
+        let tokenStates: [TokenStatus] = [.valid, .expired, .refreshing, .missing, .revoked, .error, .drifted]
+        expect(!tokenStates.contains { $0.rawValue == CodexCLI.absentLabel },
+               "`absent` is not a token-health state — an absent identity has no credential to be healthy or not")
     }
 
     // MARK: - AccountSync host-local provider exclusion (#104)
@@ -3915,6 +4343,85 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("ranking export test threw: \(error)")
+            }
+        }
+    }
+
+    /// `ranking.json` must represent an absent expected identity (#135)
+    /// **additively**: `schema` unchanged, the `absent` key omitted for every
+    /// normal account, and the absent row emitted with an already-understood
+    /// `status` so a consumer that has never heard of `absent` still excludes
+    /// it from its pool.
+    private static func testRankingExportMarksAbsentIdentity() {
+        withSelfTestTempDir("ranking-absent") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let outPath = dir.appendingPathComponent("ranking.json").path
+
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+                let db = try openDatabase(dbPath)
+                let now = ISO8601DateFormatter().string(from: Date())
+
+                // A healthy, provisioned Codex account on this host.
+                poller.saveCodexHomeAccount(
+                    accountId: "user-present", email: "present@example.com", plan: "pro",
+                    codexHome: "/tmp/selftest-ranking-absent-\(UUID().uuidString)"
+                )
+                try db.run("""
+                    INSERT INTO usage_history
+                        (account_id, timestamp, primary_percent, session_percent,
+                         weekly_all_percent, weekly_sonnet_percent, raw_data, is_synthetic)
+                    VALUES ('user-present', ?, 20, NULL, 20, 0,
+                            '{"overall_status":"allowed","weekly_status":"allowed"}', 0)
+                """, now)
+
+                // An identity this host is expected to have but never got.
+                poller.declareCodexIdentity(email: "agent3@example.com", homeLabel: "agent3")
+
+                RankingExporter.exportNow(dbPath: dbPath, outputPath: outPath)
+
+                guard let data = FileManager.default.contents(atPath: outPath),
+                      let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let accounts = root["accounts"] as? [[String: Any]] else {
+                    checks += 1
+                    failures.append("absent-identity ranking export produced no readable accounts array")
+                    return
+                }
+
+                expectEqual(root["schema"] as? Int, RankingExporter.schemaVersion,
+                            "absent is additive — the schema version does not change")
+                expectEqual(accounts.count, 2, "both the provisioned and the absent identity are listed")
+
+                let byEmail = Dictionary(uniqueKeysWithValues: accounts.compactMap { obj -> (String, [String: Any])? in
+                    guard let email = obj["email"] as? String else { return nil }
+                    return (email, obj)
+                })
+
+                let present = byEmail["present@example.com"]
+                expect(present?["absent"] == nil,
+                       "a normal account omits the key entirely — nothing changes for an existing consumer")
+                expectEqual(present?["status"] as? String, "available", "the provisioned account is routable")
+                expectEqual((present?["utilization"] as? [String: Any])?["7d"] as? Double, 0.2,
+                            "…and reports its real utilization")
+
+                let absent = byEmail["agent3@example.com"]
+                expectEqual(absent?["absent"] as? Bool, true, "the absent identity is flagged")
+                expectEqual(absent?["provider"] as? String, "openai", "…carries its provider like every other account")
+                expectEqual(absent?["status"] as? String, "blocked",
+                            "…and reports an already-understood status, so a consumer ignorant of `absent` still excludes it")
+                expect(absent?["utilization"] == nil,
+                       "no utilization is fabricated for an identity that has never been read")
+                expect(absent?["resets"] == nil, "no reset instants either")
+                expect(absent?["updated_at"] == nil,
+                       "no updated_at — nothing has ever been polled for this identity on this host")
+
+                let text = String(data: data, encoding: .utf8) ?? ""
+                expect(!text.contains("codex_home") && !text.contains("/.codex-"),
+                       "ranking.json never carries a home path — it names a user")
+            } catch {
+                checks += 1
+                failures.append("absent-identity ranking export test threw: \(error)")
             }
         }
     }

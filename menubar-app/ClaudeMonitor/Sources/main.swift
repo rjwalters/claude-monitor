@@ -366,7 +366,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
             item.target = self
             item.representedObject = account.id
-            if let usage = usageStore.latestUsage[account.id] {
+            if account.isAbsent {
+                // An absent identity (#135) has no reading and never will
+                // until it is provisioned here — say so rather than leave a
+                // bare name that reads like an account with nothing used yet.
+                item.title = "\(account.displayName) (\(CodexCLI.absentLabel))"
+            } else if let usage = usageStore.latestUsage[account.id] {
                 let pct = Int(max(usage.sessionPercent ?? 0, usage.weeklyAllPercent ?? 0))
                 item.title = "\(account.displayName) (\(pct)%)"
             }

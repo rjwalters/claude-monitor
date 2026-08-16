@@ -41,6 +41,11 @@ struct Account: Identifiable {
     /// this column existed. Host-local by design: a home path is meaningless on
     /// another machine, so `AccountSync` deliberately does not carry it (#103).
     let codexHome: String?
+    /// A Codex identity this host is *expected* to have but has not been
+    /// provisioned with — see `isAbsentCodexIdentity` for the exact rule.
+    /// Computed at load time from the row's credential/home state; it is not a
+    /// stored column, so nothing has to be kept in sync with reality.
+    let isAbsent: Bool
 
     init(
         id: String,
@@ -50,7 +55,8 @@ struct Account: Identifiable {
         plan: String?,
         lastUpdated: Date?,
         latestPercent: Double?,
-        codexHome: String? = nil
+        codexHome: String? = nil,
+        isAbsent: Bool = false
     ) {
         self.id = id
         self.provider = provider
@@ -60,6 +66,7 @@ struct Account: Identifiable {
         self.lastUpdated = lastUpdated
         self.latestPercent = latestPercent
         self.codexHome = codexHome
+        self.isAbsent = isAbsent
     }
 
     /// Returns the best display name for the account
@@ -164,6 +171,49 @@ struct UsageRecord: Identifiable {
 /// Linux daemon and `ranking.json` reason about the same score.
 func headroomScore(_ usage: UsageRecord?) -> Double? {
     usage?.rateLimit.headroomScore
+}
+
+/// Whether an account row names a Codex identity this host is *expected* to
+/// have but has not been provisioned with — "absent" (#135).
+///
+/// Codex homes are host-local by construction (#104 ruled out ever syncing an
+/// OpenAI credential between machines), so an identity that exists on one host
+/// simply does not exist on another until someone runs `codex provision` there.
+/// Before this rule, "never provisioned here" and "does not exist at all" were
+/// the same observation — a row that quietly wasn't in the table. A **paste of
+/// an identity-only transfer payload** (`ACCOUNT_EMAIL_N` + `ACCOUNT_PROVIDER_N`
+/// with no `ACCOUNT_KEY_N`, see `OAuthPoller.exportAccountsEnv`) creates the
+/// placeholder row that makes the gap nameable.
+///
+/// The first two conditions are the exact negation of
+/// `loadActiveCredentials`'s admission test: an OpenAI row with **neither** a
+/// stored token **nor** a registered `codex_home` can never be polled on this
+/// host, whatever created it. That also catches an OpenAI account that arrived
+/// through an `accounts import` bundle from a host that had a home — which is
+/// right, since it is equally unpollable here.
+///
+/// `hasLocalReading` is the conservative third condition, and it only ever
+/// *shrinks* the absent set: a row this host has actually taken a usage
+/// reading for was demonstrably provisioned here at some point, so whatever is
+/// wrong with it now (a credential row deleted out from under it, a database
+/// edited by another tool) it is not "never set up here". Claiming otherwise
+/// would relabel a pre-existing row as absent purely because this feature
+/// shipped — the one way a bookkeeping layer could do real harm.
+///
+/// It is a *derived* property, never a stored column: provision the identity
+/// and the row stops being absent on the next load, with no bookkeeping to
+/// update and nothing to go stale.
+///
+/// Lives in the portable core so `UsageStore`'s ranking/selection, the popover
+/// badge, `codex list`, and `ranking.json` all apply one rule rather than four
+/// look-alikes.
+func isAbsentCodexIdentity(
+    provider: AccountProvider,
+    hasStoredToken: Bool,
+    hasCodexHome: Bool,
+    hasLocalReading: Bool
+) -> Bool {
+    provider == .openai && !hasStoredToken && !hasCodexHome && !hasLocalReading
 }
 
 struct UsageDataPoint: Identifiable {
@@ -757,11 +807,16 @@ class UsageStore: ObservableObject {
     /// account has since gone stale — this fallback only governs the
     /// *automatic* choice, which `sortedAccountsForPopover` already excludes
     /// stale accounts from where a fresher alternative exists.
+    ///
+    /// An **absent** identity (#135) can never drive the menubar, pinned or
+    /// not: it is a placeholder for an account this host was never provisioned
+    /// with, so it has no usage to show and never will until it is provisioned.
     var effectivePrimaryAccountId: String? {
-        if let pinned = primaryAccountId, accounts.contains(where: { $0.id == pinned }) {
+        if let pinned = primaryAccountId,
+           let account = accounts.first(where: { $0.id == pinned }), !account.isAbsent {
             return pinned
         }
-        return sortedAccountsForPopover.first?.id
+        return sortedAccountsForPopover.first(where: { !$0.isAbsent })?.id
     }
 
     /// User picked a row as the menubar source (or `nil` to revert to auto).
@@ -785,6 +840,13 @@ class UsageStore: ObservableObject {
             (account: account, usage: latestUsage[account.id])
         }
         let sorted = pairs.sorted { a, b in
+            // An absent identity (#135) is a placeholder for an account this
+            // host doesn't have — it carries no reading at all, so without this
+            // gate its empty windows would score as a perfect 0% "most
+            // available" and it would win the auto-selection outright. It sorts
+            // after every real account, ahead of nothing but another absent one.
+            if a.account.isAbsent != b.account.isAbsent { return !a.account.isAbsent }
+
             // Cause-independent staleness backstop: a stale reading cannot
             // win over a fresher alternative no matter what percentage it
             // last reported, because that percentage is exactly what's no
@@ -880,10 +942,27 @@ class UsageStore: ObservableObject {
             let accountColumns = tableColumns(db, "accounts")
             let hasProvider = accountColumns.contains("provider")
             let hasCodexHome = accountColumns.contains("codex_home")
+            // Whether this row still has a usable stored token — the other half
+            // of the absent-identity rule (`isAbsentCodexIdentity`). Counted in
+            // SQL so no token value is ever read into memory here.
+            let hasCredentials = !tableColumns(db, "oauth_credentials").isEmpty
+            let storedTokenCount = hasCredentials
+                ? """
+                  (SELECT COUNT(*) FROM oauth_credentials c
+                    WHERE c.account_id = accounts.id
+                      AND c.access_token IS NOT NULL AND TRIM(c.access_token) != '')
+                  """
+                : "0"
+            // A missing table reads as "no evidence", which can only make a
+            // row look less absent — never falsely absent.
+            let localReading = tableColumns(db, "usage_history").isEmpty
+                ? "1"
+                : "EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = accounts.id)"
             let accountStmt = try db.prepare("""
                 SELECT id, account_name, email, plan, last_updated,
                        \(hasProvider ? "provider" : "NULL"),
-                       \(hasCodexHome ? "codex_home" : "NULL")
+                       \(hasCodexHome ? "codex_home" : "NULL"),
+                       \(storedTokenCount), \(localReading)
                 FROM accounts ORDER BY last_updated DESC
             """)
 
@@ -894,7 +973,15 @@ class UsageStore: ObservableObject {
                 let acctPlan = row[3] as? String
                 let acctLastUpdated = row[4] as? String
                 let acctProvider = AccountProvider(stored: row[5] as? String)
-                let acctCodexHome = (row[6] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                let acctCodexHome = (row[6] as? String).flatMap {
+                    $0.trimmingCharacters(in: .whitespaces).isEmpty ? nil : $0
+                }
+                let acctAbsent = isAbsentCodexIdentity(
+                    provider: acctProvider,
+                    hasStoredToken: ((row[7] as? Int64) ?? 0) > 0,
+                    hasCodexHome: acctCodexHome != nil,
+                    hasLocalReading: ((row[8] as? Int64) ?? 0) != 0
+                )
 
                 // Get latest percent from usage_history
                 var percent: Double? = nil
@@ -913,7 +1000,8 @@ class UsageStore: ObservableObject {
                     plan: acctPlan,
                     lastUpdated: UsageRecord.parseISO(acctLastUpdated),
                     latestPercent: percent,
-                    codexHome: acctCodexHome
+                    codexHome: acctCodexHome,
+                    isAbsent: acctAbsent
                 )
                 loadedAccounts.append(account)
 

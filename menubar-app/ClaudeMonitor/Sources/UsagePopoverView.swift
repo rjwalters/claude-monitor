@@ -227,6 +227,33 @@ struct ProviderBadge: View {
     }
 }
 
+/// Marks a row as a Codex identity this host is expected to have but was never
+/// provisioned with (#135). Deliberately passive and always visible: the point
+/// of the whole feature is that you notice the gap without going looking for
+/// it, so a badge that only appears in a CLI command you have to remember to
+/// run would not have solved anything.
+///
+/// The word rendered here is `CodexCLI.absentLabel` itself, not a second
+/// literal, so the popover and `codex list` cannot name this condition two
+/// different ways. (`drift` needs `SelfTest` to *pin* two constants equal
+/// because `TokenStatus.drifted` and `CodexCLI.driftLabel` are genuinely
+/// separate declarations; here there is only ever one string.)
+struct AbsentBadge: View {
+    var body: some View {
+        Text(CodexCLI.absentLabel)
+            .font(.caption2)
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .overlay(
+                RoundedRectangle(cornerRadius: 3)
+                    .stroke(Color.secondary.opacity(0.5), lineWidth: 1)
+            )
+            .help("This host is expected to have this Codex identity but has never been provisioned with it. Codex homes are host-local and are never synced — run `claude-monitor codex provision <label>` here to create the home, log in, and register it.")
+            .accessibilityLabel("Absent — not provisioned on this host")
+    }
+}
+
 /// Pixel-art marks for each upstream, drawn from a bitmap rather than bundled
 /// as image assets — the package ships no resources and has no dependencies,
 /// and a handful of filled rects stays crisp at any scale factor.
@@ -653,33 +680,33 @@ struct UsagePopoverView: View {
     /// The multi-provider keys #67 adds (`ACCOUNT_PROVIDER_N` etc.) are
     /// additive to this same base pair, so no separate detection is needed
     /// for a payload that also carries OpenAI/Codex entries.
+    ///
+    /// A payload of nothing *but* declared Codex identities (#135) carries no
+    /// `ACCOUNT_KEY_` at all — that is the point of it — so the provider key
+    /// is accepted as an alternative marker. Detection stays deliberately
+    /// loose; `parseAccountPairs` is what actually decides what a payload
+    /// contains.
     static func clipboardContainsAccounts() -> Bool {
         guard let s = NSPasteboard.general.string(forType: .string) else { return false }
-        return s.contains("ACCOUNT_EMAIL_") && s.contains("ACCOUNT_KEY_")
+        return s.contains("ACCOUNT_EMAIL_")
+            && (s.contains("ACCOUNT_KEY_") || s.contains("ACCOUNT_PROVIDER_"))
     }
 
-    /// Serialize active, tokened accounts into env format and put them on the
-    /// clipboard so they can be pasted into a Claude Monitor on another
-    /// machine. Anthropic accounts always round-trip (#67); a Codex/OpenAI
-    /// account is host-local and never has a token to export (#123 nulls
-    /// `access_token`/`refresh_token` at migration), so it is left out and
-    /// counted in `excludedHostLocal` instead — surfaced below rather than
-    /// silently dropped.
+    /// Serialize accounts into env format and put them on the clipboard so
+    /// they can be pasted into a Claude Monitor on another machine. Anthropic
+    /// accounts round-trip with their credential (#67); a Codex/OpenAI account
+    /// has no credential to carry (#104/#123) and travels as an **identity
+    /// only** — its email, provider, and home label — so the destination host
+    /// can name the identity it is missing (#135).
     private func copyAccounts() {
         // `exportAccountsEnv` returns nil only when there is truly nothing to
         // report: the store is empty, or every credential is inactive for a
-        // reason unrelated to being host-local. A Codex-only host still gets
-        // a non-nil result (count 0, excludedHostLocal > 0) so its status
-        // message can name the reason instead of reading a bare, misleading
-        // "Nothing to copy" (a regression of #67 that #123 reintroduced).
-        guard let (env, count, excludedHostLocal) = oauthPoller.exportAccountsEnv() else {
+        // reason unrelated to being a Codex identity. A Codex-only host still
+        // gets a non-nil result (count 0, identityOnly > 0) so its status
+        // message can name what was copied instead of reading a bare,
+        // misleading "Nothing to copy" (#129).
+        guard let (env, count, identityOnly) = oauthPoller.exportAccountsEnv() else {
             flashTransferStatus("Nothing to copy")
-            return
-        }
-
-        guard count > 0 else {
-            let plural = excludedHostLocal == 1 ? "account is" : "accounts are"
-            flashTransferStatus("Nothing to copy (\(excludedHostLocal) Codex \(plural) host-local — register with codex add --home)")
             return
         }
 
@@ -688,12 +715,13 @@ struct UsagePopoverView: View {
         pb.setString(env, forType: .string)
         clipboardHasAccounts = true
 
-        let copiedNote = "Copied \(count) account\(count == 1 ? "" : "s")"
-        if excludedHostLocal > 0 {
-            let plural = excludedHostLocal == 1 ? "account" : "accounts"
-            flashTransferStatus("\(copiedNote) (\(excludedHostLocal) Codex \(plural) skipped — host-local)")
+        let identityNote = identityOnly == 0
+            ? ""
+            : " + \(identityOnly) Codex \(identityOnly == 1 ? "identity" : "identities") (no credential)"
+        if count == 0 {
+            flashTransferStatus("Copied \(identityOnly) Codex \(identityOnly == 1 ? "identity" : "identities") (no credentials — provision each host)")
         } else {
-            flashTransferStatus(copiedNote)
+            flashTransferStatus("Copied \(count) account\(count == 1 ? "" : "s")\(identityNote)")
         }
     }
 
@@ -726,7 +754,16 @@ struct UsagePopoverView: View {
                 // generally. Only when the paste actually carries an entry
                 // for a given provider does that provider's absent accounts
                 // get removed.
-                let providersInPaste = Set(results.map { $0.provider })
+                //
+                // **Identity-only entries (#135) do not arm replace
+                // semantics.** A declaration says "this host should have this
+                // identity"; it is not a statement that every other Codex
+                // identity here is unwanted. Letting it delete would mean a
+                // paste from a host that happens to have fewer Codex accounts
+                // silently unregisters a working, provisioned home — a
+                // destructive act the operator never asked for, to undo work
+                // (`codex provision`) that can only be redone interactively.
+                let providersInPaste = Set(results.filter { !$0.identityOnly }.map { $0.provider })
                 let pastedEmailsByProvider = Dictionary(grouping: results, by: { $0.provider })
                     .mapValues { Set($0.map { $0.email.lowercased() }) }
                 let toRemove = store.accounts.filter { account in
@@ -895,6 +932,13 @@ struct SummaryRow: View {
         tokenStatus == .drifted
     }
 
+    /// True when this row is a declared-but-unprovisioned Codex identity
+    /// (#135). It has no credential, no home, and no reading — it is a name,
+    /// so it renders as one: greyed, badged, and with every figure blank.
+    private var isAbsent: Bool {
+        account.isAbsent
+    }
+
     private var tokenDotColor: Color {
         switch tokenStatus {
         case .valid: return .green
@@ -910,6 +954,9 @@ struct SummaryRow: View {
     /// `OAuthPoller.driftDetailMessage` composed at poll time, so the popover
     /// never has to re-derive or restate what `codex list` already says.
     private var tokenStatusHelp: String {
+        if isAbsent {
+            return "No credential on this host — this identity has never been provisioned here. Run `claude-monitor codex provision <label>`."
+        }
         if isDrifted, let detail = credentialStatus?.lastError, !detail.isEmpty {
             return detail
         }
@@ -939,8 +986,10 @@ struct SummaryRow: View {
     /// (no known cause, just an old reading) gets the identical treatment
     /// (#148): a frozen percentage is exactly what "stale" means, so it must
     /// stop being presented as current too.
+    /// An absent identity (#135) is included on the same principle: it has no
+    /// reading at all, and must never present one.
     private var displayUsage: UsageRecord? {
-        (isDrifted || isStale) ? nil : usage
+        (isDrifted || isStale || isAbsent) ? nil : usage
     }
 
     /// Data age in seconds (nil if no usage data)
@@ -970,6 +1019,7 @@ struct SummaryRow: View {
     /// explicit "as of <time>" rather than letting the row's silence imply
     /// the number is still current.
     private var freshnessLabel: String {
+        if isAbsent { return "Not provisioned on this host — nothing has ever been polled" }
         guard let age = dataAge else { return "No data" }
         if isDrifted { return tokenStatusHelp }
         let interval = oauthPoller.pollInterval
@@ -1013,12 +1063,18 @@ struct SummaryRow: View {
                     .opacity(isMenubarSelected && !isExplicitlyPinned ? 0.55 : 1.0)
             }
             .buttonStyle(.plain)
+            // An absent identity has no usage to put in the menu bar, so it
+            // cannot be the menubar source — `effectivePrimaryAccountId`
+            // refuses to return one even if it were somehow pinned (#135).
+            .disabled(isAbsent)
             .frame(width: SummaryColumns.radio, alignment: .center)
-            .help(isExplicitlyPinned
-                  ? "Pinned to menu bar — click to clear"
-                  : (isMenubarSelected
-                     ? "Auto-selected (most available) — click to pin"
-                     : "Click to show this account in the menu bar"))
+            .help(isAbsent
+                  ? "Not provisioned on this host — nothing to show in the menu bar"
+                  : (isExplicitlyPinned
+                     ? "Pinned to menu bar — click to clear"
+                     : (isMenubarSelected
+                        ? "Auto-selected (most available) — click to pin"
+                        : "Click to show this account in the menu bar")))
             .pointerCursorOnHover()
 
             // Account name — inline-editable (double-click to rename)
@@ -1058,11 +1114,16 @@ struct SummaryRow: View {
                         Text(account.displayName)
                             .lineLimit(1)
                             .truncationMode(.middle)
+                            .foregroundColor(isAbsent ? .secondary : .primary)
+                        if isAbsent { AbsentBadge() }
                     }
+                    .opacity(isAbsent ? 0.6 : 1.0)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                     .onTapGesture(count: 2) { startRename() }
-                    .help("\(account.provider.displayName) — double-click to rename")
+                    .help(isAbsent
+                          ? "\(account.provider.displayName) — declared on this host but never provisioned here; double-click to rename"
+                          : "\(account.provider.displayName) — double-click to rename")
                 }
             }
             .frame(width: SummaryColumns.account, alignment: .leading)

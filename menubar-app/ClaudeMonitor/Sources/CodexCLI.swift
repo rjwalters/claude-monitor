@@ -11,7 +11,10 @@ import Foundation
 ///   home is currently logged in — including **drift**, a registered home that
 ///   has since been logged in as a *different* account. That is the visible
 ///   face of the poller's own identity guard (`OAuthPoller.codexHomeDrift`),
-///   whose refusal to attribute such a reading is otherwise silent.
+///   whose refusal to attribute such a reading is otherwise silent. It also
+///   reports **absent** (#135): an identity this host is expected to have but
+///   was never provisioned with, carried here by an account copy/paste and
+///   remediated by the `codex provision <label>` line printed beside it.
 /// - `codex import` brings a credential in from Codex CLI's own store — the
 ///   original path, still supported.
 ///
@@ -373,14 +376,27 @@ enum CodexCLI {
 
         Task {
             var sawDrift = false
+            var absentRemediations: [String] = []
             if !accounts.isEmpty {
                 print("ACCOUNT   PLAN        AUTH               CODEX_HOME")
                 for account in accounts {
-                    let status = await authStatus(for: account)
+                    // An absent identity is never probed: there is no home to
+                    // ask, and asking the *ambient* one would report some other
+                    // account's login state as if it were this row's (#135).
+                    let status = account.isAbsent ? absentLabel : await authStatus(for: account)
                     if status.hasPrefix(driftLabel) { sawDrift = true }
                     let plan = (account.plan ?? "—").padded(to: 11)
-                    let home = account.codexHome ?? "(default: $CODEX_HOME, else ~/.codex)"
+                    let home = account.isAbsent
+                        ? "(not provisioned on this host)"
+                        : (account.codexHome ?? "(default: $CODEX_HOME, else ~/.codex)")
                     print("\(account.accountId.prefix(8))… \(plan) \(status.padded(to: 18)) \(home)")
+                    if account.isAbsent {
+                        let remediation = account.provisionLabel.map {
+                            "  → claude-monitor codex provision \($0)"
+                        } ?? "  → claude-monitor codex provision <label>"
+                        print(remediation)
+                        absentRemediations.append(remediation)
+                    }
                 }
             } else {
                 print("No OpenAI (Codex) accounts registered.")
@@ -399,6 +415,14 @@ enum CodexCLI {
 
             print("")
             print("`needs login` → run: CODEX_HOME=<home> codex login --device-auth")
+            if !absentRemediations.isEmpty {
+                print("`\(absentLabel)` → this host is expected to have this identity (it was carried")
+                print("          over by an account copy/paste) but has never been provisioned with")
+                print("          it. Codex homes are host-local and are never synced — run the")
+                print("          `codex provision` line printed above to create the home, log in,")
+                print("          and register it. That converts this placeholder into a real")
+                print("          polling account rather than adding a second row.")
+            }
             if sawDrift {
                 print("`\(driftLabel)` → this CODEX_HOME is now logged in as a different account than the")
                 print("          row it is registered against, so its usage is not attributed to that")
@@ -418,6 +442,19 @@ enum CodexCLI {
     /// equal (#146) so `codex list` and the popover's drift badge can never
     /// name this condition two different ways.
     static let driftLabel = "drift"
+
+    /// The status word for an identity this host is declared to have but was
+    /// never provisioned with (#135). Deliberately its own word, distinct from
+    /// `needs login` (a home exists, it just isn't authenticated) and from
+    /// `home missing` (a home was registered and has since been deleted):
+    /// here there is no home at all and nothing on this host ever had one.
+    ///
+    /// Not `private`: the popover's `AbsentBadge` and the menubar menu render
+    /// this exact constant rather than a second literal, so the CLI and the UI
+    /// cannot name this condition two different ways — the same guarantee
+    /// `driftLabel` carries. `nonisolated` because those UI call sites read it
+    /// from views that carry no `@MainActor` annotation of their own.
+    nonisolated static let absentLabel = "absent"
 
     /// `~/.codex*` directories on disk that are not already covered by a
     /// registered account — pure filesystem discovery, no writes, no login.
@@ -459,7 +496,11 @@ enum CodexCLI {
         for account in registered {
             if let home = account.codexHome {
                 known.insert(OAuthPoller.normalizeCodexHome(home))
-            } else {
+            } else if !account.isAbsent {
+                // An absent identity reads no home at all (#135) — it has never
+                // been provisioned here. Letting it stand in for the ambient
+                // home would hide a genuinely unregistered `~/.codex` from
+                // discovery, which is the opposite of this command's job.
                 sawAmbientAccount = true
             }
         }
@@ -698,6 +739,17 @@ enum CodexCLI {
                     home itself. An account with no registered home reads the
                     ambient $CODEX_HOME (else ~/.codex) — which is fine as long
                     as it is the only OpenAI account on the host.
+
+                    Identities this host is *expected* to have but has never
+                    been provisioned with read `absent`, with the exact
+                    `codex provision <label>` command that fills the gap. They
+                    get there by pasting an account copy from a host that has
+                    them: a Codex account travels as an identity (email +
+                    provider + home label) and never as a credential, so the
+                    paste records the name and this host still has to log in
+                    for itself. Absent is deliberately distinct from `needs
+                    login` (a home exists but isn't authenticated) and from
+                    not being listed at all.
 
                     Also scans ~/.codex* on disk for homes that exist but
                     aren't registered yet — each is listed separately with its
