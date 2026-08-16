@@ -1211,7 +1211,7 @@ class OAuthPoller: ObservableObject {
                 FROM oauth_credentials c
                 LEFT JOIN accounts a ON a.id = c.account_id
                 WHERE c.is_active = 1
-                  AND (c.access_token IS NOT NULL OR \(homeRegistered))
+                  AND ((c.access_token IS NOT NULL AND TRIM(c.access_token) != '') OR \(homeRegistered))
             """)
 
             for row in stmt {

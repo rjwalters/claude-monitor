@@ -3164,15 +3164,13 @@ enum SelfTest {
                        + "which is precisely why `is_active` is not part of the absence predicate")
                 expect(!polled.contains("openai-null"),
                        "a token-free row with no registered home is not resurrected into the poll set")
-                // Deliberately pinned as-is: `loadActiveCredentials` tests only
-                // `access_token IS NOT NULL`, so an empty-string token is still
-                // admitted there. That is a pre-existing gap in *that* query's
-                // own predicate — a separate edge case from the absence
-                // predicate this test covers, and explicitly out of scope for
-                // #169. Asserted rather than ignored so that closing it shows up
-                // here as a deliberate change instead of passing unnoticed.
-                expect(polled.contains("openai-empty"),
-                       "known gap: loadActiveCredentials admits an empty-string token (separate from #169)")
+                // #173 closed the gap #169 deliberately left open:
+                // `loadActiveCredentials` now guards with the same
+                // `TRIM(access_token) != ''` spelling `storedTokenCountSQL`
+                // uses, so an empty-string token is no longer admitted into
+                // the poll set either.
+                expect(!polled.contains("openai-empty"),
+                       "an empty-string token is not a token — loadActiveCredentials excludes it (#173)")
             } catch {
                 checks += 1
                 failures.append("stored-token predicate test threw: \(error)")
