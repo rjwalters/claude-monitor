@@ -110,6 +110,7 @@ enum SelfTest {
         testDeclaredCodexIdentityIsAbsent()
         testProvisioningAbsentIdentityConvertsInPlace()
         testAbsentIdentityDoesNotMakeAmbientHomeAmbiguous()
+        testOpenAIAccountCountIncludesLegacyRowWithUsageHistory()
         testDeclaredIdentityRePropagates()
         testHeadlessEnvFileCanDeclareIdentities()
         testAbsentVocabularyIsDistinct()
@@ -3161,6 +3162,72 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("absent-vs-ambient test threw: \(error)")
+            }
+        }
+    }
+
+    /// #168: `openAIAccountCount`'s SQL must be exactly the negation of
+    /// `isAbsentCodexIdentity`, which excludes a row only when it has no
+    /// stored token, no registered home, AND no local usage reading. A
+    /// tokenless, homeless OpenAI row with `usage_history` — the shape left
+    /// behind by #123's `nullOutOpenAITokens` migration on an account that
+    /// had already been polled here — is not absent, so it must still be
+    /// counted as a candidate owner of the ambient home. Before this fix the
+    /// count omitted the `usage_history` term entirely and excluded this row
+    /// too, silently narrowing the #111 ambiguity guard.
+    private static func testOpenAIAccountCountIncludesLegacyRowWithUsageHistory() {
+        withSelfTestTempDir("legacy-usage-history") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+                let db = try openDatabase(dbPath)
+
+                // A legacy row: no token, no registered home, but it has a
+                // usage_history reading from before its access_token was
+                // nulled out.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-legacy', 'legacy@example.com', 'legacy@example.com', 'pro',
+                            '2026-01-01T00:00:00Z', 0, 'openai')
+                """)
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, primary_percent)
+                    VALUES ('user-legacy', '2026-01-01T00:00:00Z', 42.0)
+                """)
+
+                expectEqual(poller.openAIAccountCount(), 1,
+                            "a tokenless, homeless row with usage_history is counted, not treated as absent")
+                expectEqual(OAuthPoller.resolveCodexHome(registered: nil, openAIAccountCount: poller.openAIAccountCount()),
+                            .ambient, "…so a lone legacy row still lets the ambient home speak for it")
+
+                // Confirm this shape is genuinely NOT absent per the shared rule
+                // — the count above should agree with isAbsentCodexIdentity.
+                let absent = isAbsentCodexIdentity(
+                    provider: .openai, hasStoredToken: false, hasCodexHome: false, hasLocalReading: true
+                )
+                expectEqual(absent, false, "isAbsentCodexIdentity agrees: hasLocalReading=true is not absent")
+
+                // A second real OpenAI account (its own stored token) now makes
+                // the ambient home ambiguous, exactly as it would if the legacy
+                // row had never had its token nulled.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-second', 'second@example.com', 'second@example.com', 'pro',
+                            '2026-01-01T00:00:00Z', 1, 'openai')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, access_token, is_active, created_at, updated_at, provider)
+                    VALUES ('user-second', 'user-second', 'token-second', 1,
+                            '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'openai')
+                """)
+                expectEqual(poller.openAIAccountCount(), 2, "both the legacy and the token-bearing row are counted")
+                expectEqual(OAuthPoller.resolveCodexHome(registered: nil, openAIAccountCount: poller.openAIAccountCount()),
+                            .ambiguous, "…restoring the pre-#166 ambiguity behavior for this pair")
+            } catch {
+                checks += 1
+                failures.append("openAIAccountCount legacy-usage-history test threw: \(error)")
             }
         }
     }
