@@ -1722,6 +1722,18 @@ class OAuthPoller: ObservableObject {
             let homeRegistered = accountColumns.contains("codex_home")
                 ? "(a.codex_home IS NOT NULL AND TRIM(a.codex_home) != '')"
                 : "0"
+            // Third term mirrors `isAbsentCodexIdentity`'s `hasLocalReading` guard
+            // (UsageStore.swift's account-loading query uses the identical
+            // EXISTS-against-usage_history shape) so this count is exactly the
+            // negation of "absent": a legacy row with no token and no registered
+            // home, but with usage_history from before #123 nulled every OpenAI
+            // access_token, must still count as a candidate owner of the ambient
+            // home — only a genuine placeholder (no reading by construction) may
+            // be excluded. A missing usage_history table reads as "no evidence",
+            // which can only make a row look less pollable, never falsely excluded.
+            let hasLocalReading = tableColumns(db, "usage_history").isEmpty
+                ? "1"
+                : "EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = a.id)"
             let count = try db.scalar("""
                 SELECT COUNT(*) FROM accounts a
                 WHERE COALESCE(a.provider, 'anthropic') = 'openai'
@@ -1729,7 +1741,8 @@ class OAuthPoller: ObservableObject {
                        OR EXISTS (SELECT 1 FROM oauth_credentials c
                                    WHERE c.account_id = a.id
                                      AND c.access_token IS NOT NULL
-                                     AND TRIM(c.access_token) != ''))
+                                     AND TRIM(c.access_token) != '')
+                       OR \(hasLocalReading))
             """) as? Int64
             return Int(count ?? 0)
         } catch {
