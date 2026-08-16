@@ -4,6 +4,8 @@ Chronological record of merged PRs and closed issues, newest first. Maintained a
 
 ### 2026-08-16
 
+- **Issue #176** (closed): Dedup repeated --db/--help CLI option parsing across CodexCLI and AccountSyncCLI
+- **PR #177**: refactor: dedup --db/--help CLI option parsing across CodexCLI and AccountSyncCLI
 - **Issue #173** (closed): loadActiveCredentials admits an empty-string access_token (no TRIM guard)
 - **PR #174**: fix: reject empty-string access_token in loadActiveCredentials
 - **Issue #169** (closed): isAbsentCodexIdentity's three hasStoredToken SQL copies diverge (missing TRIM/is_active checks)
