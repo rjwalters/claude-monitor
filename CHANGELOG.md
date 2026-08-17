@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.19.0] - 2026-08-15
+## [1.19.0] - 2026-08-17
 
 ### Summary
 
@@ -13,10 +13,11 @@ asking the Codex CLI itself over `codex app-server`, so the app holds no token
 to expire, rotate, or leak — and each Codex account can be polled from its own
 `CODEX_HOME`, which is the foundation for tracking more than one Codex identity.
 
-The supporting tooling is partly here too: `codex provision <label>` stands up a
-home, logs into it, and registers it in one step, and `codex list` reports a home
-that has been re-logged-in as a different identity. Full discovery of every
-home and a declarative intended-identity set are still tracked in #130.
+The supporting tooling is here too: `codex provision <label>` stands up a
+home, logs into it, and registers it in one step, `codex list` reports a home
+that has been re-logged-in as a different identity, and a declared-but-
+unprovisioned identity now shows as **absent** everywhere accounts are shown.
+Full discovery of every home is still tracked in #130.
 
 ### Added
 
@@ -43,6 +44,20 @@ home and a declarative intended-identity set are still tracked in #130.
   identity no longer matches the account registered against it is shown as a
   distinct state naming the identity it now holds, rather than silently
   producing a stale-looking row (#134, PR #138)
+- **A declared-but-unprovisioned Codex identity is reported as "absent".** A
+  host-local Codex home that was never stood up used to be indistinguishable
+  from an identity that doesn't exist. The intended set now travels on the
+  existing clipboard/env account transfer as identity-only entries (no token,
+  no path — a home *label*, never a username-bearing path), and the gap
+  surfaces everywhere accounts are shown: greyed popover rows, `codex list`
+  printing the exact `codex provision <label>` that fills it, and
+  `ranking.json` emitting `"absent": true` with `"status": "blocked"` so
+  consumers exclude it from their pools (#135, #166)
+- **Freshness thresholds derive from the poll interval, and stale rows are
+  gated.** A cause-independent staleness backstop (`AccountFreshness`, 3× the
+  configured poll interval) replaces hard-coded minute literals, so no account
+  row presents a frozen figure as current — stale rows blank their percentages
+  and show an explicit "as of <time>" (#148, #154)
 - **Capped accounts sort by when they come back.** Accounts tied on headroom —
   in practice the block of exhausted accounts all reading 0% — now order by time
   until the reset that actually gates them: the weekly reset once the week is
@@ -74,6 +89,18 @@ home and a declarative intended-identity set are still tracked in #130.
 
 ### Fixed
 
+- **The menubar badge no longer shows a frozen percentage.** The status-item
+  badge rendered the last-known figure even when the active account's data was
+  stale or its Codex identity had drifted; it now falls back to "--" via the
+  same gate the popover row already applied (#160, #161)
+- **Legacy OpenAI rows count toward home-ambiguity bookkeeping.**
+  `openAIAccountCount` excluded any tokenless, homeless OpenAI row — including
+  pre-#123 rows that still carry usage history — which over-narrowed the
+  ambient-home ambiguity guard; the SQL predicate is now exactly the negation
+  of `isAbsentCodexIdentity` (#171)
+- **An empty-string `access_token` no longer admits a row into the poll set.**
+  `loadActiveCredentials` only tested `IS NOT NULL`, so a row with
+  `access_token = ''` was polled as if credentialed (#173, #174)
 - **Removing an account deletes its credential.** `clearAccountData` deleted
   usage history and the account row but never `oauth_credentials`,
   `probe_snapshots`, or `named_limits`, and the declared foreign key was inert
