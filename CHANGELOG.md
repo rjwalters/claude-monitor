@@ -4,7 +4,91 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.19.0] - 2026-08-17
+## [1.20.0] - 2026-08-17
+
+### Summary
+
+The Codex-identity ergonomics that 1.19.0 deferred. Standing up a Codex home is
+now one command (`codex provision <label>`), `codex list` discovers homes on
+disk that were never registered and reports a home that has been re-logged-in
+as someone else, the poller adopts such a re-logged-in identity instead of
+freezing on it, and a declared-but-unprovisioned identity is shown as
+**absent** everywhere accounts appear — the popover, `codex list`, and
+`ranking.json`. Underneath, a single poll-interval-derived staleness rule now
+gates every surface, so neither a popover row nor the menubar badge can present
+a frozen figure as current.
+
+### Added
+
+- **`codex provision <label>` collapses home-create, login, and register.**
+  Standing up a Codex identity was three steps and a remembered path convention,
+  repeated per host; it is now one command (#133, PR #139)
+- **`codex list` reports a re-logged-in home as drift.** A home whose current
+  identity no longer matches the account registered against it is shown as a
+  distinct state naming the identity it now holds, rather than silently
+  producing a stale-looking row (#134, PR #138)
+- **`codex list` discovers unregistered `~/.codex*` homes on disk.** Previously
+  it enumerated only accounts already in `usage.db`, so extra homes on a host
+  gave no signal at all; each discovered home is now listed with its login state
+  and the exact `codex add --home <path>` that registers it. Read-only
+  throughout (#130, PR #140)
+- **A re-logged-in Codex identity is adopted instead of frozen.** When a
+  registered home's identity drifts (an operator ran `codex login` as a
+  different account), the poller re-attributes: an existing row for the new
+  identity is repointed at the home, or a fresh row is registered in the same
+  shape `codex add --home` produces. The previous identity's row keeps its
+  history and its drifted status. Adoption is keyed only by the identity the
+  home itself reported, never by the polled credential, so it structurally
+  cannot write one identity's usage onto another's row (#147, PR #158)
+- **A declared-but-unprovisioned Codex identity is reported as "absent".** A
+  host-local Codex home that was never stood up used to be indistinguishable
+  from an identity that doesn't exist. The intended set now travels on the
+  existing clipboard/env account transfer as identity-only entries (no token,
+  no path — a home *label*, never a username-bearing path), and the gap
+  surfaces everywhere accounts are shown: greyed popover rows, `codex list`
+  printing the exact `codex provision <label>` that fills it, and
+  `ranking.json` emitting `"absent": true` with `"status": "blocked"` so
+  consumers exclude it from their pools (#135, PR #166)
+- **Freshness thresholds derive from the poll interval, and stale rows are
+  gated.** A cause-independent staleness backstop (`AccountFreshness`, 3× the
+  configured poll interval) replaces hard-coded minute literals, so no account
+  row presents a frozen figure as current — stale rows blank their percentages
+  and show an explicit "as of <time>" (#148, PR #154)
+
+### Fixed
+
+- **Codex identity drift is a distinct account state, not a log line.** A
+  registered home logged in as a different account used to be reported only by
+  a deduped log line while the popover kept the row's last status and stale
+  percentages. A `drifted` status is now set on every poll that still finds
+  the conflict and cleared on the next clean one, shown as its own orange dot
+  naming the identity and the remediation command, with percent/headroom cells
+  rendered as "—" (#146, PR #152)
+- **The menubar badge no longer shows a frozen percentage.** The status-item
+  badge rendered the last-known figure even when the active account's data was
+  stale or its Codex identity had drifted; it now falls back to "--" via the
+  same gate the popover row already applied (#160, PR #161)
+- **Legacy OpenAI rows count toward home-ambiguity bookkeeping.**
+  `openAIAccountCount` excluded any tokenless, homeless OpenAI row — including
+  pre-#123 rows that still carry usage history — which over-narrowed the
+  ambient-home ambiguity guard; the SQL predicate is now exactly the negation
+  of `isAbsentCodexIdentity` (PR #171)
+- **An empty-string `access_token` no longer admits a row into the poll set.**
+  `loadActiveCredentials` only tested `IS NOT NULL`, so a row with
+  `access_token = ''` was polled as if credentialed (#173, PR #174)
+- **The tier-2 poll log line no longer claims a stored-credential fallback**
+  that #104 removed (PR #153)
+
+### Changed
+
+- **Internal refactors with no behavior change:** the absent-identity
+  stored-token predicate is spelled once as SQL (`storedTokenCountSQL`, #169,
+  PR #172); `--db`/`--help` parsing is shared across the subcommand CLIs
+  (`CLIArgs`, #176, PR #177); the pointing-hand hover cursor is a View modifier
+  (PR #163); unread `userId`/`idToken` fields dropped from the OpenAI response
+  structs (PR #155); SelfTest temp-dir/stub boilerplate deduplicated (PR #144)
+
+## [1.19.0] - 2026-08-15
 
 ### Summary
 
@@ -13,11 +97,10 @@ asking the Codex CLI itself over `codex app-server`, so the app holds no token
 to expire, rotate, or leak — and each Codex account can be polled from its own
 `CODEX_HOME`, which is the foundation for tracking more than one Codex identity.
 
-The supporting tooling is here too: `codex provision <label>` stands up a
-home, logs into it, and registers it in one step, `codex list` reports a home
-that has been re-logged-in as a different identity, and a declared-but-
-unprovisioned identity now shows as **absent** everywhere accounts are shown.
-Full discovery of every home is still tracked in #130.
+Note that this release ships the *mechanism*, not yet the ergonomics: homes are
+registered by hand with `codex add --home <path>`, and there is no discovery,
+drift reporting, or cross-host view of which identities a machine actually has.
+That tooling is tracked in #130 and lands in a following release.
 
 ### Added
 
@@ -37,27 +120,6 @@ Full discovery of every home is still tracked in #130.
   `auth.json` per home, a per-account home is what allows several Codex
   identities to coexist instead of each login clobbering the last. Homes are
   host-local by design and are never exported or synced (#103, PR #114)
-- **`codex provision <label>` collapses home-create, login, and register.**
-  Standing up a Codex identity was three steps and a remembered path convention,
-  repeated per host; it is now one command (#133, PR #139)
-- **`codex list` reports a re-logged-in home as drift.** A home whose current
-  identity no longer matches the account registered against it is shown as a
-  distinct state naming the identity it now holds, rather than silently
-  producing a stale-looking row (#134, PR #138)
-- **A declared-but-unprovisioned Codex identity is reported as "absent".** A
-  host-local Codex home that was never stood up used to be indistinguishable
-  from an identity that doesn't exist. The intended set now travels on the
-  existing clipboard/env account transfer as identity-only entries (no token,
-  no path — a home *label*, never a username-bearing path), and the gap
-  surfaces everywhere accounts are shown: greyed popover rows, `codex list`
-  printing the exact `codex provision <label>` that fills it, and
-  `ranking.json` emitting `"absent": true` with `"status": "blocked"` so
-  consumers exclude it from their pools (#135, #166)
-- **Freshness thresholds derive from the poll interval, and stale rows are
-  gated.** A cause-independent staleness backstop (`AccountFreshness`, 3× the
-  configured poll interval) replaces hard-coded minute literals, so no account
-  row presents a frozen figure as current — stale rows blank their percentages
-  and show an explicit "as of <time>" (#148, #154)
 - **Capped accounts sort by when they come back.** Accounts tied on headroom —
   in practice the block of exhausted accounts all reading 0% — now order by time
   until the reset that actually gates them: the weekly reset once the week is
@@ -89,18 +151,6 @@ Full discovery of every home is still tracked in #130.
 
 ### Fixed
 
-- **The menubar badge no longer shows a frozen percentage.** The status-item
-  badge rendered the last-known figure even when the active account's data was
-  stale or its Codex identity had drifted; it now falls back to "--" via the
-  same gate the popover row already applied (#160, #161)
-- **Legacy OpenAI rows count toward home-ambiguity bookkeeping.**
-  `openAIAccountCount` excluded any tokenless, homeless OpenAI row — including
-  pre-#123 rows that still carry usage history — which over-narrowed the
-  ambient-home ambiguity guard; the SQL predicate is now exactly the negation
-  of `isAbsentCodexIdentity` (#171)
-- **An empty-string `access_token` no longer admits a row into the poll set.**
-  `loadActiveCredentials` only tested `IS NOT NULL`, so a row with
-  `access_token = ''` was polled as if credentialed (#173, #174)
 - **Removing an account deletes its credential.** `clearAccountData` deleted
   usage history and the account row but never `oauth_credentials`,
   `probe_snapshots`, or `named_limits`, and the declared foreign key was inert
