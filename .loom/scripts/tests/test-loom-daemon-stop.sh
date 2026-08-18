@@ -94,7 +94,20 @@ WORKDIR="$(mktemp -d)"
 # LOOM_AUTONOMY_MARKER inline on their own invocation (a per-command assignment
 # always wins over this exported default, same precedence as before). This
 # only closes the call sites that do NOT pin them.
-live_state_sandbox_init "$WORKDIR/live-state"
+#
+# The return code is CHECKED, never bare (#6420). init returns non-zero when it
+# could not `cd` into the sandbox root (#6386 — the cwd tier is then still aimed
+# at wherever this suite was launched from, i.e. potentially a LIVE checkout) or
+# when the ambient supervisor label is the real production one (#5501). This
+# suite runs under `set -uo pipefail` with NO `-e`, so a bare call would swallow
+# both and continue with a HALF-ARMED sandbox — the exact state the helper's own
+# failure path exists to prevent — while driving the real lifecycle scripts.
+if ! live_state_sandbox_init "$WORKDIR/live-state"; then
+    echo "FATAL: live-state sandbox init failed — refusing to run this suite against a half-armed sandbox (#6420)." >&2
+    echo "  See the reason above (lib/live-state-sandbox.sh): a writable sandbox root is required, and the ambient LOOM_LAUNCHD_LABEL / LOOM_WATCHDOG_LABEL must not be the real production identities." >&2
+    rm -rf "$WORKDIR"
+    exit 1
+fi
 
 # Suite-level safety guard (#4078): a decoy process whose argv ends in
 # `/loom-daemon` — exactly what the stop script's label-blind `pgrep -f
@@ -131,11 +144,21 @@ else
 fi
 
 # 2. A live PID-file-tracked process is stopped (SIGTERM path).
+#
+# `LOOM_PID_FILE=''` on this and the cases below is deliberate and
+# load-bearing since #6386: loom-daemon-stop.sh now resolves LOOM_PID_FILE
+# AHEAD of the $PWD-derived state home, and live_state_sandbox_init exports it
+# suite-wide, so a case that means to exercise the $PWD tier must say so. An
+# empty value is skipped by the resolver exactly like an unset one (same idiom
+# as test-loom-daemon-watchdog.sh's `env LOOM_PID_FILE= LOOM_WORKSPACE= …`
+# pins). It is safe here because the paired `cd "$WORKDIR"` makes the $PWD tier
+# resolve inside this suite's own scratch workspace -- and keeping these cases
+# on that tier is what keeps the derived fallback itself under test.
 SLEEP_PID_FILE="$WORKDIR/.loom/.daemon.pid"
 ( sleep 30 & echo $! > "$SLEEP_PID_FILE" )
 sleep_pid=$(cat "$SLEEP_PID_FILE")
 bg_proc_track "$sleep_pid"
-( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" >/dev/null 2>&1 )
+( cd "$WORKDIR" && LOOM_PID_FILE='' LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" >/dev/null 2>&1 )
 rc2=$?
 assert_eq "0" "$rc2" "live pid: stop exits 0"
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -161,7 +184,7 @@ fi
 sleep_pid2=$(cat "$SLEEP_PID_FILE")
 bg_proc_track "$sleep_pid2"
 start_ts=$(date +%s)
-( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" --force >/dev/null 2>&1 )
+( cd "$WORKDIR" && LOOM_PID_FILE='' LOOM_LAUNCHD_LABEL="$FAKE_LABEL" bash "$STOP_SCRIPT" --force >/dev/null 2>&1 )
 end_ts=$(date +%s)
 elapsed=$((end_ts - start_ts))
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -226,7 +249,7 @@ FAKE
     bg_proc_track "$relaunch_pid"
 
     stuck_out=$( cd "$WORKDIR" && PATH="$FAKE_BIN_DIR:$PATH" RELAUNCH_PID="$relaunch_pid" \
-        LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" 2>&1 )
+        LOOM_PID_FILE='' LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" 2>&1 )
     stuck_rc=$?
 
     assert_eq "1" "$stuck_rc" "relaunched-daemon-still-alive: stop exits non-zero (does not report success)"
@@ -369,7 +392,7 @@ printf 'started_at=x\n' > "$MARKER"
 ( sleep 30 & echo $! > "$WORKDIR/.loom/.daemon.pid" )
 live_pid=$(cat "$WORKDIR/.loom/.daemon.pid")
 bg_proc_track "$live_pid"
-( cd "$WORKDIR" && LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_AUTONOMY_MARKER="$MARKER" \
+( cd "$WORKDIR" && LOOM_PID_FILE='' LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_AUTONOMY_MARKER="$MARKER" \
     LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" >/dev/null 2>&1 )
 kill -9 "$live_pid" 2>/dev/null || true
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -532,7 +555,10 @@ NON_REPO_DIR="$(mktemp -d)"
 ( sleep 30 & echo $! > "$MACHINE_HOME/.loom/.daemon.pid" )
 machine_pid=$(cat "$MACHINE_HOME/.loom/.daemon.pid")
 bg_proc_track "$machine_pid"
-out_machine=$( cd "$NON_REPO_DIR" && HOME="$MACHINE_HOME" LOOM_MACHINE_CHECKOUT="$MACHINE_CHECKOUT" \
+# `LOOM_PID_FILE=''` (empty): this case's whole point is that the MACHINE tier
+# resolves the pid file from the scratch $HOME/.loom, so the suite-wide
+# sandbox pin must not stand in for it (#6386). Safe — HOME is scratch here.
+out_machine=$( cd "$NON_REPO_DIR" && LOOM_PID_FILE='' HOME="$MACHINE_HOME" LOOM_MACHINE_CHECKOUT="$MACHINE_CHECKOUT" \
     LOOM_LAUNCHD_LABEL="$FAKE_LABEL" LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" 2>&1 )
 rc_machine=$?
 assert_eq "0" "$rc_machine" "machine mode: stop from a non-repo dir exits 0"
@@ -633,6 +659,105 @@ else
     echo -e "${RED}✗${NC} #5131: an explicitly-scoped marker is still torn down (sandboxed suites unaffected)"
 fi
 rm -rf "$scope_dir"
+
+# ============================================================
+# ============================================================
+# #6386: LOOM_PID_FILE is TIER 1 — a stop that was TOLD which pid file to use
+# must never fall back to the one $PWD's checkout implies.
+#
+# The incident: an Auditor ran the CI shell suites from a fleet host's LIVE
+# checkout. Case #5131(a) above invokes this script with
+# LOOM_PID_FILE="$scope_dir/absent.pid" and no `cd` into a fixture — but
+# loom-daemon-stop.sh READ NO LOOM_PID_FILE AT ALL. It derived
+# PID_FILE="$REPO_ROOT/.loom/.daemon.pid" from `find_repo_root`'s walk up from
+# $PWD, landed on the live checkout, and SIGTERM'd + `rm -f`'d the fleet's
+# authoritative dispatcher. It stayed down for 11 hours. (The marker survived
+# only because the marker/loom-dir side DID honor LOOM_SOCKET_PATH — that
+# split resolution is the defect.)
+#
+# Reproduced below against a FAKE "live checkout" fixture — a scratch dir with
+# its own `.loom/.daemon.pid` naming a decoy `sleep`. Never the real checkout,
+# never a real daemon pid: the fixture is what `find_repo_root` would latch
+# onto, so it plays the victim's role exactly.
+# ============================================================
+pf_root="$(mktemp -d)"
+fake_checkout="$pf_root/live-checkout"
+mkdir -p "$fake_checkout/.loom" "$pf_root/loomdir"
+
+# (a) The #5131(a) invocation shape, run FROM the "live checkout" (the Auditor's
+#     cwd). LOOM_PID_FILE names an absent scratch file, so there is nothing to
+#     stop — the checkout's own pid file must be neither read nor removed, and
+#     its decoy must survive.
+sleep 30 &
+pf_checkout_decoy=$!
+bg_proc_track "$pf_checkout_decoy"
+echo "$pf_checkout_decoy" > "$fake_checkout/.loom/.daemon.pid"
+( cd "$fake_checkout" && LOOM_SOCKET_PATH="$pf_root/loomdir/loom-daemon.sock" \
+    LOOM_PID_FILE="$pf_root/absent.pid" LOOM_LAUNCHD_LABEL="com.example.scratch-6386" \
+    LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" ) >/dev/null 2>&1
+pf_a_rc=$?
+assert_eq "0" "$pf_a_rc" "#6386: a stop pointed at an absent LOOM_PID_FILE exits 0 (nothing to stop)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if kill -0 "$pf_checkout_decoy" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6386: the \$PWD checkout's daemon SURVIVES a stop scoped to another pid file (the 11h-outage repro)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6386: the \$PWD checkout's daemon SURVIVES a stop scoped to another pid file (the 11h-outage repro)"
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$(cat "$fake_checkout/.loom/.daemon.pid" 2>/dev/null)" == "$pf_checkout_decoy" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6386: the \$PWD checkout's .loom/.daemon.pid is never read or removed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6386: the \$PWD checkout's .loom/.daemon.pid is never read or removed"
+    echo "  pid file now: [$(cat "$fake_checkout/.loom/.daemon.pid" 2>/dev/null || echo '<gone>')] expected [$pf_checkout_decoy]"
+fi
+
+# (b) Positive half — the precedence is a real choice, not "LOOM_PID_FILE means
+#     do nothing": with BOTH files populated, the LOOM_PID_FILE one is the one
+#     that gets stopped, and the $PWD one is left completely alone. Without
+#     this, (a) would also pass on a script that simply never stops anything.
+sleep 30 &
+pf_env_decoy=$!
+bg_proc_track "$pf_env_decoy"
+echo "$pf_env_decoy" > "$pf_root/named.pid"
+( cd "$fake_checkout" && LOOM_SOCKET_PATH="$pf_root/loomdir/loom-daemon.sock" \
+    LOOM_PID_FILE="$pf_root/named.pid" LOOM_LAUNCHD_LABEL="com.example.scratch-6386" \
+    LOOM_DAEMON_STOP_GRACE_SECS=2 bash "$STOP_SCRIPT" ) >/dev/null 2>&1
+TESTS_RUN=$((TESTS_RUN + 1))
+if ! kill -0 "$pf_env_decoy" 2>/dev/null; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6386: LOOM_PID_FILE outranks \$PWD — the pid it names IS the one stopped"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6386: LOOM_PID_FILE outranks \$PWD — the pid it names IS the one stopped"
+    kill -9 "$pf_env_decoy" 2>/dev/null || true
+fi
+TESTS_RUN=$((TESTS_RUN + 1))
+if kill -0 "$pf_checkout_decoy" 2>/dev/null \
+    && [[ "$(cat "$fake_checkout/.loom/.daemon.pid" 2>/dev/null)" == "$pf_checkout_decoy" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6386: …and the \$PWD checkout's daemon + pid file are still untouched"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6386: …and the \$PWD checkout's daemon + pid file are still untouched"
+fi
+
+# (c) --help documents the new tier, so an operator reading the script's own
+#     contract sees which file a stop will target.
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$help_out" | grep -q 'LOOM_PID_FILE'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6386: --help documents LOOM_PID_FILE"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6386: --help documents LOOM_PID_FILE"
+fi
+
+kill -9 "$pf_checkout_decoy" 2>/dev/null || true
+rm -rf "$pf_root"
 
 # ============================================================
 # ============================================================

@@ -11,7 +11,7 @@
 # `log_warn` buried inside that particular sweep's own log file. From the
 # moment #5457 merged, every sweep on an affected host silently stopped
 # narrating to safehouse — and the failure ran for 11 hours before a human
-# noticed the public 2amlogic.com fleet pulse had gone stale, because nothing
+# noticed the public fleet pulse had gone stale, because nothing
 # outside a sweep's own log was watching for it.
 #
 # This script is that "something watching": a standalone, on-demand check
@@ -156,7 +156,7 @@ for _root in "${ROOTS[@]}"; do
                 echo "check-safehouse-socket: $_root -- OK (socket resolved: $_socket)"
                 ;;
             unreachable_no_socket)
-                echo "check-safehouse-socket: $_root -- DRIFT: safehouse.enabled is true but no socket resolves (safehouse.socket / \$LOOM_SAFEHOUSE_SOCKET / \$SAFEHOUSED_SOCKET) -- no safehouse narration will be recorded from this repo; the 2amlogic.com public fleet pulse is fed exclusively from safehouse narration (issue #5523)." >&2
+                echo "check-safehouse-socket: $_root -- DRIFT: safehouse.enabled is true but no socket resolves (safehouse.socket / \$LOOM_SAFEHOUSE_SOCKET / \$SAFEHOUSED_SOCKET) -- no safehouse narration will be recorded from this repo; the public fleet pulse is fed exclusively from safehouse narration (issue #5523)." >&2
                 ;;
             unreachable_missing_file)
                 echo "check-safehouse-socket: $_root -- DRIFT: safehouse.enabled is true, socket resolved to '$_socket', but nothing exists there yet -- is safehoused running? (issue #5523)" >&2

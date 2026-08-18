@@ -463,7 +463,28 @@ by the standalone checker and daemon admission:
   "mcp"]` on `builder.json`. A role with no `runtimeRequirements` key has no
   constraints (any runtime is compatible). This is a distinct field from the
   pre-existing `suggestedWorkerType` (a dispatch *preference* hint) — the checker
-  reads only `runtimeRequirements`.
+  reads only `runtimeRequirements`, and `runtime_admission::resolve_and_admit`
+  never lets `suggestedWorkerType` change which runtime is actually selected
+  (see below) — only `runtimeRequirements` is enforced.
+
+  **`suggestedWorkerType` is observability-only, deliberately never a selection
+  input (#6201).** Wiring a role's own hint into the `choose_runtime`
+  precedence chain sounds appealing but is unsound in general: `builder.json`
+  declares the *aspirational* `"codex"` (the eventual promotion target once
+  Codex's `worktreeIsolation` capability promotes past `"partial"` — see
+  "Promotion gate" in `guardrail-parity-codex.md`) while its own
+  `runtimeRequirements` make Codex fail closed *today* — if the hint drove
+  selection, every zero-config Builder/sweep dispatch would immediately try
+  Codex and get rejected. Instead, `resolve_and_admit`'s `ResolvedRuntime`
+  carries the declared `suggested_worker_type` alongside the *actually*
+  admitted runtime, and `runtime_admission::suggested_worker_type_mismatch_warning`
+  logs a loud `WARN` (from both `role_runner`'s standalone role ticks and
+  `sweep_registry`'s per-sweep dispatch) whenever they diverge AND something
+  really did override the built-in default (`RuntimeSource::BuiltIn` is
+  exempt — see that function's doc comment) — the diagnostic the #6201
+  incident lacked entirely: `curator.json` declared `"claude"`, a broad
+  `runtimes.default`-style override silently redirected it onto Codex, and
+  nothing logged the divergence anywhere for nine days.
 - **Matcher** — `defaults/scripts/check-runtime-capabilities.sh --role <name>
   --runtime <name>` loads both files and checks requirements ⊆ capabilities,
   where a requirement is satisfied only by a declared `"yes"` (`"partial"` AND

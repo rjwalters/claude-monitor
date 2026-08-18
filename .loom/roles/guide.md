@@ -1305,25 +1305,37 @@ work_log_max_issue() {
   { grep -oE 'Issue #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+'; echo 0; } | sort -rn | head -1
 }
 
-# Whether "PR #<N>" is already literally recorded in WORK_LOG.md (#5516).
-# `grep -qx` matches a full extracted-number LINE exactly, so `#550` can
-# never false-match a recorded `#5501` the way a plain substring grep would.
-# This is the presence check update_work_log() uses INSTEAD of a pure
-# `.number > $last_pr` comparison — see the #5516 comment at its call site
-# for why number order cannot be trusted as a proxy for "already recorded".
+# Whether "PR #<N>" is already literally recorded in WORK_LOG.md as its own
+# bullet entry (#5516, anchoring fixed by #6087). The pattern is anchored to
+# the bullet lead-in (`^- \*\*PR #N\*\*`, no trailing-space requirement — a
+# genuine PR entry reads `- **PR #N**: <title>`, immediately followed by a
+# colon, not a space), not a bare `PR #[0-9]+` scan of the whole file — an
+# unanchored scan can false-match a PR number that only appears inside
+# ANOTHER entry's title text (e.g. "PR #550" mentioned in an issue title),
+# permanently and silently suppressing that PR's own entry. The literal `$1`
+# immediately followed by `\*\*` already rules out a longer recorded number
+# extending it (e.g. `$1=550` cannot match a recorded `#5501`, since the next
+# character after "550" in that line is "1", not "*"). This is the presence
+# check update_work_log() uses INSTEAD of a pure `.number > $last_pr`
+# comparison — see the #5516 comment at its call site for why number order
+# cannot be trusted as a proxy for "already recorded".
 work_log_has_pr() {
-  grep -oE 'PR #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+' | grep -qx "$1"
+  grep -qE "^- \*\*PR #${1}\*\*" "$DOCS_WT/WORK_LOG.md" 2>/dev/null
 }
 
-# Whether "Issue #<N>" is already literally recorded in WORK_LOG.md (#5539,
-# mirroring work_log_has_pr()/#5516 above). Same `grep -qx` exact-line-match
-# reasoning: `#552` can never false-match a recorded `#5521`. This is the
-# presence check update_work_log() uses INSTEAD of a pure
+# Whether "Issue #<N>" is already literally recorded in WORK_LOG.md as its
+# own bullet entry (#5539, mirroring work_log_has_pr()/#5516 above; anchoring
+# fixed by #6087). Same bullet-lead-in anchoring: `^- \*\*Issue #N\*\* `, not
+# a bare `Issue #[0-9]+` scan of the whole file — an unanchored scan can
+# false-match an issue number that only appears inside ANOTHER entry's title
+# text (e.g. issue #6058's own title containing the literal text
+# "Issue #5895"), permanently and silently suppressing that issue's own
+# entry. This is the presence check update_work_log() uses INSTEAD of a pure
 # `.number > $last_issue` comparison — see the #5539 comment at its call
 # site for why issue-close order cannot be trusted as a proxy for "already
 # recorded" any more than PR-merge order could.
 work_log_has_issue() {
-  grep -oE 'Issue #[0-9]+' "$DOCS_WT/WORK_LOG.md" 2>/dev/null | grep -oE '[0-9]+' | grep -qx "$1"
+  grep -qE "^- \*\*Issue #${1}\*\* " "$DOCS_WT/WORK_LOG.md" 2>/dev/null
 }
 ```
 
@@ -1409,10 +1421,34 @@ fi
 
 If a docs PR is already open, **skip the entire document maintenance phase** to prevent PR accumulation (and release the lock — there is nothing left for this tick to do).
 
+**#6327 CORRECTED UNDERSTANDING, DO NOT RE-LITIGATE:** issue #6327 was filed
+observing N-host duplicate `docs: Guide document maintenance update` PRs and
+initially asked for a generic lease/claim primitive for this phase, "the way
+sweeps now have it" (#6165). Verification against live forge history found
+that premise incomplete: single-writer discipline for THIS phase already
+exists — the same-host `docs-guide-lock.sh` mkdir lock above plus Step 5's
+uncached `OPEN_DOCS_PR_RECHECK` (#5615, just above) together bound the
+cross-host race, and `test-guide-docs-pr-race.sh` regression-tests that
+combination the way #6315 did for the sweep-side lease fencing check. The
+observed duplication was sequential, debounce-respecting churn (every host
+reading the same forge-anchored `last_work_log_write_epoch()` /
+`last_work_plan_write_epoch()` clock), not two hosts racing to write the same
+PR at once. The residual, still-open problem is aggregate PR volume as
+dispatcher count grows — addressed by making the debounce windows
+config-tunable (`guide.docsMaintenance.workLogDebounceSecs` /
+`workPlanDebounceSecs`, see `update_work_log()` / `update_work_plan()`
+below), not by adding a lease. Do not build a lease/claim primitive for this
+phase unless a future regression run of `test-guide-docs-pr-race.sh` actually
+finds the lock+recheck insufficient.
+
 ### Step 2: Update WORK_LOG.md
 
 Append entries for newly merged PRs and newly closed issues not yet recorded
-(presence checks, not number watermarks — see #5516 and #5539 below).
+(presence checks, not number watermarks — see #5516 and #5539 below). Only
+write if the pending delta has survived a batching window since the last
+WORK_LOG-writing docs-maintenance merge, **or** has grown large enough to
+write immediately regardless of the window (see "WORK_LOG debounce" in
+`update_work_log()` below, #6133).
 
 ```bash
 # #5454 BUG, DO NOT REINTRODUCE: this phase's OWN merged PRs must never count as
@@ -1436,6 +1472,217 @@ Append entries for newly merged PRs and newly closed issues not yet recorded
 # can never drift apart.
 GUIDE_DOCS_PR_EXCLUDE='((.headRefName // "") | startswith("docs/guide-update")) or (.title == "docs: Guide document maintenance update")'
 
+# Epoch seconds of the most recently MERGED docs-maintenance PR whose changed
+# files actually included WORK_LOG.md, or 0 if none has ever merged (empty
+# history / query failure). Mirrors `last_work_plan_write_epoch()` (Step 3,
+# #5929) but anchored on WORK_LOG.md instead of WORK_PLAN.md: reuses
+# GUIDE_DOCS_PR_EXCLUDE as the "is this a docs-maintenance PR" predicate
+# rather than redefining it, and additionally requires the merge to have
+# actually touched WORK_LOG.md — a docs-maintenance PR that only touched
+# WORK_PLAN.md (or README.md) must NOT anchor THIS clock, for the identical
+# #5929 reason: otherwise an unrelated WORK_PLAN-only rewrite would reset the
+# WORK_LOG debounce clock and could suppress an overdue WORK_LOG write
+# indefinitely.
+last_work_log_write_epoch() {
+  local ts
+  ts=$("$GH_READ" pr list --state merged --limit 30 --json number,title,mergedAt,headRefName,files \
+    --jq "[.[] | select($GUIDE_DOCS_PR_EXCLUDE) | select([(.files // [])[].path] | index(\"WORK_LOG.md\") != null)] | sort_by(.mergedAt) | reverse | .[0].mergedAt // empty")
+  [ -z "$ts" ] && { echo 0; return; }
+  date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0
+}
+
+# #6097 BUG, DO NOT REINTRODUCE: bumping `--limit` on the closed-issue query
+# (#6086 raised it 200 -> 1000, believing 1000 was "well above realistic
+# per-window volume") is not a durable fix — this repo's actual 30-day
+# closed-issue count (1156, verified 2026-08-12 via `gh api search/issues`
+# total_count, see #6096/#6097) already exceeded the raised cap within days.
+# Any single fixed `--limit` is eventually outrun by review-cadence/role-count
+# growth, and `gh issue list` never reports how many items truly matched the
+# query, so a truncated 1000-row fetch and a genuinely-complete one are
+# INDISTINGUISHABLE from its output alone — that ambiguity, not the specific
+# number 1000, was the real bug. The two helpers below make correctness
+# independent of any specific constant: `fetch_closed_issues_complete()` asks
+# the search API's `total_count` field (the ground truth `gh issue list`
+# doesn't expose) for the window's real size, and only if that exceeds the
+# safety cap does it recursively bisect the date range until every
+# sub-window is provably under the cap, merging the halves back together
+# (deduped by number, since both halves share the boundary date). A
+# self-check inside it also compares what was actually fetched against
+# `total_count` for the *exact* window queried — not merely "count ==
+# --limit", which cannot distinguish "truncated" from "the window
+# legitimately closed exactly 1000 issues" — so any residual truncation is
+# caught and logged instead of silently dropped (#6097 AC2).
+_work_log_search_total_count() {
+  # True count of items within a search range, via the search API's
+  # `total_count` field. Echoes "-1" (never fails the caller) when the count
+  # could not be determined — callers must treat that as "unknown", not
+  # "zero". `-X GET` is REQUIRED: `gh api` silently switches its default HTTP
+  # method to POST once any `-f`/`-F` flag is present, and `search/issues`
+  # only accepts GET — a bare `-f q=...` 404s instead of searching. Resolves
+  # `owner/repo` locally from the git remote (never `gh repo view --json
+  # nameWithOwner`, which is GraphQL-backed and fails first under quota
+  # exhaustion — #4659, and sweep.md's "Resolve the repository locally"
+  # rule), mirroring check-duplicate.sh's `get_repo_nwo()` parse.
+  #
+  # `predicate` (#6144) generalizes this beyond the issue-side-only original:
+  # it takes the search predicate as a second, optional argument — defaults
+  # to `is:issue is:closed` (the original, issue-side behavior, unchanged for
+  # every existing caller) so `fetch_closed_issues_complete()` below needs no
+  # changes. `fetch_merged_prs_complete()` passes `is:pr is:merged` instead —
+  # GitHub's search API unifies issues and PRs under the same `search/issues`
+  # endpoint, so no separate endpoint or `_pr` companion function is needed,
+  # only a different predicate string.
+  local search_range="$1"
+  local predicate="${2:-is:issue is:closed}"
+  local repo_nwo
+  repo_nwo=$(git remote get-url origin 2>/dev/null \
+    | sed -E 's#^git@[^:]+:##; s#^https?://[^/]+/##; s#\.git/?$##')
+  if [ -z "$repo_nwo" ]; then
+    echo "-1"
+    return
+  fi
+  "$GH_READ" api -X GET search/issues \
+    -f "q=repo:$repo_nwo $predicate $search_range" \
+    --jq '.total_count' 2>/dev/null || echo "-1"
+}
+
+fetch_closed_issues_complete() {
+  # Fetch EVERY closed issue in [start, end) — end empty means open-ended,
+  # ">=start" — without truncation, no matter how large the window's true
+  # volume is. `depth` only guards a degenerate/malformed window from
+  # recursing forever; it is never expected to bind in normal operation.
+  local start="$1" end="$2" depth="${3:-0}" safety_cap=1000
+  local search_range
+  if [ -n "$end" ]; then
+    search_range="closed:${start}..${end}"
+  else
+    search_range="closed:>=${start}"
+  fi
+
+  local true_count
+  true_count=$(_work_log_search_total_count "$search_range")
+
+  if [ "$true_count" -gt "$safety_cap" ] 2>/dev/null && [ "$depth" -lt 10 ]; then
+    # This window alone would truncate a single bounded fetch no matter how
+    # large `--limit` is set — bisect by date and recurse on each half.
+    local end_resolved start_epoch end_epoch
+    end_resolved="${end:-$(date -u +%Y-%m-%d)}"
+    start_epoch=$(date -u -d "$start" +%s 2>/dev/null || date -u -j -f %Y-%m-%d "$start" +%s)
+    end_epoch=$(date -u -d "$end_resolved" +%s 2>/dev/null || date -u -j -f %Y-%m-%d "$end_resolved" +%s)
+
+    if [ $(( (end_epoch - start_epoch) / 86400 )) -ge 2 ]; then
+      local mid_epoch mid_date left right
+      mid_epoch=$(( (start_epoch + end_epoch) / 2 ))
+      mid_date=$(date -u -d "@$mid_epoch" +%Y-%m-%d 2>/dev/null || date -u -r "$mid_epoch" +%Y-%m-%d)
+      left=$(fetch_closed_issues_complete "$start" "$mid_date" $((depth + 1)))
+      right=$(fetch_closed_issues_complete "$mid_date" "$end" $((depth + 1)))
+      # Merge via process substitution, NOT `--argjson` — a wide window's
+      # halves can each be hundreds of KB of JSON, and passing that through
+      # `--argjson`'s command-line argument blows past the OS `ARG_MAX` and
+      # fails with "Argument list too long" (observed while validating this
+      # fix against this repo's real 30-day volume, #6097).
+      jq -c -s '.[0] + .[1] | unique_by(.number)' \
+        <(printf '%s\n' "$left") <(printf '%s\n' "$right")
+      return 0
+    fi
+    # Already down to a single day and still over the cap (or the depth cap
+    # was hit first): fall through to the plain fetch below and let the
+    # self-check warn — a >1000-closed-in-one-day volume is implausible but
+    # must not fail silently if it ever happens.
+  fi
+
+  local batch fetched_count
+  batch=$("$GH_READ" issue list --state closed --search "$search_range" --limit "$safety_cap" \
+    --json number,title,closedAt)
+  fetched_count=$(printf '%s\n' "$batch" | jq 'length')
+
+  # #6097 AC2 self-check: compare the fetch against the search API's own
+  # total_count for this EXACT window, not against `--limit`. A mismatch is
+  # unambiguous evidence of truncation. Silent when total_count itself was
+  # unavailable (-1) — that is "unknown", not "confirmed truncated".
+  if [ "$true_count" -ge 0 ] 2>/dev/null && [ "$fetched_count" -ne "$true_count" ]; then
+    echo "WARNING: closed-issue fetch for window [$start, ${end:-now}) returned $fetched_count of $true_count (search API total_count) -- possible truncation, see #6097." >&2
+  fi
+
+  printf '%s\n' "$batch"
+}
+
+# #6144 BUG, DO NOT REINTRODUCE: the PR-side candidate fetch used to end with
+# a flat `gh pr list --state merged --search "merged:>=$since" --limit 1000`,
+# with only a `count == 1000` stderr warning as a self-check — a strictly
+# weaker signal than `total_count` because it cannot distinguish "truncated"
+# from "the window legitimately merged exactly 1000 PRs". This repo's actual
+# 30-day merged-PR count (1348, verified 2026-08-13 via `gh api search/issues`
+# total_count) exceeded the cap for real, silently dropping 348 PRs the exact
+# same way #6097 hit on the issue side. `fetch_merged_prs_complete()` below is
+# the same bisection mechanism as `fetch_closed_issues_complete()` above,
+# parameterized for `merged:`/`mergedAt` instead of `closed:`/`closedAt` (and
+# `is:pr is:merged` instead of `is:issue is:closed` for the total_count
+# predicate) — see that function's header comment for the full rationale.
+fetch_merged_prs_complete() {
+  # Fetch EVERY merged PR in [start, end) — end empty means open-ended,
+  # ">=start" — without truncation, no matter how large the window's true
+  # volume is. `depth` only guards a degenerate/malformed window from
+  # recursing forever; it is never expected to bind in normal operation.
+  local start="$1" end="$2" depth="${3:-0}" safety_cap=1000
+  local search_range
+  if [ -n "$end" ]; then
+    search_range="merged:${start}..${end}"
+  else
+    search_range="merged:>=${start}"
+  fi
+
+  local true_count
+  true_count=$(_work_log_search_total_count "$search_range" "is:pr is:merged")
+
+  if [ "$true_count" -gt "$safety_cap" ] 2>/dev/null && [ "$depth" -lt 10 ]; then
+    # This window alone would truncate a single bounded fetch no matter how
+    # large `--limit` is set — bisect by date and recurse on each half.
+    local end_resolved start_epoch end_epoch
+    end_resolved="${end:-$(date -u +%Y-%m-%d)}"
+    start_epoch=$(date -u -d "$start" +%s 2>/dev/null || date -u -j -f %Y-%m-%d "$start" +%s)
+    end_epoch=$(date -u -d "$end_resolved" +%s 2>/dev/null || date -u -j -f %Y-%m-%d "$end_resolved" +%s)
+
+    if [ $(( (end_epoch - start_epoch) / 86400 )) -ge 2 ]; then
+      local mid_epoch mid_date left right
+      mid_epoch=$(( (start_epoch + end_epoch) / 2 ))
+      mid_date=$(date -u -d "@$mid_epoch" +%Y-%m-%d 2>/dev/null || date -u -r "$mid_epoch" +%Y-%m-%d)
+      left=$(fetch_merged_prs_complete "$start" "$mid_date" $((depth + 1)))
+      right=$(fetch_merged_prs_complete "$mid_date" "$end" $((depth + 1)))
+      # Merge via process substitution, NOT `--argjson` — a wide window's
+      # halves can each be hundreds of KB of JSON, and passing that through
+      # `--argjson`'s command-line argument blows past the OS `ARG_MAX` and
+      # fails with "Argument list too long" (#6097).
+      jq -c -s '.[0] + .[1] | unique_by(.number)' \
+        <(printf '%s\n' "$left") <(printf '%s\n' "$right")
+      return 0
+    fi
+    # Already down to a single day and still over the cap (or the depth cap
+    # was hit first): fall through to the plain fetch below and let the
+    # self-check warn — a >1000-merged-in-one-day volume is implausible but
+    # must not fail silently if it ever happens.
+  fi
+
+  local batch fetched_count
+  # `headRefName` MUST stay in the --json field list — jq cannot filter on a
+  # field gh was not asked to return, and `.headRefName` would silently be
+  # null (update_work_log()'s `$GUIDE_DOCS_PR_EXCLUDE` filter depends on it).
+  batch=$("$GH_READ" pr list --state merged --search "$search_range" --limit "$safety_cap" \
+    --json number,title,mergedAt,headRefName)
+  fetched_count=$(printf '%s\n' "$batch" | jq 'length')
+
+  # #6144 self-check (mirrors the #6097 AC2 self-check): compare the fetch
+  # against the search API's own total_count for this EXACT window, not
+  # against `--limit`/a hardcoded count. A mismatch is unambiguous evidence of
+  # truncation. Silent when total_count itself was unavailable (-1) — that is
+  # "unknown", not "confirmed truncated".
+  if [ "$true_count" -ge 0 ] 2>/dev/null && [ "$fetched_count" -ne "$true_count" ]; then
+    echo "WARNING: merged-PR fetch for window [$start, ${end:-now}) returned $fetched_count of $true_count (search API total_count) -- possible truncation, see #6144." >&2
+  fi
+
+  printf '%s\n' "$batch"
+}
+
 update_work_log() {
   # Neither PRs nor issues are filtered by a number watermark anymore — see
   # the #5516 (PR) and #5539 (issue) comments below. `work_log_max_issue()` /
@@ -1457,19 +1704,34 @@ update_work_log() {
   # after it before this phase's next tick. `merged:>=$since` bounds the
   # query by calendar time instead, so an out-of-order PR stays reachable for
   # as long as it is plausible for one to sit in review — 30 days is a
-  # generous ceiling for Doctor/review dwell time. `--limit 200` on top is a
-  # safety cap, not the primary bound. Shared below with the issue-side
-  # `closed:>=$since` query (#5539) for the same reason: a flat `--limit 50`
-  # on closed issues can push an out-of-order closure out of the query too.
+  # generous ceiling for Doctor/review dwell time. Shared below with the
+  # issue-side `closed:>=$since` query (#5539) for the same reason: a flat
+  # `--limit 50` on closed issues can push an out-of-order closure out of the
+  # query too.
   local since
   since=$(date -u -d '30 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-30d +%Y-%m-%d)
 
   # Get merged-PR candidates in the window, minus this phase's own docs PRs.
-  # `headRefName` MUST stay in the --json field list — jq cannot filter on a
-  # field gh was not asked to return, and `.headRefName` would silently be null.
-  local candidate_prs=$("$GH_READ" pr list --state merged --search "merged:>=$since" --limit 200 \
-    --json number,title,mergedAt,headRefName \
-    --jq "[.[] | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
+  #
+  # #6144 BUG, DO NOT REINTRODUCE: this used to end with a flat `gh pr list
+  # --state merged --search "merged:>=$since" --limit 1000` (raised from 200
+  # by #6086, on the belief that 1000 was "well above realistic per-window
+  # merge volume"). It was not — this repo's actual 30-day merged-PR count
+  # (1348, verified 2026-08-13) already exceeded it, silently truncating the
+  # fetch the exact same way #6086 did at the lower threshold, and the same
+  # way #6097 hit on the issue side. `fetch_merged_prs_complete()` (defined
+  # above `update_work_log()`) replaces the fixed-`--limit` fetch: it checks
+  # the search API's `total_count` for the window and only bisects the date
+  # range when that count actually exceeds the safety cap, so correctness no
+  # longer depends on outguessing this repo's volume. Kept as a separate
+  # `_raw` variable (pre-filter) so a future self-check on the aggregate
+  # result can still see the true fetched size — filtering out this phase's
+  # own docs PRs first would understate it.
+  local candidate_prs_raw
+  candidate_prs_raw=$(fetch_merged_prs_complete "$since" "")
+  local candidate_prs
+  candidate_prs=$(printf '%s\n' "$candidate_prs_raw" \
+    | jq -c "[.[] | select(($GUIDE_DOCS_PR_EXCLUDE) | not)] | sort_by(.mergedAt) | reverse")
 
   # Presence check (#5516 fix): keep a candidate only if "PR #<N>" is not
   # already literally recorded in WORK_LOG.md — not whether its number is
@@ -1499,15 +1761,27 @@ update_work_log() {
   # kept/dropped via a presence check against the committed WORK_LOG.md
   # (mirroring #5516's Option 1 fix) instead of a watermark comparison.
   #
-  # Widen the window by date, not just count: a fixed `--limit 50` can still
-  # push an out-of-order issue out of the query entirely once 50 other
-  # issues close after it before this phase's next tick. `closed:>=$since`
-  # bounds the query by calendar time instead (same 30-day `$since` computed
-  # above for PRs), so an out-of-order issue stays reachable for as long as
-  # it is plausible for one to sit open after a lower-numbered sibling
-  # closes.
-  local candidate_issues=$("$GH_READ" issue list --state closed --search "closed:>=$since" --limit 200 \
-    --json number,title,closedAt --jq 'sort_by(.closedAt) | reverse')
+  # Widen the window by date, not just count: `closed:>=$since` bounds the
+  # query by calendar time (same 30-day `$since` computed above for PRs), so
+  # an out-of-order issue stays reachable for as long as it is plausible for
+  # one to sit open after a lower-numbered sibling closes.
+  #
+  # #6097 BUG, DO NOT REINTRODUCE: this used to end with a flat `--limit
+  # 1000` (raised from 200 by #6086, on the belief that 1000 was "a safety
+  # cap well above realistic per-window closed-issue volume"). It was not —
+  # this repo's actual 30-day closed-issue count (1156, verified
+  # 2026-08-12) already exceeded it, silently truncating the fetch the exact
+  # same way #6086 did at the lower threshold. A plain `--limit` bump alone
+  # can never be a permanent fix for this query: this repo's closed-issue
+  # volume is high enough, and growing with review cadence/role count, that
+  # ANY fixed constant will eventually be outrun again, and `gh issue list`
+  # gives no signal that it happened. `fetch_closed_issues_complete()`
+  # (defined above `update_work_log()`) replaces the fixed-`--limit` fetch:
+  # it checks the search API's `total_count` for the window and only
+  # bisects the date range when that count actually exceeds the safety cap,
+  # so correctness no longer depends on outguessing this repo's volume.
+  local candidate_issues
+  candidate_issues=$(fetch_closed_issues_complete "$since" "" | jq -c 'sort_by(.closedAt) | reverse')
 
   # Presence check (#5539 fix, mirroring #5516's work_log_has_pr): keep a
   # candidate only if "Issue #<N>" is not already literally recorded in
@@ -1533,9 +1807,74 @@ update_work_log() {
   # the exclusion/presence-check, so the phase reports "current" and returns
   # 1, and (with WORK_PLAN/README also unchanged) Step 5's `git diff --cached
   # --quiet` finds nothing to commit and creates no PR.
-  if [ "$(printf '%s\n' "$new_prs" | jq 'length')" -eq 0 ] && [ "$(printf '%s\n' "$new_issues" | jq 'length')" -eq 0 ]; then
+  local total_new
+  total_new=$(( $(printf '%s\n' "$new_prs" | jq 'length') + $(printf '%s\n' "$new_issues" | jq 'length') ))
+  if [ "$total_new" -eq 0 ]; then
     echo "No new merged PRs or closed issues. WORK_LOG.md is current."
     return 1
+  fi
+
+  # WORK_LOG debounce (#6133), DO NOT REINTRODUCE per-delta writes: before
+  # this, ANY single new merged PR or closed issue (`total_new >= 1`) was
+  # write-worthy on its own, so a steady stream of ordinary, individually
+  # unremarkable merges each produced their own `docs: Guide document
+  # maintenance update` PR on whichever tick first noticed them — observed
+  # as 4 near-identical WORK_LOG-only docs PRs merged in ~3h for ~20 total
+  # net lines (#6088-#6091). Unlike WORK_PLAN's periodic full-regenerate
+  # (#5890/#5929, Step 3), WORK_LOG is append-only/event-driven — entries
+  # never need to be correct "as of right now", only recorded before this
+  # tick's presence-check window ages them out — so *batching* several
+  # ticks' worth of accumulated entries into one write is the natural fit,
+  # rather than gating a regenerated snapshot the way WORK_PLAN does. Two
+  # knobs, evaluated together (mirrors `LOOM_WORK_PLAN_DEBOUNCE_SECS`'s
+  # shape, plus an entry-count escape hatch WORK_PLAN has no equivalent of,
+  # since a "diff" is binary for WORK_PLAN but WORK_LOG has a natural
+  # "how much is pending" signal):
+  #   - `LOOM_WORK_LOG_MIN_ENTRIES` (default 5): once the pending delta
+  #     reaches this size, write IMMEDIATELY, debounce window or not — this
+  #     is the "no starvation" guarantee for a large accumulated delta from
+  #     the acceptance criteria: a burst of activity must never sit
+  #     unrecorded for a full debounce window just because it arrived early
+  #     in the window.
+  #   - `LOOM_WORK_LOG_DEBOUNCE_SECS` (default 1800 = 30 min, roughly one
+  #     Guide tick at the documented 15-30 minute cadence): below the
+  #     min-entries threshold, a pending delta waits until at least this
+  #     long has elapsed since WORK_LOG.md was last actually WRITTEN by a
+  #     merged docs-maintenance PR, via `last_work_log_write_epoch()`
+  #     (defined above) — the same forge-history anchor strategy as
+  #     `last_work_plan_write_epoch()`, so nothing gitignored resets on a
+  #     fresh checkout. Deliberately shorter than
+  #     `LOOM_WORK_PLAN_DEBOUNCE_SECS`'s 3600s default: WORK_LOG entries are
+  #     individually small and cheap to batch, but a merge/close event
+  #     going unrecorded for a full hour is a worse staleness trade than for
+  #     WORK_PLAN's roadmap snapshot, which is stale-tolerant by nature.
+  # `LOOM_WORK_LOG_DEBOUNCE_NOW` is a test seam only (mirrors
+  # `LOOM_WORK_PLAN_DEBOUNCE_NOW`) — never set it in normal operation.
+  #
+  # #6327: the debounce window is also overridable via
+  # `guide.docsMaintenance.workLogDebounceSecs` in `.loom/config.json` —
+  # mirrors the `guide.docsMaintenance.poolPressureThreshold`/
+  # `poolPressureMaxDeferSecs` config-read pattern (#6141) below in Step 4b.
+  # Precedence env var > config > default: `LOOM_WORK_LOG_DEBOUNCE_SECS`, if
+  # set, always wins (preserves the existing test seam); otherwise the config
+  # value is used if present; otherwise the 1800s default. A fleet operator
+  # scaling dispatcher count up can widen this per-repo without hand-exporting
+  # env vars into every host's role-runner environment.
+  local debounce_secs min_entries
+  debounce_secs="${LOOM_WORK_LOG_DEBOUNCE_SECS:-$(jq -r '.guide.docsMaintenance.workLogDebounceSecs // 1800' .loom/config.json 2>/dev/null)}"
+  [ -n "$debounce_secs" ] || debounce_secs=1800
+  min_entries="${LOOM_WORK_LOG_MIN_ENTRIES:-5}"
+
+  if [ "$total_new" -lt "$min_entries" ]; then
+    local last_merged_epoch now_epoch elapsed
+    last_merged_epoch="$(last_work_log_write_epoch)"
+    now_epoch="${LOOM_WORK_LOG_DEBOUNCE_NOW:-$(date -u +%s)}"
+    elapsed=$(( now_epoch - last_merged_epoch ))
+
+    if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$debounce_secs" ]; then
+      echo "WORK_LOG.md has $total_new pending entr(ies) (< ${min_entries}-entry threshold), and only ${elapsed}s since WORK_LOG.md was last written (< ${debounce_secs}s debounce) — batching for a later tick."
+      return 1
+    fi
   fi
 
   # Group entries by date and prepend them to "$DOCS_WT/WORK_LOG.md" (below the
@@ -1689,14 +2028,6 @@ render_plan_body() {
   count() { [ -z "$1" ] && printf '0' || printf '%s\n' "$1" | grep -c '^- '; }
 
   local held urgent ready building review approved curated proposals epics
-  # #5930: PRs carrying `loom:operator` are Judge-approved work stuck on a
-  # human merge-risk-hold decision — folded into the generated region (see
-  # the "#5930, DO NOT put a hand-written narrative section outside the
-  # markers" note above) so it is exactly as (non-)volatile as every other
-  # section here, and so it is included FIRST since it is the single
-  # highest-priority thing an operator can act on.
-  held=$("$GH_READ" pr list --label "loom:operator" --state open --limit 200 --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title)"')
   urgent=$("$GH_READ" issue list --label "loom:urgent" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
   ready=$("$GH_READ" issue list --label "loom:issue" --state open --limit 200 --json number,title \
@@ -1705,8 +2036,22 @@ render_plan_body() {
     --jq '.[] | "- **#\(.number)**: \(.title)"')
   review=$("$GH_READ" pr list --label "loom:review-requested" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
-  approved=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,title \
-    --jq '.[] | "- **#\(.number)**: \(.title)"')
+  # #5930/#6457: PRs carrying `loom:operator` are Judge-approved work stuck on
+  # a human merge-risk-hold decision — folded into the generated region (see
+  # the "#5930, DO NOT put a hand-written narrative section outside the
+  # markers" note above) so it is exactly as (non-)volatile as every other
+  # section here, and so it is included FIRST since it is the single
+  # highest-priority thing an operator can act on. `held` is derived from
+  # `approved`'s already-fetched PR list (filtered on `loom:operator` label
+  # membership) rather than a second independently-cached/independently
+  # search-indexed `gh pr list --label "loom:operator"` query, so the two can
+  # never disagree about which open `loom:pr` PRs also carry `loom:operator`
+  # (#6457 — a PR labeled `loom:operator` moments before generation could
+  # appear in "Approved" but be silently omitted from the Pileup section).
+  local approved_json
+  approved_json=$("$GH_READ" pr list --label "loom:pr" --state open --limit 200 --json number,title,labels)
+  approved=$(printf '%s' "$approved_json" | jq -r '.[] | "- **#\(.number)**: \(.title)"')
+  held=$(printf '%s' "$approved_json" | jq -r '.[] | select([(.labels // [])[].name] | index("loom:operator")) | "- **#\(.number)**: \(.title)"')
   curated=$("$GH_READ" issue list --label "loom:curated" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title) *(curated)*"')
   local architect hermit
@@ -1790,8 +2135,14 @@ update_work_plan() {
   # `LOOM_WORK_PLAN_DEBOUNCE_NOW` is a test seam only (mirrors
   # `urgent-flip-guard.sh`'s `LOOM_URGENT_GUARD_NOW`) — never set it in
   # normal operation.
+  #
+  # #6327: the debounce window is also overridable via
+  # `guide.docsMaintenance.workPlanDebounceSecs` in `.loom/config.json` —
+  # same config-read pattern and env > config > default precedence as
+  # `update_work_log()`'s `workLogDebounceSecs` above (see its #6327 note).
   local debounce_secs last_merged_epoch now_epoch elapsed
-  debounce_secs="${LOOM_WORK_PLAN_DEBOUNCE_SECS:-3600}"
+  debounce_secs="${LOOM_WORK_PLAN_DEBOUNCE_SECS:-$(jq -r '.guide.docsMaintenance.workPlanDebounceSecs // 3600' .loom/config.json 2>/dev/null)}"
+  [ -n "$debounce_secs" ] || debounce_secs=3600
   last_merged_epoch="$(last_work_plan_write_epoch)"
   now_epoch="${LOOM_WORK_PLAN_DEBOUNCE_NOW:-$(date -u +%s)}"
   elapsed=$(( now_epoch - last_merged_epoch ))
@@ -1844,6 +2195,125 @@ check_readme_staleness() {
 
 README updates should be **conservative**: only update sections that are clearly stale. Do not rewrite the entire README.
 
+### Step 4b: Check Token-Pool Pressure (#6135)
+
+**Problem this guards against:** the sweep queue tends to run dry at exactly
+the moments the fleet's Claude account pool is most exhausted — other roles
+are retrying against a shrinking set of available accounts, and Guide keeps
+ticking every 15-30 minutes regardless, finding a WORK_LOG/WORK_PLAN delta and
+filing its own PR into the same scarce pool (observed: 12 of 17 pool accounts
+quota-exhausted while Guide kept filing doc-maintenance PRs). Every
+Guide-filed PR still has to clear Judge (and possibly Doctor), so filing one
+at exactly the worst time competes with substantive work for the resource
+under the most pressure.
+
+**Cheap by construction (AC4):** this reads the **already-written**
+`.loom/tokens/.ranking` file — the running daemon self-refreshes it on its
+own ~10-minute loop (`autonomous.tokenRankingRefresh`, see
+`.loom/docs/token-pool.md`) — rather than
+invoking `loom-daemon tokens check --ranking`, which would trigger a fresh
+per-account probe (a real, if minimal, request against the very pool this
+check exists to protect) on every dry-queue tick. A plain file read costs
+nothing. Missing/empty/unparseable ranking data fails **open** (proceeds as
+if there is no pressure) — the same fail-open posture the rest of this phase
+uses for best-effort forge probes; a missing telemetry file is not evidence
+of pressure, and starving doc maintenance because the ranking file happens to
+be absent would be worse than occasionally filing without one.
+
+```bash
+# Fraction of pool accounts NOT `available` (0.0-1.0), read straight off the
+# `.ranking` file's pipe-delimited `name|status|5h_util|limit_reset` lines
+# (token-pool.md "Account health probe + ranking") -- never a fresh probe.
+# A malformed row (empty status field) is treated as available (fail open),
+# never counted as pressure.
+pool_pressure_fraction() {
+  local ranking="$(git rev-parse --show-toplevel 2>/dev/null)/.loom/tokens/.ranking"
+  [ -f "$ranking" ] || { echo "0"; return; }
+
+  local total unavailable
+  # `grep -c` exits 1 (a normal "zero matches" result, not an error) on an
+  # empty/no-pipe file while still printing "0" to stdout -- an `|| echo 0`
+  # fallback here would fire on that same exit 1 and duplicate the output
+  # into two lines ("0\n0"), corrupting the arithmetic below. `grep -c`
+  # always prints exactly one numeric line regardless of match count, so no
+  # fallback is needed; only guard against a genuinely empty capture.
+  total=$(grep -c '|' "$ranking" 2>/dev/null)
+  if [ -z "$total" ] || [ "$total" -eq 0 ]; then
+    echo "0"
+    return
+  fi
+  unavailable=$(awk -F'|' '$2 != "" && $2 != "available" { c++ } END { print c+0 }' "$ranking")
+  awk -v u="$unavailable" -v t="$total" 'BEGIN { printf "%.4f", u/t }'
+}
+
+# Epoch seconds of the most recently MERGED docs-maintenance PR of ANY kind
+# (WORK_LOG, WORK_PLAN, and/or README), or 0 if none has ever merged.
+# Deliberately NOT filtered to a specific file the way
+# last_work_log_write_epoch()/last_work_plan_write_epoch() are (#5929) --
+# this anchors the pool-pressure MAX-DEFER ceiling below, which asks "how
+# long has Guide gone without shipping ANYTHING", not "since this one file
+# last changed". Reuses GUIDE_DOCS_PR_EXCLUDE (Step 2) so the "is this a
+# docs-maintenance PR" predicate stays defined in exactly one place.
+last_docs_maintenance_merge_epoch() {
+  local ts
+  ts=$("$GH_READ" pr list --state merged --limit 30 --json number,title,mergedAt,headRefName \
+    --jq "[.[] | select($GUIDE_DOCS_PR_EXCLUDE)] | sort_by(.mergedAt) | reverse | .[0].mergedAt // empty")
+  [ -z "$ts" ] && { echo 0; return; }
+  date -u -d "$ts" +%s 2>/dev/null || date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$ts" +%s 2>/dev/null || echo 0
+}
+
+# Two knobs read config > env > default, precedence noted inline. Mirrors the
+# buildGate.loadThreshold/buildGate.maxDeferSeconds precedent already in
+# .loom/config.json:
+#   - guide.docsMaintenance.poolPressureThreshold (default 0.70): fraction of
+#     pool accounts NOT `available` at/above which a pending doc-maintenance
+#     PR is deferred instead of filed this tick (AC2).
+#   - guide.docsMaintenance.poolPressureMaxDeferSecs (default 14400 = 4h): an
+#     ABSOLUTE ceiling on how long doc maintenance can be deferred for
+#     pressure alone -- once this much time has elapsed since the last
+#     docs-maintenance PR merged, it files anyway regardless of pressure
+#     (AC3, the "never starves permanently" guarantee).
+# `LOOM_GUIDE_POOL_PRESSURE_NOW` is a test seam only (mirrors
+# `LOOM_WORK_LOG_DEBOUNCE_NOW`) -- never set it in normal operation.
+should_defer_for_pool_pressure() {
+  local threshold max_defer
+  threshold="${LOOM_GUIDE_POOL_PRESSURE_THRESHOLD:-$(jq -r '.guide.docsMaintenance.poolPressureThreshold // 0.7' .loom/config.json 2>/dev/null)}"
+  max_defer="${LOOM_GUIDE_POOL_PRESSURE_MAX_DEFER_SECS:-$(jq -r '.guide.docsMaintenance.poolPressureMaxDeferSecs // 14400' .loom/config.json 2>/dev/null)}"
+  [ -n "$threshold" ] || threshold=0.7
+  [ -n "$max_defer" ] || max_defer=14400
+
+  local fraction
+  fraction="$(pool_pressure_fraction)"
+
+  # Below threshold -- proceed exactly as today (no pressure signal, or not
+  # enough of one to act on).
+  if awk -v f="$fraction" -v t="$threshold" 'BEGIN { exit !(f < t) }'; then
+    return 1
+  fi
+
+  # At/above threshold -- bounded backoff. The max-defer ceiling ALWAYS wins
+  # once it has elapsed, so doc maintenance never starves permanently no
+  # matter how long the pool stays under pressure (AC3).
+  local last_merged_epoch now_epoch elapsed
+  last_merged_epoch="$(last_docs_maintenance_merge_epoch)"
+  now_epoch="${LOOM_GUIDE_POOL_PRESSURE_NOW:-$(date -u +%s)}"
+  elapsed=$(( now_epoch - last_merged_epoch ))
+
+  if [ "$last_merged_epoch" -gt 0 ] && [ "$elapsed" -lt "$max_defer" ]; then
+    echo "Token pool pressure ${fraction} >= threshold ${threshold}, and only ${elapsed}s since the last docs-maintenance PR merged (< ${max_defer}s max-defer ceiling) -- deferring document maintenance to a later tick."
+    return 0
+  fi
+
+  echo "Token pool pressure ${fraction} >= threshold ${threshold}, but the ${max_defer}s max-defer ceiling has elapsed (or no prior docs-maintenance PR ever merged) -- filing anyway."
+  return 1
+}
+```
+
+This is called from `create_docs_pr()` (Step 5) immediately after confirming
+there is a real delta to file — see "before opening a WORK_LOG/WORK_PLAN PR"
+(AC1) — so the pressure check never runs, and never influences behavior, on a
+tick that would not have filed a PR anyway.
+
 ### Step 5: Create Bundled Docs PR
 
 If any documents were updated, bundle all changes into a single PR.
@@ -1863,11 +2333,33 @@ create_docs_pr() {
   # is what `git -C "$DOCS_WT"` makes them).
   git -C "$DOCS_WT" add WORK_LOG.md WORK_PLAN.md README.md
 
+  # Snapshot which of the three files actually changed, for the telemetry
+  # record below (issue #6136) — captured now, before the `diff --cached`
+  # check below consumes the staged diff.
+  DOCS_CHANGED_FILES="$(git -C "$DOCS_WT" diff --cached --name-only | paste -sd, -)"
+
   # Check if there are actual changes to commit
   if git -C "$DOCS_WT" diff --cached --quiet; then
     echo "No document changes to commit."
     # Release the docs-guide lock (see Step 1) — nothing left for this tick
     # to do, and a held lock would needlessly block the next one.
+    ./.loom/scripts/docs-guide-lock.sh release
+    return
+  fi
+
+  # #6135: back off when the token pool is under pressure (see Step 4b for
+  # should_defer_for_pool_pressure()'s full rationale/knobs) -- checked HERE,
+  # right after confirming there IS a real delta, so it gates exactly "before
+  # opening a WORK_LOG/WORK_PLAN PR" (AC1) and never touches a tick that
+  # would not have filed one anyway.
+  if should_defer_for_pool_pressure; then
+    # Nothing was pushed or created -- unstage/discard the local diff so this
+    # worktree is left clean. docs-worktree.sh resets $DOCS_WT to a fresh
+    # branch off origin on the NEXT tick regardless (see "Where This Phase
+    # Writes"), so nothing here needs to survive; Steps 2-4 simply recompute
+    # the same delta (plus anything new) against the still-unwritten
+    # committed WORK_LOG.md/WORK_PLAN.md then.
+    git -C "$DOCS_WT" reset --hard HEAD
     ./.loom/scripts/docs-guide-lock.sh release
     return
   fi
@@ -1903,8 +2395,11 @@ Automated document maintenance by Guide triage agent."
   git -C "$DOCS_WT" push -u origin "$branch"
 
   # Create PR. `gh pr create` infers the head branch from the working
-  # directory, so run it from inside the docs worktree.
-  (cd "$DOCS_WT" && gh pr create \
+  # directory, so run it from inside the docs worktree. Captured on stdout
+  # (the PR URL, `gh pr create`'s normal success output) so the doc-
+  # maintenance telemetry record below (issue #6136) can be tagged with the
+  # PR number instead of just "a docs PR happened".
+  DOCS_PR_URL=$(cd "$DOCS_WT" && gh pr create \
     --title "docs: Guide document maintenance update" \
     --label "loom:review-requested" \
     --body "$(cat <<'PRBODY'
@@ -1925,6 +2420,26 @@ See issue #1784 for the feature specification.
 *Automated by Guide role - document maintenance phase*
 PRBODY
 )")
+  echo "$DOCS_PR_URL"
+  DOCS_PR_NUMBER="${DOCS_PR_URL##*/}"
+
+  # Fleet observability (issue #6136): emit doc-maintenance telemetry BEFORE
+  # releasing the lock, so `docs-guide-lock.sh age` still reports this tick's
+  # elapsed Document Maintenance time (Step 1's acquire through here) — a
+  # proxy for the agent/token spend this tick consumed. This is purely
+  # additive visibility: it does not change what the phase does, only what an
+  # operator can observe about it afterward (see guide-docs-telemetry.sh's
+  # header comment and .loom/docs/observability.md for the full rationale and
+  # how to query it). A failure here (e.g. `jq` missing) must never block the
+  # PR that already exists — best-effort, errors suppressed.
+  if [[ "$DOCS_PR_NUMBER" =~ ^[0-9]+$ ]]; then
+    DOCS_PHASE_AGE_SECS="$(./.loom/scripts/docs-guide-lock.sh age 2>/dev/null || echo "")"
+    ./.loom/scripts/guide-docs-telemetry.sh record \
+      --pr "$DOCS_PR_NUMBER" \
+      --duration-sec "$DOCS_PHASE_AGE_SECS" \
+      --files "${DOCS_CHANGED_FILES:-WORK_LOG.md,WORK_PLAN.md,README.md}" \
+      || echo "guide-docs-telemetry.sh record failed — non-fatal, PR #$DOCS_PR_NUMBER already exists"
+  fi
 
   # Release the docs-guide lock (see Step 1) now that the PR exists. Step 1's
   # open-docs-PR check — not this lock — is what prevents the NEXT tick from
@@ -1956,12 +2471,18 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
+  │    ├─ Token-pool pressure check (#6135): if the pool is under pressure
+  │    │    AND the max-defer ceiling has not elapsed, discard the local diff,
+  │    │    release the lock, and defer to a later tick instead of filing
   │    ├─ Commit all document changes (git -C "$DOCS_WT", NOT pushed yet)
   │    ├─ Cross-host recheck: re-run the open-docs-PR search with an
   │    │    UNCACHED `gh` call — if a PR now exists (another fleet host's
   │    │    tick), discard the local commit and release the lock instead of
   │    │    pushing/creating (#5615)
   │    ├─ Push and create PR with loom:review-requested
+  │    ├─ Record doc-maintenance telemetry (guide-docs-telemetry.sh record,
+  │    │    best-effort — issue #6136) BEFORE releasing the lock, so
+  │    │    `docs-guide-lock.sh age` still reflects this tick's elapsed time
   │    ├─ Release the docs-guide lock
   │    └─ (committed WORK_LOG.md / WORK_PLAN.md ARE the durable state)
   └─ If no changes: release the docs-guide lock, skip (no PR created)
@@ -2001,6 +2522,17 @@ Document Maintenance Phase
   distinct from the lock above: the lock stops concurrent ticks from racing
   each other, this check stops a later tick from piling a second PR onto a
   still-open one from an earlier, non-racing tick
+- **Doc-maintenance throughput is separately observable** (issue #6136) — each
+  successful `create_docs_pr()` records a local telemetry line (PR number,
+  repo, files changed, and the phase's elapsed lock-hold time as an
+  agent/token-spend proxy) via `guide-docs-telemetry.sh record`, appended to
+  `.loom/logs/guide-docs-telemetry.jsonl`. Query it with
+  `./.loom/scripts/guide-docs-telemetry.sh report --since 7d` (or `--json` for
+  scripting) to see doc-maintenance PR count and spend over a window without
+  manually correlating PR history — this is purely additive visibility and
+  never changes what this phase does or when it runs. See
+  `.loom/docs/observability.md` for how this fits (and does not fit) the
+  fleet-wide `sweep.*` telemetry pipeline
 - High-water marks are derived from the committed WORK_LOG.md itself (not a
   gitignored side-car that resets every fresh cron checkout), so they survive
   across ticks and prevent duplicate WORK_LOG entries
@@ -2024,6 +2556,22 @@ Document Maintenance Phase
   the clock and suppresses an overdue WORK_PLAN rewrite indefinitely. A change
   that persists past the window still produces exactly one PR; a change that
   reverts before the window elapses produces none (see Step 3)
+- **A pending WORK_LOG.md delta is batched, not written on every tick that
+  finds one** (#6133) — WORK_LOG is append-only/event-driven (unlike
+  WORK_PLAN's periodic full-regenerate), so the gate combines two knobs
+  instead of pure elapsed time: a delta writes IMMEDIATELY once it reaches
+  `LOOM_WORK_LOG_MIN_ENTRIES` (default 5 combined new-PR-plus-closed-issue
+  entries — the "no starvation" guarantee for a large accumulated delta),
+  and otherwise waits for `LOOM_WORK_LOG_DEBOUNCE_SECS` (default 1800 = 30
+  min — shorter than WORK_PLAN's 3600s default because an unrecorded
+  merge/close event is a worse staleness trade than WORK_PLAN's
+  stale-tolerant roadmap snapshot) since WORK_LOG.md was last actually
+  WRITTEN by a merged docs-maintenance PR, anchored via
+  `last_work_log_write_epoch()` the same way `last_work_plan_write_epoch()`
+  anchors WORK_PLAN's clock (filtered to merges whose changed files include
+  WORK_LOG.md, so an unrelated WORK_PLAN-only or README-only write can never
+  reset it). Observed before this fix: 4 near-identical WORK_LOG-only docs
+  PRs merged in ~3h for ~20 total net lines (#6088-#6091)
 - **Hand-written regions of `WORK_PLAN.md` are subject to the same churn
   prevention as the generated region, not exempt from it** (#5930) — the
   "Operator Attention: Merge-Risk-Hold Pileup" call-out that used to live
@@ -2037,5 +2585,17 @@ Document Maintenance Phase
   never byte-identical to the previous commit even when the underlying facts
   (which PRs are held, why) have not changed
 - README updates are conservative (stale sections only)
+- **A ready-to-file WORK_LOG/WORK_PLAN delta is deferred, not filed
+  immediately, when the fleet's Claude account pool is under pressure**
+  (#6135, Step 4b) — filing a docs-maintenance PR still costs a Judge pass
+  (and possibly Doctor), competing with substantive work for the pool's
+  scarcest capacity at exactly the moment other roles are retrying against
+  a shrinking set of available accounts. Gated on `pool_pressure_fraction()`
+  (a cheap read of the already-refreshed `.loom/tokens/.ranking` file, never
+  a fresh probe) against `guide.docsMaintenance.poolPressureThreshold`
+  (default 0.70), and bounded by an absolute
+  `guide.docsMaintenance.poolPressureMaxDeferSecs` ceiling (default 14400 =
+  4h) so doc maintenance never starves permanently even if pressure never
+  clears
 - All changes go through the standard PR review pipeline
 

@@ -36,7 +36,16 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+# guide.md is shipped (installed at .claude/commands/loom/guide.md), so
+# resolve it the way each layout actually lays it out: the installed path
+# first (consumer repos, and Loom's own dogfooded checkout), falling back
+# to the defaults/ source-tree path (a bare source checkout with no
+# .claude/commands/loom/ copy yet). See issue #6194 / #6241.
+if [[ -f "$REPO_ROOT/.claude/commands/loom/guide.md" ]]; then
+    GUIDE_MD="$REPO_ROOT/.claude/commands/loom/guide.md"
+else
+    GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

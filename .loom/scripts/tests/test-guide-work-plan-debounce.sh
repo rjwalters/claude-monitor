@@ -65,7 +65,16 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+# guide.md is shipped (installed at .claude/commands/loom/guide.md), so
+# resolve it the way each layout actually lays it out: the installed path
+# first (consumer repos, and Loom's own dogfooded checkout), falling back
+# to the defaults/ source-tree path (a bare source checkout with no
+# .claude/commands/loom/ copy yet). See issue #6194 / #6241.
+if [[ -f "$REPO_ROOT/.claude/commands/loom/guide.md" ]]; then
+    GUIDE_MD="$REPO_ROOT/.claude/commands/loom/guide.md"
+else
+    GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -104,8 +113,10 @@ assert_grep 'select\(\$GUIDE_DOCS_PR_EXCLUDE\)' "$GUIDE_MD" \
     "last_work_plan_write_epoch() reuses GUIDE_DOCS_PR_EXCLUDE rather than redefining the docs-PR predicate"
 assert_grep 'index\(\\"WORK_PLAN\.md\\"\)' "$GUIDE_MD" \
     "last_work_plan_write_epoch() additionally filters merged PRs to ones whose files include WORK_PLAN.md (#5929)"
-assert_grep 'LOOM_WORK_PLAN_DEBOUNCE_SECS:-3600' "$GUIDE_MD" \
-    "update_work_plan() reads LOOM_WORK_PLAN_DEBOUNCE_SECS with a 3600s (1h) default"
+assert_grep 'LOOM_WORK_PLAN_DEBOUNCE_SECS:-\$\(jq -r' "$GUIDE_MD" \
+    "update_work_plan() reads LOOM_WORK_PLAN_DEBOUNCE_SECS, falling back to a config read (#6327)"
+assert_grep 'guide\.docsMaintenance\.workPlanDebounceSecs // 3600' "$GUIDE_MD" \
+    "update_work_plan() reads guide.docsMaintenance.workPlanDebounceSecs from .loom/config.json with a 3600s (1h) default (#6327)"
 assert_grep 'update_work_plan\(\) \{' "$GUIDE_MD" \
     "update_work_plan() is defined"
 
@@ -183,6 +194,67 @@ else
     RESULT="$(printf '%s\n' "$FIXTURE_JSON" | eval "jq -r \"$JQ_EXPR\"" 2>/dev/null)"
     assert_eq "$RESULT" "2026-08-10T10:00:00Z" \
         "the WORK_LOG-only docs PR (#5940, merged most recently) is skipped in favor of the older docs PR that actually touched WORK_PLAN.md (#5900) -- a non-docs PR touching WORK_PLAN.md (#5935) is never eligible either"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 1c (#6327): config-key precedence for the debounce window -- env var
+# (if set) always wins; config value used when env var unset; hardcoded 3600
+# default when neither is present. Mirrors
+# test-guide-work-log-debounce.sh's Test 2b, but for WORK_PLAN. Extracts the
+# EXACT assignment + fallback lines from guide.md and evals them in a
+# sandbox, so the test and the prompt can never drift apart.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 1c: LOOM_WORK_PLAN_DEBOUNCE_SECS config-key precedence (env > config > default, #6327)"
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "SKIP: jq not available"
+else
+    DEBOUNCE_LINE="$(awk '/debounce_secs="\$\{LOOM_WORK_PLAN_DEBOUNCE_SECS/{print; getline; print; exit}' "$GUIDE_MD")"
+    if [[ -n "$DEBOUNCE_LINE" ]]; then
+        pass "extracted the debounce_secs assignment + fallback lines from update_work_plan()"
+    else
+        fail "could not extract the debounce_secs assignment lines from update_work_plan()"
+    fi
+
+    SANDBOX="$(mktemp -d)"
+    cleanup_sandbox_wp() { rm -rf "$SANDBOX"; }
+    trap cleanup_sandbox_wp EXIT
+    mkdir -p "$SANDBOX/.loom"
+
+    run_debounce_line() {
+        # $1 = optional LOOM_WORK_PLAN_DEBOUNCE_SECS value ("" = unset)
+        local env_val="$1" out
+        out=$(cd "$SANDBOX" && env ${env_val:+LOOM_WORK_PLAN_DEBOUNCE_SECS="$env_val"} bash -c "
+            $(printf '%s' "$DEBOUNCE_LINE" | sed -E 's/^\s*//')
+            echo \"\$debounce_secs\"
+        ")
+        printf '%s' "$out"
+    }
+
+    rm -f "$SANDBOX/.loom/config.json"
+    RESULT="$(run_debounce_line "")"
+    assert_eq "$RESULT" "3600" \
+        "no guide.docsMaintenance block at all falls back to the hardcoded 3600s default"
+
+    cat > "$SANDBOX/.loom/config.json" <<'JSON'
+{"guide": {"docsMaintenance": {"workPlanDebounceSecs": 7200}}}
+JSON
+    RESULT="$(run_debounce_line "")"
+    assert_eq "$RESULT" "7200" \
+        "guide.docsMaintenance.workPlanDebounceSecs in .loom/config.json overrides the 3600s default"
+
+    RESULT="$(run_debounce_line "1200")"
+    assert_eq "$RESULT" "1200" \
+        "LOOM_WORK_PLAN_DEBOUNCE_SECS env var wins over the config value when both are set"
+
+    rm -f "$SANDBOX/.loom/config.json"
+    RESULT="$(run_debounce_line "600")"
+    assert_eq "$RESULT" "600" \
+        "LOOM_WORK_PLAN_DEBOUNCE_SECS env var wins over the default when no config block is present"
+
+    trap - EXIT
+    cleanup_sandbox_wp
 fi
 
 # ---------------------------------------------------------------------------

@@ -40,9 +40,27 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-ROLE_DIR="$REPO_ROOT/defaults/.claude/commands/loom"
-DOCS_DIR="$REPO_ROOT/defaults/docs"
-SCRIPTS_DIR="$REPO_ROOT/defaults/scripts"
+# Role prompts, docs, and scripts are all shipped (installed at
+# .claude/commands/loom, .loom/docs, .loom/scripts respectively), so resolve
+# each the way each layout actually lays it out: the installed path first
+# (consumer repos, and Loom's own dogfooded checkout), falling back to the
+# defaults/ source-tree path (a bare source checkout with no installed copy
+# yet). See issue #6194 / #6241.
+if [[ -d "$REPO_ROOT/.claude/commands/loom" ]]; then
+    ROLE_DIR="$REPO_ROOT/.claude/commands/loom"
+else
+    ROLE_DIR="$REPO_ROOT/defaults/.claude/commands/loom"
+fi
+if [[ -d "$REPO_ROOT/.loom/docs" ]]; then
+    DOCS_DIR="$REPO_ROOT/.loom/docs"
+else
+    DOCS_DIR="$REPO_ROOT/defaults/docs"
+fi
+if [[ -d "$REPO_ROOT/.loom/scripts" ]]; then
+    SCRIPTS_DIR="$REPO_ROOT/.loom/scripts"
+else
+    SCRIPTS_DIR="$REPO_ROOT/defaults/scripts"
+fi
 STATE_MACHINE="$DOCS_DIR/label-state-machine.md"
 
 RED='\033[0;31m'

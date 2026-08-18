@@ -28,6 +28,11 @@
 # (older) Loom install, and assert the scratch repo's tracked tree is
 # byte-for-byte unchanged afterward.
 #
+# Source-tree-only by design (#6194): install.sh lives at the repo root, not
+# under defaults/, so it is never shipped into an installed consumer repo.
+# This suite SKIPs (exit 0) rather than errors when run outside Loom's own
+# checkout.
+#
 # Usage:
 #   bash defaults/scripts/tests/test-install-full-reinstall-no-target-mutation.sh
 
@@ -54,8 +59,8 @@ fail() {
 }
 
 if [[ ! -f "$INSTALL_SH" ]]; then
-  echo "ERROR: $INSTALL_SH not found" >&2
-  exit 1
+  echo "SKIP: source-tree-only test, $INSTALL_SH not found (install.sh is not shipped into an installed repo)" >&2
+  exit 0
 fi
 
 if ! command -v git &> /dev/null; then

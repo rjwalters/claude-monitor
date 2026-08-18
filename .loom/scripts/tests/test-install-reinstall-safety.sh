@@ -34,6 +34,11 @@
 # and the uninstall staging scope are tested by actually invoking
 # install.sh / uninstall-loom.sh against throwaway temp git repos.
 #
+# Source-tree-only by design (#6194): install.sh and scripts/uninstall-loom.sh
+# both live at the repo root, not under defaults/, so neither is shipped into
+# an installed consumer repo. This suite SKIPs (exit 0) rather than errors
+# when run outside Loom's own checkout.
+#
 # Usage:
 #   bash defaults/scripts/tests/test-install-reinstall-safety.sh
 
@@ -106,12 +111,12 @@ assert_nonzero_exit() {
 }
 
 if [[ ! -f "$INSTALL_SH" ]]; then
-    echo "ERROR: $INSTALL_SH not found" >&2
-    exit 1
+    echo "SKIP: source-tree-only test, $INSTALL_SH not found (not shipped into an installed repo)" >&2
+    exit 0
 fi
 if [[ ! -f "$UNINSTALL_SH" ]]; then
-    echo "ERROR: $UNINSTALL_SH not found" >&2
-    exit 1
+    echo "SKIP: source-tree-only test, $UNINSTALL_SH not found (not shipped into an installed repo)" >&2
+    exit 0
 fi
 
 # Extract a single top-level function body ("name() {" ... "}") from a file.
@@ -526,6 +531,128 @@ else
 fi
 
 rm -rf "$T8"
+echo ""
+
+echo "================================================================"
+echo "Group 6: --local mode preserves live .loom/worktrees/* by default (issue #5973)"
+echo "================================================================"
+echo ""
+
+# Regression guard for issue #5973: uninstall-loom.sh's RUNTIME_DIRS Step 5
+# loop used to `rm -rf .loom/worktrees` unconditionally -- the whole
+# directory, including every live `issue-N` worktree inside it -- with no
+# dirty-check and no per-worktree naming in the output. install.sh's
+# --confirm-reinstall / --clean reinstall flows chain
+# "uninstall-loom.sh --yes --local" directly against the live target, so a
+# plain reinstall silently destroyed any worktree an operator had
+# deliberately kept checked out between sessions (branches survived; the
+# working directories did not).
+#
+# Case 1: a CLEAN, git-registered worktree under .loom/worktrees/ must
+# survive a plain `--local` uninstall (no --remove-worktrees) -- the new
+# default.
+T9=$(mktemp -d /tmp/loom-worktree-preserve-test.XXXXXX)
+git -C "$T9" init --quiet
+git -C "$T9" config user.email "test@test.com"
+git -C "$T9" config user.name "Test"
+mkdir -p "$T9/.loom/roles" "$T9/.loom/scripts"
+echo '{}' > "$T9/.loom/config.json"
+git -C "$T9" add -A
+git -C "$T9" commit -m "existing install" --quiet
+git -C "$T9" worktree add "$T9/.loom/worktrees/issue-100" -b "feature/issue-100" --quiet
+
+OUTPUT9="$("$UNINSTALL_SH" --yes --local "$T9" 2>&1 < /dev/null)"
+EXIT9=$?
+assert_zero_exit "$EXIT9" "Case 1: uninstall-loom.sh --local (no --remove-worktrees) exits 0"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -d "$T9/.loom/worktrees/issue-100" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 1: .loom/worktrees/issue-100 directory survives on disk"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 1: .loom/worktrees/issue-100 directory was removed"
+fi
+
+WT_LIST_9="$(git -C "$T9" worktree list 2>/dev/null)"
+assert_contains "$WT_LIST_9" "issue-100" \
+    "Case 1: git still lists .loom/worktrees/issue-100 as a registered worktree"
+assert_contains "$OUTPUT9" "Preserving" \
+    "Case 1: output announces that worktrees were preserved"
+assert_contains "$OUTPUT9" ".loom/worktrees/issue-100" \
+    "Case 1: output names the specific preserved worktree (not just a parent-dir summary)"
+
+rm -rf "$T9"
+echo ""
+
+# Case 2: a DIRTY (uncommitted changes) worktree must be REFUSED even with
+# --remove-worktrees passed -- git's own dirty-check, not a blind rm -rf.
+T10=$(mktemp -d /tmp/loom-worktree-dirty-refuse-test.XXXXXX)
+git -C "$T10" init --quiet
+git -C "$T10" config user.email "test@test.com"
+git -C "$T10" config user.name "Test"
+mkdir -p "$T10/.loom/roles" "$T10/.loom/scripts"
+echo '{}' > "$T10/.loom/config.json"
+git -C "$T10" add -A
+git -C "$T10" commit -m "existing install" --quiet
+git -C "$T10" worktree add "$T10/.loom/worktrees/issue-200" -b "feature/issue-200" --quiet
+echo "uncommitted work" > "$T10/.loom/worktrees/issue-200/wip.txt"
+
+OUTPUT10="$("$UNINSTALL_SH" --yes --local --remove-worktrees "$T10" 2>&1 < /dev/null)"
+EXIT10=$?
+assert_zero_exit "$EXIT10" "Case 2: uninstall-loom.sh --local --remove-worktrees exits 0 overall (one skip doesn't abort the run)"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ -d "$T10/.loom/worktrees/issue-200" ]] && [[ -f "$T10/.loom/worktrees/issue-200/wip.txt" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 2: dirty worktree (and its uncommitted file) survives --remove-worktrees"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 2: dirty worktree was destroyed despite uncommitted changes"
+fi
+
+assert_contains "$OUTPUT10" "skipped" \
+    "Case 2: output reports the dirty worktree as skipped, not silently dropped"
+assert_contains "$OUTPUT10" ".loom/worktrees/issue-200" \
+    "Case 2: output names the specific skipped worktree"
+
+rm -rf "$T10"
+echo ""
+
+# Case 3: a CLEAN worktree IS removed when --remove-worktrees is explicitly
+# passed -- the fix must not over-correct into "never remove". Uses
+# `git worktree remove` (not `rm -rf`), so the branch itself survives, same
+# as the pre-#5973 behavior the original report observed.
+T11=$(mktemp -d /tmp/loom-worktree-optin-remove-test.XXXXXX)
+git -C "$T11" init --quiet
+git -C "$T11" config user.email "test@test.com"
+git -C "$T11" config user.name "Test"
+mkdir -p "$T11/.loom/roles" "$T11/.loom/scripts"
+echo '{}' > "$T11/.loom/config.json"
+git -C "$T11" add -A
+git -C "$T11" commit -m "existing install" --quiet
+git -C "$T11" worktree add "$T11/.loom/worktrees/issue-300" -b "feature/issue-300" --quiet
+
+OUTPUT11="$("$UNINSTALL_SH" --yes --local --remove-worktrees "$T11" 2>&1 < /dev/null)"
+EXIT11=$?
+assert_zero_exit "$EXIT11" "Case 3: uninstall-loom.sh --local --remove-worktrees exits 0"
+
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ ! -d "$T11/.loom/worktrees/issue-300" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: Case 3: clean worktree IS removed when --remove-worktrees is passed"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: Case 3: clean worktree survived despite --remove-worktrees"
+fi
+
+assert_contains "$OUTPUT11" "removed: .loom/worktrees/issue-300" \
+    "Case 3: output names the specific removed worktree"
+BRANCH_LIST_11="$(git -C "$T11" branch --list 'feature/issue-300')"
+assert_contains "$BRANCH_LIST_11" "feature/issue-300" \
+    "Case 3: the branch itself survives (git worktree remove, not a branch delete)"
+
+rm -rf "$T11"
 echo ""
 
 echo "================================================================"

@@ -32,10 +32,10 @@ window, each caught only by an out-of-band check hours to days later:
 - **loom#5874** — a prompt change shipped with no `VERSION` bump, so every
   "is the fleet current" currency check kept reporting green while behaviour
   differed host to host.
-- **2AMLogic/2am#239** — a scheduled cleaner timer was installed recording an
+- **example-org/fleet-repo#302** — a scheduled cleaner timer was installed recording an
   interpreter it would itself refuse to run under — "installed" but doomed to
   fail on every fire.
-- **2AMLogic/2am#156** — the sharpest case: `doctor` was added to the
+- **example-org/fleet-repo#303** — the sharpest case: `doctor` was added to the
   role-runner default set, the PR closed COMPLETED, and the machine-level
   `defaults.json` on disk genuinely contained the change — yet zero doctor
   activity appeared on any host for 2.5 hours, until a manual daemon restart,

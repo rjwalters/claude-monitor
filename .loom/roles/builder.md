@@ -304,7 +304,7 @@ PR LIFECYCLE (Builder only creates, Judge/Champion manage):
 - **Check dependencies**: Verify all task list items are checked before claiming
 - **Claim issue**: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
 - **Do the work**: Implement, test, commit, create PR
-- **Mark PR for review**: `gh pr create --label "loom:review-requested"` (MUST use the structured body template — canonical in builder-pr.md § "Creating the PR")
+- **Mark PR for review**: `./.loom/scripts/create-pr.sh --label "loom:review-requested"` — never a bare `gh pr create` (#6074). MUST use the structured body template — canonical in builder-pr.md § "Creating the PR"
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
 
 ## Exception: Explicit User Instructions
@@ -552,6 +552,11 @@ The script now refuses to run from a linked worktree (exit `1`, `--dry-run`
 included). If you see that refusal, the fix is to **stop**, not to re-run with
 `--allow-worktree` — that override exists for a human operator deliberately
 rewriting the main checkout's installed copies, not for a Builder mid-issue.
+(A separate `--output <dir>` staging mode, #6106, exists for an operator who
+needs a complete resync generated safely while the fleet is live — it is also
+not for a Builder mid-issue: see
+[`.loom/docs/troubleshooting.md`](../../../.loom/docs/troubleshooting.md) if you land
+here as the human operator rather than a Builder subagent.)
 
 ### Working with gh CLI from a Worktree
 
@@ -678,7 +683,7 @@ Before claiming, check for these warning signs:
 
 Curator guidance requires volatile facts (counts, version numbers, file/line references, "no X is needed" claims) to carry an "as of `<sha/date>`" stamp — e.g. `"24 verbs as of \`289be45\`, 2026-08-04"` rather than a bare `"24 verbs"` (see `curator.md` → "Date-stamp volatile facts"). Treat that stamp as a **prompt to re-verify**, not a substitute for verification — a fact that was true "as of" curation time can already be stale by the time you implement, especially in a repo with several concurrently active worktrees.
 
-**Before acting on a stamped fact whose value is embedded directly in an acceptance criterion's output** — e.g. "CHANGELOG lists 13 new verbs", "no schema_version bump needed" — re-derive it against the current tree first: re-run the same grep/count/check the curator used, don't just eyeball the date and move on. This matters most when the action you're about to take **can't be undone** (a version bump, a tag push, a publish, an external API write): a stale count baked into a permanent artifact cannot be un-shipped afterward. This guards against exactly the failure in 2AMLogic/klayout-tools#342 — a correctly-curated verb count and a "no bump needed" claim both went stale within two days, ahead of an irrevocable PyPI publish.
+**Before acting on a stamped fact whose value is embedded directly in an acceptance criterion's output** — e.g. "CHANGELOG lists 13 new verbs", "no schema_version bump needed" — re-derive it against the current tree first: re-run the same grep/count/check the curator used, don't just eyeball the date and move on. This matters most when the action you're about to take **can't be undone** (a version bump, a tag push, a publish, an external API write): a stale count baked into a permanent artifact cannot be un-shipped afterward. This guards against exactly the failure in example-org/tool-repo#203 — a correctly-curated verb count and a "no bump needed" claim both went stale within two days, ahead of an irrevocable PyPI publish.
 
 If re-verification finds the stamped fact has drifted, update the acceptance criterion / your PR description to match the current tree (and note the discrepancy) rather than silently completing the original wording.
 
@@ -1040,6 +1045,54 @@ For additional PR quality guidelines, see **builder-pr.md**.
 - **Run the project's formatter + linter on your changed files before committing** — discover the commands from repo convention (`buildGate.command`, `CONTRIBUTING.md`, CI workflow, or the language's standard tool, e.g. `ruff format`/`ruff check` for Python, `cargo fmt`/`cargo clippy` for Rust). A format-only CI failure is a **guaranteed Judge rejection** that costs a full Doctor cycle for a one-command fix — see **builder-pr.md § "Format and Lint Changed Files"**
 - **Test-first discipline, for behavior changes**: write the failing test (or bug-reproducing test) before the fix, confirm it fails for the right reason, then implement to green. Record a `TDD:` line in the PR's Test Plan section — Judge re-verifies it against the diff, not just your say-so. Full requirement, format, and advisory/blocking rules: **builder-pr.md § "Test-First Discipline (TDD line)"** (ADR-0015).
 
+### Live Verification You Cannot Perform: Say So, Don't Claim It
+
+Some acceptance criteria can only be satisfied by **live** behavior — driving a
+real browser, scraping a remote page, parsing DOM the project does not itself
+produce, hitting a rate-limited or credentialed endpoint, exercising hardware.
+Your worktree often cannot do that: the debug browser is behind a shared mutex,
+the credential is the operator's, the endpoint is unreachable from the sweep host.
+
+**When a live check is impossible in your own worktree/environment, the PR body
+MUST say so explicitly and link the tracking / live-verification issue.** Never
+tick an acceptance criterion that requires live behavior — never write
+"verified", "works", or "manually tested" for it — on the strength of an offline
+fixture alone.
+
+State it in the PR's `## Test Plan` (or `## Acceptance Criteria Verification`)
+section, in this shape:
+
+```markdown
+**Live verification NOT performed.** Criterion "<the live criterion>" requires
+<the live resource: shared debug Chrome behind the browser mutex / production
+credential / rate-limited endpoint>, which is unavailable in this worktree.
+Offline evidence attached below covers <what it actually covers>; it does NOT
+establish live behavior. Live verification tracked in #<N>.
+```
+
+If no tracking issue exists yet, **file one** (`./.loom/scripts/create-issue.sh`)
+describing the live run someone with the resource must perform, and link it —
+this is the pattern walters-family-tree #375 followed informally.
+
+**Do not build a circular fixture and present it as live evidence.** If your test
+constructs *both* sides of a merge/join/comparison from the **same** saved
+payload, it only proves the two halves agree — the real page parser never meets
+the page's own output, so the test cannot fail on the defects that actually
+occur live. Where you can, capture a real response once and run the **real**
+page-parsing function over it to produce the page side of the merge; where you
+cannot, say the fixture is offline-only rather than implying it is live-equivalent.
+Judge treats an undisclosed circular fixture on browser-driving / scraper /
+DOM-parsing code as **blocking** (`judge.md` → "Live Verification for
+Browser-Driving / Scraper / DOM-Parsing PRs"), so an honest disclosure costs you
+nothing and a silent claim costs a full review cycle.
+
+**Precedent**: walters-family-tree PR #371 was a browser-driving catalogue
+scraper verified offline only, with every fixture circular. Its first live run
+surfaced three separate defects (a settle that fired before the table hydrated;
+a hard-coded `catalogs[0]` plus a double-counted mirrored table; a zero-padded
+page ID that never matched the unpadded data ID), each needing its own fix
+round — none of which any offline fixture could have caught.
+
 ### MANDATORY: Derive Titles From Your Diff, Not the Issue
 
 **Before committing or creating a PR**, you MUST review your actual code changes and derive titles from them:
@@ -1105,7 +1158,17 @@ here; follow it there.
 
 ### Creating the PR
 
-The canonical `gh pr create` body template (Summary / Changes / Acceptance
+**Immediately before `git push` + opening the PR, run the lease fencing
+check** — `./.loom/scripts/sweep-lease-fence.sh check "$N"` — and abort (no
+push, no PR) on exit `3`/`4` (expired / superseded lease). Canonical guidance
+in **builder-pr.md § "Lease Fencing: Confirm You Still Own the Claim" (Epic
+#6165 Phase 3, #6309)**.
+
+**Open the PR with `./.loom/scripts/create-pr.sh`, never a bare `gh pr create`
+(#6074)** — it adopts an already-open PR for your branch and rides through the
+GitHub App permission window that otherwise 403s the create *after* your push
+has landed (the failure that made re-dispatched Builders rebuild identical
+work). The canonical body template (Summary / Changes / Acceptance
 Criteria Verification / Test Plan + the `Closes #N` reference) lives in
 **builder-pr.md § "Creating the PR"** — use it verbatim. Do NOT create PRs with
 just `Closes #N`; the body must include the structured sections. Add the

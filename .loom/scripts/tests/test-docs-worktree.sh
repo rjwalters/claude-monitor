@@ -34,8 +34,22 @@ SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SCRIPTS_DIR/../.." && pwd)"
 
 DOCS_WORKTREE_SH="$SCRIPTS_DIR/docs-worktree.sh"
-GUARD_SH="$REPO_ROOT/defaults/hooks/guard-worktree-paths.sh"
-GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+# guard-worktree-paths.sh and guide.md are both shipped (installed at
+# .loom/hooks/guard-worktree-paths.sh and .claude/commands/loom/guide.md
+# respectively), so resolve each the way each layout actually lays it out:
+# the installed path first (consumer repos, and Loom's own dogfooded
+# checkout), falling back to the defaults/ source-tree path (a bare source
+# checkout with no installed copy yet). See issue #6194 / #6241.
+if [[ -f "$REPO_ROOT/.loom/hooks/guard-worktree-paths.sh" ]]; then
+    GUARD_SH="$REPO_ROOT/.loom/hooks/guard-worktree-paths.sh"
+else
+    GUARD_SH="$REPO_ROOT/defaults/hooks/guard-worktree-paths.sh"
+fi
+if [[ -f "$REPO_ROOT/.claude/commands/loom/guide.md" ]]; then
+    GUIDE_MD="$REPO_ROOT/.claude/commands/loom/guide.md"
+else
+    GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+fi
 WORK_PLAN_MD="$REPO_ROOT/WORK_PLAN.md"
 
 RED='\033[0;31m'
@@ -62,6 +76,15 @@ assert_no_grep() {
 if ! command -v jq >/dev/null 2>&1; then
     echo "SKIP: jq not available"
     exit 0
+fi
+
+if [[ ! -f "$GUARD_SH" ]]; then
+    echo -e "${RED}FATAL${NC}: guard-worktree-paths.sh not found at $GUARD_SH"
+    exit 1
+fi
+if [[ ! -f "$GUIDE_MD" ]]; then
+    echo -e "${RED}FATAL${NC}: guide.md not found at $GUIDE_MD"
+    exit 1
 fi
 
 # Canonicalize once, up front: on macOS `/var` is a symlink to `/private/var`,

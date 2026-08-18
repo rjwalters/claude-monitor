@@ -49,6 +49,12 @@
 #                             resolve its OWN fixture repo root instead)
 #   LOOM_MACHINE_CHECKOUT  -> UNSET  (pid-file tier 2 + the scripts' machine
 #                             mode, whose state home is the real $HOME/.loom)
+#   $PWD                   -> <dir>  (#6386: NOT an env override — the OTHER
+#                             resolution tier. `find_repo_root` walks up from
+#                             the cwd, so a suite run from the live checkout
+#                             hands every un-`cd`-ed sub-invocation the LIVE
+#                             `.loom` as its state home. <dir> is given its own
+#                             `.loom/` so it is a valid workspace root.)
 #
 # Supervisor IDENTITY (launchd label, systemd unit) is NOT a filesystem state
 # path, so it is not fingerprinted the way the paths above are — the syscall-
@@ -266,10 +272,23 @@ live_state_sandbox_snapshot() {
 # Redirect every live state path into <dir>. Exports are inherited by every
 # sub-invocation, so a call site that forgets to sandbox something still cannot
 # reach a production path.
+#
+# ALSO `cd`s the calling shell into <dir> (#6386). Env exports only cover the
+# paths a script reads from the environment; the lifecycle scripts' OTHER
+# resolution tier is `find_repo_root`, which walks up from $PWD. A suite
+# launched from the live checkout (an Auditor running the CI suites in-place is
+# the normal case) therefore leaves every sub-invocation that forgets its own
+# `cd` resolving REPO_ROOT — and so `DAEMON_STATE_HOME="$REPO_ROOT/.loom"` —
+# straight onto the LIVE checkout. That is how #6386's 11h fleet-dispatcher
+# outage happened. <dir> gets its own `.loom/` so it IS a valid workspace root:
+# find_repo_root stops there, the scripts resolve a scratch state home instead
+# of refusing, and a forgotten `cd` can no longer escape. Cases that
+# deliberately exercise a fixture still `cd` into it themselves (a per-case
+# `cd` always wins over this default, same as a per-invocation env pin).
 live_state_sandbox_init() {
     local dir="$1"
     [[ -n "$dir" ]] || { echo "live_state_sandbox_init: missing <dir>" >&2; return 1; }
-    mkdir -p "$dir" "$dir/logs" "$dir/machine-level-bin-sandbox"
+    mkdir -p "$dir" "$dir/logs" "$dir/machine-level-bin-sandbox" "$dir/.loom"
 
     export LOOM_PID_FILE="$dir/.daemon.pid"
     export LOOM_AUTONOMY_MARKER="$dir/autonomy-desired"
@@ -284,6 +303,16 @@ live_state_sandbox_init() {
     unset LOOM_WORKSPACE
     unset LOOM_MACHINE_CHECKOUT
     unset LOOM_DAEMON_BIN
+
+    # Leave the caller standing in the sandbox (#6386) — see the header comment
+    # above. Done AFTER the exports so a failure here cannot leave a half-armed
+    # sandbox, and reported loudly (rather than silently ignored) because a
+    # failed `cd` means the cwd tier is still pointed at wherever the suite was
+    # launched from.
+    if ! cd "$dir"; then
+        echo "live-state-sandbox: could not cd into the sandbox root '$dir' — \$PWD still resolves to $PWD, so find_repo_root can escape to the live checkout (#6386)." >&2
+        return 1
+    fi
 
     # Supervisor identity (#5501): catches a harness that `export`ed the real
     # LOOM_LAUNCHD_LABEL / LOOM_WATCHDOG_LABEL BEFORE calling init — the exact

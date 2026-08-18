@@ -31,8 +31,22 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-SRC_HOOKS="$REPO_ROOT/defaults/hooks"
-SRC_LIB="$REPO_ROOT/defaults/scripts/lib"
+# Hooks and the guard lib are both shipped (installed at .loom/hooks and
+# .loom/scripts/lib respectively), so resolve each the way each layout
+# actually lays it out: the installed path first (consumer repos, and
+# Loom's own dogfooded checkout), falling back to the defaults/
+# source-tree path (a bare source checkout with no installed copy yet).
+# See issue #6194 / #6241.
+if [[ -d "$REPO_ROOT/.loom/hooks" ]]; then
+    SRC_HOOKS="$REPO_ROOT/.loom/hooks"
+else
+    SRC_HOOKS="$REPO_ROOT/defaults/hooks"
+fi
+if [[ -d "$REPO_ROOT/.loom/scripts/lib" ]]; then
+    SRC_LIB="$REPO_ROOT/.loom/scripts/lib"
+else
+    SRC_LIB="$REPO_ROOT/defaults/scripts/lib"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,6 +59,15 @@ pass() { PASS=$((PASS + 1)); TOTAL=$((TOTAL + 1)); printf "${GREEN}PASS${NC} %s\
 fail() { FAIL=$((FAIL + 1)); TOTAL=$((TOTAL + 1)); printf "${RED}FAIL${NC} %s\n" "$1"; }
 
 command -v jq >/dev/null 2>&1 || { echo "jq is required for this suite"; exit 1; }
+
+if [[ ! -d "$SRC_HOOKS" ]]; then
+    echo -e "${RED}FATAL${NC}: hooks directory not found at $SRC_HOOKS"
+    exit 1
+fi
+if [[ ! -d "$SRC_LIB" ]]; then
+    echo -e "${RED}FATAL${NC}: scripts/lib directory not found at $SRC_LIB"
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Fixture: an isolated git repo with the installed hook layout and ONE managed

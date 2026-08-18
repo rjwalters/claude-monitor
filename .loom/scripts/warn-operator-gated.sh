@@ -7,12 +7,16 @@
 # declare operator-gating in their BODY TEXT ("the index is login-walled, so
 # acquisition is operator-gated", "Operator decision: send this paired with
 # the paper") without carrying either label — so the sentinel would plan to
-# dispatch them as ordinary build candidates.
+# dispatch them as ordinary build candidates. Some declare it in their TITLE
+# instead ("Operator: visit the county archive and photograph the 1850
+# census page") with a body that contains none of the phrase vocabulary
+# below — a real 2026-08-17 sweep run missed exactly this shape (#6391).
 #
 # This tool scans each candidate's already-fetched `body` (the same field the
 # survey fetches for ## Affected Files overlap estimation, #4161, and
-# Depends on / Requires edge detection, #3759 — no new API call) for two
-# independent, ADVISORY-ONLY signals:
+# Depends on / Requires edge detection, #3759 — no new API call) plus the
+# candidate's `title` (one extra `gh issue view --json title` read per
+# candidate, #6391) for three independent, ADVISORY-ONLY signals:
 #
 #   1. Direct phrase match — the body itself contains an instruction-shaped
 #      operator-gate fragment (see PHRASES below). Case-insensitive.
@@ -23,6 +27,13 @@
 #      shape from the issue: the sweep would skip the prerequisite as
 #      operator-only (or needs-capability), then dispatch the dependent that
 #      needs it.
+#   3. Title-prefix match (#6391) — the title itself, after stripping leading
+#      whitespace/markdown decoration, STARTS WITH `Operator:` / `Operator —`
+#      / `Operator-only` (see TITLE_PREFIXES below). Case-insensitive. A
+#      PREFIX match, not a substring-anywhere match — a title that merely
+#      contains "operator" mid-sentence ("Fix operator dashboard rendering")
+#      does not match. Checked independently of the body, so it still fires
+#      when the body is empty or contains none of the PHRASES vocabulary.
 #
 # ADVISORY ONLY: this tool never hard-skips a candidate, never mutates a
 # label, and never blocks the sweep. It only ANNOTATES the confirmation-gate
@@ -40,9 +51,10 @@
 #   ⚠ body declares operator-gating: "<matched phrase>"
 #   ⚠ depends on #<A>, which is loom:operator-only
 #   ⚠ depends on #<A>, which is loom:needs-capability
-# A candidate matching both signal 1 and signal 2 prints two lines (one per
-# signal); a dependency carrying BOTH labels prints one dependency line per
-# label (deduplicated by label, in declared order).
+#   ⚠ title declares operator-gating: "<matched prefix>"
+# A candidate matching more than one signal prints one line per signal; a
+# dependency carrying BOTH labels prints one dependency line per label
+# (deduplicated by label, in declared order).
 #
 # Zero matches across the whole candidate set -> zero lines of output, and the
 # caller's plan/listing is byte-for-byte unchanged from before this tool
@@ -69,7 +81,7 @@ err()  { echo -e "${RED}ERROR: $1${NC}" >&2; }
 info() { echo -e "${BLUE}ℹ $1${NC}" >&2; }
 
 show_help() {
-    sed -n '2,58p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,70p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ---- phrase vocabulary (extracted by tests) ----
@@ -81,12 +93,22 @@ show_help() {
 # credentials" / "needs credentials" for the same reason: a bare "credentials"
 # substring would false-positive on unrelated text like "store credentials in
 # .env" or "credentials are already configured".
+#
+# The "human action" pair (#6198) is narrowed the same way: agents commonly
+# open an operator-task body with "**Operator task — requires human action, not
+# automation.**", which `requires operator` misses by one word. `requires human
+# action` / `needs human action` are instruction-shaped; a bare `human`
+# substring would false-positive on ordinary prose like "the human-in-the-loop
+# design" or "a human reviews the diff".
 PHRASES=(
     'operator-gated'
     'operator-only in substance'
     'operator authorization required'
     'operator decision:'
+    'operator task'
     'requires operator'
+    'requires human action'
+    'needs human action'
     'login-walled'
     'paid gpu'
     'requires credentials'
@@ -103,6 +125,40 @@ _operator_gate_phrase_match() {
     for phrase in "${PHRASES[@]}"; do
         if printf '%s' "$lower_body" | grep -qF -- "$phrase"; then
             printf '%s' "$phrase"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ---- title-prefix vocabulary (extracted by tests, #6391) ----
+# A title that opens by declaring operator-gating up front — "Operator:
+# visit the archive", "Operator — renew the domain", "Operator-only: rotate
+# this credential" — is a distinct discipline from the PHRASES vocabulary
+# above: a PREFIX match (must appear at the true start of the title, after
+# stripping leading whitespace/markdown decoration), not a substring-anywhere
+# match. A title that merely mentions "operator" mid-sentence ("Fix operator
+# dashboard rendering") must NOT match — same false-positive discipline the
+# PHRASES vocabulary already applies to bodies.
+TITLE_PREFIXES=(
+    'Operator:'
+    'Operator —'
+    'Operator-only'
+)
+
+# Return 0 (and print the matched prefix, display-cased as declared in
+# TITLE_PREFIXES) when `title`, after stripping leading whitespace and
+# markdown decoration (heading `#`, emphasis `*`/`_`, blockquote `>`, list
+# marker `-`), starts with one of TITLE_PREFIXES case-insensitively.
+# Otherwise return 1 and print nothing.
+_operator_gate_title_prefix_match() {
+    local title="$1" prefix stripped lower_stripped lower_prefix
+    stripped="$(printf '%s' "$title" | sed -E 's/^[[:space:]#*_>-]+//')"
+    lower_stripped="$(printf '%s' "$stripped" | tr '[:upper:]' '[:lower:]')"
+    for prefix in "${TITLE_PREFIXES[@]}"; do
+        lower_prefix="$(printf '%s' "$prefix" | tr '[:upper:]' '[:lower:]')"
+        if [[ "$lower_stripped" == "$lower_prefix"* ]]; then
+            printf '%s' "$prefix"
             return 0
         fi
     done
@@ -126,6 +182,23 @@ parse_operator_gate_deps() {
 # returns 0.
 _warn_candidate_operator_gated() {
     local candidate="$1"
+
+    # Signal 3: title-prefix match (#6391). Checked independently of the
+    # body read below, so it still fires when the body is empty or its
+    # early-return below would otherwise skip the rest of this function.
+    local title
+    if [[ -n "$REPO_NWO" ]]; then
+        title="$(gh issue view "$candidate" --repo "$REPO_NWO" --json title -q '.title' 2>/dev/null || echo '')"
+    else
+        title="$(gh issue view "$candidate" --json title -q '.title' 2>/dev/null || echo '')"
+    fi
+    if [[ -n "$title" ]]; then
+        local title_matched
+        if title_matched="$(_operator_gate_title_prefix_match "$title")"; then
+            printf '%s\t⚠ title declares operator-gating: "%s"\n' "$candidate" "$title_matched"
+            MATCH_COUNT=$((MATCH_COUNT + 1))
+        fi
+    fi
 
     local body
     if [[ -n "$REPO_NWO" ]]; then

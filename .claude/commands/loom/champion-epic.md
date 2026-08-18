@@ -80,7 +80,7 @@ criteria and post a fresh "Epic Needs Revision" comment on **every** Champion
 pass, with nothing checking whether the epic had actually changed since the last
 rejection. An epic that is never revised therefore accumulates one near-identical
 rejection comment per cycle, indefinitely, and no human is ever pulled in.
-Observed downstream on 2AMLogic/2am#184: three rejections inside three hours
+Observed downstream on example-org/fleet-repo#301: three rejections inside three hours
 (16:40:55Z, 18:10:39Z, 19:17:50Z), the same finding each time, no edit to the
 body in between.
 
@@ -294,8 +294,8 @@ Check each of the 6 criteria above. If ANY criterion fails, skip to Step 4 (reje
 An epic's own phase description sometimes names an external blocker — e.g.
 "Phase 1 — Blocked by: `owner/repo#N`" — pointing at another issue, often
 another epic, sometimes in a different repo entirely (the incident that
-motivated this section: 2AMLogic/marketing#56's Phase 1 named
-2AMLogic/klayout-tools#391 as its blocker). **Do not read that reference as a
+motivated this section: example-org/downstream-repo#101's Phase 1 named
+example-org/tool-repo#202 as its blocker). **Do not read that reference as a
 bare `state == OPEN` check** — an epic can sit open for months after every one
 of its capability children has closed and shipped, simply because nobody ran
 "Epic Completion" below to close it. Treating that as a live block twice

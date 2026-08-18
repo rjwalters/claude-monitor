@@ -29,9 +29,15 @@
 #   2. UNVERIFIABLE — a verdict label is present, but no marker comment exists
 #                     for THAT verdict kind. Fail safe: the verdict is kept.
 #                     This is the pre-migration/rollout case (verdicts written
-#                     before this guard shipped carry no marker) and the
-#                     mixed-fleet case (a host still running the older prompt).
-#                     Never force-clear on missing evidence.
+#                     before this guard shipped carry no marker), the
+#                     mixed-fleet case (a host still running the older prompt),
+#                     and — most commonly in practice — the case where the
+#                     model simply dropped the marker (#6319: observed on
+#                     roughly one verdict in four). Never force-clear on
+#                     missing evidence; with --anchor, remediate instead (#2b).
+#  2b. ANCHORED      — --anchor was passed and the UNVERIFIABLE verdict was
+#                     given a marker recording the CURRENT head, so it becomes
+#                     invalidatable from here on (#6319).
 #   3. FRESH        — the newest matching marker's SHA equals the current head
 #                     SHA. The verdict still describes the tree in front of it.
 #   4. STALE        — the newest matching marker's SHA differs from the current
@@ -53,6 +59,7 @@
 # Usage:
 #   verdict-staleness-guard.sh <pr-number>            # report only
 #   verdict-staleness-guard.sh <pr-number> --clear     # report + act on STALE
+#   verdict-staleness-guard.sh <pr-number> --anchor    # report + act on UNVERIFIABLE
 #
 # With --clear, a STALE verdict is cleared in one transition:
 #   - remove the stale verdict label (`loom:pr` / `loom:changes-requested`)
@@ -60,6 +67,31 @@
 #     when present — those are findings about the OLD tree too
 #   - add `loom:review-requested` so a Judge picks the PR up again
 #   - post an auditable comment naming the old and new SHAs
+#
+# With --anchor, an UNVERIFIABLE verdict is remediated rather than merely
+# reported (#6319): the guard posts a comment carrying the marker the verdict
+# should have had, recording the head SHA as of NOW.
+#
+# The marker is prose-compliance, not a mechanism — judge.md ASKS the model to
+# append it at every one of ~19 verdict-write sites, and production dropped it
+# on roughly one verdict in four. Every dropped marker silently reinstates the
+# pre-#5686 hazard for the life of the label: the approval survives any
+# force-push undetected and Champion may auto-merge a tree nobody approved.
+# Anchoring bounds that exposure to one pass instead of forever.
+#
+# Anchoring is deliberately NOT a verdict:
+#   - It writes NO labels. The verdict label was already there and stays
+#     exactly as it was, so anchoring cannot approve, reject, or un-park
+#     anything — the only state it changes is "this verdict can now be
+#     checked". It is therefore safe in a way --clear is not.
+#   - It cannot reconstruct which tree was actually reviewed. If the head
+#     already moved before the anchor, the verdict is anchored to a tree that
+#     may never have been reviewed. Anchoring bounds FUTURE exposure only, and
+#     is a backstop for judge.md's marker, never a substitute for it.
+#   - It is idempotent: the marker it posts is exactly what step 3 scans for,
+#     so the next run reads FRESH and never anchors twice.
+#   - It is suppressed on a hold label, like --clear (see below): a PR a human
+#     deliberately parked should not collect automated comments either.
 #
 # --clear is suppressed (DECISION stays STALE, CLEARED=0) when the PR carries
 # an explicit hold label — `loom:blocked`, `loom:operator`, or
@@ -69,20 +101,28 @@
 # as untrustworthy: STALE is STALE whether or not it was cleared.
 #
 # Output (stdout — one KEY=VALUE per line, machine-parseable):
-#   DECISION=NO_VERDICT|UNVERIFIABLE|FRESH|STALE
+#   DECISION=NO_VERDICT|UNVERIFIABLE|ANCHORED|FRESH|STALE
 #   REASON=<short human-readable reason>
 #   HEAD_SHA=<current head sha>
 #   VERDICT_LABEL=<loom:pr|loom:changes-requested|"">
 #   MARKER_SHA=<sha the verdict was recorded against, or "">
 #   CLEARED=0|1
+#   ANCHORED=0|1
 #
 # Exit codes:
 #   0  = FRESH (verdict is valid for the current head — safe to act on)
 #   10 = NO_VERDICT (no terminal verdict label on this PR)
 #   11 = UNVERIFIABLE (verdict present, no marker — fail safe, verdict kept)
 #   12 = STALE (verdict invalidated by a head-SHA move)
+#   13 = ANCHORED (was UNVERIFIABLE; --anchor stamped a marker at the current
+#        head, so it is invalidatable from here on. Labels untouched.)
 #   1  = usage or environment error (bad args, `gh` call failed). Callers must
 #        treat this like any other `gh` failure — NOT as "the verdict is fine".
+#
+# CALLERS MUST NOT SWALLOW THE EXIT CODE with `|| true` (#6319). UNVERIFIABLE
+# is the one outcome that looks like success and is not: it means a verdict
+# label is standing that nothing can ever invalidate. Count it, report it, or
+# pass --anchor to fix it — but do not discard it.
 #
 # This script decides about ONE given PR number. Finding the candidate set
 # (open PRs carrying a verdict label) stays with the caller — judge.md's
@@ -93,14 +133,16 @@ set -uo pipefail
 
 PR=""
 CLEAR=0
+ANCHOR=0
 
 usage() {
-  echo "Usage: $0 <pr-number> [--clear]" >&2
+  echo "Usage: $0 <pr-number> [--clear] [--anchor]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --clear) CLEAR=1; shift ;;
+    --anchor) ANCHOR=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*)
       echo "ERROR: unknown option: $1" >&2
@@ -142,12 +184,14 @@ verdict_token_for_label() { # <label> -> approved|changes-requested
 
 emit() {
   local decision="$1" reason="$2" head_sha="$3" verdict_label="$4" marker_sha="$5" cleared="$6"
+  local anchored="${7:-0}"
   echo "DECISION=$decision"
   echo "REASON=$reason"
   echo "HEAD_SHA=$head_sha"
   echo "VERDICT_LABEL=$verdict_label"
   echo "MARKER_SHA=$marker_sha"
   echo "CLEARED=$cleared"
+  echo "ANCHORED=$anchored"
 }
 
 # Keep `gh`'s stdout (the JSON we parse) and stderr SEPARATE. `gh` writes
@@ -173,6 +217,18 @@ fi
 
 LABELS="$(jq -r '[.labels[].name] | join("\n")' <<<"$PR_JSON" 2>/dev/null || true)"
 has_label() { printf '%s\n' "$LABELS" | grep -qx -- "$1"; }
+
+# The explicit-hold labels: a PR an operator (or Champion's capped-PR recovery
+# pass) deliberately took out of automated flow. Echoes the first one present,
+# or nothing. Shared by --clear (step 5) and --anchor (step 3b) so the two
+# write paths can never disagree about what "parked" means.
+hold_label() {
+  local held
+  for held in "loom:blocked" "loom:operator" "loom:operator-only"; do
+    if has_label "$held"; then echo "$held"; return 0; fi
+  done
+  echo ""
+}
 
 # --- Step 2: which terminal verdict (if any) does this PR carry? ------------
 # `loom:pr` is checked first: when both are somehow present (the contradictory
@@ -223,8 +279,46 @@ if [[ -n "$MARKER_LINES" ]]; then
 fi
 
 if [[ -z "$MARKER_SHA" ]]; then
-  emit "UNVERIFIABLE" "verdict label $VERDICT_LABEL present but no <!-- loom:verdict-sha ... verdict=$VERDICT_TOKEN --> marker found (pre-marker verdict) — failing safe, verdict kept" \
-    "$HEAD_SHA" "$VERDICT_LABEL" "" 0
+  UNVERIFIABLE_REASON="verdict label $VERDICT_LABEL present but no <!-- loom:verdict-sha ... verdict=$VERDICT_TOKEN --> marker found (marker never written) — failing safe, verdict kept"
+
+  # --- Step 3b: UNVERIFIABLE — optionally anchor to the current head (#6319) -
+  # Note the asymmetry with --clear below, and that it is deliberate: this
+  # posts a comment but touches NO labels, so it cannot approve, reject, or
+  # re-queue anything. It only makes the standing verdict checkable from here
+  # on. Without it the verdict stays permanently unverifiable and keeps the
+  # full pre-#5686 hazard for as long as the label sits there.
+  if [[ "$ANCHOR" -eq 1 ]]; then
+    HOLD_LABEL="$(hold_label)"
+    if [[ -n "$HOLD_LABEL" ]]; then
+      emit "UNVERIFIABLE" "$UNVERIFIABLE_REASON; anchor suppressed — PR is on an explicit $HOLD_LABEL hold" \
+        "$HEAD_SHA" "$VERDICT_LABEL" "" 0 0
+      exit 11
+    fi
+
+    gh pr comment "$PR" --body "<!-- loom:verdict-sha sha=$HEAD_SHA verdict=$VERDICT_TOKEN -->
+**Verdict anchored to the current head — no marker had been recorded**
+
+This PR carries \`$VERDICT_LABEL\`, but no verdict-SHA marker was ever written for that verdict, so it was **unverifiable**: nothing could tell whether it still described the tree in front of it, and it would have survived a force-push undetected — the exact pre-#5686 hazard.
+
+This comment records the head SHA as of now, \`$HEAD_SHA\`. It is **not** a review and implies no judgment about this tree: the \`$VERDICT_LABEL\` label is unchanged. From here on the verdict is invalidatable — if the head moves off \`$HEAD_SHA\`, the stale-verdict pass clears \`$VERDICT_LABEL\` and returns the PR to \`loom:review-requested\`.
+
+Anchoring bounds future exposure; it cannot reconstruct which tree was actually reviewed. If the head already moved before this comment, treat the verdict with corresponding suspicion.
+
+---
+*Automated by verdict-staleness-guard.sh (#6319)*" >/dev/null 2>"$GH_STDERR" || {
+      echo "ERROR: failed to post verdict-anchor comment on PR #$PR: $(cat "$GH_STDERR" 2>/dev/null)" >&2
+      emit "UNVERIFIABLE" "$UNVERIFIABLE_REASON; anchor failed" \
+        "$HEAD_SHA" "$VERDICT_LABEL" "" 0 0
+      exit 1
+    }
+
+    emit "ANCHORED" "verdict $VERDICT_LABEL had no marker and was anchored to the current head $HEAD_SHA — invalidatable from here on; labels untouched" \
+      "$HEAD_SHA" "$VERDICT_LABEL" "$HEAD_SHA" 0 1
+    exit 13
+  fi
+
+  emit "UNVERIFIABLE" "$UNVERIFIABLE_REASON" \
+    "$HEAD_SHA" "$VERDICT_LABEL" "" 0 0
   exit 11
 fi
 
@@ -243,10 +337,7 @@ CLEARED=0
 REASON="verdict $VERDICT_LABEL was rendered against $MARKER_SHA but head is now $HEAD_SHA"
 
 if [[ "$CLEAR" -eq 1 ]]; then
-  HOLD_LABEL=""
-  for held in "loom:blocked" "loom:operator" "loom:operator-only"; do
-    if has_label "$held"; then HOLD_LABEL="$held"; break; fi
-  done
+  HOLD_LABEL="$(hold_label)"
 
   if [[ -n "$HOLD_LABEL" ]]; then
     REASON="$REASON; clear suppressed — PR is on an explicit $HOLD_LABEL hold"

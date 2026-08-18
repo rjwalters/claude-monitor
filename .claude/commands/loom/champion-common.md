@@ -128,8 +128,8 @@ wrong for an **epic** — an epic can sit `OPEN` for months after every one of
 its capability/implementation children has closed and the feature has
 shipped, simply because nobody ran `champion-epic.md`'s "Epic Completion"
 step to close it. A dependent that cites that epic as a blocker then reads as
-blocked forever. This is exactly what happened to 2AMLogic/marketing#56
-against 2AMLogic/klayout-tools#391 (14/15 children closed, the feature
+blocked forever. This is exactly what happened to example-org/downstream-repo#101
+against example-org/tool-repo#202 (14/15 children closed, the feature
 shipped, the epic still open) across two consecutive Champion passes, and it
 compounded into an unrecoverable **cross-repo** deadlock because the epic's
 one remaining phase happened to depend back on the blocked dependent (the
@@ -147,13 +147,13 @@ section for how the two complement each other).
 ### Step 1 — parse the reference (cross-repo aware)
 
 Blocking references in this fleet are frequently cross-repo (the
-marketing#56 → klayout-tools#391 shape) — `owner/repo#N`, not just `#N` in
+downstream-repo#101 → tool-repo#202 shape) — `owner/repo#N`, not just `#N` in
 the current repo. `gh issue view` does **not** accept the bare `owner/repo#N`
 positional form (`invalid issue format`) — it needs `-R owner/repo <N>` (or a
 full URL), so parsing must split the two:
 
 ```bash
-# $1 = a candidate reference string, e.g. "#391" or "2AMLogic/klayout-tools#391"
+# $1 = a candidate reference string, e.g. "#202" or "example-org/tool-repo#202"
 # $2 = "owner/repo" Champion is currently running in (used when $1 is bare)
 parse_blocker_ref() {
   local ref="$1" this_repo="$2"

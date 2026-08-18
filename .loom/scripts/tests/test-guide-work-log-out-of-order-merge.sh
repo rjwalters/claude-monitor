@@ -44,7 +44,16 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+# guide.md is shipped (installed at .claude/commands/loom/guide.md), so
+# resolve it the way each layout actually lays it out: the installed path
+# first (consumer repos, and Loom's own dogfooded checkout), falling back
+# to the defaults/ source-tree path (a bare source checkout with no
+# .claude/commands/loom/ copy yet). See issue #6194 / #6241.
+if [[ -f "$REPO_ROOT/.claude/commands/loom/guide.md" ]]; then
+    GUIDE_MD="$REPO_ROOT/.claude/commands/loom/guide.md"
+else
+    GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -93,6 +102,8 @@ assert_grep '^work_log_has_pr\(\) \{' "$GUIDE_MD" \
     "work_log_has_pr() is defined"
 assert_grep 'if ! work_log_has_pr' "$GUIDE_MD" \
     "update_work_log() gates new PR candidates through work_log_has_pr()"
+assert_grep '\^- \\\*\\\*PR #\$\{1\}\\\*\\\*' "$GUIDE_MD" \
+    "work_log_has_pr() is anchored to the bullet lead-in, not a bare substring scan (#6087)"
 assert_grep 'select\(\(\$GUIDE_DOCS_PR_EXCLUDE\) \| not\)' "$GUIDE_MD" \
     "the docs-PR exclusion (#5454) is still applied to PR candidates"
 assert_grep '[-]-search "merged:>=\$since"' "$GUIDE_MD" \
@@ -120,11 +131,13 @@ else
     exit 1
 fi
 
-# work_log_has_pr(), verbatim in behavior: exact-line match against the
-# extracted "PR #<N>" numbers already recorded in WORK_LOG.md.
+# work_log_has_pr(), verbatim in behavior (post-#6087): anchored to the
+# bullet lead-in (`^- **PR #N**`), not a bare substring scan of the whole
+# file — see Test 6 below for the title-substring false-positive regression
+# this anchoring fixes.
 work_log_has_pr() {
     local n="$1" work_log="$2"
-    grep -oE 'PR #[0-9]+' "$work_log" 2>/dev/null | grep -oE '[0-9]+' | grep -qx "$n"
+    grep -qE "^- \*\*PR #${n}\*\*" "$work_log" 2>/dev/null
 }
 
 # Mirror of update_work_log()'s fixed PR path: $1 = the merged-PR JSON gh
@@ -299,6 +312,53 @@ assert_eq "$(printf '%s' "$RESULT4" | jq -r '.[0].number')" "5485" \
     "the surviving entry is the genuine out-of-order PR (#5485), not the docs PR"
 assert_eq "$(printf '%s' "$RESULT4" | jq -r "[.[] | select(.title == \"$DOCS_TITLE\")] | length")" "0" \
     "the out-of-order docs-maintenance PR (#5480) never re-enters via the presence-check fix"
+
+# ---------------------------------------------------------------------------
+# Test 6: THE #6087 REGRESSION (mirror-image of the issue-side case) — a PR
+# number appearing only INSIDE another entry's title text must not
+# false-positive the presence check. An unanchored `grep -oE 'PR #[0-9]+' |
+# grep -qx` scan over the whole file would find a PR number mentioned inside
+# an unrelated title (e.g. "PR #550" referenced in an issue's own title) as a
+# substring match and incorrectly report it as already logged, permanently
+# suppressing that PR's own entry. The anchored presence check must return
+# false for it here.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 6: a PR number appearing only inside another entry's title text is not a false-positive match (#6087)"
+
+WORK_LOG5="$SANDBOX/WORK_LOG5.md"
+cat > "$WORK_LOG5" <<'EOF'
+# Work Log
+
+### 2026-08-12
+
+- **PR #6070**: fix(guard): retry the original mitigation from PR #550 with a narrower scope
+EOF
+
+# Sanity check: the raw, unanchored repro DOES false-match (illustrating the
+# bug in generic grep-over-the-whole-file usage) — this is the shape the fix
+# must NOT rely on.
+if grep -oE 'PR #[0-9]+' "$WORK_LOG5" | grep -oE '[0-9]+' | grep -qx "550"; then
+    pass "sanity check: an unanchored substring scan over the whole file does false-match #550 (illustrates the bug)"
+else
+    fail "sanity check: expected the raw unanchored repro to false-match #550"
+fi
+
+# The actual fixed work_log_has_pr() (anchored to the bullet lead-in) must
+# NOT be fooled by #550 appearing inside #6070's title text.
+if work_log_has_pr "550" "$WORK_LOG5"; then
+    fail "work_log_has_pr() false-positived on #550 (appears only inside #6070's title text)"
+else
+    pass "work_log_has_pr() correctly reports #550 as NOT present (only appears inside #6070's title)"
+fi
+
+# #6070 itself, which genuinely has its own bullet entry, must still be
+# found present.
+if work_log_has_pr "6070" "$WORK_LOG5"; then
+    pass "work_log_has_pr() still correctly finds #6070's own genuine bullet entry"
+else
+    fail "work_log_has_pr() failed to find #6070's own genuine bullet entry"
+fi
 
 # ---------------------------------------------------------------------------
 echo ""

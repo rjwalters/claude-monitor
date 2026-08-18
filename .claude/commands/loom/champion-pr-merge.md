@@ -177,7 +177,7 @@ VERDICT_RC=$?
 |------|---------|--------|
 | `0` | **FRESH** — the approval was rendered against the current head SHA | Proceed to criterion 1. |
 | `10` | No verdict label (raced away between listing and now) | **Skip this PR** — it is no longer merge-eligible. |
-| `11` | **UNVERIFIABLE** — approved before the marker convention shipped, or by a host still running the older prompt | Proceed to criterion 1. The guard fails **safe** (verdict kept) rather than force-clearing every pre-migration approval on rollout; this is the pre-#5686 risk posture and it shrinks to nothing as marked verdicts replace unmarked ones. |
+| `11` | **UNVERIFIABLE** — no marker for this verdict: approved before the marker convention shipped, by a host still running the older prompt, or (most often in practice, #6319) because the Judge simply dropped the marker | Proceed to criterion 1. The guard fails **safe** (verdict kept) rather than force-clearing every unmarked approval; this is the pre-#5686 risk posture, so it is a real exposure, not just a rollout artifact. Since #6319 both Judge's Stale-Verdict Sweep (`--anchor`) and `loom-daemon`'s periodic `reconcile_pr_verdicts` stamp the missing marker at the then-current head, so this state should be rare and short-lived — a PR that keeps reporting `11` is either on an explicit hold or something is wrong; say so in the completion summary rather than passing over it silently. |
 | `12` | **STALE** — the approval covers a tree that is gone | **Do NOT merge.** The guard already removed `loom:pr`, re-queued the PR as `loom:review-requested`, and posted a comment naming both SHAs. `continue` to the next PR. |
 | any other | `gh`/environment error | **Do NOT merge.** Treat exactly like any other `gh` failure in this document — skip the PR this pass and retry next tick. Never read an error as "the approval is fine". |
 
@@ -591,7 +591,7 @@ the honored override, so the merge is not silent (#4742).
 **Migration note (retired config knob)**: `champion.auto_merge_max_lines` is **no longer read**. If your repo's `.loom/config.json` sets it, the key is now inert — delete it (leaving it does no harm, but it no longer has any effect). Repos that used a low value to keep Champion conservative should instead rely on this criterion's conservative bias, hold individual PRs by removing `loom:pr`, or stop running Champion's auto-merge pass. Repos that set a high value to work *around* the ceiling can simply drop the key.
 
 ### 3. Critical File Exclusion Check
-- [ ] No changes to critical configuration or infrastructure files
+- [ ] No changes to critical configuration or infrastructure files, **except** a version-only diff hunk in one of the 6 version-bearing files (see "Version-only diff carve-out" below)
 
 **Critical file patterns** (do NOT auto-merge if PR modifies any of these):
 - `Cargo.toml` - root dependency changes
@@ -634,6 +634,54 @@ CRITICAL_PATTERNS=(
   "_migration.py"
 )
 
+# Version-only diff carve-out (#6147): `scripts/version.sh bump` — which CI's
+# "defaults/ Changes Require a VERSION Bump" check forces on every PR
+# touching `defaults/` — mechanically rewrites exactly these 6 files with
+# nothing but a version-string change, no matter what the rest of the PR
+# does. Without this carve-out, every one of them trips a CRITICAL_PATTERNS
+# entry above on every single defaults/-touching, Judge-approved PR — a
+# 100%-reproducing false positive confirmed on 7 separate PRs (#6018, #6092,
+# #6114, #6118, #6137, #6142, #6146) that permanently blocked auto-merge with
+# no override (`loom:auto-merge-ok` overrides only criterion #2, not #3).
+# This function returns success (0) ONLY when $file is one of the exact 6
+# paths below (`==`, never a substring match — a hypothetical
+# `some-crate/Cargo.toml` is NOT in scope for this carve-out) AND every
+# changed (+/-) content line in that file's diff matches the version-line
+# pattern for its format. Any other change to the file's content — a real
+# dependency bump, a new field, a changed description, anything — makes it
+# return failure, and the file fails criterion #3 exactly as it did before
+# this carve-out existed.
+version_only_diff() {
+  local file="$1" number="$2"
+  local pattern
+  case "$file" in
+    package.json|mcp-loom/package.json|mcp-loom/package-lock.json)
+      # JSON: `  "version": "X.Y.Z",` at any indentation.
+      pattern='^[+-][[:space:]]*"version":[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+",?[[:space:]]*$'
+      ;;
+    loom-daemon/Cargo.toml|loom-api/Cargo.toml|Cargo.lock)
+      # TOML: `version = "X.Y.Z"`. Cargo.lock repeats this line once per
+      # touched [[package]] block (loom-api and loom-daemon bump together),
+      # so more than one changed pair is expected and still eligible as long
+      # as every pair matches.
+      pattern='^[+-]version = "[0-9]+\.[0-9]+\.[0-9]+"[[:space:]]*$'
+      ;;
+    *)
+      return 1  # not one of the 6 version-bearing files — never eligible
+      ;;
+  esac
+
+  # Every +/- content line in the file's diff must match $pattern. Diff
+  # metadata lines (+++/---) are excluded; unchanged context lines never
+  # start with +/- so they are already excluded by the first grep.
+  local bad_lines
+  bad_lines=$(gh api "repos/{owner}/{repo}/pulls/$number/files" --paginate \
+    --jq --arg f "$file" '.[] | select(.filename == $f) | .patch' \
+    | grep -E '^[+-]' | grep -vE '^(\+\+\+|---)' | grep -vE "$pattern")
+
+  [ -z "$bad_lines" ]
+}
+
 # Check each file against patterns. This loop MUST actually run over the full
 # $FILES list above — do not skip straight to "PASS" or "no critical-file
 # changes" in any comment/summary without having executed it. A rejection or
@@ -645,20 +693,40 @@ CRITICAL_PATTERNS=(
 for file in $FILES; do
   for pattern in "${CRITICAL_PATTERNS[@]}"; do
     if [[ "$file" == *"$pattern"* ]]; then
-      echo "FAIL: Critical file modified: $file"
-      exit 1
+      if version_only_diff "$file" <number>; then
+        echo "PASS (version-only carve-out): $file"
+      else
+        echo "FAIL: Critical file modified: $file"
+        exit 1
+      fi
+      continue 2
     fi
   done
 done
 
-echo "PASS: No critical files modified"
+echo "PASS: No critical files modified (or only version-only carve-out files)"
 ```
+
+**Version-only diff carve-out (#6147)**: the carve-out is a deterministic,
+textual check — it never becomes a judgment call. It applies file-by-file:
+a PR that touches `loom-api/Cargo.toml` with only the version bump AND
+`package.json` with a real new dependency still fails criterion #3 overall
+(on `package.json`), even though `loom-api/Cargo.toml` alone would have
+passed. The carve-out is independent of criterion #2 — it only ever removes
+this one criterion's veto on the mechanical version-sync files; the PR's
+actual substantive changes (in whichever other files it touches) still go
+through criterion #2's normal merge-risk judgment as usual. Do **not**
+generalize this pattern to any other critical file or any other kind of
+"trivial-looking" diff — it is scoped to exactly these 6 filenames and
+exactly a version-string line change.
 
 **Rationale**: Changes to these files require careful human review due to high impact.
 
 This criterion is deliberately kept **in addition to** the merge-risk judgment in criterion #2, not folded into it: it is a deterministic, wording-independent floor that hard-fails on a known list of filenames no matter how the judgment call goes. Criterion #2 is the open-ended complement — it covers the high-blast-radius surfaces this list does not enumerate (see Edge Case 10 in `champion-reference.md`: the pattern list is known to miss new critical files). Neither replaces the other, and `loom:auto-merge-ok` overrides only #2.
 
 **Regression note (#4613, PR #4611 incident, 2026-07-30)**: a concurrent Champion evaluation of a 117-changed-file PR posted a comment claiming "no critical-file changes" while the PR actually removed a `.github/workflows/*.yml` file matching this criterion's own pattern list. The evaluation used `gh pr view --json files`, which truncates at 100 files with no error, and/or asserted the pass without re-running the loop above. Always fetch files via the paginated `gh api .../pulls/<number>/files --paginate` command shown above, and never assert this criterion's result in prose without having just executed that loop against the full file list.
+
+**Verified against PR #6118 (#6147)**: PR #6118's `scripts/version.sh bump` commit touched `Cargo.lock`, `loom-api/Cargo.toml`, `loom-daemon/Cargo.toml`, `mcp-loom/package.json`, `mcp-loom/package-lock.json`, and `package.json` — every changed line in each of those 6 files' diffs was confirmed to match the version-line patterns above, so `version_only_diff` returns success for all 6 and the carve-out applies. The same PR's substantive change (a fix to `defaults/scripts/merge-pr.sh` and its tests) touches no critical-file pattern at all, so it was never subject to this criterion in the first place — it went through criterion #2's judgment as normal, unaffected by this carve-out.
 
 ### 4. Merge Conflict Check
 - [ ] PR is mergeable (no conflicts with base branch)
@@ -727,23 +795,73 @@ echo "PASS: Recently updated ($HOURS_AGO hours ago)"
 # Get all CI checks. `gh pr checks --json` exposes `bucket` (the rolled-up
 # pass/fail/pending/skipping/cancel state) and `name` — there is NO `conclusion`
 # or `status` field (those were invalid and made this gate silently vacuous).
-# Capture stdout ONLY: when a PR has no checks, gh prints "no checks reported..."
-# to STDERR and exits non-zero with EMPTY stdout, so an empty result is the
-# robust no-checks signal (do not grep error text).
 # Plain `gh` — NOT "$GH_READ": CI status is the read the merge is gated on,
 # and a cached green can predate the push that broke the build. (`gh pr checks`
 # is passthrough inside the wrapper anyway; this is belt-and-suspenders.)
-CHECKS=$(gh pr checks <number> --json bucket,name 2>/dev/null)
+#
+# #6211: empty stdout from `gh pr checks --json` is NOT, by itself, proof "no
+# CI checks are configured". `gh pr checks` can ALSO return empty stdout
+# during a transient forge failure (e.g. an intermittent TLS handshake error,
+# the same failure mode #6169 hit — observed ~1 call in 3 on one host), and
+# with stderr discarded and the exit code unchecked, the two cases were
+# indistinguishable. This is Champion's auto-merge gate, so trusting the
+# wrong one is a real false-positive path: a PR with genuinely pending/unrun
+# CI could get merged. The genuine no-checks case has a documented, stable
+# signature — EMPTY stdout, NONZERO exit, and stderr containing "no checks
+# reported" — only THAT combination is trusted as "no checks exist". Any
+# other empty read (including a swallowed/blank stderr) is ambiguous and
+# retried once before failing closed. Note the genuine no-checks case never
+# waits: its signature matches on the very first read, so the common
+# checkless-repo case (e.g. quickstart repos) is not artificially delayed —
+# only an ambiguous read pays the one retry.
+read_ci_checks() {
+  local number="$1" attempt out err_file err rc
+  for attempt in 1 2; do
+    err_file=$(mktemp)
+    out=$(gh pr checks "$number" --json bucket,name 2>"$err_file")
+    rc=$?
+    err=$(cat "$err_file"); rm -f "$err_file"
 
-# Handle case where no checks exist (empty stdout, or an empty JSON array).
-# NOTE: pipe raw `gh --json` output to jq via `printf '%s\n' "$VAR" | jq`, never
-# `echo "$VAR" | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escape
-# sequences by default, turning a literal two-char `\n` inside a JSON string
-# value into a raw newline and corrupting the JSON before jq ever parses it
-# (#5094).
-if [ -z "$CHECKS" ] || [ "$(printf '%s\n' "$CHECKS" | jq 'length')" = "0" ]; then
+    # Non-empty stdout with real content: checks exist, use them. NOTE: pipe
+    # raw `gh --json` output to jq via `printf '%s\n' "$VAR" | jq`, never
+    # `echo "$VAR" | jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escape
+    # sequences by default, turning a literal two-char `\n` inside a JSON
+    # string value into a raw newline and corrupting the JSON before jq ever
+    # parses it (#5094).
+    if [ -n "$out" ] && [ "$(printf '%s\n' "$out" | jq 'length')" != "0" ]; then
+      CHECKS="$out"; NO_CHECKS="false"
+      return 0
+    fi
+
+    # Confirmed genuine "no checks" signature — trust it immediately.
+    if [ "$rc" -ne 0 ] && printf '%s' "$err" | grep -qi "no checks reported"; then
+      CHECKS=""; NO_CHECKS="true"
+      return 0
+    fi
+
+    # Ambiguous empty read (unrecognized or empty stderr) — retry once
+    # before giving up; a real forge blip almost always clears on retry.
+    [ "$attempt" -eq 1 ] && sleep 3
+  done
+
+  # Still ambiguous after a retry: do NOT default to "no checks". Fail
+  # closed — the caller treats this exactly like "pending" (skip this pass,
+  # re-evaluate next tick) rather than risk an auto-merge on a false
+  # no-checks read.
+  CHECKS=""; NO_CHECKS="unknown"
+  return 1
+}
+
+read_ci_checks <number>
+
+if [ "$NO_CHECKS" = "true" ]; then
   echo "PASS: No CI checks required"
   exit 0
+fi
+
+if [ "$NO_CHECKS" = "unknown" ]; then
+  echo "SKIP: gh pr checks returned an ambiguous empty read twice in a row (not the confirmed no-checks signature) — treating as unresolved, not merge-safe"
+  exit 1
 fi
 
 # Parse checks by bucket. Buckets: pass, fail, pending, skipping, cancel.
@@ -769,12 +887,13 @@ echo "PASS: All CI checks passing"
 ```
 
 **Edge cases handled**:
-- **No CI checks**: Passes (allows merge) — detected via empty stdout, not error text
+- **No CI checks**: Passes (allows merge) — detected via the confirmed `rc!=0` + "no checks reported" stderr signature, not bare empty stdout (#6211)
+- **Ambiguous empty read** (ordinary empty stdout without the no-checks stderr signature — e.g. a transient forge failure): retried once, then fails closed as SKIP rather than being trusted as "no checks" (#6211)
 - **Pending checks**: Skips (waits for completion) — `bucket == "pending"`
 - **Failed checks**: Fails (blocks merge) — `bucket == "fail"` or `"cancel"`
 - **Skipped checks**: Passes — `bucket == "skipping"` is not a failure
 
-**Rationale**: Only merge when all automated checks pass or no checks are configured
+**Rationale**: Only merge when all automated checks pass or no checks are configured. A read that cannot confirm either state must not be treated as safe to merge.
 
 ---
 
@@ -835,10 +954,21 @@ UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
 NOW_TS=$(date +%s)
 HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
 
-# Check CI status (empty stdout = no checks; see criterion #6 above)
-CHECKS=$(gh pr checks "$PR_NUMBER" --json bucket,name 2>/dev/null)
-if [ -z "$CHECKS" ] || [ "$(printf '%s\n' "$CHECKS" | jq 'length')" = "0" ]; then
+# Check CI status — re-read fresh in THIS pass rather than reusing criterion
+# #6's result (same "never restate from memory" discipline as every other
+# bullet here). Uses read_ci_checks() from criterion #6 above (empty stdout
+# alone is NOT proof of "no checks" — see that section's #6211 rationale for
+# why NO_CHECKS is only ever "true" on the confirmed no-checks signature).
+read_ci_checks "$PR_NUMBER"
+if [ "$NO_CHECKS" = "true" ]; then
   CI_STATUS="No CI checks required"
+elif [ "$NO_CHECKS" = "unknown" ]; then
+  # Should not happen: criterion #6 already gated entry to this step and
+  # would have SKIPed on the same ambiguous-empty-read outcome. Fail closed
+  # defensively rather than post a comment claiming a status we never
+  # confirmed.
+  echo "ERROR: CI status re-read came back ambiguous after criterion #6 already passed — do not merge this pass; skip and retry next tick" >&2
+  exit 1
 else
   CI_STATUS="All CI checks passing"
 fi
@@ -1036,7 +1166,7 @@ for blocked in $BLOCKED_ISSUES; do
   # `extract_blocker_refs` from champion-common.md → "Epic-Aware Blocker Check"
   # Step 1: it generalizes the old two-stage `#N`-only pipeline (#4508) to ALSO
   # capture an optional `owner/repo` prefix ahead of the `#N`, so a cross-repo
-  # epic blocker (the marketing#56 → klayout-tools#391 incident shape) is not
+  # epic blocker (the downstream-repo#101 → tool-repo#202 incident shape) is not
   # misread as same-repo. It stays tolerant of markdown emphasis/colon and
   # extracts every reference on a dependency line. An empty ALL_DEPS here would
   # silently remove loom:blocked with no confirmation gate, so under-parsing is

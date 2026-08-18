@@ -955,6 +955,108 @@ _reset_partial_increment_labels() {
 }
 
 # ---------------------------------------------------------------------------
+# Closed-issue `loom:building` cleanup (#6199).
+#
+# The #2838 "no label cleanup on close" decision reasoned that a stale label
+# on a closed issue is harmless — every queue query filters on open state, so
+# it can never cause a duplicate build or a blocked candidate. That is still
+# true. What #6199 found is that the decision also has a real, if narrow,
+# cost: any consumer that reasonably reads `loom:building` as "in flight"
+# WITHOUT also filtering on state — a dashboard, a capacity check, an
+# operator `gh issue list --label loom:building` spot-check, or a future tool
+# — gets pure noise once the population of closed-but-still-labelled issues
+# grows (observed: 20 stale claims on one consumer repo, 0 real ones). The
+# label has stopped meaning what its name says for anyone who doesn't already
+# know to filter it out.
+#
+# Scope decision (recorded here per #6199's own "worth deciding deliberately"
+# note): this pass covers ONLY the merge-driven auto-close path (`Closes #N`
+# / `Fixes #N` / `Resolves #N`, resolved the same way Champion's "Verify
+# Issue Auto-Close" step does — via GitHub's GraphQL
+# `closingIssuesReferences`, see forge_pr_close_targets above) — the
+# deterministic case merge-pr.sh already owns and can act on right at the
+# confirmed-merge choke point, with zero extra liveness/state ambiguity: a
+# merge just happened on the PR that closed the issue, so the label is
+# unconditionally stale. An issue closed OUTSIDE a merge (closed manually, as
+# a duplicate, or `--reason "not planned"` by an autonomous role) is
+# deliberately OUT OF SCOPE here — merge-pr.sh has no hook into that path at
+# all, and inventing one (e.g. polling every issue close event) is
+# disproportionate to a cosmetic-but-annoying defect. That population is
+# instead handled by the standalone, idempotent
+# `clean-stale-building-labels.sh` (same directory) — run once against this
+# repo as part of #6199 to clear the accumulated backlog, and safe to re-run
+# on demand (by an operator, or wired into a periodic role) for any future
+# manual-close stragglers. See that script's header for the full rationale.
+#
+# Runs AFTER _reset_partial_increment_labels (and therefore after any #4569
+# premature-auto-close revert) so an issue that pass just reopened is no
+# longer `closed` by the time this pass reads it — reopened partial-increment
+# issues must keep `loom:building` (they return to `loom:issue` instead, via
+# that pass), never lose the label outright.
+#
+# GitHub-only for v1 (guarded on FORGE_TYPE), mirroring
+# _reset_partial_increment_labels's gating — forge_gh_remove_label_rl_safe is
+# a `gh`-specific helper. Every step is best-effort and must never fail the
+# merge.
+
+# Strip `loom:building` from one issue this merge closed, if it is still
+# present. Idempotent: a no-op when the issue isn't actually closed (a
+# transient PR-close-target false positive, or #4569 reopened it above),
+# already lacks the label, or is actually a PR.
+_strip_one_closed_issue_building_label() {
+  local issue_num="$1"
+  local issue_json issue_state issue_labels
+
+  # Fresh (uncached) read, mirroring _reset_one_partial_issue's freshness
+  # discipline: we need the label/state AS OF right now, not as of PR
+  # creation or the GraphQL closingIssuesReferences snapshot.
+  issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
+
+  # A PR is also an "issue" on this endpoint (has a .pull_request member).
+  if [[ "$(echo "$issue_json" | jq -r 'has("pull_request")')" == "true" ]]; then
+    return 0
+  fi
+
+  issue_state="$(echo "$issue_json" | jq -r '.state // ""')"
+  if [[ "$issue_state" != "closed" ]]; then
+    # Not (or no longer) closed — either a #4569 revert just reopened it, the
+    # forge's close hadn't landed yet when we read it, or it was never
+    # actually closed. Leave the label; a later merge or the standalone
+    # cleanup script will catch it once it genuinely closes.
+    return 0
+  fi
+
+  issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
+  if ! printf '%s\n' "$issue_labels" | grep -qx 'loom:building'; then
+    return 0
+  fi
+
+  if forge_gh_remove_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" 2>/dev/null; then
+    success "Issue #$issue_num: removed stale loom:building label (closed by this merge, #6199)"
+  else
+    warning "Could not remove loom:building from closed issue #$issue_num — may need manual: gh issue edit $issue_num --repo $REPO_NWO --remove-label loom:building"
+  fi
+}
+
+# Resolve this PR's closing issue targets and strip loom:building from each
+# that is (still) closed. Best-effort; returns 0 unconditionally.
+_strip_closed_issue_building_labels() {
+  [[ "$FORGE_TYPE" == "github" ]] || return 0
+
+  local close_targets
+  close_targets="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
+  [[ -n "$close_targets" ]] || return 0
+
+  local issue_num
+  while IFS= read -r issue_num; do
+    [[ -n "$issue_num" ]] || continue
+    _strip_one_closed_issue_building_label "$issue_num"
+  done <<< "$close_targets"
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Automated stacked-PR reconciliation on parent merge (#3747, stacked-PR v2,
 # item 1 of the v2 epic — the remaining five items stay deferred).
 #
@@ -1090,6 +1192,80 @@ _auto_reconcile_stacked_children() {
     _reconcile_one_stacked_child "$child_pr" "$child_branch" "$PR_BRANCH"
   done <<< "$rows"
 
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Stale-cached-mergeable recheck before refusal (#6104).
+#
+# GitHub's REST `.mergeable` field is computed asynchronously and invalidated
+# on every push to the base branch. On a repo with continuous automated
+# merges it can read a stale `false` shortly after a base-branch push even
+# though the branch would merge cleanly against current main. The gate at
+# the synchronous-merge callsite previously trusted the first `.mergeable`
+# read and refused immediately, asserting a conflict that did not actually
+# exist.
+#
+# This function, called only once `.mergeable` has already read `false`:
+#   1. Re-queries PR state via the UNCACHED recheck path
+#      (forge_get_pr_nocache) after a short backoff, up to `retries` times.
+#      Uses the uncached path deliberately — $GH may be wrapped by
+#      `gh-cached` (see merge-pr.sh's $GH setup), and re-reading through that
+#      cache would keep returning the same stale value, defeating the
+#      backoff entirely (mirrors the existing _NRC_RECHECK_JSON pattern).
+#   2. If still `false` after all retries, corroborates with a local
+#      `git merge-tree` check against the freshly fetched base ref — this is
+#      what lets the caller distinguish "the forge's cached state is
+#      stale/unknown" from "this branch genuinely conflicts" (a real
+#      conflict will also fail `git merge-tree`).
+#
+# Usage:
+#   _recheck_mergeable_before_refusal NWO PR_NUMBER GH_CMD BASE_REF HEAD_REF REPO_ROOT [RETRIES] [DELAY]
+#
+# Echoes exactly one "<action>:<reason>" line on stdout, always returns 0 (the
+# decision is conveyed via stdout, not exit status, so callers under
+# `set -e` can safely capture it with `$(...)`):
+#   merge:<reason>            - proceed with the merge (recheck succeeded, or
+#                                merge-tree independently confirms clean).
+#   refuse-conflict:<reason>  - refuse; local git merge-tree independently
+#                                confirms a real conflict.
+#   refuse-stale:<reason>     - refuse; the forge's cached state never
+#                                resolved to true, and local corroboration was
+#                                unavailable (missing refs, fetch failure) —
+#                                NOT a confirmed conflict, just unresolved.
+_recheck_mergeable_before_refusal() {
+  local nwo="$1" pr_number="$2" gh_cmd="$3" base_ref="$4" head_ref="$5" repo_root="$6"
+  local retries="${7:-3}" delay="${8:-3}"
+  local attempt recheck_json recheck_mergeable
+
+  for attempt in $(seq 1 "$retries"); do
+    sleep "$delay"
+    recheck_json="$(forge_get_pr_nocache "$nwo" "$pr_number" "$gh_cmd" 2>/dev/null || echo '{}')"
+    recheck_mergeable="$(echo "$recheck_json" | jq -r '.mergeable // empty')"
+    if [[ "$recheck_mergeable" == "true" ]]; then
+      echo "merge:cached mergeable=false was stale; recheck #$attempt (post-backoff, uncached) now reports mergeable=true"
+      return 0
+    fi
+  done
+
+  # Still false/unknown after the backoff retries — corroborate with a local
+  # git merge-tree check before conceding this is a genuine conflict.
+  if [[ -z "$base_ref" ]] || [[ -z "$head_ref" ]]; then
+    echo "refuse-stale:forge reports mergeable=false after $retries recheck(s); base/head ref unavailable for local corroboration"
+    return 0
+  fi
+
+  if ! git -C "$repo_root" fetch -q origin "$base_ref" "$head_ref" 2>/dev/null; then
+    echo "refuse-stale:forge reports mergeable=false after $retries recheck(s); could not fetch origin/$base_ref and origin/$head_ref for local corroboration"
+    return 0
+  fi
+
+  if git -C "$repo_root" merge-tree --write-tree "origin/$base_ref" "origin/$head_ref" >/dev/null 2>&1; then
+    echo "merge:forge reports mergeable=false after $retries recheck(s), but local 'git merge-tree' against origin/$base_ref is clean — proceeding (stale/false-negative cached state)"
+    return 0
+  fi
+
+  echo "refuse-conflict:forge reports mergeable=false after $retries recheck(s), confirmed by local 'git merge-tree' against origin/$base_ref — this branch genuinely conflicts"
   return 0
 }
 
@@ -1735,9 +1911,32 @@ fi
 # (in which case we fall through to the shared cleanup block below).
 if [[ "$AUTO_MERGE" != "true" ]]; then
 
-# Check mergeability
+# Check mergeability (#6104). REST `.mergeable` is computed asynchronously and
+# invalidated on every push to the base branch — on a fast-moving repo it can
+# read a stale `false` for a PR that would actually merge cleanly. Before
+# refusing outright, re-query (uncached) after a short backoff, and if it's
+# still `false`, corroborate with a local `git merge-tree` check so the
+# refusal message can distinguish "the forge's cached state is stale/unknown"
+# from "this branch genuinely conflicts" — see _recheck_mergeable_before_refusal().
 if [[ "$PR_MERGEABLE" == "false" ]]; then
-  error "PR #$PR_NUMBER has merge conflicts — resolve before merging"
+  _MSM_BASE_REF="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"
+  _MSM_DECISION="$(_recheck_mergeable_before_refusal "$REPO_NWO" "$PR_NUMBER" "$GH" \
+    "$_MSM_BASE_REF" "$PR_BRANCH" "$REPO_ROOT" \
+    "${LOOM_MERGEABLE_RECHECK_RETRIES:-3}" "${LOOM_MERGEABLE_RECHECK_DELAY:-3}")"
+  _MSM_ACTION="${_MSM_DECISION%%:*}"
+  _MSM_REASON="${_MSM_DECISION#*:}"
+  case "$_MSM_ACTION" in
+    merge)
+      info "PR #$PR_NUMBER: $_MSM_REASON"
+      ;;
+    refuse-conflict)
+      error "PR #$PR_NUMBER has merge conflicts — resolve before merging ($_MSM_REASON)"
+      ;;
+    *)
+      error "PR #$PR_NUMBER has merge conflicts — resolve before merging (forge's cached mergeable state is stale/unknown and could not be corroborated locally: $_MSM_REASON)"
+      ;;
+  esac
+  unset _MSM_BASE_REF _MSM_DECISION _MSM_ACTION _MSM_REASON 2>/dev/null || true
 fi
 
 if [[ "$DRY_RUN" == "true" ]]; then
@@ -1853,23 +2052,39 @@ fi  # end synchronous-merge path (AUTO_MERGE != "true")
 # Best-effort — never fails the merge. See the function definitions above.
 _reset_partial_increment_labels || true
 
+# Closed-issue `loom:building` cleanup (#6199). Runs right after the partial-
+# increment pass (so a #4569 revert of a premature auto-close has already
+# happened, and that issue is correctly skipped here — see the function's own
+# header comment above) and at the same confirmed-merge choke point.
+# Best-effort — never fails the merge.
+_strip_closed_issue_building_labels || true
+
 # Automated stacked-PR reconciliation (#3747, stacked-PR v2 item 1). Runs at the
 # same confirmed-merge choke point, and BEFORE branch deletion below so the
 # parent branch ref still resolves as reconcile-stack.sh's rebase <upstream>
 # argument. Best-effort — never fails the merge. See the function above.
 _auto_reconcile_stacked_children || true
 
-# NOTE: Label cleanup on linked issues is intentionally skipped for the
-# `Closes #N` / `Fixes #N` / `Resolves #N` auto-close case.
-# Labels on closed/merged items are harmless — all agents filter by open state.
-# See: https://github.com/rjwalters/loom/issues/2838
+# NOTE: Full label cleanup on linked issues remains intentionally skipped for
+# the `Closes #N` / `Fixes #N` / `Resolves #N` auto-close case — MOST labels
+# on a closed issue are harmless, since every queue-driving agent filters on
+# open state. See: https://github.com/rjwalters/loom/issues/2838
 #
-# EXCEPTION (#3667): non-closing `Part of #N` / `Contributes to #N` partial-
+# EXCEPTION 1 (#3667): non-closing `Part of #N` / `Contributes to #N` partial-
 # increment references leave the referenced issue OPEN after merge, so its
 # `loom:building` label would otherwise be orphaned. The
 # _reset_partial_increment_labels call above handles exactly that case by
-# swapping loom:building -> loom:issue on the still-open referenced issue. The
-# `Closes`-keyword path below is unchanged.
+# swapping loom:building -> loom:issue on the still-open referenced issue.
+#
+# EXCEPTION 2 (#6199): `loom:building` specifically — unlike other labels — is
+# read by some consumers (dashboards, capacity checks, manual spot-checks) as
+# meaning "in flight" WITHOUT also filtering on issue state, so a stale claim
+# left on a just-closed issue silently becomes noise rather than staying truly
+# harmless. The _strip_closed_issue_building_labels call above removes it from
+# each issue THIS merge closed (via `Closes`/`Fixes`/`Resolves`). #2838's core
+# reasoning — "don't bother cleaning up labels on close" — still holds for
+# every other label, and for issues closed by means other than a merge (see
+# that function's header for the recorded scope decision).
 #
 # NOTE: This script does NOT close linked issues. Issue auto-close is GitHub's
 # responsibility — GitHub's PR parser closes issues referenced via `Closes #N`,
@@ -1900,8 +2115,20 @@ fi
 # LOOM_PRESERVE_WORKTREE=1 to skip cleanup unconditionally.
 #
 # Two worktree-path conventions are recognized:
-#   - .loom/worktrees/issue-<N>/  (Loom-issue branches: feature/issue-<N>)
-#   - .loom/worktrees/pr-<N>/     (external-fork / ad-hoc branches; #3358)
+#   - .loom/worktrees/issue-<N>/  (Loom-issue branches: feature/issue-<N>;
+#     the Builder's worktree)
+#   - .loom/worktrees/pr-<N>/     (external-fork / ad-hoc branches, #3358;
+#     OR a Judge/Doctor review worktree for an ordinary feature/issue-<N>
+#     branch created via pr-worktree.sh when no builder issue-<N> worktree
+#     was present at review time, #6264)
+#
+# A pr-<N> worktree of the LATTER shape can exist ALONGSIDE an issue-<N>
+# worktree for the same PR (the builder worktree is created/reused after the
+# Judge's pr-<N> review worktree, or vice versa) — the merge-time cleanup
+# below checks for both when PR_BRANCH matches feature/issue-<N>, not just
+# the issue-<N> path (#6264: previously only the external-fork branch ever
+# considered a pr-<N> path, so a co-existing Judge review worktree on an
+# ordinary issue branch was never cleaned up and survived the merge).
 #
 # Branch-to-issue regex is the strict `^feature/issue-([0-9]+)$` pattern so
 # branches like `release-1` or `fix-bug-42` correctly classify as PR-style
@@ -2215,8 +2442,31 @@ _remove_loom_worktree() {
     return 0
   fi
   info "Removing worktree: $worktree_path"
-  if git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>/dev/null; then
-    success "Worktree removed"
+  # #6372: capture the actual git error (was silently discarded via 2>/dev/null)
+  # and, on first failure, try one `git worktree prune` + retry cycle before
+  # giving up — a stale worktree registration (administrative metadata out of
+  # sync with the actual directory) can make the first removal attempt fail
+  # even though nothing is genuinely holding the worktree open, and `prune`
+  # clears exactly that kind of staleness. Confirmed via reproduction: the
+  # original report recovered manually with `git worktree prune && rm -rf
+  # <path>`, and `git worktree prune` alone (no `rm -rf`) is sufficient when
+  # the directory itself is intact — only the registration was stale.
+  local remove_err="" removed=false pruned=false
+  if remove_err="$(git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>&1)"; then
+    removed=true
+  elif git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1; then
+    pruned=true
+    if remove_err="$(git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>&1)"; then
+      removed=true
+    fi
+  fi
+
+  if [[ "$removed" == "true" ]]; then
+    if [[ "$pruned" == "true" ]]; then
+      success "Worktree removed (after pruning a stale worktree registration)"
+    else
+      success "Worktree removed"
+    fi
     # #5950: attribute the removal in the shared ledger. `attached_branch` is
     # only resolved on the unmanaged/explicit-override path; on the default
     # issue/PR path the branch is already `PR_BRANCH`, so fall back to that
@@ -2236,7 +2486,16 @@ _remove_loom_worktree() {
       _maybe_delete_local_branch "$attached_branch"
     fi
   else
-    warning "Could not remove worktree at $worktree_path"
+    # Best-effort by design (#6372): the merge itself already succeeded and is
+    # unaffected by cleanup failing, so this stays a warning rather than an
+    # error() (which would exit 1 and misreport the merge as failed). But
+    # unlike a bare "could not remove" with no context, name the actual git
+    # failure and give an explicit remediation — matching the quality of the
+    # existing partial-increment message elsewhere in this function.
+    warning "Could not remove worktree at $worktree_path (best-effort cleanup — the merge itself already succeeded and is unaffected):"
+    warning "$remove_err"
+    warning "Remediation: git worktree prune && git -C \"$REPO_ROOT\" worktree remove \"$worktree_path\" --force"
+    warning "If that still fails: rm -rf \"$worktree_path\" && git -C \"$REPO_ROOT\" worktree prune"
   fi
 }
 
@@ -2303,9 +2562,15 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     # root (#3530) is discovered here; defaults to $REPO_ROOT/.loom/worktrees.
     WT_ROOT_DIR="$(loom_worktree_root "$REPO_ROOT")"
     DEFAULT_WT_PATH=""
+    JUDGE_PR_WT_PATH=""
     if [[ "$PR_BRANCH" =~ ^feature/issue-([0-9]+)$ ]]; then
       ISSUE_NUM="${BASH_REMATCH[1]}"
       DEFAULT_WT_PATH="$WT_ROOT_DIR/issue-$ISSUE_NUM"
+      # #6264: a Judge (or Doctor) review of this same ordinary Loom-issue PR
+      # may ALSO have created a co-existing pr-$PR_NUMBER worktree via
+      # pr-worktree.sh — checked and removed independently below, alongside
+      # (not instead of) the issue-$ISSUE_NUM path above.
+      JUDGE_PR_WT_PATH="$WT_ROOT_DIR/pr-$PR_NUMBER"
     else
       # External-fork / ad-hoc branch — the doctor would have used a
       # `pr-<PR_NUMBER>` worktree if any.
@@ -2358,6 +2623,32 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
         fi
       else
         info "No worktree found at $DEFAULT_WT_PATH (and none tracking '$PR_BRANCH' in 'git worktree list')"
+      fi
+    fi
+
+    # #6264: independently check for a co-existing Judge/Doctor review
+    # worktree at pr-$PR_NUMBER, alongside whatever the issue-$ISSUE_NUM
+    # handling above did. Only set when PR_BRANCH matched feature/issue-<N>
+    # (the external-fork branch above already used pr-$PR_NUMBER as
+    # DEFAULT_WT_PATH and handled it there — this block would be a pure
+    # duplicate for that branch, so JUDGE_PR_WT_PATH stays empty there).
+    #
+    # Checked by PATH existence, not by the branch checked out inside it —
+    # pr-worktree.sh creates this worktree via `git worktree add --detach`
+    # then `gh pr checkout --force`; the latter fails (and leaves the
+    # worktree on a detached HEAD) when the branch collides with one already
+    # checked out elsewhere (e.g. this same issue's issue-$ISSUE_NUM
+    # worktree) — see pr-worktree.sh's collision handling. A path-based check
+    # here removes the worktree either way, matching reap_pr_worktrees'
+    # (loom-daemon's #5939 periodic backstop) own PR-number+path keyed
+    # eligibility, which is likewise branch-state-independent.
+    if [[ -n "$JUDGE_PR_WT_PATH" ]] && [[ -d "$JUDGE_PR_WT_PATH" ]]; then
+      if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
+        warning "Preserving Judge/Doctor review worktree at $JUDGE_PR_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER and its live state is not CLOSED"
+        info "This is the partial-increment case (#3667) or an issue-state lookup failure; cleanup will be retried by a future merge that actually closes #$ISSUE_NUM, or run 'loom-clean' manually once it does"
+      else
+        info "Found co-existing Judge/Doctor review worktree at $JUDGE_PR_WT_PATH (PR #$PR_NUMBER, alongside issue-$ISSUE_NUM handling above) — removing (#6264)"
+        _remove_loom_worktree "$JUDGE_PR_WT_PATH"
       fi
     fi
     # Local-branch delete (#4100): the default-convention path, the

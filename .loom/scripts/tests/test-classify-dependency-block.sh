@@ -184,7 +184,7 @@ echo "--- is_dependency_finding: dependency word AND a reference, both required 
 
 assert_true is_dependency_finding '- Technical Feasibility: hard dependency on #3, which is still open' \
     "dependency word + #N is a dependency finding"
-assert_true is_dependency_finding '- Blocked by 2AMLogic/klayout-tools#391' \
+assert_true is_dependency_finding '- Blocked by example-org/tool-repo#202' \
     "cross-repo reference is a dependency finding"
 if is_dependency_finding '- Technical Feasibility: requires a migration plan before this can land'; then
     fail "a dependency WORD with no reference is a merits finding (ordinary English must not defer)"
@@ -196,6 +196,20 @@ if is_dependency_finding '- Implementation Clarity: acceptance criteria are unte
 else
     pass "a reference with no dependency word is a merits finding"
 fi
+
+# #4196/#6112: a bare "Dependencies" noun (quoting a section heading) plus an
+# incidental, unrelated issue-number mention must NOT read as a dependency
+# finding. The real #4196 escalation bullet, reproduced verbatim in shape.
+FINDING_4196='- Scope appropriateness: the issue'"'"'s own "Dependencies / references" section recommends filing Phase 2 as its own issue. Phase 1 is shipped (#3997).'
+if is_dependency_finding "$FINDING_4196"; then
+    fail "a bare 'Dependencies' section-heading reference is a merits finding, not a dependency wait (#6112)"
+else
+    pass "a bare 'Dependencies' section-heading reference is a merits finding, not a dependency wait (#6112)"
+fi
+assert_true is_dependency_finding '- Technical Feasibility: hard dependency on private/repo#77, which is still open' \
+    "'dependency on' + #N still classifies as a dependency finding after the #6112 fix"
+assert_true is_dependency_finding '- Technical Feasibility: this has a dependency of the RTL work on #3' \
+    "'dependency of' + #N still classifies as a dependency finding"
 
 echo
 echo "--- findings_are_dependency_only: one merits finding disqualifies the set ---"
@@ -609,6 +623,31 @@ assert_contains "$OUT" "REASON: merits-finding" "reason is the merits finding"
 assert_eq "" "$(labels_log 5)" "the label is untouched"
 
 echo
+echo "--- REGRESSION GUARD (#6112): the #4196 incident shape is never un-escalated on a bare 'Dependencies' heading match ---"
+# The exact incident: the escalation's own REASON is merits-finding (a Scope
+# Appropriateness finding quoting the issue's "Dependencies / references"
+# heading, with an incidental #3997 mention), never a real dependency wait --
+# so even once #3997 closes, this must stay escalated, not un-escalate.
+reset_state
+issue_fixture 'o/r#5' OPEN 'A proposal.' 'loom:architect,loom:operator-only' \
+    '<!-- champion:proposal-escalated -->
+**Champion: Escalating to Operator — Repeated Rejection Without Revision**
+
+**Recurring findings:**
+- Scope appropriateness: the issue'"'"'s own "Dependencies / references" section
+  recommends filing Phase 2 as its own issue. Phase 1 is shipped (#3997).
+
+A human needs to decide.
+
+---
+*Automated by Champion role*'
+issue_fixture 'o/r#3997' CLOSED 'Phase 1 work.' ''
+run_cdb --issue 5 --repo o/r --check-unescalate --apply
+assert_eq "1" "$RC" "the #4196 shape stays escalated even though #3997 (the incidental mention) is closed"
+assert_contains "$OUT" "REASON: merits-finding" "reason is merits-finding, matching #4196's own REASON, not a dependency wait"
+assert_eq "" "$(labels_log 5)" "the label is untouched -- no incorrect un-escalation"
+
+echo
 echo "--- REGRESSION GUARD: a dependency-CYCLE escalation is never un-escalated ---"
 reset_state
 issue_fixture 'o/r#5' OPEN 'A proposal. Blocked by #3.' 'loom:architect,loom:operator-only' \
@@ -815,7 +854,7 @@ assert_eq "3" "$RC" "after healing, the stale dependency verdict triggers a re-e
 
 # =====================================================================
 # End-to-end regression: the 5-issue "recurred after closure" scenario
-# (2AMLogic/sky130-asic-puzzle, 2026-08-08) -- #1 is startable outright, #4 is
+# (example-org/canary-repo, 2026-08-08) -- #1 is startable outright, #4 is
 # startable outright, #2 hard-depends on #1 with NO stated subset (a genuine
 # full park), and #3/#5 each hard-depend on #1 but declare a startable subset
 # independent of it. #1 is open throughout the first half of this test, then

@@ -90,7 +90,20 @@ mkdir -p "$WORKDIR/.loom/logs"
 # with no override at all, so pre-fix they resolved LOOM_SOCKET_PATH's default
 # fallback (`${LOOM_SOCKET_PATH:-$HOME/.loom/loom-daemon.sock}` in
 # loom-daemon-start.sh) straight onto the REAL $HOME/.loom.
-live_state_sandbox_init "$WORKDIR/live-state"
+#
+# The return code is CHECKED, never bare (#6420). init returns non-zero when it
+# could not `cd` into the sandbox root (#6386 — the cwd tier is then still aimed
+# at wherever this suite was launched from, i.e. potentially a LIVE checkout) or
+# when the ambient supervisor label is the real production one (#5501). This
+# suite runs under `set -uo pipefail` with NO `-e`, so a bare call would swallow
+# both and continue with a HALF-ARMED sandbox — the exact state the helper's own
+# failure path exists to prevent — while driving the real lifecycle scripts.
+# (The EXIT trap above already owns $WORKDIR cleanup on this exit path.)
+if ! live_state_sandbox_init "$WORKDIR/live-state"; then
+    echo "FATAL: live-state sandbox init failed — refusing to run this suite against a half-armed sandbox (#6420)." >&2
+    echo "  See the reason above (lib/live-state-sandbox.sh): a writable sandbox root is required, and the ambient LOOM_LAUNCHD_LABEL / LOOM_WATCHDOG_LABEL must not be the real production identities." >&2
+    exit 1
+fi
 
 FAKE_BIN="$WORKDIR/fake-loom-daemon"
 cat > "$FAKE_BIN" <<'EOF'
@@ -129,6 +142,66 @@ assert_eq "FAKE_DAEMON WF=[] HG=[]" "$out" "--from-config leaves both env vars u
 # 7. --no-work-finder forces finder off (explicit; matches default).
 out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --no-work-finder --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
 assert_eq "FAKE_DAEMON WF=[0] HG=[0]" "$out" "--no-work-finder forces finder off"
+
+# ---------- host-sleep prevention wrap, foreground mode (#6311) ----------
+# A fake `systemd-inhibit` on PATH logs its own invocation, then strips
+# everything up to `--` and execs the remainder — mirroring how
+# test-spawn-claude.sh's #5111 systemd-run stub hands off to its wrapped
+# command, so FAKE_BIN still runs (and the assertion can see BOTH the wrap
+# invocation AND the wrapped daemon's own output).
+SLEEP_STUB_DIR="$WORKDIR/sleep-stub"
+mkdir -p "$SLEEP_STUB_DIR"
+SLEEP_INHIBIT_LOG="$WORKDIR/systemd-inhibit.log"
+cat > "$SLEEP_STUB_DIR/systemd-inhibit" <<STUB
+#!/usr/bin/env bash
+echo "\$*" >> "$SLEEP_INHIBIT_LOG"
+args=("\$@")
+skip=0
+for ((i = 0; i < \${#args[@]}; i++)); do
+    if [[ "\${args[i]}" == "--" ]]; then
+        skip=\$((i + 1))
+        break
+    fi
+done
+exec "\${args[@]:skip}"
+STUB
+chmod +x "$SLEEP_STUB_DIR/systemd-inhibit"
+
+# 7b. host.preventSleep absent (default off): no wrap, FAKE_BIN still runs,
+#     systemd-inhibit is never invoked even though it's on PATH.
+: > "$SLEEP_INHIBIT_LOG"
+rm -f "$WORKDIR/.loom/config.json"
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_HOST_PREVENT_SLEEP \
+    PATH="$SLEEP_STUB_DIR:$PATH" LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[0] HG=[0]" "$out" "absent host.preventSleep: --foreground still runs FAKE_BIN unwrapped (#6311)"
+assert_eq "" "$(cat "$SLEEP_INHIBIT_LOG" 2>/dev/null)" "absent host.preventSleep: systemd-inhibit is never invoked (#6311 byte-identical default)"
+
+# 7c. host.preventSleep=true: --foreground wraps FAKE_BIN in
+#     `systemd-inhibit --what=idle:sleep --who=loom --why=daemon --`.
+: > "$SLEEP_INHIBIT_LOG"
+echo '{"host": {"preventSleep": true}}' > "$WORKDIR/.loom/config.json"
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_HOST_PREVENT_SLEEP \
+    PATH="$SLEEP_STUB_DIR:$PATH" LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[0] HG=[0]" "$out" "host.preventSleep=true: --foreground still runs FAKE_BIN through the wrap (#6311)"
+sleep_inhibit_log_content="$(cat "$SLEEP_INHIBIT_LOG" 2>/dev/null)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "$sleep_inhibit_log_content" == *"--what=idle:sleep"* && "$sleep_inhibit_log_content" == *"--why=daemon"* ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} host.preventSleep=true: systemd-inhibit is invoked with --what=idle:sleep --why=daemon (#6311)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} host.preventSleep=true: systemd-inhibit is invoked with --what=idle:sleep --why=daemon (#6311)"
+    echo "  actual log: [$sleep_inhibit_log_content]"
+fi
+
+# 7d. LOOM_HOST_PREVENT_SLEEP=0 env override wins over config true -> disabled.
+: > "$SLEEP_INHIBIT_LOG"
+out=$( ( cd "$WORKDIR" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE \
+    LOOM_HOST_PREVENT_SLEEP=0 PATH="$SLEEP_STUB_DIR:$PATH" LOOM_DAEMON_BIN="$FAKE_BIN" bash "$START_SCRIPT" --foreground 2>/dev/null ) | grep '^FAKE_DAEMON' )
+assert_eq "FAKE_DAEMON WF=[0] HG=[0]" "$out" "LOOM_HOST_PREVENT_SLEEP=0 env override: --foreground still runs (#6311)"
+assert_eq "" "$(cat "$SLEEP_INHIBIT_LOG" 2>/dev/null)" "LOOM_HOST_PREVENT_SLEEP=0 wins over host.preventSleep=true config (#6311)"
+
+rm -f "$WORKDIR/.loom/config.json"
 
 # ---------- --from-config composition (#4353) ----------
 # --from-config used to be a strict either/or: it never looked at
@@ -341,6 +414,22 @@ else
     echo "$unit_out" | sed 's/^/    /'
 fi
 
+# S1b (#6129): a clean operator stop (SIGTERM->143, SIGINT->130) must land the
+# unit in `inactive`, not `failed` -- SuccessExitStatus= reclassifies both
+# codes as a clean exit; RestartPreventExitStatus= is the belt-and-braces
+# guard against a raw (non-systemctl) `kill -TERM` newly tripping
+# Restart=on-success now that those codes count as "success".
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$unit_out" | grep -qx 'SuccessExitStatus=143 130' \
+    && echo "$unit_out" | grep -qx 'RestartPreventExitStatus=143 130'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} --print-unit renders SuccessExitStatus=143 130 + RestartPreventExitStatus=143 130 (#6129)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} --print-unit renders SuccessExitStatus=143 130 + RestartPreventExitStatus=143 130 (#6129)"
+    echo "$unit_out" | sed 's/^/    /'
+fi
+
 # Shared stub systemctl: records every call, answers daemon-reload/enable as
 # success and `show -p MainPID --value` with a live pid we control. Structurally
 # unable to touch a real unit.
@@ -402,9 +491,11 @@ TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -f "$SD_HOME/.config/systemd/user/$SD_UNIT" ]] \
     && grep -qx 'Restart=on-success' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
     && grep -qx 'KillMode=mixed' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
-    && grep -qx 'TimeoutStopSec=20' "$SD_HOME/.config/systemd/user/$SD_UNIT"; then
+    && grep -qx 'TimeoutStopSec=20' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
+    && grep -qx 'SuccessExitStatus=143 130' "$SD_HOME/.config/systemd/user/$SD_UNIT" \
+    && grep -qx 'RestartPreventExitStatus=143 130' "$SD_HOME/.config/systemd/user/$SD_UNIT"; then
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "${GREEN}✓${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed (#4862) + TimeoutStopSec=20 (#4950)"
+    echo -e "${GREEN}✓${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed (#4862) + TimeoutStopSec=20 (#4950) + SuccessExitStatus/RestartPreventExitStatus=143 130 (#6129)"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "${RED}✗${NC} systemd path: renders the unit file under ~/.config/systemd/user with Restart=on-success + KillMode=mixed + TimeoutStopSec=20"
@@ -2341,6 +2432,63 @@ else
     echo "  systemctl calls: $(cat "$HEAL8_LOG")"
 fi
 rm -rf "$HEAL8_REPO" "$HEAL8_HOME"
+
+# ============================================================
+# PF. LOOM_PID_FILE is an OUTPUT of this script, never an input (#6420).
+#
+# loom-daemon-stop.sh / -update.sh / -watchdog.sh / daemon_pidfile.rs all
+# resolve an inbound LOOM_PID_FILE as TIER 1 (#6386/#5118). This script is the
+# other end of that contract -- the EXPORTER -- and deliberately derives
+# "<state home>/.daemon.pid" instead, because honoring an inbound value here
+# would WIDEN (not narrow) what a start touches: the ambient LOOM_PID_FILE in
+# any agent session names the LIVE daemon's pid file, and this script rm -f's,
+# rewrites, and hands that path to a new daemon (#5179's shape). These cases
+# pin that decision so it cannot be "aligned" away silently; the rationale
+# lives at the derivation site in loom-daemon-start.sh.
+#
+# Driven read-only through --print-plist / --print-unit (pure rendering, no
+# side effects on any platform), which print the pid path this script chose.
+# ============================================================
+PF_REPO="$(mktemp -d)"
+PF_HOME="$(mktemp -d)"
+mkdir -p "$PF_REPO/.loom" "$PF_HOME/Library/LaunchAgents"
+PF_DERIVED="$PF_REPO/.loom/.daemon.pid"
+PF_INBOUND="$PF_HOME/inbound-should-be-ignored.pid"
+
+pf_plist=$( cd "$PF_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_MACHINE_CHECKOUT -u LOOM_WORKSPACE \
+    HOME="$PF_HOME" LOOM_PID_FILE="$PF_INBOUND" LOOM_LAUNCHD_LABEL="com.example.loom-pidfile-test-$$" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>/dev/null )
+pf_plist_value=$( echo "$pf_plist" | grep -A1 '<key>LOOM_PID_FILE</key>' | grep '<string>' | sed -e 's/.*<string>//' -e 's|</string>.*||' )
+assert_eq "$PF_DERIVED" "$pf_plist_value" "#6420: an inbound LOOM_PID_FILE does NOT displace the derived pid file in the rendered plist"
+
+pf_unit=$( cd "$PF_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_MACHINE_CHECKOUT -u LOOM_WORKSPACE \
+    HOME="$PF_HOME" LOOM_PID_FILE="$PF_INBOUND" LOOM_SYSTEMD_UNIT="loom-daemon-pidfile-test-$$.service" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-unit 2>/dev/null )
+pf_unit_value=$( echo "$pf_unit" | sed -n 's/^Environment=LOOM_PID_FILE=//p' )
+assert_eq "$PF_DERIVED" "$pf_unit_value" "#6420: an inbound LOOM_PID_FILE does NOT displace the derived pid file in the rendered systemd unit"
+
+# Control: the derived path is a real choice, not "the inbound value happens to
+# be unreadable". Moving the STATE HOME (the supported lever) does move it.
+PF_MACHINE="$(mktemp -d)"
+mkdir -p "$PF_MACHINE/.loom"
+pf_machine_plist=$( cd "$PF_REPO" && env -u LOOM_WORK_FINDER -u LOOM_MAIN_HEALTH_GATE -u LOOM_WORKSPACE \
+    HOME="$PF_MACHINE" LOOM_MACHINE_CHECKOUT="$PF_MACHINE" LOOM_PID_FILE="$PF_INBOUND" \
+    LOOM_LAUNCHD_LABEL="com.example.loom-pidfile-test-$$" LOOM_DAEMON_BIN="$FAKE_BIN" \
+    bash "$START_SCRIPT" --print-plist 2>/dev/null )
+pf_machine_value=$( echo "$pf_machine_plist" | grep -A1 '<key>LOOM_PID_FILE</key>' | grep '<string>' | sed -e 's/.*<string>//' -e 's|</string>.*||' )
+assert_eq "$PF_MACHINE/.loom/.daemon.pid" "$pf_machine_value" "#6420: moving the state home (the supported lever) DOES move the derived pid file"
+
+# The asymmetry with stop/update/watchdog must be documented, not silent.
+pf_help=$( bash "$START_SCRIPT" --help 2>&1 )
+TESTS_RUN=$((TESTS_RUN + 1))
+if echo "$pf_help" | grep -q 'LOOM_PID_FILE' && echo "$pf_help" | grep -qi 'OUTPUT, not input'; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "${GREEN}✓${NC} #6420: --help documents LOOM_PID_FILE as an output of this script, not an input"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "${RED}✗${NC} #6420: --help documents LOOM_PID_FILE as an output of this script, not an input"
+fi
+rm -rf "$PF_REPO" "$PF_HOME" "$PF_MACHINE"
 
 # ============================================================
 # Live daemon state guard (#5179, adopted here per #5191): every live `.loom`

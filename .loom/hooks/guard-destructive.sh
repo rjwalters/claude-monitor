@@ -9,7 +9,7 @@
 # to it instead of shipping (and separately maintaining) a second generic guard.
 #
 # This dispatcher decides at RUNTIME which generic guard to run:
-#   1. The canonical Repo Skills guard, IF it is present AND passes ALL THREE
+#   1. The canonical Repo Skills guard, IF it is present AND passes ALL FOUR
 #      probes below. This is the preferred path in a repo that has Repo Skills
 #      installed.
 #   2. Otherwise the vendored generic guard shipped alongside this file
@@ -17,7 +17,7 @@
 #      Skills — and any repo whose canonical guard fails any probe — keep full
 #      destructive-command coverage.
 #
-# The three probes (#4894, #5916 — ALL are REQUIRED, not either/or):
+# The four probes (#4894, #5916, #5974 — ALL are REQUIRED, not either/or):
 #   a. VERSION probe — the canonical guard carries the rjwalters/repo#29 fix
 #      (detected by the `repo#29` marker comment; presence/version probe, no
 #      semver arithmetic).
@@ -36,6 +36,14 @@
 #      --jq '.[] | .number'` (a `|` inside a trailing single-quoted `--jq` arg,
 #      after an already-masked `--search` value, gets misread as a real shell
 #      pipe boundary during segment scanning).
+#   d. CAPABILITY probe (#5974) — the canonical guard also carries the
+#      ungated hard deny on `gh pr comment`/`gh issue comment --body @path`
+#      (issue #4523: this shape posts the literal string `@path` instead of
+#      expanding the file). Detected by $BODY_LITERAL_AT_MARKER below — the
+#      same stable decision-tag guard-destructive-generic.sh passes to its
+#      own deny() call for that rule. Without this, a canonical guard that
+#      passes probes (a)-(c) can still silently drop the `--body @path`
+#      protection entirely, with no warning and no override.
 #
 # Probe (a) alone used to be sufficient, but it only proves the canonical guard
 # picked up an unrelated upstream fix — it says nothing about whether the
@@ -43,10 +51,10 @@
 # carried the repo#29 marker WITHOUT the write-confinement category (Repo
 # Skills 0.7.0), the dispatcher would `exec` it and that category would stop
 # running silently, with no warning and no override (#4894). Requiring probes
-# (b) and (c) too means the dispatcher only ever defers to a canonical guard
-# that genuinely offers equal-or-better coverage; a canonical guard missing
-# any one of the three still routes to the vendored fallback, which always
-# carries all three.
+# (b), (c), and (d) too means the dispatcher only ever defers to a canonical
+# guard that genuinely offers equal-or-better coverage; a canonical guard
+# missing any one of the four still routes to the vendored fallback, which
+# always carries all four.
 #
 # Probe (c) is INERT today (never yet passing): as of 2026-08-10,
 # rjwalters/repo has not ported an equivalent search/jq masking fix upstream,
@@ -145,29 +153,54 @@ WRITE_CONFINEMENT_MARKER='worktree-write-confinement'
 SEARCH_MASK_MARKER='--comment|--search'
 ARGJSON_MASK_MARKER='--arg|--argjson'
 
+# CAPABILITY probe (d) marker (#5974). Stable decision-tag the vendored
+# guard's `gh pr comment`/`gh issue comment --body @path` hard deny passes to
+# its own deny() call (issue #4523 — see the "gh-comment-body-literal-at"
+# argument in guard-destructive-generic.sh's --body @path check). Grepping
+# for this exact tag proves the canonical guard actually ported that rule,
+# not just the unrelated version/write-confinement/search-mask fixes.
+#
+# Scope decision (issue #5974, item 3): this dispatcher gates on
+# `gh-comment-body-literal-at` ALONE — it does NOT add separate probes for
+# the three companion decision-tags guard-destructive-generic.sh also emits
+# for the same underlying hazard (`gh-edit-body-literal-at` for `gh pr/issue
+# edit --body @path`, and the `-var` suffixed tags for the same two rules
+# reached through a shell-variable indirection, #4601/PR #4600). All four
+# tags are added, changed, and removed together in guard-destructive-
+# generic.sh's history — they are one feature (issue #4523's --body @path
+# protection) implemented as four deny() call sites, never edited
+# independently — so a single marker is an adequate, low-maintenance proxy
+# for "did this canonical guard port issue #4523's fix at all", with the same
+# safe failure direction as probe (c): a guard that somehow ported only a
+# subset would fail this probe and route to the vendored fallback, never the
+# reverse.
+BODY_LITERAL_AT_MARKER='gh-comment-body-literal-at'
+
 # Prefer the canonical guard ONLY when it carries the rjwalters/repo#29 fix
-# (VERSION probe) AND independently implements BOTH the write-confinement
-# category (CAPABILITY probe (b), #4894) AND the search/jq masking fix
-# (CAPABILITY probe (c), #5916 — see the header comment above for why all
-# three are required). The cheap bash-builtin `[[ -r ]]` test (zero forks)
-# guards all four greps, so a repo without Repo Skills pays no extra process
-# — preserving the guard's #3687 read-only fast path in that common case. In
-# a dual-install repo the marker greps cost at most four forks per command
-# before the canonical guard's own fast path runs; each grep -q/-qF
+# (VERSION probe) AND independently implements the write-confinement
+# category (CAPABILITY probe (b), #4894), the search/jq masking fix
+# (CAPABILITY probe (c), #5916), AND the --body @path literal-string hard
+# deny (CAPABILITY probe (d), #5974 — see the header comment above for why
+# all four are required). The cheap bash-builtin `[[ -r ]]` test (zero
+# forks) guards all five greps, so a repo without Repo Skills pays no extra
+# process — preserving the guard's #3687 read-only fast path in that common
+# case. In a dual-install repo the marker greps cost at most five forks per
+# command before the canonical guard's own fast path runs; each grep -q/-qF
 # short-circuits at the first match, and each later probe only runs once the
 # earlier one has already matched.
 if [[ -r "$CANONICAL_GUARD" ]] \
    && grep -q 'repo#29' "$CANONICAL_GUARD" 2>/dev/null \
    && grep -q "$WRITE_CONFINEMENT_MARKER" "$CANONICAL_GUARD" 2>/dev/null \
    && grep -qF -- "$SEARCH_MASK_MARKER" "$CANONICAL_GUARD" 2>/dev/null \
-   && grep -qF -- "$ARGJSON_MASK_MARKER" "$CANONICAL_GUARD" 2>/dev/null; then
+   && grep -qF -- "$ARGJSON_MASK_MARKER" "$CANONICAL_GUARD" 2>/dev/null \
+   && grep -q -- "$BODY_LITERAL_AT_MARKER" "$CANONICAL_GUARD" 2>/dev/null; then
     exec bash "$CANONICAL_GUARD"
 fi
 
 # Fall back to the vendored generic guard (standalone-Loom repos, a repo whose
 # Repo Skills copy predates the repo#29 fix, or a repo whose Repo Skills copy
-# has the fix but not yet the write-confinement and/or search/jq masking
-# categories, #4894, #5916).
+# has the fix but not yet the write-confinement, search/jq masking, and/or
+# --body @path literal-string categories, #4894, #5916, #5974).
 if [[ -r "$VENDORED_GUARD" ]]; then
     exec bash "$VENDORED_GUARD"
 fi

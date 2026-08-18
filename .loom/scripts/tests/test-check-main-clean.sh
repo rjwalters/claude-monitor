@@ -36,6 +36,9 @@
 #     LOOM_QUARANTINE_COMMENT=0 opt-out, and a failing `gh` call are all
 #     no-ops or best-effort failures that never change the check's exit code
 #     (#5691)
+#   - the breadcrumb comment never contains the raw machine hostname — it is
+#     redacted behind a short, stable, non-reversible `host-<hash>` identifier
+#     (#6189)
 #
 # Usage:
 #   ./.loom/scripts/tests/test-check-main-clean.sh
@@ -903,6 +906,137 @@ if [[ "$RC" -eq 4 ]] \
     pass "a failed breadcrumb comment is logged but the quarantine itself still succeeds (exit 4)"
 else
     fail "expected exit 4 with both a quarantined and a failed-comment event logged, got rc=$RC; out=$out"
+fi
+rm -rf "$GHDIR" "$REPO"
+
+# ========================================================================
+# Abandoned-conflict detection (#6162 AC3)
+# ========================================================================
+
+# make_repo_with_conflicted_stash_pop <dir> -> leaves the working tree with
+# an unmerged index entry (UU) and NO merge/rebase in progress: pushes a
+# stash, commits a conflicting change on top, then pops the stash so it
+# collides — the exact `git stash pop` conflict shape from the #6162
+# incident (`Updated upstream` / `Stashed changes` markers).
+make_repo_with_conflicted_stash_pop() {
+    local dir
+    dir=$(mktemp -d)
+    git -C "$dir" init -q
+    git -C "$dir" config user.email t@t.t
+    git -C "$dir" config user.name test
+    printf '.loom/worktrees/\n' > "$dir/.gitignore"
+    printf 'echo original\n' > "$dir/script.sh"
+    git -C "$dir" add .gitignore script.sh
+    git -C "$dir" commit -q -m init
+    printf 'echo modified-in-worktree\n' > "$dir/script.sh"
+    git -C "$dir" stash push -q -m wip
+    printf 'echo modified-on-disk\n' > "$dir/script.sh"
+    git -C "$dir" commit -aq -m "modify on disk"
+    git -C "$dir" stash pop >/dev/null 2>&1 || true
+    echo "$dir"
+}
+
+echo "Test 39: an abandoned stash-pop conflict (UU, no merge in progress) exits 3 with a distinct message"
+REPO=$(make_repo_with_conflicted_stash_pop)
+out=$( cd "$REPO" && "$SCRIPT" 2>&1 ); RC=$?
+if [[ "$RC" -eq 3 ]] \
+   && [[ "$out" == *"ABANDONED CONFLICT STATE"* ]] \
+   && [[ "$out" == *"UU script.sh"* ]] \
+   && [[ "$out" == *"#6162"* ]]; then
+    pass "exit 3 with the abandoned-conflict-specific message naming the unmerged path"
+else
+    fail "expected exit 3 + ABANDONED CONFLICT STATE message naming UU script.sh, got rc=$RC; out=$out"
+fi
+
+echo "Test 40: an abandoned conflict is reported the same way from inside a worktree"
+git -C "$REPO" worktree add -q .loom/worktrees/issue-6162test -b feature/issue-6162test HEAD 2>/dev/null || true
+out=$( cd "$REPO/.loom/worktrees/issue-6162test" && "$SCRIPT" 2>&1 ); RC=$?
+if [[ "$RC" -eq 3 && "$out" == *"ABANDONED CONFLICT STATE"* ]]; then
+    pass "detects the abandoned conflict in main from inside a worktree"
+else
+    fail "expected exit 3 + ABANDONED CONFLICT STATE from inside a worktree, got rc=$RC; out=$out"
+fi
+git -C "$REPO" worktree remove --force .loom/worktrees/issue-6162test 2>/dev/null || true
+
+echo "Test 41: an abandoned conflict is never --quarantine'd — refuses even when --quarantine is passed"
+out=$( cd "$REPO" && "$SCRIPT" --quarantine --label "run=RUNID-CONFLICT issue=9004" 2>&1 ); RC=$?
+if [[ "$RC" -eq 3 ]] \
+   && [[ "$out" == *"ABANDONED CONFLICT STATE"* ]] \
+   && [[ "$out" != *'"event":"main-clean.quarantine"'* ]]; then
+    pass "--quarantine does not attempt to stash an abandoned conflict; still exits 3"
+else
+    fail "expected --quarantine to refuse (exit 3, no quarantine event), got rc=$RC; out=$out"
+fi
+
+echo "Test 42: an abandoned conflict is never --baseline'd away, even matching itself"
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-conflict.txt"
+mkdir -p "$(dirname "$SNAP")"
+git -C "$REPO" status --porcelain > "$SNAP"    # baseline that already contains the UU line
+out=$( cd "$REPO" && "$SCRIPT" --baseline "$SNAP" 2>&1 ); RC=$?
+if [[ "$RC" -eq 3 && "$out" == *"ABANDONED CONFLICT STATE"* ]]; then
+    pass "--baseline does not suppress an abandoned conflict even if pre-recorded"
+else
+    fail "expected --baseline to still hard-fail on the conflict, got rc=$RC; out=$out"
+fi
+rm -rf "$REPO"
+
+echo "Test 43: an ORDINARY merge conflict (merge actually in progress) falls back to the generic dirty message"
+REPO=$(make_repo)
+printf 'echo original\n' > "$REPO/script.sh"
+git -C "$REPO" add script.sh
+git -C "$REPO" commit -q -m "add script"
+git -C "$REPO" checkout -qb other
+printf 'echo other-branch\n' > "$REPO/script.sh"
+git -C "$REPO" commit -aq -m "other change"
+git -C "$REPO" checkout -q main 2>/dev/null || git -C "$REPO" checkout -q master
+printf 'echo main-branch\n' > "$REPO/script.sh"
+git -C "$REPO" commit -aq -m "main change"
+git -C "$REPO" merge other -q >/dev/null 2>&1 || true
+out=$( cd "$REPO" && "$SCRIPT" 2>&1 ); RC=$?
+if [[ "$RC" -eq 3 ]] \
+   && [[ "$out" != *"ABANDONED CONFLICT STATE"* ]] \
+   && [[ "$out" == *"MAIN worktree is dirty"* ]]; then
+    pass "a live in-progress merge conflict uses the generic dirty message, not the abandoned-conflict one"
+else
+    fail "expected the generic dirty message (MERGE_HEAD present), got rc=$RC; out=$out"
+fi
+rm -rf "$REPO"
+
+echo "Test 44: quarantine breadcrumb comment never leaks the raw machine hostname (#6189)"
+REPO=$(make_repo_with_source)
+SNAP="$REPO/.loom/sweep-checkpoint/main-clean-baseline-hostleak.txt"
+( cd "$REPO" && "$SCRIPT" --snapshot "$SNAP" >/dev/null 2>&1 )
+printf 'original tracked content\ncontaminating edit\n' > "$REPO/tracked_source.py"
+
+GHDIR=$(mktemp -d)
+make_gh_shim "$GHDIR" success
+
+out1=$( cd "$REPO" && PATH="$GHDIR:$PATH" "$SCRIPT" --baseline "$SNAP" --quarantine \
+        --label "run=RUNID-HOSTLEAK1 issue=9005" 2>&1 ); RC1=$?
+BODY1=$(cat "$GHDIR/gh-body" 2>/dev/null || echo "")
+
+RAW_HOST=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "")
+
+# Run a second quarantine (fresh contamination) to confirm the redacted
+# identifier is stable across invocations on the same host.
+printf 'original tracked content\nsecond contaminating edit\n' > "$REPO/tracked_source.py"
+out2=$( cd "$REPO" && PATH="$GHDIR:$PATH" "$SCRIPT" --baseline "$SNAP" --quarantine \
+        --label "run=RUNID-HOSTLEAK2 issue=9005" 2>&1 ); RC2=$?
+BODY2=$(cat "$GHDIR/gh-body" 2>/dev/null || echo "")
+
+HOST_ID_1=$(printf '%s' "$BODY1" | grep -o 'host-[0-9a-f]\{8\}' || echo "")
+HOST_ID_2=$(printf '%s' "$BODY2" | grep -o 'host-[0-9a-f]\{8\}' || echo "")
+
+if [[ "$RC1" -eq 4 && "$RC2" -eq 4 ]] \
+   && [[ -n "$RAW_HOST" ]] \
+   && [[ "$BODY1" != *"$RAW_HOST"* ]] \
+   && [[ "$BODY2" != *"$RAW_HOST"* ]] \
+   && [[ -n "$HOST_ID_1" ]] \
+   && [[ "$HOST_ID_1" == "$HOST_ID_2" ]] \
+   && [[ "$BODY1" == *"stash@{0}"* ]]; then
+    pass "posted comment body redacts the raw hostname behind a stable host-<hash> identifier"
+else
+    fail "expected no raw hostname in the posted body and a stable host-<hash> id, got rc1=$RC1 rc2=$RC2 raw_host='$RAW_HOST' body1='$BODY1' body2='$BODY2' out1='$out1' out2='$out2'"
 fi
 rm -rf "$GHDIR" "$REPO"
 

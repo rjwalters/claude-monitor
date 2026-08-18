@@ -465,6 +465,125 @@ run_guard 218
 assert_eq "12" "$RC" "(n) Appended commit also invalidates the verdict -> exit 12"
 assert_not_contains "$OUT" "DECISION=FRESH" "(n) Not reported FRESH"
 
+# --- #6319: --anchor, the UNVERIFIABLE remediation -------------------------
+#
+# The gap: the marker exists only because judge.md ASKS the model to append it
+# at ~19 separate verdict-write sites, and production dropped it on roughly
+# one verdict in four. Every dropped marker leaves a verdict label standing
+# that nothing can ever invalidate — the full pre-#5686 hazard, silently, for
+# the life of the label. Until #6319 the unmarked path had exactly one test
+# ((e) above) and no remediation at all.
+
+# (o) An unmarked verdict with --anchor -> ANCHORED (exit 13): a marker is
+#     posted for the CURRENT head, and — critically — NO label is written.
+#     Anchoring is not a verdict; it only makes the standing verdict checkable.
+reset_state
+pr_json 219 "$SHA_B" "loom:pr"
+{ echo "["; plain_comment "2026-08-15T00:00:00Z" "LGTM, approving."; echo "]"; } > "$STUB_DIR/comments-219.json"
+run_guard 219 --clear --anchor
+assert_eq "13" "$RC" "(o) Unmarked verdict with --anchor -> exit 13"
+assert_eq "ANCHORED" "$(get_field "$OUT" DECISION)" "(o) DECISION=ANCHORED"
+assert_eq "1" "$(get_field "$OUT" ANCHORED)" "(o) ANCHORED=1"
+assert_eq "0" "$(get_field "$OUT" CLEARED)" "(o) CLEARED=0 — anchoring is not a clear"
+assert_eq "$SHA_B" "$(get_field "$OUT" MARKER_SHA)" "(o) MARKER_SHA is now the current head"
+assert_eq "" "$WRITES" "(o) NO label writes — the verdict label is left exactly as it was"
+assert_contains "$COMMENTS_POSTED" "<!-- loom:verdict-sha sha=$SHA_B verdict=approved -->" \
+  "(o) Anchor comment carries the marker in the exact scanned format"
+assert_contains "$COMMENTS_POSTED" "not** a review" "(o) Anchor comment disclaims being a review"
+
+# (o2) Idempotency: the anchor comment is exactly what step 3 scans for, so a
+#      second pass reads FRESH and never posts a duplicate. (A guard that
+#      re-anchored every pass would comment-spam every unmarked verdict.)
+reset_state
+pr_json 220 "$SHA_B" "loom:pr"
+{
+  echo "["
+  plain_comment "2026-08-15T00:00:00Z" "LGTM, approving."
+  echo ","
+  verdict_comment "2026-08-15T00:05:00Z" "$SHA_B" "approved"
+  echo "]"
+} > "$STUB_DIR/comments-220.json"
+run_guard 220 --clear --anchor
+assert_eq "0" "$RC" "(o2) Re-run after anchoring -> exit 0 (FRESH)"
+assert_eq "FRESH" "$(get_field "$OUT" DECISION)" "(o2) DECISION=FRESH on the second pass"
+assert_eq "" "$COMMENTS_POSTED" "(o2) No duplicate anchor comment"
+assert_eq "" "$WRITES" "(o2) Still no label writes"
+
+# (o3) --anchor is suppressed on an explicit hold, exactly like --clear: a PR
+#      a human parked should not collect automated comments either.
+reset_state
+pr_json 221 "$SHA_B" "loom:pr" "loom:blocked"
+{ echo "["; plain_comment "2026-08-15T00:00:00Z" "LGTM."; echo "]"; } > "$STUB_DIR/comments-221.json"
+run_guard 221 --clear --anchor
+assert_eq "11" "$RC" "(o3) Unmarked verdict on a held PR -> still exit 11"
+assert_eq "UNVERIFIABLE" "$(get_field "$OUT" DECISION)" "(o3) DECISION stays UNVERIFIABLE on a hold"
+assert_eq "0" "$(get_field "$OUT" ANCHORED)" "(o3) ANCHORED=0 on a hold"
+assert_contains "$OUT" "anchor suppressed" "(o3) REASON explains the suppression"
+assert_eq "" "$COMMENTS_POSTED" "(o3) No comment posted on a held PR"
+assert_eq "" "$WRITES" "(o3) No label writes on a held PR"
+
+# (o4) THE REGRESSION THAT MATTERS: a verdict that ALREADY carries a marker
+#      must behave byte-for-byte as before --anchor existed. Passing --anchor
+#      alongside --clear must not divert a STALE verdict into the anchor path
+#      (which would re-bless a stale approval by stamping it at the new head).
+reset_state
+pr_json 222 "$SHA_C" "loom:pr"
+{ echo "["; verdict_comment "2026-08-08T03:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-222.json"
+run_guard 222 --clear --anchor
+assert_eq "12" "$RC" "(o4) Marked stale approval with --anchor -> still exit 12 (STALE)"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(o4) Stale approval still cleared"
+assert_eq "0" "$(get_field "$OUT" ANCHORED)" "(o4) ANCHORED=0 — a marked verdict is never anchored"
+assert_eq "$SHA_A" "$(get_field "$OUT" MARKER_SHA)" "(o4) MARKER_SHA is still the ORIGINAL recorded SHA"
+assert_contains "$WRITES" "--remove-label loom:pr" "(o4) Stale approval removed as before"
+assert_not_contains "$COMMENTS_POSTED" "<!-- loom:verdict-sha sha=$SHA_C" \
+  "(o4) No anchor marker stamped at the new head"
+
+# (o5) --anchor on a FRESH verdict is a no-op (nothing to remediate).
+reset_state
+pr_json 223 "$SHA_A" "loom:changes-requested"
+{ echo "["; verdict_comment "2026-08-08T02:22:00Z" "$SHA_A" "changes-requested"; echo "]"; } > "$STUB_DIR/comments-223.json"
+run_guard 223 --anchor
+assert_eq "0" "$RC" "(o5) --anchor on a fresh verdict -> exit 0"
+assert_eq "0" "$(get_field "$OUT" ANCHORED)" "(o5) ANCHORED=0"
+assert_eq "" "$COMMENTS_POSTED" "(o5) No comment on a fresh verdict"
+
+# (o6) Anchor comment-write failure -> exit 1 with ANCHORED=0, so the caller
+#      knows the verdict is STILL unverifiable rather than believing it was
+#      remediated. No labels touched either way.
+reset_state
+pr_json 224 "$SHA_B" "loom:changes-requested"
+{ echo "["; plain_comment "2026-08-15T00:00:00Z" "Please fix."; echo "]"; } > "$STUB_DIR/comments-224.json"
+touch "$STUB_DIR/comment-fail-224"
+run_guard 224 --clear --anchor
+assert_eq "1" "$RC" "(o6) Anchor comment failure -> exit 1"
+assert_eq "0" "$(get_field "$OUT" ANCHORED)" "(o6) ANCHORED=0 when the anchor write failed"
+assert_eq "UNVERIFIABLE" "$(get_field "$OUT" DECISION)" "(o6) Still reported UNVERIFIABLE"
+assert_eq "" "$WRITES" "(o6) No label writes when the anchor failed"
+
+# (o7) Anchoring is per verdict KIND: the PR holds loom:changes-requested but
+#      only an `approved` marker exists (the (f2) mixed-fleet case). The
+#      anchor must be stamped under the CURRENTLY-HELD kind, or the verdict
+#      stays unverifiable forever.
+reset_state
+pr_json 225 "$SHA_B" "loom:changes-requested"
+{ echo "["; verdict_comment "2026-08-08T03:10:00Z" "$SHA_B" "approved"; echo "]"; } > "$STUB_DIR/comments-225.json"
+run_guard 225 --anchor
+assert_eq "13" "$RC" "(o7) Marker of the wrong kind is still unmarked -> anchored, exit 13"
+assert_contains "$COMMENTS_POSTED" "<!-- loom:verdict-sha sha=$SHA_B verdict=changes-requested -->" \
+  "(o7) Anchor stamped under the currently-held verdict kind"
+
+# (o8) Default (no --anchor) is unchanged: an unmarked verdict is reported
+#      UNVERIFIABLE and remediated by nothing. Existing callers that have not
+#      opted in see byte-for-byte the pre-#6319 behavior.
+reset_state
+pr_json 226 "$SHA_B" "loom:pr"
+{ echo "["; plain_comment "2026-08-15T00:00:00Z" "LGTM."; echo "]"; } > "$STUB_DIR/comments-226.json"
+run_guard 226 --clear
+assert_eq "11" "$RC" "(o8) No --anchor -> exit 11 as before"
+assert_eq "0" "$(get_field "$OUT" ANCHORED)" "(o8) ANCHORED=0 without --anchor"
+assert_eq "" "$COMMENTS_POSTED" "(o8) No comment without --anchor"
+assert_eq "" "$WRITES" "(o8) No label writes without --anchor"
+
 # --- Summary -------------------------------------------------------------
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

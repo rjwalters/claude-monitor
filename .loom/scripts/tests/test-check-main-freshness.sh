@@ -369,6 +369,52 @@ else
     fail "plain up-to-date fixture unexpectedly warned: $stderr_out"
 fi
 
+# -------- Test 13: behind, with no resync source tree available -> the
+# "run resync" remediation ALSO warns about the missing precondition (#6202) --------
+# This is the exact scenario reported in #6202: a plain consumer clone that
+# never ran install.sh has no defaults/hooks|scripts, no .loom/loom-source-path,
+# and no install-metadata.json "loom_source" — so following the standard
+# remediation ("run resync-installed.sh") fails on first use. The behind-branch
+# warning must now say so up front.
+echo "Test 13: behind + no resync source tree warns about the missing precondition (#6202)"
+make_fixture
+advance_origin
+clone="$WORKDIR/clone"
+rm -rf "$clone/defaults" "$clone/.loom"   # ensure no source tree is resolvable
+stderr_out="$(cd "$clone" && "$SCRIPT" 2>&1 >/dev/null)"
+if printf '%s' "$stderr_out" | grep -q "6202"; then
+    pass "behind-with-no-source-tree warning references issue #6202"
+else
+    fail "behind-with-no-source-tree warning missing #6202 reference. Got: $stderr_out"
+fi
+if printf '%s' "$stderr_out" | grep -q "loom-source-path"; then
+    pass "behind-with-no-source-tree warning names the loom-source-path sidecar fix"
+else
+    fail "behind-with-no-source-tree warning missing the loom-source-path fix. Got: $stderr_out"
+fi
+
+# -------- Test 14: behind, but a resync source tree IS resolvable via
+# .loom/loom-source-path -> no missing-precondition note (#6202) --------
+echo "Test 14: behind + resolvable .loom/loom-source-path prints no missing-precondition note (#6202)"
+make_fixture
+advance_origin
+clone="$WORKDIR/clone"
+rm -rf "$clone/defaults"
+src_clone="$WORKDIR/loom-source"
+mkdir -p "$src_clone/defaults/scripts" "$clone/.loom"
+printf '%s' "$src_clone" > "$clone/.loom/loom-source-path"
+stderr_out="$(cd "$clone" && "$SCRIPT" 2>&1 >/dev/null)"
+if printf '%s' "$stderr_out" | grep -qi "behind"; then
+    pass "behind-with-resolvable-source still prints the behind warning"
+else
+    fail "behind-with-resolvable-source lost the behind warning. Got: $stderr_out"
+fi
+if ! printf '%s' "$stderr_out" | grep -q "6202"; then
+    pass "behind-with-resolvable-source prints no missing-precondition note"
+else
+    fail "behind-with-resolvable-source unexpectedly warned about a missing precondition. Got: $stderr_out"
+fi
+
 # -------- Summary --------
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

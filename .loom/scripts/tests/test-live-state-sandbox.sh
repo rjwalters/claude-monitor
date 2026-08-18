@@ -310,6 +310,149 @@ check "$(
 )" \
     "LOOM_DAEMON_STOP_DRYRUN=1 bypasses the guard for the real labels (the supported dry-run seam)"
 
+# ============================================================
+# 10. $PWD is a resolution tier too (#6386): the lifecycle scripts derive
+#     DAEMON_STATE_HOME from `find_repo_root`'s walk up from the cwd, so a
+#     suite launched from the LIVE checkout hands every sub-invocation that
+#     forgets its own `cd` the live `.loom` as its state home. That is the 11h
+#     fleet-dispatcher outage. init now `cd`s into the sandbox and gives it a
+#     `.loom/`, so the cwd tier lands in scratch by default.
+# ============================================================
+
+# 10a. init leaves the caller standing in the sandbox.
+cwd10=$(
+    eval "$NEUTRAL_ENV"
+    export HOME="$FAKE_HOME"
+    cd "$FAKE_REPO" || exit 1
+    live_state_sandbox_init "$WORKDIR/sandbox10" >/dev/null 2>&1
+    pwd -P
+)
+check "$([[ "$cwd10" == "$(cd "$WORKDIR/sandbox10" && pwd -P)" ]] && echo 0 || echo 1)" \
+    "init cds the caller into the sandbox root, off the live checkout (#6386)" \
+    "cwd after init: $cwd10"
+
+# 10b. …and the sandbox is a VALID workspace root, so find_repo_root's walk
+#      stops there instead of continuing up into the live checkout. (A cd into
+#      a dir with no `.loom` would keep walking and land right back on it.)
+root10=$(
+    eval "$NEUTRAL_ENV"
+    export HOME="$FAKE_HOME"
+    cd "$FAKE_REPO" || exit 1
+    live_state_sandbox_init "$WORKDIR/sandbox10" >/dev/null 2>&1
+    _lss_repo_root_from "$PWD"
+)
+check "$([[ "$root10" == "$WORKDIR/sandbox10" ]] && echo 0 || echo 1)" \
+    "the sandbox root has its own .loom/, so the cwd tier resolves to scratch, not the checkout (#6386)" \
+    "repo root from cwd: $root10 (checkout is $FAKE_REPO)"
+
+# 10c. Without the cd, the same walk lands on the live checkout — the tier this
+#      hardening closes is real, not hypothetical. (Guards against 10a/10b
+#      passing vacuously if the fixture stopped being reachable.)
+root10c=$(
+    eval "$NEUTRAL_ENV"
+    export HOME="$FAKE_HOME"
+    cd "$FAKE_REPO" || exit 1
+    _lss_repo_root_from "$PWD"
+)
+check "$([[ "$root10c" == "$FAKE_REPO" ]] && echo 0 || echo 1)" \
+    "control: without the cd, the cwd tier resolves to the live checkout" \
+    "repo root from cwd: $root10c"
+
+# 10d. A cd that CANNOT succeed is fatal and loud, never a silent half-armed
+#      sandbox: the paths are exported but the cwd tier is still aimed at
+#      wherever the suite was launched from, which is the dangerous half.
+mkdir -p "$WORKDIR/blocked" && : > "$WORKDIR/blocked/notadir"
+case10d_err="$WORKDIR/case10d.err"
+(
+    eval "$NEUTRAL_ENV"
+    export HOME="$FAKE_HOME"
+    cd "$FAKE_REPO" || exit 1
+    live_state_sandbox_init "$WORKDIR/blocked/notadir/sandbox" >/dev/null
+) 2>"$case10d_err"
+rc10d=$?
+check "$([[ "$rc10d" -ne 0 ]] && echo 0 || echo 1)" \
+    "init FAILS when it cannot cd into the sandbox root (rc=$rc10d, #6386)"
+check "$(grep -q '6386' "$case10d_err" && echo 0 || echo 1)" \
+    "the failed-cd message explains that find_repo_root can still escape" "$(cat "$case10d_err")"
+
+# ============================================================
+# 11. init's failure return must be CHECKED by its callers (#6420).
+#
+#     10d proves the helper fails loudly. That is only half the contract: the
+#     CI suites run under `set -uo pipefail` with NO `-e`, so a BARE
+#     `live_state_sandbox_init …` swallows that failure and carries on with a
+#     half-armed sandbox — env paths redirected, but the cwd tier still aimed
+#     at wherever the suite was launched from (a live checkout, in the #6386
+#     incident) — while driving the real lifecycle scripts.
+# ============================================================
+
+# 11a. Structural: every call site in the four daemon-lifecycle suites checks
+#      the return code (`if ! …` or `… || …`). Enumerated from the files
+#      themselves so a NEW bare call site fails this suite rather than being
+#      discovered on a fleet host.
+GUARDED_CALLERS=(
+    test-loom-daemon-start.sh
+    test-loom-daemon-stop.sh
+    test-loom-daemon-update.sh
+    test-loom-daemon-quiesce.sh
+)
+unchecked=""
+no_call=""
+for suite in "${GUARDED_CALLERS[@]}"; do
+    suite_file="$SCRIPT_DIR/$suite"
+    call_lines="$(grep -nE '^[^#]*live_state_sandbox_init[[:space:]]+"' "$suite_file" 2>/dev/null)"
+    if [[ -z "$call_lines" ]]; then
+        no_call="$no_call $suite"
+        continue
+    fi
+    while IFS= read -r call_line; do
+        [[ -n "$call_line" ]] || continue
+        if [[ "$call_line" != *"if ! "* && "$call_line" != *"||"* ]]; then
+            unchecked="$unchecked
+    $suite:$call_line"
+        fi
+    done <<< "$call_lines"
+done
+check "$([[ -z "$no_call" ]] && echo 0 || echo 1)" \
+    "every daemon-lifecycle suite still calls live_state_sandbox_init (the check below is not vacuous)" \
+    "no call site found in:$no_call"
+check "$([[ -z "$unchecked" ]] && echo 0 || echo 1)" \
+    "no daemon-lifecycle suite calls live_state_sandbox_init bare — every call site checks its rc (#6420)" \
+    "unchecked call sites:$unchecked"
+
+# 11b. Behavioural: the guarded shape actually aborts, and the bare shape
+#      actually does NOT (the reason 11a is worth enforcing). Both run the same
+#      guaranteed-failing init as 10d, in a scratch script that mirrors a
+#      suite's own `set -uo pipefail` preamble.
+cat > "$WORKDIR/mini-suite-guarded.sh" <<MINI
+#!/usr/bin/env bash
+set -uo pipefail
+source "$SCRIPT_DIR/lib/live-state-sandbox.sh"
+if ! live_state_sandbox_init "$WORKDIR/blocked/notadir/sandbox"; then
+    echo "ABORTED"
+    exit 1
+fi
+echo "REACHED-THE-CASES"
+MINI
+guarded_out="$(bash "$WORKDIR/mini-suite-guarded.sh" 2>/dev/null)"
+guarded_rc=$?
+check "$([[ "$guarded_rc" -ne 0 && "$guarded_out" == *"ABORTED"* && "$guarded_out" != *"REACHED-THE-CASES"* ]] && echo 0 || echo 1)" \
+    "a checked call site aborts before any case runs when init fails (rc=$guarded_rc, #6420)" \
+    "output: $guarded_out"
+
+cat > "$WORKDIR/mini-suite-bare.sh" <<MINI
+#!/usr/bin/env bash
+set -uo pipefail
+source "$SCRIPT_DIR/lib/live-state-sandbox.sh"
+live_state_sandbox_init "$WORKDIR/blocked/notadir/sandbox"
+echo "REACHED-THE-CASES"
+MINI
+bare_out="$(bash "$WORKDIR/mini-suite-bare.sh" 2>/dev/null)"
+bare_rc=$?
+check "$([[ "$bare_rc" -eq 0 && "$bare_out" == *"REACHED-THE-CASES"* ]] && echo 0 || echo 1)" \
+    "control: a BARE call site sails past the same failure under set -uo pipefail (rc=$bare_rc, #6420)" \
+    "output: $bare_out"
+
 echo
 echo "Ran $TESTS_RUN tests: $TESTS_PASSED passed, $TESTS_FAILED failed"
 [[ "$TESTS_FAILED" -eq 0 ]]

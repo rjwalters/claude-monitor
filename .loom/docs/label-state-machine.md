@@ -241,7 +241,7 @@ without a sub-kind in the same argument.
 
 ## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
 
-A fleet-wide census (2AMLogic/2am#184) found `loom:operator-only` carrying at
+A fleet-wide census (example-org/fleet-repo#301) found `loom:operator-only` carrying at
 least two very different populations under one label: issues that are
 genuinely **operator-by-right** (disclosure flips, spending, legal, tier
 grants, fleet membership — a human must rule regardless of tooling), and
@@ -269,11 +269,11 @@ the same way). Nothing about *routing* differs yet — only the label's
 *meaning* is narrower, and the description now records which capability
 request must land before a human should reconsider it. This issue (#5817) was
 deliberately scoped to the split only; **which label to apply when** and the
-bidirectional routing convention are addressed below (2AMLogic/2am#184's
+bidirectional routing convention are addressed below (example-org/fleet-repo#301's
 remaining asks, #5818).
 
 **Additive only.** No existing `loom:operator-only` issue is retagged as part
-of introducing this label — 2AMLogic/2am#184 explicitly rejected retrofitting
+of introducing this label — example-org/fleet-repo#301 explicitly rejected retrofitting
 the existing backlog ("retrofitting 120 issues is not proposed; apply going
 forward"). The value is in the intake rate for newly filed/curated issues,
 the same "no backfill" principle the operator-only sub-kinds above already
@@ -282,18 +282,18 @@ follow.
 ## Bidirectional routing: `loom:operator-only` ↔ `loom:needs-capability` (#5818)
 
 Splitting the label (#5817, above) answers "which label applies to a *new*
-block." This section answers the other half of 2AMLogic/2am#184's asks: what
+block." This section answers the other half of example-org/fleet-repo#301's asks: what
 an agent does when it re-reads an **existing** `loom:operator-only` issue and
 recognizes the block was never actually operator-by-right — it is unbuilt
 capability that got parked under the cautious label before this split
 existed, or before whoever applied it thought to look for the distinction.
 
-**The worked example that motivated this.** 2AMLogic/2am#184 traced this
-exact shape through `gf180-pll`'s spec-ratification issue, which held three
+**The worked example that motivated this.** example-org/fleet-repo#301 traced this
+exact shape through an analog-canary repo's spec-ratification issue, which held three
 canaries because it was labeled `loom:operator-only` and nobody had connected
 "operator-only" to "the capability this needs — `spec-review`'s ratify
 verdict — already exists, it is just forbidden from acting on its own
-output." The fix, 2AMLogic/klayout-tools#654, promoted `spec-review`'s ratify
+output." The fix, example-org/tool-repo#204, promoted `spec-review`'s ratify
 verdict from advisory to binding: a tool change in the repo that owns the
 capability, not a human ruling at all. Recognizing that shape earlier — a
 capability that exists but is deliberately non-authoritative, not a decision

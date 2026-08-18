@@ -28,7 +28,7 @@
 # Installation selection is DERIVABLE, not configured: `GET
 # /repos/{owner}/{repo}/installation` (JWT-authed) resolves the installation
 # for any repo the app can see, cached per-owner so a fleet spanning multiple
-# GitHub accounts/orgs (e.g. rjwalters vs 2AMLogic) resolves the right
+# GitHub accounts/orgs (e.g. rjwalters vs example-org) resolves the right
 # installation for whichever repo it is currently operating on.
 #
 # # Fallback-first (the load-bearing default)
@@ -56,10 +56,12 @@
 # Usage (executable):
 #   ./github-app-token.sh status                 # cheap, no network
 #   ./github-app-token.sh get-token OWNER/REPO    # mints/reuses a token
+#   ./github-app-token.sh get-token --force OWNER/REPO   # ignores the cache
 #
 # Usage (sourced, for tests / advanced callers):
 #   source ".../lib/github-app-token.sh"
 #   github_app_configured && github_app_get_token "owner/repo"
+#   github_app_configured && github_app_get_token "owner/repo" force
 
 set -euo pipefail
 
@@ -368,14 +370,26 @@ _github_app_api_mint_token() {
 
 # --- Top-level entry point ---
 
-# github_app_get_token <owner/repo> -> echoes a valid installation token on
-# stdout, minting or reusing the cache as needed. On success also sets
+# github_app_get_token <owner/repo> [force] -> echoes a valid installation
+# token on stdout, minting or reusing the cache as needed. On success also sets
 # GITHUB_APP_INSTALLATION_ID and GITHUB_APP_TOKEN_EXPIRES_AT (non-secret).
 # Returns 1 (with $_GH_APP_LAST_ERROR set) on any failure -- callers MUST
 # treat that as "fall back to ambient auth", not a hard error (#4430 AC:
 # expired/revoked/unreadable key falls back rather than hard-failing).
+#
+# A non-empty second argument (`force`) BYPASSES the token cache and always
+# mints (#6074). An installation token is minted with the permissions the
+# installation held at mint time and is then reused for up to ~1h, so a
+# permission grant that has *already propagated* on GitHub's side is still
+# invisible to every caller until that cached token ages out -- the exact
+# window that made a Builder's `git push` succeed (Contents:write, present in
+# the cached token) while `gh pr create` returned `403 Resource not accessible
+# by integration`. Forcing a fresh mint collapses that window from ~1h to one
+# API round-trip. The freshly minted token overwrites the cache, so the
+# recovery is shared with every later caller on this host rather than being
+# re-paid per call site.
 github_app_get_token() {
-  local nwo="$1"
+  local nwo="$1" force="${2:-}"
   if ! github_app_configured; then
     return 1
   fi
@@ -397,7 +411,10 @@ github_app_get_token() {
   fi
 
   local cached token expires_at expires_epoch
-  cached=$(_github_app_read_cache "$installation_id" || echo "")
+  cached=""
+  if [[ -z "$force" ]]; then
+    cached=$(_github_app_read_cache "$installation_id" || echo "")
+  fi
   if [[ -n "$cached" ]]; then
     token=$(echo "$cached" | jq -r '.token')
     expires_at=$(echo "$cached" | jq -r '.expires_at')
@@ -444,7 +461,16 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
       ;;
     get-token)
       shift || true
-      _nwo="${1:-}"
+      # `--force` may appear before or after the owner/repo argument (#6074).
+      _gh_app_force=""
+      _nwo=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --force) _gh_app_force="force" ;;
+          *) _nwo="$1" ;;
+        esac
+        shift
+      done
       if [[ -z "$_nwo" ]]; then
         jq -cn '{status:"error", message:"owner/repo argument required"}'
         exit 0
@@ -464,7 +490,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
       # trailing-newline-terminated line -- the token), then split the
       # captured 3-line output back apart out here (#5401).
       if _gh_app_out=$(
-        github_app_get_token "$_nwo" &&
+        github_app_get_token "$_nwo" "$_gh_app_force" &&
           printf '%s\n%s' "$GITHUB_APP_INSTALLATION_ID" "$GITHUB_APP_TOKEN_EXPIRES_AT"
       ); then
         _gh_app_token="${_gh_app_out%%$'\n'*}"
@@ -479,7 +505,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
       fi
       ;;
     *)
-      echo "Usage: github-app-token.sh {status|get-token OWNER/REPO}" >&2
+      echo "Usage: github-app-token.sh {status|get-token [--force] OWNER/REPO}" >&2
       exit 64
       ;;
   esac

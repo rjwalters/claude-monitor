@@ -491,6 +491,9 @@ Full policy, TTL/invalidation semantics, and the manual verification steps:
     Execute automatable steps and document results in evaluation comment.
     Flag observation-only steps as "not executed — requires manual verification."
     (See Test Plan Execution section below for details.)
+    **Exception**: if the diff touches browser-driving / scraper / DOM-parsing
+    code, "manually test in browser" is NOT a flag-and-move-on step — see
+    "Live Verification for Browser-Driving / Scraper / DOM-Parsing PRs".
 8. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
 9. **Evaluate changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `gh pr comment` to provide evaluation feedback
@@ -737,11 +740,13 @@ completion write — see `doctor.md`'s "Verdict-Time CAS Recheck".
 - [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`)
 - [ ] I will NEVER call `gh pr review` in any form
 - [ ] I will run `gh pr comment` AND `gh pr edit` atomically (chained with `&&`)
-- [ ] If my review body came from a scratch file, I passed it via `--body-file
-      <path>` (or `gh api -F body=@<path>`) — NEVER `--body @<path>` (see the
-      `--body @path` anti-pattern warning above) — and I re-fetched the posted
-      comment (`gh pr view <number> --comments` or `gh api
-      .../issues/<number>/comments`) to verify it renders my actual review
+- [ ] If my review body came from a scratch file, the filename is namespaced by
+      the PR/issue number (`review-<N>.md`, never a fixed name like
+      `review.md` — wave subagents share one scratchpad, #6381), I passed it
+      via `--body-file <path>` (or `gh api -F body=@<path>`) — NEVER `--body
+      @<path>` (see the `--body @path` anti-pattern warning above) — and I
+      re-fetched the posted comment (`gh pr view <number> --comments` or `gh
+      api .../issues/<number>/comments`) to verify it renders my actual review
       prose, not a literal path string
 - [ ] My verdict comment ends with the `<!-- loom:verdict-sha sha=$VERDICT_SHA
       verdict=approved|changes-requested -->` marker, using the SHA from the
@@ -785,6 +790,22 @@ and the trivial-fix approval. A verdict written without a marker is
 kept, never force-cleared), which means an unmarked stale approval keeps
 exactly the pre-#5686 danger. Do not skip the marker.
 
+**This instruction is not the enforcement mechanism, and it never was
+(#6319).** Measured in production, the marker was dropped on roughly one
+verdict in four — by the same judge identity, in the same 90-minute window,
+so it is a compliance rate, not a stale prompt. In the observed case an
+unmarked approval was auto-merged 24 seconds later; a force-push in that
+window would have gone undetected. Two mechanical backstops now cover the
+omission: the stale-verdict sweep below runs the guard with `--anchor`, and
+`loom-daemon`'s `reconcile_pr_verdicts` anchors on its periodic tick. Both
+post the missing marker at whatever the head is *when they run*.
+
+**That is a bound on future exposure, not a repair.** Neither backstop knows
+which tree you actually reviewed — if the head moved between your verdict and
+the anchor, they anchor an approval to a tree nobody read, and it will then
+read as `FRESH`. Only the marker *you* write at verdict time records the truth.
+Stamp it.
+
 **Only stamp genuine verdicts.** Stand-down notes, progress comments,
 fallback-queue notes, and the stale-verdict notice itself are not verdicts and
 must NOT carry this marker — stamping one would make a non-verdict look like a
@@ -800,13 +821,31 @@ nothing would ever look at it again. Sweep those two queues first:
 ```bash
 # Report-and-act gate; one call per candidate PR. Exit codes:
 #   0 = FRESH (verdict matches current head), 10 = no verdict label,
-#   11 = UNVERIFIABLE (no marker — fail safe, verdict kept),
-#   12 = STALE (cleared + re-queued when --clear is passed), 1 = gh/env error.
+#   11 = UNVERIFIABLE (no marker AND could not anchor — fail safe, kept),
+#   12 = STALE (cleared + re-queued when --clear is passed),
+#   13 = ANCHORED (no marker; --anchor stamped one at the current head, #6319),
+#   1 = gh/env error.
+UNANCHORED=""; ANCHORED=""
 for PR in $("$GH_READ" pr list --state=open --limit 200 --json number,labels \
     --jq '.[] | select([.labels[].name] | any(. == "loom:pr" or . == "loom:changes-requested")) | .number'); do
-  ./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear || true
+  ./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear --anchor
+  case "$?" in
+    13) ANCHORED="$ANCHORED #$PR" ;;
+    11) UNANCHORED="$UNANCHORED #$PR" ;;
+  esac
 done
+[ -n "$ANCHORED" ] && echo "ANCHORED (marker was missing, stamped at current head):$ANCHORED"
+[ -n "$UNANCHORED" ] && echo "UNVERIFIABLE (still unanchored — do NOT trust these verdicts):$UNANCHORED"
 ```
+
+**Do not write `|| true` here (#6319).** That is what this loop used to do,
+and it discarded the one outcome that looks like success and is not:
+`UNVERIFIABLE` means a verdict label is standing that *nothing can ever
+invalidate*. Passing `--anchor` fixes most of them (the guard stamps the
+missing marker; it writes no labels, so nothing is approved, rejected, or
+un-parked by doing so), and the residual `11`s are exactly the PRs an operator
+needs named — typically ones on a `loom:blocked` / `loom:operator` /
+`loom:operator-only` hold, where the guard deliberately declines to comment.
 
 The guard removes the stale verdict label (plus its per-tree companions
 `loom:ci-failure` / `loom:merge-conflict`), adds `loom:review-requested`, and
@@ -826,8 +865,11 @@ fresh evaluation. Do not carry over any conclusion from the cleared verdict.
 
 **Daemon backstop**: `loom-daemon`'s `claim_reconciliation` pass runs the same
 decision (`reconcile_pr_verdicts`) on its periodic tick, so a stale verdict is
-cleared even when no Judge pass happens to run. This sweep is the fast path,
-not the only path — see `daemon-reference.md` → "Stale-verdict reconciliation".
+cleared even when no Judge pass happens to run. It also runs the same
+anchoring remediation and counts every `UNVERIFIABLE` verdict it sees, so an
+unmarked verdict cannot survive more than one tick unanchored (#6319; kill
+switch `LOOM_VERDICT_ANCHOR=0`). This sweep is the fast path, not the only
+path — see `daemon-reference.md` → "Stale-verdict reconciliation".
 
 **This is a distinct concern from the stand-down/claim logic above.** Claim
 staleness asks "is the *reviewer* still alive?"; verdict staleness asks "is
@@ -1061,6 +1103,8 @@ ISSUE_NUM=$(gh pr view <number> --json headRefName --jq '.headRefName' | sed 's/
 if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
     echo "Builder worktree exists - using it directly"
     cd ".loom/worktrees/issue-${ISSUE_NUM}"
+    # Verify it actually reflects this PR before evaluating anything in it —
+    # see "Verify the Worktree Matches the PR Before Using It" below.
 else
     # No builder worktree — self-cleaning worktree via pr-worktree.sh, not a
     # bare checkout in the current directory
@@ -1068,6 +1112,47 @@ else
     cd ".loom/worktrees/pr-<number>"
 fi
 ```
+
+### Verify the Worktree Matches the PR Before Using It (#6257)
+
+**Reusing an existing builder worktree is a `cd`, not a checkout — nothing about it re-verifies the worktree still reflects the PR.** A worktree left behind by an earlier Builder/Judge/Doctor pass can drift: local `HEAD` can sit behind the PR's actual pushed tip (a later push from another session never pulled into this copy), leftover uncommitted WIP from an interrupted session can still be sitting in the tree, and (per #6095/#6100) the branch's upstream tracking ref can be pointed at the wrong remote branch. `worktree.sh`'s upstream-tracking correction and drift check run on its own invocation — **not** automatically just because you `cd` into a directory that already exists, so do not assume either already happened.
+
+Immediately after the `cd` above, before any evaluation touches the code —
+**pin the worktree path once into `WORKTREE_ABS` and use `git -C
+"$WORKTREE_ABS" ...` for every check below, never a bare `git status`/`git
+rev-parse` that relies on the `cd` still being in effect.** A `cd` earlier in
+the same shell session persists for every command that follows it in that
+session, including a later, unrelated command you intended for a *different*
+directory (e.g. the main checkout) — that silent redirection is exactly what
+made a prior Judge falsely report both a worktree and the main checkout clean
+from a single `cd`'d `git status` (#6373). `-C` makes the target directory
+explicit in the command itself, so it can't be hijacked by a stale `cd`:
+
+```bash
+WORKTREE_ABS="$(pwd)"   # already inside the worktree from the `cd` above
+PR_HEAD_SHA=$(gh pr view <number> --json headRefOid --jq '.headRefOid')
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD)
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain)
+
+if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
+    echo "Worktree drift detected (HEAD=$WT_HEAD_SHA, PR head=$PR_HEAD_SHA, dirty=$([ -n "$WT_STATUS" ] && echo yes || echo no)) - resyncing"
+    # Preserve any uncommitted WIP first (never a bare `git stash` — see
+    # "Never use bare `git stash` for ad-hoc WIP" in doctor.md):
+    if [ -n "$WT_STATUS" ]; then
+        ./.loom/scripts/worktree.sh snapshot "$ISSUE_NUM" --include-untracked
+        git -C "$WORKTREE_ABS" checkout -- .
+    fi
+    git -C "$WORKTREE_ABS" pull --ff-only
+fi
+```
+
+Only proceed to evaluation once `WT_HEAD_SHA` matches `PR_HEAD_SHA` and `WT_STATUS` is empty. If `git pull --ff-only` fails (local history has actually diverged, not just fallen behind), do not force anything — fall back to `git fetch && git reset --hard origin/feature/issue-${ISSUE_NUM}` then re-point the upstream (`git branch --set-upstream-to=origin/feature/issue-${ISSUE_NUM}`), same as the manual recovery `doctor.md` documents under "Expected worktree state after setup".
+
+If your evaluation also needs to state that the main checkout is clean (e.g.
+confirming a contamination scare is resolved), name `$WORKTREE_ABS` and the
+main-checkout path explicitly in that claim, and check the main checkout with
+`./.loom/scripts/check-main-clean.sh` — never a second bare `git status` in
+the same session.
 
 ### Why This Matters
 
@@ -1741,14 +1826,18 @@ gh issue view <issue-number> --json labels -q '.labels[].name' | grep -qx 'loom:
 
 ```bash
 # Get current PR description
-gh pr view <number> --json body -q .body > /tmp/pr-body.txt
+# Name the scratch file after the PR number, never a fixed constant like
+# /tmp/pr-body.txt — wave subagents share one scratchpad directory, and a
+# fixed filename lets a concurrent Judge/Doctor on a different PR overwrite
+# yours between write and read (#6381). See comment-body-literal-path.md.
+gh pr view <number> --json body -q .body > /tmp/pr-body-<number>.txt
 
 # Edit the file to add "Closes #XXX" line
 # (Use your editor or sed)
-echo -e "\nCloses #123" >> /tmp/pr-body.txt
+echo -e "\nCloses #123" >> /tmp/pr-body-<number>.txt
 
 # Update PR with corrected description
-gh pr edit <number> --body-file /tmp/pr-body.txt
+gh pr edit <number> --body-file /tmp/pr-body-<number>.txt
 ```
 
 **Step 3: Document the change in your comment** (run the Verdict-Time CAS Recheck immediately before the `gh pr edit` below)
@@ -1933,7 +2022,7 @@ gh pr view <number> --json body --jq '.body'
 | Category | Examples | Action |
 |----------|----------|--------|
 | **Automatable** | "run `pnpm test:unit`", "verify output contains X", "check file Z exists", "run `pnpm check:ci`" | Execute and capture output |
-| **Observation-only** | "watch for N seconds", "start daemon and observe", "verify UI behavior", "manually test in browser" | Flag as not executed |
+| **Observation-only** | "watch for N seconds", "start daemon and observe", "verify UI behavior", "manually test in browser" | Flag as not executed — **except** when the diff touches browser-driving / scraper / DOM-parsing code, where "manually test in browser" is not sufficient on its own: see "Live Verification for Browser-Driving / Scraper / DOM-Parsing PRs" below |
 | **Long-running (>2 min)** | "run full integration suite", "stress test for 5 minutes" | Skip with explanation |
 | **External dependency** | "test against staging API", "verify email delivery" | Skip with explanation |
 | **Unclear/ambiguous** | Vague steps without concrete commands | Ask for clarification |
@@ -1971,7 +2060,67 @@ Include a "Test Execution" section in your evaluation comment:
 | All test plan steps are observation-only | Document that none were automatable |
 | Test plan step fails | Report the failure; use judgment on whether to block approval |
 
-**Important:** Test plan execution supplements the evaluation — it is not a blocking requirement. The Judge should use judgment about whether test plan failures warrant requesting changes or are acceptable with a note.
+**Important:** Test plan execution supplements the evaluation — it is not a blocking requirement. The Judge should use judgment about whether test plan failures warrant requesting changes or are acceptable with a note. **The one carve-out is the next subsection**: for a PR touching browser-driving / scraper / DOM-parsing code, the live-verification evidence described there *is* blocking.
+
+### Live Verification for Browser-Driving / Scraper / DOM-Parsing PRs
+
+**Scope — read this first.** This subsection applies **only** to a diff that
+drives a real browser, scrapes a remote page, or parses DOM/HTML the project
+does not itself produce (Puppeteer/Playwright/CDP drivers, `fetch` + HTML
+parsers, catalogue/listing scrapers, selector-based row readers). It does
+**not** apply to ordinary UI work, to a PR that merely renders markup the repo
+owns, or to anything else. If the diff has no such component, the normal
+non-blocking posture above is unchanged — do not invoke this subsection.
+
+**The rule.** For an in-scope PR, "manually tested in browser" (or any
+equivalent unverified assertion of live behavior) is **not sufficient on its
+own** for approval. Approval requires the PR to demonstrate **one** of:
+
+- **(a) A live-response fixture parsed by the real page parser.** The fixture
+  is captured from an actual live response, and the **page-parsing side of any
+  merge/join is produced by running the real page-parsing function**
+  (`readFilmRow`-style — the same function that runs in production) over that
+  captured response. It must not be synthesized by hand, or derived from the
+  same saved payload that produced the expected/data side of the merge.
+- **(b) A recorded live run** performed by whoever holds the shared resource /
+  mutex (the debug browser, the session, the rate-limited endpoint), with the
+  run's output pasted into the PR or a link to it attached. A claim that a
+  live run happened, with no output and no link, does not satisfy this.
+
+**Named review smell: "circular fixture."** Both sides of a merge, join, or
+comparison built from **one** saved payload — so the parser is only ever
+checked against data that already agrees with it, and never meets the page's
+own output. A circular fixture proves the two halves of the test agree; it
+proves nothing about whether the code reads the real page. **Treat it as
+blocking.** Cite it by name ("circular fixture") in your evaluation comment so
+the smell is greppable across reviews.
+
+**Verify it, or block on it — do not file it as a non-blocking follow-up**
+(the same imperative the Performance section applies to N-bound build code). A
+"worth a live check later" note in a Judge review is exactly how a PR ships
+three separate live defects at once.
+
+**Precedent (why this is blocking).** On rjwalters/walters-family-tree, PR
+#371 (a browser-driving catalogue scraper) was built and Judged **offline
+only** — fixture self-tests plus a check against a saved payload — because
+live verification needed a shared debug Chrome behind a mutex. Every fixture
+was circular. The first live run surfaced **three** defects, each needing its
+own fix round: a settle that fired before the table hydrated (0 rows read); a
+hard-coded `catalogs[0]` picking the wrong catalogue while a mirrored table
+double-counted rows; and a zero-padded page ID (`007664503`) that never
+matched the unpadded data ID (`7664503`), so the merge silently produced
+nothing. All three were reachable only by running the real parser against real
+page output.
+
+**What to do when the evidence is absent.** Request changes and name which of
+(a) or (b) you need. If the Builder states live verification was impossible in
+their environment (see `builder.md` → "Live Verification You Cannot Perform"),
+that disclosure is the honest, expected path — but it does **not** convert an
+unverified live-behavior acceptance criterion into a met one. Either hold the
+PR for the resource holder's recorded run, or, if the operator elects to land
+it before live verification, require that a live-verification tracking issue
+is filed and linked from the PR body before you approve, and say plainly in
+your verdict that the live behavior is unverified.
 
 ## Test-First (TDD) Claim Verification
 
@@ -2039,6 +2188,42 @@ When running quality checks (step 7), use **scoped test execution** — run only
 - **Update PR labels correctly**:
   - If approved: Remove `loom:review-requested`, add `loom:pr` (blue badge)
   - If changes needed: Remove `loom:review-requested`, add `loom:changes-requested` (amber badge)
+
+## Measurable Claims Need Their Measurement (or a Marker, #6380)
+
+**A verdict is an input other roles are designed to trust** — a Doctor works
+from what you wrote, a Champion merges on it, and a Curator or Builder
+reading a cross-reference in your comment will reasonably build on it rather
+than re-deriving it. That trust is what makes an unmeasured assertion in a
+verdict more costly than the same guess anywhere else: it's cheap to write
+and expensive to un-believe once it has propagated. In one real sweep, two
+Judges asserted opposite, unmeasured facts about whether a deployed bundle
+stripped comments — the first "appeared" right, the second was stated as
+settled and was simply false; a correction comment had to reconcile both
+after the operator finally ran the grep.
+
+Any claim in your verdict comment that is **measurable** — what a file
+contains, whether a code path is reachable, a count, whether a step actually
+ran — must carry one of:
+
+- **The measurement itself**: the command and its output, however short
+  (`grep -c '^\s*//' dist/worker.js` → `1,842`), or
+- **An explicit unverified marker**: "not measured", "reported by the
+  builder, not re-derived", "inferred from the type declarations" — anything
+  that tells the next reader the claim still needs re-derivation before they
+  build on it.
+
+This covers the PR under review **and advice about other issues offered in
+passing** — "issue #181 won't recover anything here, comments are already
+stripped" needs the same grep behind it that a formal finding would, even
+though it's a parenthetical about a different issue, not the verdict itself.
+See "Observed vs. inferred" below for the same discipline applied to
+follow-up issues you file.
+
+No mechanical check enforces this — grepping verdicts for unsourced claims
+would false-positive constantly on ordinary review prose. The bar is a
+habit: before writing a sentence that states a fact about code or behavior,
+ask whether you ran something to know it, and say so either way.
 
 ## Handling Minor Concerns
 
@@ -2192,10 +2377,13 @@ EOF
 ## Example Commands
 
 ```bash
-# Step 0: clear any verdict that no longer describes its PR's current tree
+# Step 0: clear any verdict that no longer describes its PR's current tree,
+# and anchor any verdict that carries no marker at all (never `|| true` — see
+# "Stale-Verdict Sweep"; exit 11 = still UNVERIFIABLE, 13 = anchored)
 for PR in $("$GH_READ" pr list --state=open --limit 200 --json number,labels \
     --jq '.[] | select([.labels[].name] | any(. == "loom:pr" or . == "loom:changes-requested")) | .number'); do
-  ./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear || true
+  ./.loom/scripts/verdict-staleness-guard.sh "$PR" --clear --anchor
+  [ "$?" -eq 11 ] && echo "UNVERIFIABLE verdict on #$PR — do not trust it"
 done
 
 # Find PRs ready for evaluation (green badges) — cached; see "Cached Forge Reads"

@@ -38,7 +38,16 @@ SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SCRIPTS_DIR/../.." && pwd)"
 
 LOCK_SH="$SCRIPTS_DIR/docs-guide-lock.sh"
-GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+# guide.md is shipped (installed at .claude/commands/loom/guide.md), so
+# resolve it the way each layout actually lays it out: the installed path
+# first (consumer repos, and Loom's own dogfooded checkout), falling back
+# to the defaults/ source-tree path (a bare source checkout with no
+# .claude/commands/loom/ copy yet). See issue #6194 / #6241.
+if [[ -f "$REPO_ROOT/.claude/commands/loom/guide.md" ]]; then
+    GUIDE_MD="$REPO_ROOT/.claude/commands/loom/guide.md"
+else
+    GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -55,6 +64,11 @@ assert_grep() {
     local pattern="$1" file="$2" msg="$3"
     if grep -qE "$pattern" "$file"; then pass "$msg"; else fail "$msg (missing pattern: $pattern)"; fi
 }
+
+if [[ ! -f "$GUIDE_MD" ]]; then
+    echo -e "${RED}FATAL${NC}: guide.md not found at $GUIDE_MD"
+    exit 1
+fi
 
 if [[ ! -x "$LOCK_SH" ]]; then
     fail "docs-guide-lock.sh missing or not executable at $LOCK_SH"

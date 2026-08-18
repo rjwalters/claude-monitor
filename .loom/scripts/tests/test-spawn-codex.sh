@@ -1272,6 +1272,89 @@ assert_eq "0" "$promoted_rc" "doctor + codex is admitted once the manifest decla
 rm -rf "$HOOKTMP"
 
 # ============================================================
+# Section 12: account-provider resolution from the runtime manifest
+#             (issue #5609, design D8)
+# ============================================================
+
+echo ""
+echo "Testing spawn-codex.sh account-provider resolution from the runtime manifest..."
+
+if command -v jq >/dev/null 2>&1; then
+    PROVIDER_WS="$(mktemp -d)"
+    mkdir -p "$PROVIDER_WS/.loom/runtimes"
+
+    PROVIDER_BIN="$TMPROOT/provider-bin"
+    mkdir -p "$PROVIDER_BIN"
+
+    # Fake profile directory the stub daemon hands back via CODEX_HOME —
+    # just enough for the auth.json presence check downstream of selection.
+    FAKE_PROFILE="$TMPROOT/fake-codex-profile"
+    mkdir -p "$FAKE_PROFILE"
+    echo '{"token":"stub"}' > "$FAKE_PROFILE/auth.json"
+
+    PROVIDER_ARGV_LOG="$TMPROOT/provider-argv.log"
+
+    cat > "$PROVIDER_BIN/loom-daemon" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == "tokens" && "\$2" == "select" && "\$3" == "--help" ]]; then
+    echo "--provider <PROVIDER>"
+    exit 0
+fi
+if [[ "\$1" == "tokens" && "\$2" == "select" ]]; then
+    printf '%s\n' "\$*" > "$PROVIDER_ARGV_LOG"
+    echo "export CODEX_HOME='$FAKE_PROFILE'"
+    echo "export LOOM_ACCOUNT_PROVIDER='codex'"
+    echo "export LOOM_ACCOUNT_NAME='stub-account'"
+    echo "LOOM_TOKEN_MODE='inventory'"
+    exit 0
+fi
+echo "unexpected loom-daemon invocation: \$*" >&2
+exit 1
+STUB
+    chmod +x "$PROVIDER_BIN/loom-daemon"
+
+    cat > "$PROVIDER_BIN/codex" <<'STUB'
+#!/usr/bin/env bash
+echo "stub-codex ran: $*"
+exit 0
+STUB
+    chmod +x "$PROVIDER_BIN/codex"
+
+    run_provider_select() {
+        rm -f "$PROVIDER_ARGV_LOG"
+        env -u CODEX_HOME -u LOOM_CODEX_HOME -u LOOM_CODEX_PROFILE -u LOOM_CODEX_NO_EXEC \
+            -u LOOM_SPAWN_NO_EXPORT -u LOOM_ROLE \
+            LOOM_SWEEP_NICE=0 \
+            LOOM_WORKSPACE="$PROVIDER_WS" LOOM_DAEMON_BIN="$PROVIDER_BIN/loom-daemon" \
+            PATH="$PROVIDER_BIN:$PATH" \
+            bash "$SPAWN_CODEX" -p "hi" >/dev/null 2>&1 || true
+        cat "$PROVIDER_ARGV_LOG" 2>/dev/null || echo "<no selection call captured>"
+    }
+
+    # codex.json ships "accountProvider": "codex" -> passed through verbatim
+    # (byte-identical to the pre-#5609 hardcoded behavior).
+    cat > "$PROVIDER_WS/.loom/runtimes/codex.json" <<'JSON'
+{"runtime": "codex", "accountProvider": "codex"}
+JSON
+    argv="$(run_provider_select)"
+    assert_contains "--provider codex" "$argv" \
+        "spawn-codex.sh passes the manifest's accountProvider (codex) to tokens select (#5609)"
+
+    # A runtime manifest present but missing the accountProvider field falls
+    # back to claude (D8's fail-open default), never fails closed.
+    cat > "$PROVIDER_WS/.loom/runtimes/codex.json" <<'JSON'
+{"runtime": "codex"}
+JSON
+    argv="$(run_provider_select)"
+    assert_contains "--provider claude" "$argv" \
+        "a runtime manifest with no accountProvider field defaults to claude (#5609)"
+
+    rm -rf "$PROVIDER_WS"
+else
+    echo "  SKIP: jq unavailable — account-provider resolution needs it"
+fi
+
+# ============================================================
 # Summary
 # ============================================================
 

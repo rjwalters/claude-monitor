@@ -247,17 +247,27 @@ _extract_refs() {
 # True (0) when the bullet is attributable to a DEPENDENCY rather than to the
 # proposal's merits. Both halves are required:
 #
-#   1. a dependency word ("blocked by", "blocker", "depends on", "dependency",
-#      "requires", "prerequisite", "waiting on"), and
+#   1. a dependency word ("blocked by", "blocker", "depends on", "dependent
+#      on", "dependency on"/"dependencies on"/"dependency of"/"dependencies
+#      of", "requires", "prerequisite", "waiting on"), and
 #   2. an actual issue/PR reference.
 #
 # (2) is what keeps ordinary English out of the timing bucket: "Requires a
 # migration plan" and "no dependency injection seam" are merits findings and
 # cite nothing, so they still escalate. A finding that cannot name the thing it
 # is waiting for is not a finding that can self-clear.
+#
+# The bare noun "dependency"/"dependencies" is deliberately EXCLUDED from (1) --
+# only "dependenc(y|ies) on|of" (a verb-phrase-shaped usage, e.g. "hard
+# dependency on #3") counts. A bare noun matches an English section heading
+# just as readily as a real blocker (e.g. a quoted "Dependencies / references"
+# heading, or "Dependencies section") with no dependency relationship implied
+# at all -- that false positive incorrectly un-escalated #4196 (#6112).
+# "dependent on" already covers the adjectival phrasing, so nothing is lost by
+# requiring the noun form to be followed by its preposition.
 is_dependency_finding() {
     local bullet="$1"
-    printf '%s' "$bullet" | grep -qiE '(blocked by|blocker|blocking|blocks|depends on|dependent on|dependenc(y|ies)|requires|prerequisite|waiting on|waits on)' || return 1
+    printf '%s' "$bullet" | grep -qiE '(blocked by|blocker|blocking|blocks|depends on|dependent on|dependenc(y|ies) (on|of)|requires|prerequisite|waiting on|waits on)' || return 1
     printf '%s' "$bullet" | grep -qE '([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+|https?://[^[:space:]),]+/(issues|pull)/[0-9]+' || return 1
     return 0
 }

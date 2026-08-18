@@ -83,7 +83,9 @@ loom-clean --dry-run
 # Non-interactive mode - auto-confirms all prompts (for CI/automation)
 loom-clean --force
 
-# Deep clean - also removes build artifacts (target/, node_modules/)
+# Deep clean - also removes build artifacts (target/, node_modules/) IN FULL,
+# service binaries built there included. --safe does not narrow this (#6127);
+# a directory backing a *running* program is skipped whole, a stopped one is not.
 loom-clean --deep
 
 # Combine flags
@@ -100,7 +102,9 @@ if it errors out instead of running.
 - Removes worktrees for closed GitHub issues (prompts per worktree in interactive mode)
 - Deletes local feature branches for closed issues
 - Cleans up Loom tmux sessions
-- (Optional with `--deep`) Removes `target/` and `node_modules/` directories
+- (Optional with `--deep`) Removes `target/` and `node_modules/` directories —
+  in full, including service binaries built there; see
+  [Never launch a service from a build-output path](#never-launch-a-service-from-a-build-output-path-6127)
 
 **IMPORTANT**: For **CI pipelines and automation**, always use `--force` flag to prevent hanging on prompts:
 ```bash
@@ -118,6 +122,53 @@ so an operator has no other way to notice). Use `loom-clean --tmux-only`
 (optionally with `--force`) outside `--safe` to clean tmux sessions
 explicitly. Even then, a session with an attached client (someone is actively
 looking at it) is preserved unless `--force` is passed.
+
+**`--safe` does NOT narrow `--deep` (#6127)**: the same reasoning applies to
+build artifacts — `target/` and `node_modules/` have no merged-PR concept
+either — but with the opposite consequence. Rather than being *skipped* like
+tmux, they are removed **in full under `--safe` exactly as under a bare
+`--deep`**. `loom-clean --deep --safe` is not a gentler deep clean; it is a
+deep clean with gentler worktree/branch handling. This was previously
+inferable only from #4890's discussion of the two classes it does gate.
+
+### Never launch a service from a build-output path (#6127)
+
+`--deep` deletes `target/` wholesale, and a **service binary built there is
+just another build artifact** to it. A launchd/systemd unit whose `program` is
+`<repo>/target/release/<bin>` therefore gets its backing file unlinked by a
+routine clean. Nothing fails at delete time — the kernel keeps the running
+process alive on the unlinked inode — so the unit stays `active (running)`,
+every liveness check passes, and the outage only fires at the **next restart**,
+where the supervisor cannot exec a missing path (launchd: `exit code 78:
+EX_CONFIG`). The confirmed repro ran three days in that state; `readlink
+/proc/<pid>/exe` reported `… (deleted)`, which is the fastest way to check a
+suspect host:
+
+```bash
+pid=$(pgrep -x <service>); readlink "/proc/$pid/exe"   # "… (deleted)" ⇒ already armed
+```
+
+As of #6127 `clean --deep` **detects this and refuses**: before removing a
+build-artifact directory it scans the process table (Linux `/proc/<pid>/exe`,
+macOS/BSD `ps -o comm=`) and, if any live process is executing a binary inside
+it, keeps the whole directory and prints `SKIPPED target/ is backing N live
+process(es) [pid … → …]`. The scheduled pass logs the same line at `WARN`. This
+is an ungated floor — there is no `--force` override and no config toggle,
+because an escape hatch a scheduled job could set would reinstate the exact
+silent-outage bug. The disk is not lost, only deferred: stop the service and
+re-run.
+
+**Two limits worth knowing**, both of which mean the operator-side rule still
+stands:
+
+- A service that is **stopped** when the clean runs is invisible to a process
+  scan. Its `program` is deleted and the next start fails identically.
+- Detection covers processes whose executable path the running user can read
+  (`/proc/<pid>/exe` is unreadable for other users' processes).
+
+So: build wherever you like, but **install** what you run — copy the binary to
+`~/.local/bin` (or a package path) and point the unit at that. `loom-daemon`
+itself was only ever immune to this by that accident of install location.
 
 **Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
 the local feature branch for every PR it merges as of #4100, but repos that ran
@@ -661,6 +712,17 @@ carries `assessment_failed` / `assessment_errors` for automation.
 - Issues without PRs older than threshold are flagged/recovered
 - Issues with stale PRs are flagged but not auto-recovered (need manual review)
 
+### `loom:building` left on a CLOSED issue (#6199)
+
+The above covers a stuck OPEN issue. A different, purely cosmetic case: a
+**closed** issue that still carries `loom:building` — `gh issue list --label
+loom:building` without `--state open` returns these as noise. `merge-pr.sh`
+strips the label from any issue its own merge closes (`Closes #N` / `Fixes
+#N` / `Resolves #N`), but issues closed by other means (manually, as a
+duplicate, or `--reason "not planned"`) are not covered automatically —
+run `./.loom/scripts/clean-stale-building-labels.sh [--repo OWNER/NAME]
+[--dry-run]` to sweep those (idempotent, safe to re-run).
+
 ### Uncommitted work in the primary clone can be quarantined at any time — branching does not protect it (#5194)
 
 **Symptom**: uncommitted edits made directly in a Loom-managed repo's **primary
@@ -1134,6 +1196,38 @@ the whole group (`kill -TERM -<pgid>`).
 
 The daemon's reaper task detects dead PIDs (every 30s) and removes them from the registry, emitting `sweep.issue.*.exited` / `sweep.issue.*.crashed` events. Since #4980 it also reaps a dead leader's *surviving* process group on that same tick, so an orphaned agent no longer keeps running unclaimed work.
 
+### Stopping the daemon does not stop the fleet — use `loom-daemon-quiesce.sh` to drain a host (#6129)
+
+`loom-daemon-stop.sh` (and a bare `systemctl --user stop loom-daemon` /
+`launchctl bootout`) stops **dispatch only** — in-flight sweep children and
+scheduled role-agent ticks (Champion/Curator/Judge/Doctor/Guide) survive by
+design, so stopping the dispatcher never destroys work in flight. On a Linux
+`systemd --user` host they can also be **architecturally detached** from the
+daemon's own process tree: `spawn-claude.sh`'s CPU-quota mechanism (#5111,
+default-on) wraps each spawn in `systemd-run --user --scope`, a transient
+scope parented to the user manager, not to `loom-daemon` — so it keeps running
+and drawing on the token pool with no forge-visible owner even after the
+daemon reports a clean stop (the 2026-08-13 `loom-worker-2` incident: role
+agents kept running after `systemctl --user stop loom-daemon` reported
+success).
+
+If you are draining a host — for maintenance, cost, or an exhausted token
+pool — and actually need every Loom-spawned process gone, run:
+
+```bash
+./.loom/scripts/cli/loom-daemon-quiesce.sh              # stop dispatch AND every in-flight role/sweep child
+./.loom/scripts/cli/loom-daemon-quiesce.sh --dry-run     # preview every target first
+```
+
+This works the same way on launchd and systemd, and is the only mechanism
+that reaches a `systemd-run --user --scope`-wrapped agent (enumerated by its
+predictable `loom-agent-*.scope` name, grouped under `loom-agents.slice`) or a
+launchd-reparented one (matched by `claude`/`claude-wrapper.sh -p /loom:*` on
+the process table, the same shape as this section's own `pstree`/`ps` recipe
+above). See [`daemon-reference.md` → "Fleet quiesce"](daemon-reference.md#fleet-quiesce--stopping-the-daemon-is-not-a-fleet-stop-6129)
+for the full mechanism and the `SuccessExitStatus=`/`failed`-vs-`inactive` fix
+that shipped alongside it.
+
 ### Stuck sweep child
 
 A sweep child whose pid is alive but whose `.loom/sweep-checkpoint/issue-<N>.json` mtime is stale is likely stuck. To recover:
@@ -1217,6 +1311,62 @@ Manual invocation:
 ./.loom/scripts/check-host-sleep.sh --quiet # stderr warning only, no stdout line
 ```
 
+#### Making it persistent instead of advisory (`host.preventSleep`, #6311)
+
+The check above only warns — it never mutates anything, so re-applying the
+`systemd-inhibit` mitigation by hand on every run/host gets old fast. Opt a
+repo IN to Loom applying it automatically via `.loom/config.json`:
+
+```json
+{ "host": { "preventSleep": true } }
+```
+
+Env override: `LOOM_HOST_PREVENT_SLEEP=1` (or `0` to force-disable).
+Precedence is the standard env > config > default-OFF tier every Loom knob
+uses (see `defaults/scripts/lib/host-sleep-config.sh`). An absent block, or
+any value that isn't a recognizable true/false spelling, resolves to
+disabled — this knob can never block or fail a sweep.
+
+- **Linux/systemd — the actual closable gap.** With the flag on, two
+  self-wrap points apply `systemd-inhibit --what=idle:sleep --who=loom
+  --why=<role>` (unprivileged, no `sudo`) automatically:
+  - `.loom/scripts/spawn-claude.sh` — the single dispatch chokepoint for
+    BOTH headless `/loom:sweep` and scheduled role-runner spawns. `--why`
+    is the child's `$LOOM_ROLE` (e.g. `sweep-lifecycle`). Verify with
+    `systemd-inhibit --list` while a sweep is running — an active `loom`
+    lock should be visible for its whole lifetime.
+  - `loom-daemon-start.sh --foreground` — wraps the foreground daemon
+    process itself. The systemd-unit-managed and nohup-fallback daemon
+    launch paths are deliberately **not** wrapped (both persist the launched
+    process's pid into places `loom-daemon-stop.sh` / the watchdog / `loom-daemon
+    status` treat as the daemon's own identity; prefixing either with
+    `systemd-inhibit` would change what that pid actually IS). In practice
+    this is not a live gap: `idle:sleep` locks are host-wide, not scoped to
+    one process's children, so any one active sweep/role-runner spawn keeps
+    the whole host — daemon included — awake for as long as it runs.
+  - Every wrap point probes first (`systemd-inhibit ... -- true`) and
+    silently skips the wrap on failure (no reachable `systemd-logind`,
+    `systemd-inhibit` missing, non-systemd Linux) — advisory-only
+    `check-host-sleep.sh` still fires normally in that case.
+  - A manually-started **interactive** session (MOM, a terminal running
+    `claude` directly) is not covered by either self-wrap — wrap it by hand
+    as `check-host-sleep.sh` itself still recommends.
+- **macOS — never automated.** The reliable mitigation
+  (`sudo pmset -c sleep 0`) is privileged and host-global; `host.preventSleep`
+  is a deliberate no-op here and **never** invokes `sudo`. Once you've
+  evaluated and applied a mitigation yourself, record it so the warning stops
+  being permanent noise:
+
+  ```json
+  { "host": { "sleepMitigationAcknowledged": "pmset sleep=0 set at image build" } }
+  ```
+
+  (env override `LOOM_HOST_SLEEP_MITIGATION_ACKNOWLEDGED`). This downgrades
+  `check-host-sleep.sh`'s full banner to a one-liner naming your mitigation —
+  it never claims the host IS protected (macOS user-idle sleep assertions are
+  not reliable, per the incident above), it only stops re-printing an
+  already-evaluated warning on every run.
+
 ### Keeping installed `.loom/` copies fresh after a pull (#3770 detect → #3777/#4239 resync)
 
 The installed Loom surfaces the harness actually executes/reads are synced from
@@ -1291,6 +1441,62 @@ export `LOOM_RESYNC_ALLOW_WORKTREE=1`); it then proceeds with a warning naming t
 main-checkout target. Running from the main checkout — including any subdirectory
 of it — is unaffected.
 
+**Generating a complete resync while the fleet is live (`--output`, #6106).**
+`--allow-worktree` and a bare re-run from the main checkout are both unsafe
+whenever the daemon may be actively dispatching sweeps in that same checkout —
+which on a fleet host is most of the time — because they write dozens of files
+directly into a checkout something else might be reading or writing concurrently.
+`--output <dir>` (or `LOOM_RESYNC_OUTPUT=<dir>`) is the safe alternative: it
+creates a disposable, **detached** `git worktree` at `<dir>` (via `git worktree
+add --detach <dir> HEAD` against the primary checkout — registering only new
+`.git/worktrees/` metadata, never reading or writing a single file in the primary
+checkout's own working tree) and resyncs **into that staging worktree** instead of
+the primary. Because nothing is written to the primary checkout either way, the
+`#4563` linked-worktree refusal does not apply when `--output` is given — it can
+be run from anywhere (the main checkout or any linked worktree) at any time,
+including mid-sweep, with zero risk to the live checkout:
+
+```bash
+./.loom/scripts/resync-installed.sh --output /tmp/loom-resync-staging
+cd /tmp/loom-resync-staging
+git checkout -b chore/resync-installed-$(date +%Y%m%d)
+git add -A && git commit -m 'chore: resync installed Loom surfaces'
+git push -u origin HEAD   # open a PR from here
+cd - && git worktree remove /tmp/loom-resync-staging   # from the primary checkout when done
+```
+
+The staging worktree is a real, independent git checkout at the primary's current
+`HEAD` — not a bare file copy — so once the sync completes it is immediately a
+normal place to `git add`/`commit`/`push` from. `--dry-run` combined with
+`--output` still creates the staging worktree (it is the preview's target) but
+auto-removes it before exiting, so a preview leaves no residue either way. The
+refusal message itself now names `--output` as the safe path, ahead of
+`--allow-worktree`.
+
+**When several `defaults/` PRs merge between periodic resync runs.** The periodic
+`chore: resync installed Loom surfaces` commit only fixes drift that existed *at
+the time it ran* — if N more `defaults/`-touching PRs merge after that commit (a
+common pattern in a busy fleet session, e.g. six PRs merging back-to-back on
+2026-08-12 before the next periodic resync landed), the installed copies fall
+behind again immediately, and an already-open resync PR that was branched before
+some of those N PRs merged can close only part of the gap once rebased. There is
+no separate tracking mechanism for this — the existing tools already cover it, but
+only if you re-run them **after the last relevant merge**, not once at the start
+of a merge wave:
+- `./.loom/scripts/check-main-freshness.sh` (or `resync-installed.sh --dry-run`,
+  exit `2` on drift) tells you whether the installed copies are stale **right
+  now** — re-run it again after each additional `defaults/` merge rather than
+  trusting a check from before the wave, since drift accumulates with every merge.
+- A resync PR opened mid-wave is a **partial** fix by construction, not a bug in
+  the PR itself. Prefer generating (or regenerating) the resync **after** the
+  wave settles, via `--output` above so it can be done immediately without
+  waiting for a quiet window — a single complete resync after N merges is
+  simpler to review than N sequential partial ones.
+- If a resync PR is already open when more `defaults/` PRs land, rebase it (or
+  regenerate it with `--output`) before merging rather than merging it as-is and
+  assuming the gap is closed — `--dry-run` after rebase confirms whether any
+  drift remains.
+
 **It can safely update itself (#4669).** `resync-installed.sh` is one of the files
 under `defaults/scripts/`, so every run copies a newer version over the very path
 the running Bash process is still reading from. It used to do that with an
@@ -1322,3 +1528,27 @@ overwrites it, list its relative path (e.g. `hooks/guard-destructive.sh`,
 `.loom/resync-ignore`; matching files are reported `skipped`. A full `loom-daemon
 init` / installer run already performs the equivalent recursive copy, so a normal
 reinstall keeps the copies current too.
+
+**Precondition: this flow needs a resolvable `defaults/` source tree (#6202).**
+`resync-installed.sh` resolves its source in priority order: (1) this checkout
+IS the Loom source repo (`defaults/hooks` or `defaults/scripts` present), (2)
+the gitignored `.loom/loom-source-path` sidecar (written only by a local
+`install.sh` / `install-loom.sh` run) points at a local clone of it, or (3) a
+legacy `install-metadata.json` `"loom_source"` field (dead for any post-#5624
+install — that field is no longer written, since it leaked the installing
+machine's absolute path). **None of these exist on a checkout that never ran
+the Loom installer locally** — a fresh developer clone, a CI checkout, or any
+machine that received the repo rather than installing into it — which is
+exactly the population most likely to be running stale surfaces, since they
+never ran the installer that would have refreshed them. On that population the
+script fails on first use with `Could not locate a defaults/ source tree to
+sync from`. `check-main-freshness.sh` now detects the same gap and appends a
+note to its own staleness warning before you reach that failure, rather than
+only after (#6202). Fix: clone <https://github.com/rjwalters/loom> locally,
+then either re-run its installer against this repo or write the sidecar
+yourself: `echo /path/to/local/loom-clone > .loom/loom-source-path`.
+
+The same list also declares a file **repo-owned**, so the installer's reinstall
+clean sweep never deletes it — see
+[`repo-owned-files.md`](repo-owned-files.md) for the full ownership rule that
+governs files living inside `.loom/hooks/` and the other managed directories.

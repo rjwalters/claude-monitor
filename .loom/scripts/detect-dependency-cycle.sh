@@ -29,7 +29,7 @@
 #
 # Examples:
 #   detect-dependency-cycle.sh --issue 56
-#   detect-dependency-cycle.sh --issue 391 --repo 2AMLogic/klayout-tools
+#   detect-dependency-cycle.sh --issue 202 --repo example-org/tool-repo
 #   detect-dependency-cycle.sh --issue 56 --report          # comment + operator-only
 #
 # Options:
@@ -123,9 +123,9 @@ NO_CACHE=0
 # a second divergent parser; it only widens the REFERENCE half so a cross-repo
 # edge is followable:
 #
-#   #391                                          -> same repo as the citing issue
-#   2AMLogic/klayout-tools#391                    -> explicit owner/repo
-#   https://github.com/2AMLogic/marketing/issues/56 -> issue URL
+#   #202                                          -> same repo as the citing issue
+#   example-org/tool-repo#202                     -> explicit owner/repo
+#   https://github.com/example-org/downstream-repo/issues/101 -> issue URL
 #
 # Two-stage, exactly like every other reuser: stage 1 selects lines declaring a
 # dependency phrase, stage 2 extracts EVERY reference on those lines (not just

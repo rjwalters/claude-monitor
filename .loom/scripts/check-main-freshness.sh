@@ -207,6 +207,67 @@ if [[ -n "$REPO_ROOT" ]]; then
     )"
 fi
 
+# ---------- resync precondition check (#6202) ----------
+#
+# Every remediation this script prints for "stale installed surfaces" tells
+# the reader to run `resync-installed.sh`. That script needs a defaults/
+# SOURCE tree to sync from, resolved (in priority order) from:
+#   1. $REPO_ROOT/defaults/{hooks,scripts}   (this checkout IS the Loom source repo)
+#   2. .loom/loom-source-path                (a sidecar written by install.sh /
+#                                              install-loom.sh; gitignored by design
+#                                              — it holds a machine-local path)
+#   3. install-metadata.json's "loom_source" (legacy compat; #5624 stopped writing
+#                                              this field, so it is dead for any
+#                                              post-#5624 install)
+#
+# None of these exist on a checkout that never ran the Loom installer locally —
+# a fresh developer clone, a CI checkout, or any machine that received the repo
+# rather than installing into it. On exactly that population, `resync-installed.sh`
+# fails on first use with "Could not locate a defaults/ source tree to sync
+# from" — discovered only AFTER following this script's own remediation, not
+# before (#6202). Mirror resolve_defaults()'s resolution order here (read-only,
+# best-effort) so the gap can be surfaced up front instead.
+resync_precondition_met() {
+    local root="$1"
+    [[ -n "$root" ]] || return 1
+    if [[ -d "$root/defaults/hooks" || -d "$root/defaults/scripts" ]]; then
+        return 0
+    fi
+    if [[ -f "$root/.loom/loom-source-path" ]]; then
+        local src
+        src="$(cat "$root/.loom/loom-source-path" 2>/dev/null || true)"
+        [[ -n "$src" && -d "$src/defaults" ]] && return 0
+    fi
+    if [[ -f "$root/.loom/install-metadata.json" ]]; then
+        local src
+        src="$(sed -n 's/.*"loom_source" *: *"\(.*\)".*/\1/p' "$root/.loom/install-metadata.json" 2>/dev/null | head -1)"
+        [[ -n "$src" && -d "$src/defaults" ]] && return 0
+    fi
+    return 1
+}
+
+RESYNC_PRECONDITION_MET=1
+if [[ -n "$REPO_ROOT" ]] && ! resync_precondition_met "$REPO_ROOT"; then
+    RESYNC_PRECONDITION_MET=0
+fi
+
+# Appended immediately after every "run resync-installed.sh" remediation line
+# above, only when the precondition is actually missing.
+warn_resync_precondition_gap() {
+    [[ "$RESYNC_PRECONDITION_MET" -eq 0 ]] || return 0
+    warn "${YELLOW}  NOTE (#6202): resync-installed.sh has no source tree to sync from on${NC}"
+    warn "${YELLOW}  this checkout — it will fail with 'Could not locate a defaults/ source${NC}"
+    warn "${YELLOW}  tree to sync from' until one of these is true:${NC}"
+    warn "${YELLOW}    - this checkout IS the Loom source repo (has defaults/hooks or${NC}"
+    warn "${YELLOW}      defaults/scripts), or${NC}"
+    warn "${YELLOW}    - .loom/loom-source-path points at a local clone of the Loom source${NC}"
+    warn "${YELLOW}      repo (written by install.sh / install-loom.sh; gitignored by${NC}"
+    warn "${YELLOW}      design, so it never arrives with a plain \`git clone\` of this repo).${NC}"
+    warn "${YELLOW}  Fix: clone https://github.com/rjwalters/loom locally, then either${NC}"
+    warn "${YELLOW}  re-run its installer against this repo, or point the sidecar at it:${NC}"
+    warn "${YELLOW}      echo /path/to/local/loom-clone > .loom/loom-source-path${NC}"
+}
+
 if [[ "$N" -eq 0 && "$A" -eq 0 ]]; then
     if [[ -z "$DRIFT_LINES" ]]; then
         info_oneliner "${GREEN}[freshness-check] local ${BRANCH} is up to date with ${REMOTE_REF}.${NC}"
@@ -230,6 +291,7 @@ if [[ "$N" -eq 0 && "$A" -eq 0 ]]; then
     warn "${BOLD}Remediation (read-only advisory — this script never resyncs for you):${NC}"
     warn "      ${BOLD}./.loom/scripts/resync-installed.sh${NC}"
     warn "  (preview first with ${BOLD}--dry-run${NC}; it only touches files present in defaults/)."
+    warn_resync_precondition_gap
     warn ""
     warn "${YELLOW}Installed-copy drift (files present in both trees):${NC}"
     warn "$DRIFT_LINES"
@@ -257,6 +319,7 @@ if [[ "$N" -gt 0 ]]; then
     warn "  then refresh the installed .loom/ copies from defaults/ (#3777):"
     warn "      ${BOLD}./.loom/scripts/resync-installed.sh${NC}"
     warn "  (preview first with ${BOLD}--dry-run${NC}; it only touches files present in defaults/)."
+    warn_resync_precondition_gap
     warn ""
 fi
 

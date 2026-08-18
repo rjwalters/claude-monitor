@@ -353,18 +353,50 @@ mask_cat_heredoc_bodies() {
                 if (substr(line, start, 1) == "-") start++
                 while (substr(line, start, 1) == " " || substr(line, start, 1) == "\t") start++
                 qc = substr(line, start, 1)
-                if (qc != SQ && qc != DQ) continue
-                start++
+                quoted_delim = (qc == SQ || qc == DQ)
+                # UNQUOTED-DELIMITER RELAXATION (issue #5672): an unquoted
+                # delimiter (`cat <<EOF`, no quotes around EOF) lets bash
+                # perform $()/backtick/$VAR expansion inside the body, so this
+                # was previously left ENTIRELY unmasked/visible -- denying real
+                # invocations, but ALSO denying the common, unremarkable
+                # `gh pr comment N --body "$(cat <<EOF ... EOF)"` idiom whenever
+                # a contributor (or an agent) forgets to quote the delimiter,
+                # even though the body is pure prose. Only the `is_cat_word`
+                # branch (cat stdout captured into a known non-executing
+                # text-data flag, already proven above via `capre`) may use an
+                # unquoted delimiter here -- `is_commit_stdin` (`git commit -F
+                # -`/`--file=-`) is deliberately EXCLUDED and keeps requiring a
+                # quoted delimiter exactly as before (#5328), since that branch
+                # has no capre-style capture proof of its own to fall back on.
+                # Masking an unquoted-delimiter cat-heredoc additionally
+                # requires the body to be PROVEN free of every expansion
+                # trigger (checked below, once the body span is located):
+                # zero dollar-sign and zero backtick characters anywhere in
+                # it. That is a strictly stronger, content-based version of
+                # the same provable-inertness guarantee the quoted-delimiter
+                # path gets for free from bash quoting rules -- so an
+                # unquoted body that could plausibly expand into something
+                # live is left completely unmasked and still denies, exactly
+                # as before this fix.
+                if (!quoted_delim && !is_cat_word) continue
+                if (quoted_delim) start++
                 wordend = start
                 while (substr(line, wordend, 1) ~ /^[A-Za-z0-9_]$/) wordend++
                 if (wordend <= start) continue
-                if (substr(line, wordend, 1) != qc) continue
-                delim = substr(line, start, wordend - start)
-                # The opener line must END after the quoted delimiter. Anything
-                # trailing it routes cat stdout somewhere else (a pipe into a
-                # shell, a redirect into a file), which is the class that must
-                # stay visible to the merge-redirect grep.
-                rest = substr(line, wordend + 1)
+                if (quoted_delim) {
+                    if (substr(line, wordend, 1) != qc) continue
+                    delim = substr(line, start, wordend - start)
+                    # The opener line must END after the quoted delimiter.
+                    # Anything trailing it routes cat stdout somewhere else (a
+                    # pipe into a shell, a redirect into a file), which is the
+                    # class that must stay visible to the merge-redirect grep.
+                    rest = substr(line, wordend + 1)
+                } else {
+                    delim = substr(line, start, wordend - start)
+                    # Same "opener line must end here" requirement as the
+                    # quoted case, just without a trailing quote char to skip.
+                    rest = substr(line, wordend)
+                }
                 if (rest ~ /[^ \t]/) continue
                 closeat = 0
                 for (j = i + 1; j <= nl; j++) {
@@ -373,6 +405,16 @@ mask_cat_heredoc_bodies() {
                     if (trimmed == delim) { closeat = j; break }
                 }
                 if (closeat == 0) continue
+                if (!quoted_delim) {
+                    body_has_expansion_char = 0
+                    for (j = i + 1; j < closeat; j++) {
+                        if (index(lines[j], "$") || index(lines[j], BT)) {
+                            body_has_expansion_char = 1
+                            break
+                        }
+                    }
+                    if (body_has_expansion_char) continue
+                }
                 for (j = i + 1; j < closeat; j++) {
                     gsub(/./, "X", lines[j])
                 }
@@ -634,19 +676,37 @@ mask_data_flag_values() {
 
 # Mask quoted POSITIONAL arguments (no preceding flag name) to a small
 # allowlist of known non-executing commands/scripts (issue #5155, extending
-# the #5115 fix above). mask_data_flag_values only recognizes text following
-# a named flag; it has no effect on a script whose free-text arguments are
-# purely positional, e.g. `./.loom/scripts/check-duplicate.sh "TITLE"
-# "DESCRIPTION"` or `grep -n "pattern" file`. Neither `grep`/`egrep`/`fgrep`/
-# `rg` nor check-duplicate.sh ever EXECUTES a positional argument -- they only
-# read it as search/dedup text -- so masking a quoted argument immediately
-# following one of these command names (optionally after short flags, e.g.
-# `grep -n "..."`) can never blind this catastrophic-tier guard to a real
-# invocation. Deliberately narrow allowlist, same "deliberately narrow"
-# convention documented above mask_cat_heredoc_bodies(): a command that WRAPS
-# the phrase and then executes it -- `sh -c "gh pr merge 123"`, `bash -c
-# '...'`, `eval "..."` -- is NOT in this allowlist and stays fully visible to
-# the merge-redirect grep below, exactly as before.
+# the #5115 fix above; extended again for echo/printf narration by #6400).
+# mask_data_flag_values only recognizes text following a named flag; it has
+# no effect on a script whose free-text arguments are purely positional, e.g.
+# `./.loom/scripts/check-duplicate.sh "TITLE" "DESCRIPTION"`, `grep -n
+# "pattern" file`, or `echo "some narration text"`. `grep`/`egrep`/`fgrep`/
+# `rg` and check-duplicate.sh never EXECUTE a positional argument -- they
+# only read it as search/dedup text -- so masking a quoted argument
+# immediately following one of these command names (optionally after short
+# flags, e.g. `grep -n "..."`) can never blind this catastrophic-tier guard
+# to a real invocation. A command that WRAPS the phrase and then executes it
+# -- `sh -c "gh pr merge 123"`, `bash -c '...'`, `eval "..."` -- is NOT in
+# this allowlist and stays fully visible to the merge-redirect grep below,
+# exactly as before.
+#
+# `echo`/`printf` are different from the other allowlisted commands: their
+# own quoted text CAN become a real execution vector, when piped into an
+# interpreter (`echo "gh pr merge 123" | bash`) or produced by a command
+# substitution consumed by one (`eval "$(echo ...)"`). So, unlike the other
+# allowlisted commands, an echo/printf match is masked ONLY when BOTH hold:
+#   1. The echo/printf invocation is not itself nested inside a `$(...)`/
+#      backtick command substitution (a strong signal its output is about to
+#      be consumed by something else, e.g. `eval`) -- decided from a
+#      precomputed per-position nesting-depth map over the whole buffer, NOT
+#      from the single character adjacent to the token, so `eval "$( echo
+#      ... )"` and its newline-separated form cannot slip through (#6400).
+#   2. The full run of quoted arguments is not immediately followed by a
+#      pipe (`|`) into another command -- `echo "..." | bash` must stay
+#      fully visible.
+# grep/rg/check-duplicate.sh are unaffected by either restriction: they never
+# execute a positional argument regardless of context, so they keep the
+# original, simpler masking behavior.
 #
 # Masks EVERY quoted argument that directly, consecutively follows the
 # command+flags (separated only by whitespace) -- not just the first -- so
@@ -657,14 +717,305 @@ mask_data_flag_values() {
 # onto the same line -- fully visible.
 mask_command_positional_args() {
     printf '%s' "$1" | awk '
+    # Per-position command-substitution nesting depth, computed with an
+    # explicit OPENER-TYPE-AWARE STACK rather than a scalar counter: `$(`
+    # pushes a SUB level, a bare `(` pushes a GROUP level, and a `)` pops
+    # whichever level is on top -- decrementing the substitution depth only
+    # when the level it popped was a SUB. A scalar counter (the first cut of
+    # the #6400 fix) let ANY `)` decrement it, so a bare parenthesized
+    # subshell used as an earlier sibling statement inside a still-open
+    # `$(...)` silently un-nested everything after it:
+    #     eval "$( (true); echo "gh pr merge 123" )"
+    # the `)` of `(true)` closed the counter, the later echo read as
+    # not-nested, its argument was masked, and this ASK-tier guard ALLOWED a
+    # command that really does eval a live `gh pr merge` (#6400 re-review).
+    # The same conflation broke `$(( ... ))` arithmetic siblings.
+    #
+    # `respect_q` selects the lexing interpretation:
+    #   0 -- quote-blind: every `(`, `)`, `$(` and backtick counts wherever it
+    #        appears. Cannot be desynchronised by an unpaired quote character
+    #        (an apostrophe inside a `#` comment line, say), but a `)` that
+    #        merely sits inside a quoted string can pop a real level.
+    #   1 -- quote-aware: single quotes are literal, double quotes suppress
+    #        bare `(`/`)` (which are not syntax there), and `$(` re-lexes its
+    #        body with a fresh quote state that is restored when its own `)`
+    #        pops -- so `"$(foo)"` and `$( echo "a)b"; ... )` both track
+    #        correctly.
+    # Neither interpretation is sound on its own, so the caller takes the MAX
+    # of the two maps. Over-reporting depth only ever WITHHOLDS masking, which
+    # keeps the flagged phrase visible and denies -- the fail-safe direction;
+    # under-reporting is what produces a silent bypass.
+    #
+    # `case ... esac` gets its own tracking because a case PATTERN terminator
+    # (`x)`) is the one common shell construct that writes a `)` with no
+    # opener at all, so it would otherwise pop a level it never opened:
+    #     eval "$( case x in x) :;; esac; echo "gh pr merge 123" )"
+    # While a `case` is open on the current stack frame a `)` is treated as a
+    # pattern terminator and pops nothing. Detection requires the literal word
+    # `case` at a command position (start of buffer, or after a newline, `;`,
+    # `&`, `|`, `(`, backtick or `{`), which keeps ordinary text such as
+    # `X=$(grep case /etc/hosts)` from tripping it -- and a false positive
+    # there would only WITHHOLD a pop, i.e. over-report, which is again the
+    # fail-safe direction.
+    #
+    # Two further constructs write a `)` with no matching opener, closed by
+    # #6408 in the same fail-safe (pop-withholding) style as `case`/`esac`:
+    #
+    #   * A `)` inside a `${...}` PARAMETER EXPANSION, e.g.
+    #         eval "$( x=${y//)/}; echo "gh pr merge 1" )"
+    #     `${...}` gets its own per-frame counter (`braceexp[psp]`, exactly
+    #     mirroring `casecnt[psp]`): `${` increments it, a `}` decrements it
+    #     while it is positive, and a `)` arriving while it is non-zero pops
+    #     nothing. Per FRAME, not global, so a real command substitution inside
+    #     the expansion (`${a:-$(date)}`) still opens and closes normally --
+    #     its `$(` pushes a fresh frame whose own counter starts at zero.
+    #
+    #   * A `)` inside a HERE-DOCUMENT BODY that the earlier
+    #     mask_cat_heredoc_bodies / mask_var_assigned_heredoc_bodies passes do
+    #     not cover (a bare `cat <<E`, not captured into a text-data flag):
+    #         eval "$( cat <<'"'"'E'"'"'
+    #         )
+    #         E
+    #         echo "gh pr merge 1" )"
+    #     On an unquoted `<<`/`<<-` the delimiter word is parsed (quoted or
+    #     bare) and the body is located by scanning forward for its terminator
+    #     line. Across that span a POP FLOOR (`popfloor`) is raised to the
+    #     current stack pointer, so a `)` in the body can only pop levels the
+    #     body itself opened -- never the enclosing `$(`. The body is still
+    #     lexed normally otherwise: an unquoted-delimiter body IS expanded by
+    #     bash, so a `$(` inside it is genuinely live and must keep raising
+    #     depth. `<<<` (here-string) is explicitly not a heredoc opener, and an
+    #     opener whose terminator line is absent from the buffer skips nothing
+    #     at all -- so an arithmetic left-shift (`$((1<<2))`) misread as an
+    #     opener cannot freeze the map.
+    #
+    # Both are monotone: they only ever WITHHOLD a pop, i.e. over-report depth,
+    # which withholds masking and keeps the flagged phrase visible. That is the
+    # same fail-safe direction as everything else in this function -- but it is
+    # still a false positive if it reaches ordinary narration, so both are
+    # bounded (per-frame counter, per-body floor) rather than global latches.
+    function subst_depth_map(txt, respect_q, depth,    n, i, j, c, pc, nc, psp, nsub, bt, q, kind, savedq, casecnt, braceexp, popfloor, savedfloor, bodyend, npend, pend, dstart, dq, delim, k, sp, eol, lineend, nextstart, linetxt, found, p, lastend) {
+        n = length(txt)
+        psp = 0      # paren-stack pointer
+        nsub = 0     # SUB levels currently open on the stack
+        bt = 0       # backtick substitution toggle (not paren-delimited)
+        q = ""       # current quote context: "" (none), SQ or DQ
+        popfloor = 0 # `)` may only pop while psp > popfloor (heredoc bodies)
+        savedfloor = 0
+        bodyend = 0  # last buffer position of the here-document body in scope
+        npend = 0    # here-document openers seen on the current line
+        casecnt[0] = 0
+        braceexp[0] = 0
+        for (i = 1; i <= n; i++) {
+            # Leaving a here-document body: restore the pop floor raised on
+            # entry, so a `)` after the terminator line closes normally again.
+            if (bodyend > 0 && i > bodyend) {
+                popfloor = savedfloor
+                bodyend = 0
+            }
+            c = substr(txt, i, 1)
+            # Backslash escapes the next character (never inside single quotes).
+            if (c == "\\" && !(respect_q && q == SQ)) {
+                depth[i] = nsub + bt
+                if (i < n) { i++; depth[i] = nsub + bt }
+                continue
+            }
+            # Inside single quotes nothing but the closing quote is syntax.
+            if (respect_q && q == SQ) {
+                if (c == SQ) { q = "" }
+                depth[i] = nsub + bt
+                continue
+            }
+            if (respect_q && c == SQ && q == "") {
+                q = SQ
+                depth[i] = nsub + bt
+                continue
+            }
+            if (respect_q && c == DQ) {
+                q = (q == DQ ? "" : DQ)
+                depth[i] = nsub + bt
+                continue
+            }
+            # `case` at a command position opens a construct whose pattern
+            # terminators are unbalanced `)`s; `esac` closes it. Both are
+            # detected without consuming the character (fall through to the
+            # default depth assignment below).
+            if (c == "c" && substr(txt, i, 4) == "case") {
+                nc = (i + 4 > n ? "" : substr(txt, i + 4, 1))
+                if (nc == "" || nc == " " || nc == "\t" || nc == "\n") {
+                    j = i - 1
+                    while (j >= 1 && (substr(txt, j, 1) == " " || substr(txt, j, 1) == "\t")) { j-- }
+                    pc = (j < 1 ? "" : substr(txt, j, 1))
+                    if (pc == "" || pc == "\n" || pc == ";" || pc == "&" || pc == "|" || pc == "(" || pc == "`" || pc == "{") {
+                        casecnt[psp]++
+                    }
+                }
+            } else if (c == "e" && substr(txt, i, 4) == "esac") {
+                nc = (i + 4 > n ? "" : substr(txt, i + 4, 1))
+                pc = (i == 1 ? "" : substr(txt, i - 1, 1))
+                if (nc !~ /[A-Za-z0-9_]/ && pc !~ /[A-Za-z0-9_]/ && casecnt[psp] > 0) {
+                    casecnt[psp]--
+                }
+            }
+            # `$(` opens a command substitution -- active unquoted AND inside
+            # double quotes. Its body re-lexes with a fresh quote state.
+            if (c == "$" && substr(txt, i + 1, 1) == "(") {
+                depth[i] = nsub + bt
+                psp++
+                kind[psp] = 1
+                savedq[psp] = q
+                casecnt[psp] = 0
+                braceexp[psp] = 0
+                q = ""
+                nsub++
+                i++
+                depth[i] = nsub + bt
+                continue
+            }
+            # `${` opens a PARAMETER EXPANSION, not a substitution: it changes
+            # no depth of its own, but a `)` written inside it (`${y//)/}`) is
+            # plain text and must pop nothing. Counted per stack frame so a
+            # real `$(...)` nested inside the expansion still closes normally
+            # (its own frame starts the counter at zero). Active unquoted AND
+            # inside double quotes; inside single quotes the branch above has
+            # already consumed the character.
+            if (c == "$" && substr(txt, i + 1, 1) == "{") {
+                braceexp[psp]++
+                depth[i] = nsub + bt
+                i++
+                depth[i] = nsub + bt
+                continue
+            }
+            # The matching `}` closes the innermost open parameter expansion on
+            # this frame. A `}` arriving with none open (a brace-group
+            # terminator, say) is ordinary text and decrements nothing.
+            if (c == "}" && braceexp[psp] > 0) {
+                braceexp[psp]--
+                depth[i] = nsub + bt
+                continue
+            }
+            # `<<` / `<<-` opens a HERE-DOCUMENT whose body is data, not shell
+            # syntax at this level. Parse the (optionally quoted) delimiter word
+            # and remember it; the body itself starts after the newline that
+            # ends this line, and is handled by the newline branch below.
+            # `<<<` is a here-STRING -- no body, no terminator line -- so it is
+            # deliberately excluded. Not syntax inside quotes.
+            if (c == "<" && substr(txt, i + 1, 1) == "<" && bodyend == 0 &&
+                substr(txt, i + 2, 1) != "<" && (!respect_q || q == "")) {
+                dstart = i + 2
+                if (substr(txt, dstart, 1) == "-") dstart++
+                while (substr(txt, dstart, 1) == " " || substr(txt, dstart, 1) == "\t") dstart++
+                dq = substr(txt, dstart, 1)
+                delim = ""
+                if (dq == SQ || dq == DQ) {
+                    k = dstart + 1
+                    while (k <= n && substr(txt, k, 1) != dq) {
+                        delim = delim substr(txt, k, 1)
+                        k++
+                    }
+                    # An unterminated delimiter quote is not a usable opener.
+                    if (k > n) { delim = "" } else { k++ }
+                } else {
+                    k = dstart
+                    while (k <= n && substr(txt, k, 1) ~ /^[A-Za-z0-9_]$/) {
+                        delim = delim substr(txt, k, 1)
+                        k++
+                    }
+                }
+                if (delim != "") {
+                    npend++
+                    pend[npend] = delim
+                    # Consume the whole `<< delim` token so the delimiter
+                    # quotes cannot perturb the quote state.
+                    for (j = i; j < k; j++) depth[j] = nsub + bt
+                    i = k - 1
+                    continue
+                }
+            }
+            # End of a line carrying one or more here-document openers: locate
+            # the terminator line of each body and raise a POP FLOOR across
+            # the whole span, so a `)` inside a body can only pop levels the
+            # body itself opened. Nothing else changes -- it is still lexed
+            # normally, because an unquoted-delimiter body IS expanded by bash
+            # and a `$(` inside it is genuinely live. An opener whose terminator
+            # line is absent from the buffer covers nothing at all.
+            if (c == "\n" && npend > 0 && bodyend == 0) {
+                p = i + 1
+                lastend = 0
+                for (k = 1; k <= npend; k++) {
+                    delim = pend[k]
+                    found = 0
+                    sp = p
+                    while (sp <= n) {
+                        eol = index(substr(txt, sp), "\n")
+                        if (eol == 0) {
+                            lineend = n
+                            nextstart = n + 1
+                        } else {
+                            lineend = sp + eol - 2
+                            nextstart = sp + eol
+                        }
+                        linetxt = substr(txt, sp, lineend - sp + 1)
+                        sub(/^[ \t]+/, "", linetxt)
+                        if (linetxt == delim) { found = 1; break }
+                        sp = nextstart
+                    }
+                    if (!found) break
+                    lastend = lineend
+                    p = nextstart
+                }
+                npend = 0
+                if (lastend > 0) {
+                    savedfloor = popfloor
+                    popfloor = psp
+                    bodyend = lastend
+                }
+                depth[i] = nsub + bt
+                continue
+            }
+            # A bare `(` is a grouping/subshell opener, NOT a substitution.
+            # It is pushed so that its matching `)` pops it instead of the
+            # `$(` level it may be nested inside. Not syntax inside quotes.
+            if (c == "(" && (!respect_q || q == "")) {
+                psp++
+                kind[psp] = 0
+                savedq[psp] = q
+                casecnt[psp] = 0
+                braceexp[psp] = 0
+                q = ""
+                depth[i] = nsub + bt
+                continue
+            }
+            # `)` pops the innermost open level, whatever its type. An
+            # unmatched `)` (empty stack, or a stack already at the current
+            # here-document body pop floor) is ignored rather than
+            # underflowing; a `)` arriving while a `case` or a `${...}`
+            # expansion is open on the current frame is likewise text that
+            # opened nothing, so it pops nothing.
+            if (c == ")" && psp > popfloor && (!respect_q || q == "") && casecnt[psp] == 0 && braceexp[psp] == 0) {
+                if (kind[psp] == 1) { nsub-- }
+                q = savedq[psp]
+                psp--
+                depth[i] = nsub + bt
+                continue
+            }
+            if (c == "`") {
+                depth[i] = nsub
+                bt = (bt ? 0 : 1)
+                continue
+            }
+            depth[i] = nsub + bt
+        }
+    }
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
         # Command-name allowlist: known non-executing commands/scripts whose
-        # positional string arguments are search/dedup text, never live shell
-        # syntax. Extend only when another read-only positional-arg consumer
-        # causes a real false positive (see #5155).
-        cmdre = "(grep|egrep|fgrep|rg|\\./\\.loom/scripts/check-duplicate\\.sh)"
+        # positional string arguments are search/dedup/narration text, never
+        # live shell syntax on their own. Extend only when another
+        # positional-arg consumer causes a real false positive (see #5155,
+        # #6400).
+        cmdre = "(grep|egrep|fgrep|rg|echo|printf|\\./\\.loom/scripts/check-duplicate\\.sh)"
         # Zero or more short/long flags between the command name and the
         # first quoted positional argument (e.g. `grep -n`, `rg -i`,
         # `check-duplicate.sh --include-merged-prs --issue 5155`).
@@ -676,11 +1027,89 @@ mask_command_positional_args() {
     END {
         s = buf
         out = ""
+
+        # Precompute the command-substitution nesting depth at EVERY position
+        # of the buffer, so the echo/printf nesting test below can ask "is the
+        # command token itself inside a substitution?" instead of inferring it
+        # from the single character adjacent to the token. Bash allows
+        # arbitrary whitespace and newlines after `$(`, so an adjacency-only
+        # test masked (i.e. ALLOWED) real wrapped invocations such as
+        # `eval "$( echo "gh pr merge 1" )"` and its newline-separated form
+        # (#6400 review).
+        #
+        # The map is built twice by subst_depth_map() above -- once quote-blind,
+        # once quote-aware -- and the per-position MAX is used, because each
+        # interpretation has a blind spot the other covers and over-reporting
+        # depth is the fail-safe direction (it withholds masking and keeps the
+        # phrase visible). See that function for the full rationale.
+        blen = length(buf)
+        subst_depth_map(buf, 0, depth_blind)
+        subst_depth_map(buf, 1, depth_quoted)
+        for (i = 1; i <= blen; i++) {
+            subdepth[i] = (depth_blind[i] > depth_quoted[i] ? depth_blind[i] : depth_quoted[i])
+        }
+
         while (match(s, anchor)) {
+            # `s` is always a literal suffix of `buf` (every reassignment below
+            # is a substr of a suffix), so this yields the absolute offset of
+            # `s` within `buf` -- needed to index subdepth[] at the real
+            # buffer position of the matched command token.
+            base    = blen - length(s)
             pre     = substr(s, 1, RSTART - 1)
             matched = substr(s, RSTART, RLENGTH)
             rest    = substr(s, RSTART + RLENGTH)
             out = out pre matched
+
+            # Identify the matched command name (first whitespace-delimited
+            # token of the anchor) and whether a delimiter character was
+            # actually consumed ahead of it, vs. a zero-width start-of-buffer
+            # match -- the latter tells us where the command token starts, so
+            # its nesting depth can be read out of the precomputed subdepth[]
+            # map above.
+            delim = substr(matched, 1, 1)
+            delim_consumed = (delim == " " || delim == "\t" || delim == "\n" || delim == ";" || delim == "&" || delim == "|" || delim == "(" || delim == "`")
+            cmdpos = base + RSTART + (delim_consumed ? 1 : 0)
+            nested_in_subst = (subdepth[cmdpos] > 0)
+            cmdpart = matched
+            if (delim_consumed) {
+                cmdpart = substr(matched, 2)
+            }
+            gsub(/^[ \t]+/, "", cmdpart)
+            gsub(/[ \t]+$/, "", cmdpart)
+            split(cmdpart, cparts, /[ \t]+/)
+            is_echoish = (cparts[1] == "echo" || cparts[1] == "printf")
+
+            # echo/printf only: look ahead across the WHOLE run of quoted
+            # positional arguments (without masking anything yet) to see
+            # whether it is immediately followed by a pipe -- a real
+            # execution vector this check must keep visible. Combined with
+            # nested_in_subst above, this decides ONCE, for the whole run,
+            # whether this echo/printf invocation is safe to mask.
+            block_mask = 0
+            if (is_echoish) {
+                if (nested_in_subst) {
+                    block_mask = 1
+                } else {
+                    look = rest
+                    while (1) {
+                        qc = substr(look, 1, 1)
+                        if (qc != DQ && qc != SQ) break
+                        endpos = 0
+                        for (i = 2; i <= length(look); i++) {
+                            if (substr(look, i, 1) == qc) { endpos = i; break }
+                        }
+                        if (endpos == 0) break
+                        look = substr(look, endpos + 1)
+                        while (substr(look, 1, 1) == " " || substr(look, 1, 1) == "\t") {
+                            look = substr(look, 2)
+                        }
+                    }
+                    if (substr(look, 1, 1) == "|") {
+                        block_mask = 1
+                    }
+                }
+            }
+
             # Mask every consecutive quoted positional argument immediately
             # following the anchor (whitespace-separated). Stops at the first
             # non-quote-starting token, so anything after the argument list
@@ -694,7 +1123,7 @@ mask_command_positional_args() {
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
-                if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                if (!block_mask && index(inner, "$(") == 0 && index(inner, "`") == 0) {
                     gsub(/./, "X", inner)
                 }
                 out = out qc inner qc

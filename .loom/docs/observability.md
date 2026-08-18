@@ -21,7 +21,7 @@ loom-daemon (per host)
   exporter: HttpsExporter (default) or OtlpExporter (opt-in, #4858)
         │
         ▼
-Cloudflare Worker backend (deploy-your-own, or the 2AM reference instance)
+Cloudflare Worker backend (deploy-your-own, or an operator-run reference instance)
   D1 (durable history) + Durable Object (live "what's running now")
         │
         ├── /api/*     authenticated, full detail   (Cloudflare Access)
@@ -171,7 +171,7 @@ warning.
 `loom-daemon status` now states the answer positively (issue #5083):
 
 ```
-Observability: OK — last export 12s ago, 3481 record(s) as host_id=robb-studio → https://…/ingest
+Observability: OK — last export 12s ago, 3481 record(s) as host_id=studio-host → https://…/ingest
 ```
 
 The same facts are machine-readable under `observability_export` in
@@ -248,13 +248,57 @@ dead-end login wall for an anonymous visitor.
 - Token/cost analytics (burn curves, forecasting, per-repo attribution, and
   why that surface is authenticated-only): `dashboard/docs/token-analytics.md`
 
-## 6. The 2AM reference instance
+## 5b. Doc-maintenance throughput (Guide, local-only, issue #6136)
 
-`dashboard.2amlogic.com` is a live, operator-owned deployment of this same
+Everything in sections 1-5 above is the `sweep.*`/`tokens.snapshot` pipeline,
+and it only ever covers **Builder sweeps** — the daemon's `SweepRegistry`
+tracks a sweep's checkpoint file and phase transitions, which is what
+`sweep.phase`/`sweep.completed`/`sweep.outcome` are sampled from
+(`.loom/docs/telemetry-schema.md`). Support-role crons — Judge, Champion,
+Curator, and Guide — run as role **prompts**
+(`defaults/.claude/commands/loom/<role>.md`), not as tracked sweeps, so none
+of them ever emit `sweep.*` records; their token spend falls into
+`dashboard/docs/token-analytics.md`'s "unattributed" bucket, reported as a
+single undifferentiated total with no per-role breakdown.
+
+Guide's Document Maintenance phase (the WORK_LOG.md/WORK_PLAN.md/README.md
+docs PRs) closes a **narrow slice** of that gap with its own small, decoupled
+local telemetry surface — deliberately **not** wired into the
+`loom-daemon`/Cloudflare pipeline above, since attaching a role prompt to the
+`SweepRegistry` machinery would be a much larger change than this issue's
+visibility-only scope:
+
+- **Emission**: `create_docs_pr()` (Step 5) calls
+  `./.loom/scripts/guide-docs-telemetry.sh record --pr <N> --duration-sec <N>
+  --files <csv>` right before releasing the docs-guide lock, appending one
+  JSON line — `{schema_version, emitted_at, emitted_at_epoch, host_id,
+  record: {kind: "guide.docs_maintenance", repo, pr_number, duration_sec,
+  files_changed}}` — to `.loom/logs/guide-docs-telemetry.jsonl` (gitignored,
+  host-local, same directory `sweep-outcome-telemetry.jsonl` already lives
+  in). `duration_sec` is the phase's elapsed lock-hold time
+  (`docs-guide-lock.sh age`, read before release) — a proxy for agent/token
+  spend, not a real token count (no token-usage API is available to a role
+  prompt's shell environment).
+- **Query**: `./.loom/scripts/guide-docs-telemetry.sh report --since 7d`
+  (accepts `7d`/`24h`/`30m`/`90s`/a bare integer of seconds; `--json` for a
+  machine-readable summary) prints doc-maintenance PR count and total/average
+  phase time over the window, from one command — a zero-activity window
+  renders "No doc-maintenance PRs in this window." rather than erroring.
+- **What this does NOT do**: it does not add a `guide.*` kind to the wire
+  schema in `.loom/docs/telemetry-schema.md`, does not export anywhere, and
+  does not appear in the Cloudflare-backed dashboard — it is a purely local,
+  single-host-at-a-time journal an operator queries directly on whichever
+  host is running Guide. A fleet-wide, dashboard-integrated version of this
+  (real per-account token attribution, multi-host aggregation) is a natural
+  follow-up, not required by #6136's acceptance criteria.
+
+## 6. The operator reference instance
+
+`dashboard.example.com` is a live, operator-owned deployment of this same
 backend (not a shared Loom service — every fleet deploys its own). Its
 specific account/database IDs, Access application layout, credential file
 locations, and cutover history now live in that operator's own
-infrastructure repo (2AMLogic/2am#2), not in this repo — this repo's
+infrastructure repo (example-org/fleet-repo#305), not in this repo — this repo's
 [`dashboard/docs/reference-deployment.md`](https://github.com/rjwalters/loom/blob/main/dashboard/docs/reference-deployment.md)
 only records the *shape* such a document should take (which values to
 capture, and why) so you can produce the equivalent for your own instance.
@@ -268,5 +312,6 @@ capture, and why) so you can produce the equivalent for your own instance.
 | `dashboard/docs/cloudflare-access.md` | Gating the authenticated view behind SSO; single-URL fallback |
 | `dashboard/docs/query-api.md` | `/api/*` vs `/public/*` routes, redaction policy, live tail |
 | `dashboard/docs/token-analytics.md` | Burn curves, forecasting, per-repo attribution |
+| `defaults/scripts/guide-docs-telemetry.sh` | Local doc-maintenance throughput telemetry (§5b) — record + report, no daemon/Cloudflare involvement |
 | `dashboard/docs/reference-deployment.md` | Generic guidance/template for recording your own instance's deployment identity in your own infrastructure repo — carries no operator identity here |
 | `loom-daemon/src/observability/mod.rs` | Config resolution, collector/queue/exporter/sender source of truth |

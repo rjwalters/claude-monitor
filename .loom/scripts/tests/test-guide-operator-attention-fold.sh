@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-guide-operator-attention-fold.sh - Regression test for issue #5930
+# test-guide-operator-attention-fold.sh - Regression test for issues #5930, #6457
 #
 # PR #5892 (closing #5890) added a debounce so the *machine-generated* region
 # of WORK_PLAN.md (between `<!-- guide:plan-body:start -->` / `:end -->`) is
@@ -38,6 +38,14 @@
 #      PR membership, produces byte-identical output — i.e. a tick where the
 #      underlying facts (which PRs are held) have not changed can never
 #      manufacture a diff, regardless of when it runs.
+#   5. #6457: `$held` is derived FROM `$approved`'s already-fetched PR list
+#      (filtered on `loom:operator` label membership) rather than issuing a
+#      second, independently-cached/independently-search-indexed
+#      `gh pr list --label "loom:operator"` query — so the "Operator
+#      Attention" and "Approved (Awaiting Merge)" sections (and the Backlog
+#      Balance count derived from `$held`) can no longer disagree about
+#      which open `loom:pr` PRs also carry `loom:operator`, even under
+#      cache-age skew or GitHub search-index lag on a just-applied label.
 #
 # Hermetic: pure grep/string reconstruction against fixture data. No forge,
 # network, or `gh` calls.
@@ -46,7 +54,16 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+# guide.md is shipped (installed at .claude/commands/loom/guide.md), so
+# resolve it the way each layout actually lays it out: the installed path
+# first (consumer repos, and Loom's own dogfooded checkout), falling back
+# to the defaults/ source-tree path (a bare source checkout with no
+# .claude/commands/loom/ copy yet). See issue #6194 / #6241.
+if [[ -f "$REPO_ROOT/.claude/commands/loom/guide.md" ]]; then
+    GUIDE_MD="$REPO_ROOT/.claude/commands/loom/guide.md"
+else
+    GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+fi
 WORK_PLAN_MD="$REPO_ROOT/WORK_PLAN.md"
 
 RED='\033[0;31m'
@@ -89,8 +106,10 @@ fi
 # ---------------------------------------------------------------------------
 echo "Test 1: guide.md folds Operator Attention into render_plan_body()"
 
-assert_grep 'held=\$\("\$GH_READ" pr list --label "loom:operator"' "$GUIDE_MD" \
-    "render_plan_body() queries loom:operator PRs into \$held"
+assert_grep 'held=\$\(printf .%s. "\$approved_json" \| jq -r .\.\[\] \| select' "$GUIDE_MD" \
+    "render_plan_body() derives \$held from \$approved_json (#6457) rather than a second live query"
+assert_not_grep '\$GH_READ" pr list --label "loom:operator"' "$GUIDE_MD" \
+    "render_plan_body() no longer issues a separate 'gh pr list --label loom:operator' query (#6457)"
 assert_grep '"Operator Attention: Merge-Risk-Hold Pileup"' "$GUIDE_MD" \
     "guide.md renders an Operator Attention: Merge-Risk-Hold Pileup section"
 
@@ -194,6 +213,56 @@ if grep -q '_None._' <<<"$RENDER_EMPTY"; then
     pass "empty loom:operator membership renders the _None._ fallback, consistent with other sections"
 else
     fail "expected the _None._ fallback for empty loom:operator membership"
+fi
+
+# ---------------------------------------------------------------------------
+# Test 5 (#6457): $held is derived from $approved's fetched PR list, so the
+# "Operator Attention" and "Approved (Awaiting Merge)" sections can no
+# longer disagree about which open loom:pr PRs also carry loom:operator —
+# even when a second, independently-cached/independently-search-indexed
+# `gh pr list --label "loom:operator"` query would have returned stale or
+# lagging results for a PR labeled `loom:operator` moments earlier.
+# ---------------------------------------------------------------------------
+echo ""
+echo "Test 5: \$held is derived from \$approved's list, not a second live query (#6457)"
+
+if command -v jq >/dev/null 2>&1; then
+    # Simulate: two PRs carry both loom:pr and loom:operator (one just
+    # labeled loom:operator moments before this "tick"); a third carries
+    # only loom:pr. A second, separately-cached `loom:operator`-filtered
+    # query is deliberately NOT modeled here, because the fix removes it
+    # entirely — $held must come from the SAME fetched JSON as $approved.
+    APPROVED_JSON_FIXTURE='[
+      {"number":6333,"title":"Test PR A","labels":[{"name":"loom:pr"},{"name":"loom:operator"}]},
+      {"number":6325,"title":"Test PR B","labels":[{"name":"loom:pr"},{"name":"loom:operator"}]},
+      {"number":9999,"title":"Test PR C","labels":[{"name":"loom:pr"}]}
+    ]'
+
+    APPROVED_DERIVED="$(printf '%s' "$APPROVED_JSON_FIXTURE" | jq -r '.[] | "- **#\(.number)**: \(.title)"')"
+    HELD_DERIVED="$(printf '%s' "$APPROVED_JSON_FIXTURE" | jq -r '.[] | select([(.labels // [])[].name] | index("loom:operator")) | "- **#\(.number)**: \(.title)"')"
+
+    if grep -q '#6333' <<<"$HELD_DERIVED" && grep -q '#6325' <<<"$HELD_DERIVED"; then
+        pass "both loom:operator-labeled PRs are derived into \$held from the same fetch as \$approved"
+    else
+        fail "expected both #6333 and #6325 in \$held derived from \$approved_json (got: $HELD_DERIVED)"
+    fi
+
+    if grep -q '#9999' <<<"$HELD_DERIVED"; then
+        fail "PR #9999 (loom:pr only, no loom:operator) unexpectedly appeared in derived \$held"
+    else
+        pass "a loom:pr-only PR is correctly excluded from derived \$held"
+    fi
+
+    if grep -q '#9999' <<<"$APPROVED_DERIVED"; then
+        pass "\$approved still lists all three loom:pr PRs (rendering unchanged by the derivation refactor)"
+    else
+        fail "expected \$approved to still include #9999"
+    fi
+
+    HELD_COUNT="$([ -z "$HELD_DERIVED" ] && printf '0' || printf '%s\n' "$HELD_DERIVED" | grep -c '^- ')"
+    assert_eq "$HELD_COUNT" "2" "Backlog Balance's derived held-count is correct by construction (2)"
+else
+    echo "  SKIP: jq not available, skipping Test 5's executable derivation check"
 fi
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,25 @@
 # can't collide with a same-named suite in this directory.
 #
 # Exit 0 = invariant holds; exit 1 = violation (details printed to stderr).
+#
+# NOTE for suite authors (#6194/#6241): this manifest check does NOT detect a
+# hardcoded source-tree-only subject path. If your new suite resolves a
+# subject under $REPO_ROOT, classify it before wiring it in:
+#   - Subject is SHIPPED (installed into a consumer repo, e.g. anything under
+#     defaults/.claude/, defaults/docs/, defaults/hooks/, or defaults/scripts/
+#     other than scripts/install/) -> resolve the installed path first
+#     (.claude/commands/loom/<x>, .loom/docs/<x>, .loom/hooks/<x>,
+#     .loom/scripts/<x>), falling back to the defaults/ source-tree path, so
+#     the suite genuinely runs in both layouts. Prefer a self-relative
+#     resolution (off $SCRIPT_DIR) when the subject ships alongside the test
+#     itself (see test-merge-pr-*.sh, test-sweep-experiment.sh).
+#   - Subject is SOURCE-TREE-ONLY (lives at the repo root outside defaults/,
+#     e.g. scripts/install/*.sh, scripts/install-loom.sh, scripts/loom) ->
+#     guard with `echo "SKIP: source-tree-only test, <path> not found (not
+#     shipped into an installed repo)" >&2; exit 0` rather than a hard
+#     `exit 1`/`FATAL` (see test-gitignore-guard.sh, test-loom-dispatcher.sh).
+# A suite with neither treatment silently breaks in every installed consumer
+# repo instead of running (or SKIPping) cleanly.
 
 set -euo pipefail
 

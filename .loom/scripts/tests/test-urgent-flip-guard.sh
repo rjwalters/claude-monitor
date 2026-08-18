@@ -37,7 +37,16 @@ SCRIPTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$SCRIPTS_DIR/../.." && pwd)"
 
 GUARD_SH="$SCRIPTS_DIR/urgent-flip-guard.sh"
-GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+# guide.md is shipped (installed at .claude/commands/loom/guide.md), so
+# resolve it the way each layout actually lays it out: the installed path
+# first (consumer repos, and Loom's own dogfooded checkout), falling back
+# to the defaults/ source-tree path (a bare source checkout with no
+# .claude/commands/loom/ copy yet). See issue #6194 / #6241.
+if [[ -f "$REPO_ROOT/.claude/commands/loom/guide.md" ]]; then
+    GUIDE_MD="$REPO_ROOT/.claude/commands/loom/guide.md"
+else
+    GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
+fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -70,6 +79,10 @@ summarize_and_exit() {
 
 if [[ ! -x "$GUARD_SH" ]]; then
     fail "urgent-flip-guard.sh missing or not executable at $GUARD_SH"
+    summarize_and_exit
+fi
+if [[ ! -f "$GUIDE_MD" ]]; then
+    fail "guide.md not found at $GUIDE_MD"
     summarize_and_exit
 fi
 

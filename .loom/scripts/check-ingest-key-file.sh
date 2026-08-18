@@ -4,7 +4,7 @@
 #
 # Root cause this guards against: on 2026-08-04, a `loom-worker-2` (Linux,
 # home `/home/ubuntu`) daemon reported observability as `disabled` because
-# its resolved `ingestKeyFile` was `/Users/rwalters/.loom/observability/ingest.key`
+# its resolved `ingestKeyFile` was `/Users/alice/.loom/observability/ingest.key`
 # — a macOS path committed verbatim into the shared `.loom/config.json`,
 # copied unmodified onto every host that pulled `main`. The real key file was
 # sitting at `/home/ubuntu/.loom/observability/ingest.key` the whole time.

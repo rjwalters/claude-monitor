@@ -159,6 +159,45 @@ build/launch" and stand down (or run only the cheap validation). Note the
 skipped heavy validation in your report so the gap is visible; do **not** file a
 bug just because heavy validation was skipped by policy.
 
+**Step D5 — some suites are HOST-MUTATING: never run them directly (#6386):**
+
+Most test suites are hermetic. A few are not: this repo's **daemon-lifecycle
+shell suites** (`test-loom-daemon-start.sh`, `-stop.sh`, `-update.sh`,
+`-quiesce.sh`, `-watchdog.sh`) execute the *real* `loom-daemon-{start,stop,
+update,quiesce}.sh`, so they `kill`, `rm -f` pid files, and `launchctl bootout` /
+`systemctl --user disable` whatever their invocations resolve.
+
+**Two things make you, specifically, the dangerous caller:**
+
+1. You run on a **fleet host**, where a live `loom-daemon` and its pid file both
+   exist — unlike CI, where neither does, so CI can never see this hazard.
+2. Your own agent session **exports the live state paths** into every child
+   process you spawn (`LOOM_PID_FILE=<the real .daemon.pid>`, `LOOM_WORKSPACE=<the
+   real checkout>`, `LOOM_LAUNCHD_LABEL=com.rjwalters.loom-daemon`). A suite that
+   merely *omits* an override does not get a neutral default — it inherits
+   production. And your cwd is normally the live checkout, which is the *other*
+   resolution tier.
+
+On 2026-08-16 that combination cost the fleet its authoritative dispatcher for
+11 hours: an idle-triggered Auditor ran `bash defaults/scripts/tests/run-ci-suites.sh`
+from the live checkout, one stop-suite case resolved the real `.loom/.daemon.pid`,
+and the daemon was SIGTERM'd (#6386).
+
+**The rules:**
+
+- Run the shell suites **only** through `defaults/scripts/tests/run-ci-suites.sh`,
+  never by invoking a `test-loom-daemon-*.sh` file directly. That runner carries
+  the live-daemon guard: when a daemon pid file exists on this host it **skips**
+  those five suites, loudly, and says so in its summary.
+- **Never set `LOOM_CI_ALLOW_DAEMON_SUITES=1`.** That override exists for an
+  operator on a host with no daemon; for you it re-opens exactly this hazard.
+- A `SKIP … (live-daemon guard, #6386)` line is a **correct outcome**, not a
+  failure. Report those suites as "not validated on this host (live daemon
+  present)" — do **not** file a bug, and do **not** work around the guard.
+- Treat the same way any suite in another repo that drives a service lifecycle,
+  a supervisor (launchd/systemd), or a shared daemon: if you cannot show it is
+  hermetic, do not run it on a host where that service is live.
+
 ### CI-Aware Validation
 
 **Before running redundant build/test, check if CI already validated the commit.**

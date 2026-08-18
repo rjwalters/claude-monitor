@@ -117,6 +117,11 @@ Commands:
             already holds a live (non-stale) lock.
   release   Release the lock. Idempotent -- exit 0 even if not held.
   status    Exit 0 if the lock is currently held and not stale, 1 otherwise.
+  age       Print the age (whole seconds) of the currently-held lock to
+            stdout and exit 0, or print nothing and exit 1 if the lock is
+            not held. Used by guide.md to compute a Document Maintenance
+            phase-duration proxy for guide-docs-telemetry.sh (issue #6136) --
+            staleness does not affect this, it reports raw elapsed time.
 
 Tunables (env vars):
   LOOM_DOCS_GUIDE_LOCK_STALE_SECS   Age in seconds after which a held lock is
@@ -130,7 +135,7 @@ if [[ "$CMD" == "--help" ]] || [[ "$CMD" == "-h" ]]; then
     show_help
     exit 0
 fi
-if [[ "$CMD" != "acquire" ]] && [[ "$CMD" != "release" ]] && [[ "$CMD" != "status" ]]; then
+if [[ "$CMD" != "acquire" ]] && [[ "$CMD" != "release" ]] && [[ "$CMD" != "status" ]] && [[ "$CMD" != "age" ]]; then
     print_error "Unknown or missing command: '${CMD}'"
     show_help >&2
     exit 2
@@ -207,6 +212,13 @@ EOF
         ;;
     status)
         if [[ -d "$LOCK_PATH" ]] && ! _lock_is_stale; then
+            exit 0
+        fi
+        exit 1
+        ;;
+    age)
+        if [[ -d "$LOCK_PATH" ]]; then
+            _lock_age_secs "$LOCK_PATH"
             exit 0
         fi
         exit 1

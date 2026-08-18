@@ -451,14 +451,29 @@ boundary no matter where it is invoked. What one pass does:
    — **excluding `sweep.modelAliases`**. That key's Rust/Python resolvers diverge;
    migrating it would freeze the divergence into every consumer repo, so it is
    left in the (lower-precedence, on-disk) legacy tier and reported as excluded.
-   **Host-local keys** (`worktree.root` — a per-host scratch-disk path) are routed
-   to the **gitignored** `.loom-local/local.json` (the resolver's `LOCAL_CONFIG_REL`
-   tier), *not* the tracked, shared `project.json`: since this same pass
-   `git rm --cached`s the legacy config, `project.json` becomes the highest tier
-   every fresh clone / CI run picks up, so a stray `worktree.root` there would
-   silently propagate one operator's filesystem layout to the whole team. An
-   existing `project.json` is left untouched (idempotency); an existing
-   `local.json` override is preserved (only a missing `worktree.root` is filled in).
+   **Host-local keys** are routed to the **gitignored** `.loom-local/local.json`
+   (the resolver's `LOCAL_CONFIG_REL` tier), *not* the tracked, shared
+   `project.json`: since this same pass `git rm --cached`s the legacy config,
+   `project.json` becomes the highest tier every fresh clone / CI run picks up, so
+   a stray host-local value there would silently propagate one operator's machine
+   to the whole team. The list is `MC_HOST_LOCAL_KEYS` in
+   `scripts/install/migrate-consumer.sh` — currently `worktree.root` (per-host
+   scratch-disk path), `safehouse.enabled` and `safehouse.socket` (whether
+   safehoused is provisioned on this box, and where its socket lives). The
+   criterion for adding one is **"the value is materially true of one host and
+   false of the others"**, and routing is per-**sub-key**, never per-object:
+   `safehouse.room` / `.rooms` / `.persona` describe what the repo does regardless
+   of who runs it, so they stay in the tracked `project.json` while their siblings
+   move. An object emptied by the routing (a `safehouse` block that was *only*
+   `enabled`/`socket`) is pruned from `project.json`. An existing `project.json` is
+   left untouched (idempotency); an existing `local.json` override is preserved —
+   only keys unset there are filled in, so `safehouse.enabled=false` survives a
+   re-run rather than being re-derived. For a host whose dirt has *already* been
+   committed (migration is a one-time pass, not an ongoing per-field fixer), the
+   by-hand per-key procedure is
+   [`docs/design/config-resolution-tiers.md`](https://github.com/rjwalters/loom/blob/main/docs/design/config-resolution-tiers.md)
+   §5 (in the Loom checkout — this doc ships into consumer repos, which have no
+   `docs/design/`).
 3. **Untrack the committed implementation** per the manifest — `git rm --cached`
    (files stay on disk, just leave the index) + a gitignore block single-sourced
    with `install-loom.sh --local`. Only the machine-served namespaces (`/.loom/`,

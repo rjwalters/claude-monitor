@@ -583,6 +583,38 @@ if [[ "$HAS_SKIP_GIT_CHECK_ARG" != "true" ]]; then
     fi
 fi
 
+# --- Account provider resolution (issue #5609, design D8) ---
+# Reads THIS runtime's own manifest (defaults/runtimes/codex.json)'s
+# "accountProvider" field so the pool `tokens select --provider` dispatches
+# into is a property of the runtime manifest, not a value hardcoded in this
+# script -- an operator can locally repoint it by editing
+# .loom/runtimes/codex.json without touching this script. Resolution mirrors
+# check-runtime-capabilities.sh's precedence: an on-disk
+# <repo>/.loom/runtimes/<name>.json wins over the defaults/runtimes/ fallback
+# next to this script. A missing file, missing field, or missing `jq` all
+# fall open to "claude" (never fail closed) -- design D8's "a missing
+# accountProvider on an un-resynced install must default to claude". Mirrors
+# the identical helper in spawn-claude.sh; each spawn adapter stays a
+# self-contained sibling rather than sourcing a shared lib for one lookup.
+_loom_account_provider_for_runtime() {
+    local runtime_name="$1" manifest=""
+    if [[ -f "${WORKSPACE}/.loom/runtimes/${runtime_name}.json" ]]; then
+        manifest="${WORKSPACE}/.loom/runtimes/${runtime_name}.json"
+    elif [[ -f "${_SCRIPT_DIR}/../runtimes/${runtime_name}.json" ]]; then
+        manifest="${_SCRIPT_DIR}/../runtimes/${runtime_name}.json"
+    fi
+    if [[ -z "$manifest" ]] || ! command -v jq >/dev/null 2>&1; then
+        printf '%s\n' "claude"
+        return
+    fi
+    local provider
+    provider="$(jq -r '.accountProvider // "claude"' "$manifest" 2>/dev/null)"
+    case "$provider" in
+        "" | null) provider="claude" ;;
+    esac
+    printf '%s\n' "$provider"
+}
+
 # --- Auth: CODEX_HOME profile passthrough (see header) ---
 CODEX_PROFILE_NAME=""
 if [[ -n "${LOOM_SPAWN_NO_EXPORT:-}" ]]; then
@@ -604,9 +636,10 @@ else
             log_error "No loom-daemon binary supporting provider-aware account selection was found."
             exit 78
         fi
+        _account_provider="$(_loom_account_provider_for_runtime codex)"
         _selection_stderr_file="$(mktemp)"
         _selection_output=""
-        if ! _selection_output="$("$_daemon_bin" tokens select --provider codex \
+        if ! _selection_output="$("$_daemon_bin" tokens select --provider "$_account_provider" \
             --workspace "$WORKSPACE" --export 2>"$_selection_stderr_file")"; then
             log_error "Codex account selection failed:"
             cat "$_selection_stderr_file" >&2 || true

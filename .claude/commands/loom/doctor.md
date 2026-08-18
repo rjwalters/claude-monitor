@@ -98,6 +98,47 @@ running an older `worktree.sh` (pre-#4823) or a symptom of a genuinely diverged
 local state — either way, fixing review feedback on top of the wrong base produces
 a PR-clobbering force-push or a diff against the wrong parent.
 
+**Run the check, don't just eyeball it (#6257).** `worktree.sh <ISSUE_NUM>`'s own
+"directory already exists" fast path now performs this same fetch-and-compare and
+prints a warning on drift, but a Doctor session that reuses an already-`cd`'d
+worktree from an earlier phase of the same sweep (no fresh `worktree.sh` call in
+between) does not get that warning re-run. Verify explicitly, immediately before
+making any edits — **pin the worktree path once into `WORKTREE_ABS` and use
+`git -C "$WORKTREE_ABS" ...` for every check, never a bare `git status`/`git
+rev-parse` that relies on a `cd` still being in effect.** A `cd` earlier in the
+same shell session persists for every later command in that session, including
+a command you intended for a *different* directory (e.g. the main checkout) —
+that silent redirection is exactly what made a prior Judge falsely report both
+a worktree and the main checkout clean from a single `cd`'d `git status`
+(#6373). `-C` makes the target directory explicit in the command itself, so it
+can't be hijacked by a stale `cd`:
+
+```bash
+WORKTREE_ABS="$(cd .loom/worktrees/issue-<ISSUE_NUM> && pwd)"
+PR_HEAD_SHA=$(gh pr view <PR_NUMBER> --json headRefOid --jq '.headRefOid')
+WT_HEAD_SHA=$(git -C "$WORKTREE_ABS" rev-parse HEAD)
+WT_STATUS=$(git -C "$WORKTREE_ABS" status --porcelain)
+
+if [ "$WT_HEAD_SHA" != "$PR_HEAD_SHA" ] || [ -n "$WT_STATUS" ]; then
+    echo "Worktree drift detected (HEAD=$WT_HEAD_SHA, PR head=$PR_HEAD_SHA, dirty=$([ -n "$WT_STATUS" ] && echo yes || echo no)) - resyncing"
+    if [ -n "$WT_STATUS" ]; then
+        ./.loom/scripts/worktree.sh snapshot <ISSUE_NUM> --include-untracked   # save WIP, never a bare `git stash` (see below)
+        git -C "$WORKTREE_ABS" checkout -- .
+    fi
+    git -C "$WORKTREE_ABS" pull --ff-only
+fi
+```
+
+Only proceed to fix review feedback once `WT_HEAD_SHA` matches `PR_HEAD_SHA` and
+`WT_STATUS` is empty. If `git pull --ff-only` fails, fall back to the
+`fetch && reset --hard` + `set-upstream-to` sequence above.
+
+If you also need to state that the main checkout is clean (e.g. after
+resolving a contamination scare), name `$WORKTREE_ABS` and the main-checkout
+path explicitly in that claim, and check the main checkout with
+`./.loom/scripts/check-main-clean.sh` — never a second bare `git status` in
+the same session.
+
 ### Never use bare `git stash` for ad-hoc WIP (#4821)
 
 `refs/stash` is **one stack shared across every linked worktree of the
@@ -314,12 +355,15 @@ Doctors prioritize work in the following order:
 
 ### Priority 1: Approved PRs with Merge Conflicts (URGENT)
 
-**Find approved PRs with merge conflicts that aren't already claimed:**
+**Find approved PRs with merge conflicts that aren't already claimed and are
+not on an explicit operator hold:**
 ```bash
 # GitHub search has no `conflicts:` qualifier, so ask the API for each PR's
-# mergeability and filter on CONFLICTING locally.
+# mergeability and filter on CONFLICTING locally. Also excludes loom:operator
+# (Champion's merge-risk hold) — mirrors the Priority 2 operator-hold
+# exclusion below (#5978).
 gh pr list --label="loom:pr" --state=open --json number,title,labels,mergeable \
-  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:treating")) | "#\(.number): \(.title)"'
+  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:treating")) | select(.labels | all(.name != "loom:operator")) | "#\(.number): \(.title)"'
 ```
 
 **Why highest priority?**
@@ -355,6 +399,17 @@ gh pr list --search "is:open is:pr label:loom:changes-requested -label:loom:bloc
 > auto-claims a held PR. This does not change PR Fix Mode or an explicit user
 > instruction naming a PR by number — those remain a deliberate human
 > decision to work on that specific PR, same as everywhere else in this file.
+>
+> **Operator-hold exclusion (Priority 1 queue, #5978).** `loom:operator`
+> (Champion's merge-risk hold) is a *different* label from `loom:blocked` /
+> `loom:operator-only` above — see `.loom/docs/label-state-machine.md`. Doctor
+> is not yet a wired entry/exit point for `loom:operator` (see that doc's
+> "Not yet wired" table) — this exclusion is therefore **filter-only**: the
+> Priority 1 query skips `loom:operator` PRs so autonomous Finding Work never
+> rebases/pushes to a held PR, but Doctor must not itself add or remove
+> `loom:operator`. Don't drop this filter when Doctor is eventually wired as a
+> real entry/exit point — re-derive it from that wiring instead. Same PR Fix
+> Mode / explicit-user-instruction carve-out as the Priority 2 note above.
 
 ### Applying `loom:operator-only`: a sub-kind label is REQUIRED (#5819)
 
@@ -443,10 +498,14 @@ at all.
 
 ### Other PRs Needing Attention
 
-**Find PRs with merge conflicts (any label):**
+**Find PRs with merge conflicts (any label):** this is a broad diagnostic scan,
+not itself a claim path — the guarded Priority 1 query above (which excludes
+`loom:treating` and `loom:operator`) is what autonomous Finding Work actually
+claims from. Still excludes `loom:operator` here too, so a Doctor skimming this
+list doesn't hand-pick a held PR (#5978).
 ```bash
-gh pr list --state=open --json number,title,mergeable \
-  | jq -r '.[] | select(.mergeable == "CONFLICTING") | "#\(.number): \(.title)"'
+gh pr list --state=open --json number,title,labels,mergeable \
+  | jq -r '.[] | select(.mergeable == "CONFLICTING") | select(.labels | all(.name != "loom:operator")) | "#\(.number): \(.title)"'
 ```
 
 **Find all open PRs:**
@@ -829,6 +888,14 @@ Do **not** add `loom:review-requested` when standing down — the Doctor who
 actually pushed owns that transition. Leave the PR's state labels alone and
 exit; your only label action is removing your own claim.
 
+**Note on new-PR creation (#6277):** Doctor normally pushes fixes to an
+*existing* PR, so the recheck above is the relevant freshness guard. If a fix
+ever requires opening a brand-new PR (e.g. splitting work into a separate
+branch), use `./.loom/scripts/create-pr.sh` — it applies the analogous check
+on the *target issue* immediately before opening the PR, refusing to open a
+duplicate against an issue a different, already-merged PR already closed.
+See `builder-pr.md` § "Creating the PR" for the full behavior.
+
 ### Verdict-Time CAS Recheck (Step 11 — immediately before the completion label write)
 
 The Pre-Push Head-SHA Recheck above catches a concurrent **code** race. It
@@ -871,9 +938,11 @@ write that actually matters, not just at claim time.
       CAS Recheck above), and aborted/stood down on a lost claim or a raced verdict
       label instead of writing over it
 - [ ] My commit(s) address the specific feedback quoted from the Judge's review
-- [ ] If any comment I posted came from a scratch file, I used `--body-file
-      <path>` (or `gh api -F body=@<path>`) — NEVER `--body @<path>` (see the
-      `--body @path` anti-pattern warning above)
+- [ ] If any comment I posted came from a scratch file, the filename is
+      namespaced by the PR/issue number (`fix-comment-<N>.md`, never a fixed
+      name — wave subagents share one scratchpad, #6381), and I used
+      `--body-file <path>` (or `gh api -F body=@<path>`) — NEVER `--body
+      @<path>` (see the `--body @path` anti-pattern warning above)
 - [ ] I re-fetched the posted comment (`gh pr view <number> --comments`) to
       verify it renders my actual prose, not a literal path string
 - [ ] I ran the label transition (`loom:changes-requested`/`loom:treating` →
@@ -1188,7 +1257,9 @@ pnpm test 2>&1 | grep -A 5 -B 2 "FAIL\|Error\|✗"
 gh pr list --search "is:open is:pr label:loom:changes-requested -label:loom:blocked -label:loom:operator-only" --json number,title,labels \
   | jq -r '.[] | select(.labels | all(.name != "loom:treating")) | "#\(.number): \(.title)"'
 
-# Find PRs with merge conflicts
+# Find PRs with merge conflicts (simplified for illustration — see Priority 1
+# above for the full guarded query, which additionally filters on
+# loom:pr / loom:treating / loom:operator, #5978)
 gh pr list --state=open --json number,title,mergeable \
   | jq -r '.[] | select(.mergeable == "CONFLICTING") | "#\(.number): \(.title)"'
 

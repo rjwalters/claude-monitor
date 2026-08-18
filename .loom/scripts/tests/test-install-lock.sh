@@ -26,6 +26,11 @@
 #      touches the target, that a stale lock does not block, and that the lock
 #      is released on both a successful run and an `error()`-triggered exit.
 #
+# Source-tree-only by design (#6194): scripts/install/install-lock.sh and
+# install.sh both live at the repo root, not under defaults/, so neither is
+# shipped into an installed consumer repo. This suite SKIPs (exit 0) rather
+# than errors when run outside Loom's own checkout.
+#
 # Usage:
 #   bash defaults/scripts/tests/test-install-lock.sh
 
@@ -79,8 +84,8 @@ $haystack"
 
 for f in "$LOCK_LIB" "$INSTALL_SH"; do
   if [[ ! -f "$f" ]]; then
-    echo "ERROR: $f not found" >&2
-    exit 1
+    echo "SKIP: source-tree-only test, $f not found (not shipped into an installed repo)" >&2
+    exit 0
   fi
 done
 
