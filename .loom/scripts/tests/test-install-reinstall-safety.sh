@@ -27,6 +27,15 @@
 #   - Hook-dedup quote-normalization (scaffolding.rs): split out to #4200,
 #     tracked as a Rust unit test there.
 #
+# Group 7 (issue #6509, follow-up to #6499/#6502): install.sh's reinstall-time
+# `git stash pop --index` against $TARGET_PATH is routed through
+# defaults/scripts/safe-stash-pop.sh (#6501) via
+# scripts/install/reinstall-stash-pop.sh::_reinstall_safe_stash_pop, so a
+# conflicting pop can never leave conflict markers / unmerged index entries
+# behind. Exercised directly against the pure, side-effect-free helper
+# function rather than the full installer end-to-end (same rationale as
+# Group 2's extracted loom_daemon_binary_stale()).
+#
 # Strategy: install.sh's loom_daemon_binary_stale() is pure and side-effect
 # free, so it is extracted via awk (same pattern as
 # test-install-source-guard.sh) and exercised in an isolated harness rather
@@ -48,6 +57,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
 UNINSTALL_SH="$REPO_ROOT/scripts/uninstall-loom.sh"
+REINSTALL_STASH_POP="$REPO_ROOT/scripts/install/reinstall-stash-pop.sh"
+REAL_SAFE_STASH_POP="$REPO_ROOT/defaults/scripts/safe-stash-pop.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -108,6 +119,27 @@ assert_nonzero_exit() {
         TESTS_FAILED=$((TESTS_FAILED + 1))
         echo -e "  ${RED}FAIL${NC}: $msg (expected non-zero, got $actual)"
     fi
+}
+
+assert_eq() {
+    local expected="$1" actual="$2" msg="$3"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ "$expected" == "$actual" ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: $msg"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: $msg"
+        echo "    expected: [$expected]"
+        echo "    actual:   [$actual]"
+    fi
+}
+
+# A tracked file carries conflict markers when it has BOTH an opening
+# `<<<<<<< ` and a closing `>>>>>>> ` at line start (same narrow definition
+# safe-stash-pop.sh and primary_checkout_reaper use).
+has_markers() {
+    grep -q '^<<<<<<< ' "$1" 2>/dev/null && grep -q '^>>>>>>> ' "$1" 2>/dev/null
 }
 
 if [[ ! -f "$INSTALL_SH" ]]; then
@@ -653,6 +685,234 @@ assert_contains "$BRANCH_LIST_11" "feature/issue-300" \
     "Case 3: the branch itself survives (git worktree remove, not a branch delete)"
 
 rm -rf "$T11"
+echo ""
+
+echo "================================================================"
+echo "Group 7: reinstall stash-pop safety (issue #6509, follow-up to #6499/#6502)"
+echo "================================================================"
+echo ""
+
+if [[ ! -f "$REINSTALL_STASH_POP" ]]; then
+    echo -e "${YELLOW}SKIP${NC}: source-tree-only helper, $REINSTALL_STASH_POP not found"
+elif [[ ! -f "$REAL_SAFE_STASH_POP" ]]; then
+    echo -e "${YELLOW}SKIP${NC}: $REAL_SAFE_STASH_POP not found (safe-stash-pop.sh, #6501)"
+else
+    # shellcheck source=/dev/null
+    source "$REINSTALL_STASH_POP"
+
+    export GIT_AUTHOR_NAME="test" GIT_AUTHOR_EMAIL="test@example.com"
+    export GIT_COMMITTER_NAME="test" GIT_COMMITTER_EMAIL="test@example.com"
+    export GIT_CONFIG_NOSYSTEM=1
+
+    G7_WORKDIR=$(mktemp -d /tmp/loom-reinstall-stash-pop-test.XXXXXX)
+    # A loom_root with NEITHER a source-tree nor a target-local
+    # safe-stash-pop.sh available -- exercises the raw-pop fallback (#6509
+    # Availability note: older install / partial tree / curl-piped standalone
+    # install predating #6501).
+    G7_NO_WRAPPER_ROOT="$G7_WORKDIR/no-wrapper-root"
+    mkdir -p "$G7_NO_WRAPPER_ROOT/defaults/scripts"
+
+    echo "-- Case 1: wrapper resolution prefers <target>/.loom/scripts/ over the source tree --"
+    G7_T1="$G7_WORKDIR/t1"
+    git init --quiet "$G7_T1"
+    git -C "$G7_T1" checkout -q -b main
+    printf 'a\n' > "$G7_T1/f.txt"
+    git -C "$G7_T1" add f.txt
+    git -C "$G7_T1" commit -q -m c1
+    mkdir -p "$G7_T1/.loom/scripts"
+    cp "$REAL_SAFE_STASH_POP" "$G7_T1/.loom/scripts/safe-stash-pop.sh"
+    chmod +x "$G7_T1/.loom/scripts/safe-stash-pop.sh"
+    printf 'a\nwip\n' > "$G7_T1/f.txt"
+    git -C "$G7_T1" stash push -q -m wip
+
+    _reinstall_safe_stash_pop "$REPO_ROOT" "$G7_T1" "stash@{0}"
+    assert_eq "wrapper" "$REINSTALL_POP_MODE" "Case 1: target-local wrapper: mode=wrapper"
+    assert_eq "$G7_T1/.loom/scripts/safe-stash-pop.sh" "$REINSTALL_POP_WRAPPER" \
+        "Case 1: target-local copy is preferred over the source-tree copy"
+    assert_eq "clean" "$REINSTALL_POP_RESULT" "Case 1: target-local wrapper: clean pop result"
+    assert_eq "0" "$REINSTALL_POP_STATUS" "Case 1: target-local wrapper: clean pop status 0"
+
+    echo "-- Case 2: falls back to <loom_root>/defaults/scripts/ with no target-local copy --"
+    G7_T2="$G7_WORKDIR/t2"
+    git init --quiet "$G7_T2"
+    git -C "$G7_T2" checkout -q -b main
+    printf 'a\n' > "$G7_T2/f.txt"
+    git -C "$G7_T2" add f.txt
+    git -C "$G7_T2" commit -q -m c1
+    printf 'a\nwip\n' > "$G7_T2/f.txt"
+    git -C "$G7_T2" stash push -q -m wip
+
+    _reinstall_safe_stash_pop "$REPO_ROOT" "$G7_T2" "stash@{0}"
+    assert_eq "wrapper" "$REINSTALL_POP_MODE" "Case 2: source-tree fallback: mode=wrapper"
+    assert_eq "$REPO_ROOT/defaults/scripts/safe-stash-pop.sh" "$REINSTALL_POP_WRAPPER" \
+        "Case 2: source-tree copy used when no target-local copy exists"
+    assert_eq "clean" "$REINSTALL_POP_RESULT" "Case 2: source-tree fallback: clean pop result"
+    assert_contains "$(cat "$G7_T2/f.txt")" "wip" "Case 2: source-tree fallback: content restored"
+    assert_eq "0" "$(git -C "$G7_T2" stash list | wc -l | tr -d ' ')" \
+        "Case 2: source-tree fallback: stash entry consumed"
+
+    echo "-- Case 3: --index staged/unstaged split preserved on the clean path (#3611) --"
+    G7_T3="$G7_WORKDIR/t3"
+    git init --quiet "$G7_T3"
+    git -C "$G7_T3" checkout -q -b main
+    printf 'line1\nline2\n' > "$G7_T3/f.txt"
+    printf 'orig\n' > "$G7_T3/g.txt"
+    git -C "$G7_T3" add f.txt g.txt
+    git -C "$G7_T3" commit -q -m c1
+    # Stage one hunk, leave the other unstaged, then stash both -- --index is
+    # what reproduces the split on pop.
+    printf 'line1\nline2\nSTAGED\n' > "$G7_T3/f.txt"
+    git -C "$G7_T3" add f.txt
+    printf 'orig\nUNSTAGED\n' > "$G7_T3/g.txt"
+    git -C "$G7_T3" stash push -q -m wip
+
+    _reinstall_safe_stash_pop "$REPO_ROOT" "$G7_T3" "stash@{0}"
+    assert_eq "clean" "$REINSTALL_POP_RESULT" "Case 3: --index split: clean pop result"
+    assert_contains "$(git -C "$G7_T3" diff --staged --name-only)" "f.txt" \
+        "Case 3: --index split: f.txt's hunk came back STAGED"
+    assert_contains "$(git -C "$G7_T3" diff --name-only)" "g.txt" \
+        "Case 3: --index split: g.txt's hunk came back UNSTAGED"
+
+    echo "-- Case 4: THE INCIDENT SHAPE (#6499/#6502) -- a conflicting reinstall pop --"
+    echo "   must never leave conflict markers or unmerged entries in \$TARGET_PATH"
+    G7_T4="$G7_WORKDIR/t4"
+    git init --quiet "$G7_T4"
+    git -C "$G7_T4" checkout -q -b main
+    mkdir -p "$G7_T4/.loom"
+    printf '{\n  "safehouse": {"socket": "/committed/loom.sock"}\n}\n' > "$G7_T4/.loom/config.json"
+    git -C "$G7_T4" add .loom/config.json
+    git -C "$G7_T4" commit -q -m "add config"
+    # Stash a host-specific edit, then have the "upstream reinstall" rewrite
+    # the same lines -- the same shape as the real incident (a
+    # `loom-daemon init` rewrite landing on top of a host-specific stashed
+    # edit).
+    printf '{\n  "safehouse": {"socket": "/host/patched.sock"}\n}\n' > "$G7_T4/.loom/config.json"
+    git -C "$G7_T4" stash push -q -m wip
+    printf '{\n  "safehouse": {"socket": "/upstream/new.sock"}\n}\n' > "$G7_T4/.loom/config.json"
+    git -C "$G7_T4" add .loom/config.json
+    git -C "$G7_T4" commit -q -m upstream
+
+    _reinstall_safe_stash_pop "$REPO_ROOT" "$G7_T4" "stash@{0}"
+    assert_eq "wrapper" "$REINSTALL_POP_MODE" "Case 4: incident shape: mode=wrapper"
+    assert_eq "restored" "$REINSTALL_POP_RESULT" \
+        "Case 4: incident shape: result=restored (conflict, rolled back)"
+    assert_nonzero_exit "$REINSTALL_POP_STATUS" "Case 4: incident shape: non-zero status signals a conflict"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if has_markers "$G7_T4/.loom/config.json"; then
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: Case 4: incident shape: NO conflict markers left in .loom/config.json"
+    else
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: Case 4: incident shape: NO conflict markers left in .loom/config.json"
+    fi
+    assert_eq "" "$(git -C "$G7_T4" ls-files --unmerged)" "Case 4: incident shape: no unmerged index entries remain"
+    assert_eq "" "$(git -C "$G7_T4" status --porcelain)" "Case 4: incident shape: working tree is clean again"
+    assert_eq "1" "$(git -C "$G7_T4" stash list | wc -l | tr -d ' ')" \
+        "Case 4: incident shape: the stash entry is PRESERVED (nothing discarded)"
+    assert_contains "$REINSTALL_POP_OUTPUT" ".loom/config.json" \
+        "Case 4: incident shape: REINSTALL_POP_OUTPUT names the conflicting file"
+
+    echo "-- Case 5: fallback -- clean pop still works when neither wrapper copy exists --"
+    G7_T5="$G7_WORKDIR/t5"
+    git init --quiet "$G7_T5"
+    git -C "$G7_T5" checkout -q -b main
+    printf 'a\n' > "$G7_T5/f.txt"
+    git -C "$G7_T5" add f.txt
+    git -C "$G7_T5" commit -q -m c1
+    printf 'a\nwip\n' > "$G7_T5/f.txt"
+    git -C "$G7_T5" stash push -q -m wip
+
+    _reinstall_safe_stash_pop "$G7_NO_WRAPPER_ROOT" "$G7_T5" "stash@{0}"
+    assert_eq "raw" "$REINSTALL_POP_MODE" "Case 5: no-wrapper fallback: mode=raw"
+    assert_eq "clean" "$REINSTALL_POP_RESULT" "Case 5: no-wrapper fallback: clean pop result"
+    assert_eq "0" "$REINSTALL_POP_STATUS" "Case 5: no-wrapper fallback: clean pop status 0"
+    assert_contains "$(cat "$G7_T5/f.txt")" "wip" "Case 5: no-wrapper fallback: content restored"
+
+    echo "-- Case 6: fallback -- a conflicting pop reproduces today's pre-#6509 raw-pop --"
+    echo "   behavior exactly (the explicitly permitted fallback shape)"
+    G7_T6="$G7_WORKDIR/t6"
+    git init --quiet "$G7_T6"
+    git -C "$G7_T6" checkout -q -b main
+    printf 'line1\nline2\nline3\n' > "$G7_T6/f.txt"
+    git -C "$G7_T6" add f.txt
+    git -C "$G7_T6" commit -q -m c1
+    printf 'STASHED\nline2\nline3\n' > "$G7_T6/f.txt"
+    git -C "$G7_T6" stash push -q -m wip
+    printf 'UPSTREAM\nline2\nline3\n' > "$G7_T6/f.txt"
+    git -C "$G7_T6" add f.txt
+    git -C "$G7_T6" commit -q -m upstream
+
+    _reinstall_safe_stash_pop "$G7_NO_WRAPPER_ROOT" "$G7_T6" "stash@{0}"
+    assert_eq "raw" "$REINSTALL_POP_MODE" "Case 6: no-wrapper conflict fallback: mode=raw"
+    assert_eq "raw_conflict" "$REINSTALL_POP_RESULT" "Case 6: no-wrapper conflict fallback: result=raw_conflict"
+    assert_nonzero_exit "$REINSTALL_POP_STATUS" "Case 6: no-wrapper conflict fallback: non-zero status"
+    assert_eq "1" "$(git -C "$G7_T6" stash list | wc -l | tr -d ' ')" \
+        "Case 6: no-wrapper conflict fallback: the stash entry is PRESERVED (nothing discarded)"
+    # This is the one branch where the pre-#6509 limitation is EXPECTED to
+    # reproduce: a raw `git stash pop --index` conflict leaves markers behind.
+    # Confirming that here proves the fallback genuinely IS the documented
+    # raw-pop-with-warning behavior, not a silently-different new behavior.
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if has_markers "$G7_T6/f.txt"; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: Case 6: markers ARE left (today's documented, permitted fallback shape)"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: Case 6: markers ARE left (today's documented, permitted fallback shape)"
+        echo "    no markers found -- fixture no longer reproduces a raw-pop conflict"
+    fi
+
+    echo "-- Case 7: install.sh wiring -- sources the helper and calls the function --"
+    echo "   (not an inline raw pop), with reapply sequenced after the pop"
+    if grep -q 'source "\$LOOM_ROOT/scripts/install/reinstall-stash-pop.sh"' "$INSTALL_SH"; then
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: Case 7: install.sh sources scripts/install/reinstall-stash-pop.sh"
+    else
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: Case 7: install.sh sources scripts/install/reinstall-stash-pop.sh"
+    fi
+
+    G7_CALL_LINE=$(grep -n '_reinstall_safe_stash_pop "\$LOOM_ROOT" "\$TARGET_PATH"' "$INSTALL_SH" | head -1 | cut -d: -f1)
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ -n "$G7_CALL_LINE" ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: Case 7: install.sh's reinstall block calls _reinstall_safe_stash_pop"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: Case 7: install.sh's reinstall block calls _reinstall_safe_stash_pop"
+    fi
+
+    # The old inline raw pop this issue replaces must be gone from the
+    # REINSTALL_STASHED_USER_CHANGES block (it still legitimately exists
+    # INSIDE reinstall-stash-pop.sh's own fallback branch, which install.sh
+    # does not duplicate).
+    if grep -q 'REINSTALL_POP_OUTPUT="\$(git -C "\$TARGET_PATH" stash pop --index 2>&1)"' "$INSTALL_SH"; then
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: Case 7: install.sh's reinstall block no longer inlines a raw 'git stash pop --index'"
+        echo "    the pre-#6509 inline raw pop is still present verbatim"
+    else
+        TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: Case 7: install.sh's reinstall block no longer inlines a raw 'git stash pop --index'"
+    fi
+
+    # Sequencing (#6509 issue body): on the wrapper's "restored" conflict
+    # path, the REINSTALL_RESET_PATHS reapply-from-snapshot loop must run
+    # AFTER the _reinstall_safe_stash_pop call, not before -- the wrapper's
+    # rollback lands each reset path back at its pre-pop (HEAD-reset) state,
+    # and only the reapply loop puts the fresh post-init Loom content back.
+    G7_RESTORED_LINE=$(grep -n '"\$REINSTALL_POP_RESULT" == "restored"' "$INSTALL_SH" | head -1 | cut -d: -f1)
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if [[ -n "$G7_CALL_LINE" && -n "$G7_RESTORED_LINE" && "$G7_RESTORED_LINE" -gt "$G7_CALL_LINE" ]]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}PASS${NC}: Case 7: the 'restored' branch's reset-path reapply is sequenced after the pop call"
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}FAIL${NC}: Case 7: the 'restored' branch's reset-path reapply is sequenced after the pop call"
+        echo "    call line=$G7_CALL_LINE restored-branch line=$G7_RESTORED_LINE"
+    fi
+
+    rm -rf "$G7_WORKDIR"
+fi
 echo ""
 
 echo "================================================================"

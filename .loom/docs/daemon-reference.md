@@ -38,6 +38,82 @@ auto-dispatches sweeps, and the [epic supervisor](#epic-supervisor-3842)
 drives `loom:epic` fork-joins. See [Operability](#operability--config-startstop-e2e-phase-d-3813)
 for enabling and tuning them.
 
+## The `LOOM_ROLE` env-var contract (#6507)
+
+`LOOM_ROLE` is a **public, stable session-identity contract**: repo-level
+hooks/scripts (SessionStart hooks, guard hooks, any tooling that needs to
+tell an operator's interactive session apart from a session Loom itself
+spawned) **may branch on `LOOM_ROLE` being set** to detect "this is a
+Loom-spawned agent session." Two shipped repo-level consumers already do
+exactly this — `.loom/hooks/guard-destructive-generic.sh` (the
+`dist/`-write-confinement role allowlist, #6021) and
+`.loom/hooks/methodology-inject.sh` (role-context injection keyed off
+`LOOM_ROLE` matching a `roles/<role>.md` filename) — see
+[`guard-hooks.md`](guard-hooks.md) for the former.
+
+**Semantics:**
+
+- **Present** ⇒ this session was spawned by Loom (a dispatched sweep child,
+  a role-runner tick, or a tmux/MOM agent launch), and its value names the
+  role (or, for a whole `/loom:sweep` launch, the sentinel role
+  `sweep-lifecycle`).
+- **Absent** ⇒ not spawned by Loom — e.g. an interactive operator session
+  (see the one residual gap below).
+
+**What sets it** — every production code path that spawns an agent session
+sets `LOOM_ROLE`, unconditionally once past its own admission/validation
+step (traced against `origin/main` @ `7d169a06`, 2026-08-18; re-verify
+against current `main` before relying on a specific line number, since a
+new spawn call site could be added later):
+
+1. `loom-daemon/src/sweep_registry/dispatch.rs` (~line 2089, inside
+   `spawn_child`) — sets `LOOM_ROLE` to the already-admitted
+   `admission.role` (always `"sweep-lifecycle"` for a full `/loom:sweep`
+   launch) alongside `LOOM_RUNTIME`. Gated by `if let Some(admission) =
+   runtime_admission`, but `runtime_admission` is only ever `None` when
+   `self.config.skip_label_flip` is true — a test-only fixture flag
+   (hermetic unit tests skip installing runtime manifests); every real
+   dispatch either admits successfully or returns `Err` before the spawn
+   is ever reached (Issue #4768).
+2. `loom-daemon/src/role_runner.rs` (~line 1212, inside
+   `run_role_with_timeout`) — same shape, for a periodic support-role tick
+   (Champion/Curator/Judge/Doctor/Auditor/Guide/Hermit/Architect). Gated by
+   `if let Some(admission) = admission`, where `admission` is only ever
+   `None` when `self.spawn_bin.is_some()` — again a test-only condition (a
+   fake spawn script substituted in tests); the production path
+   (`spawn_bin` unset) always resolves a real admission or bails out before
+   spawning (Issue #4768).
+3. `loom-daemon/src/agent_session/spawn.rs` (~line 647, inside the
+   tmux/MOM `run()` path used by `agent-spawn.sh` / interactive terminal
+   launch) — sets `LOOM_ROLE` to `opts.role` **unconditionally**, no `if
+   let Some` gate at all. `opts.role.is_empty()` is already rejected
+   earlier in the same function (returns exit `1` before any tmux session
+   is created), so by the time this line runs `opts.role` is guaranteed
+   non-empty.
+
+**Known residual gap**: an operator manually typing `/loom:<role>` (e.g.
+`/loom:doctor`) inside an *already-running* interactive session produces a
+role agent with **no `LOOM_ROLE` in its environment** — the session itself
+was never spawned by any of the three paths above, so there is nothing for
+a spawner to set. This case is structurally outside what an env-var
+contract can cover (there is no spawn event to hook), and is handled
+instead on the consumer side via a prompt-conditional directive. Do not
+treat an unset `LOOM_ROLE` as proof no Loom role is active in the current
+prompt — only as proof the *session* was not Loom-spawned.
+
+A regression test pins this invariant against silent regression on the
+`dispatch.rs` and `role_runner.rs` admission-success paths (the two call
+sites gated by an `if let Some`) — see
+`dispatch_sets_loom_role_from_admitted_role` (Issue #4768, pre-existing) and
+`invoke_sets_loom_role_env_on_admitted_spawn` (Issue #6507) in
+`loom-daemon/src/sweep_registry/dispatch.rs` and
+`loom-daemon/src/role_runner.rs` respectively, plus
+`test_run_sets_loom_role_session_env` in
+`loom-daemon/src/agent_session/spawn.rs` for the unconditional tmux path.
+
+`LOOM_RUNTIME`'s own contract is documented separately in
+[`runtime-adapters.md`](runtime-adapters.md) — not covered here.
+
 ## Architecture (Phases A-C)
 
 ```
@@ -2078,6 +2154,45 @@ missing/unparseable-`updatedAt`-fails-safe-to-`Keep` posture). See
 `claim_reconciliation.rs`'s `decide_pr` doc comment for the full rationale
 and its `decide_pr_reclaims_via_claim_labeled_at_despite_standdown_inflated_updated_at`
 regression test, which reproduces the PR #4614 shape directly.
+
+**Liveness means the *claimant's* own heartbeat, on both sides (#4638, narrowed
+by #6523).** Anchoring solely on `claim_labeled_at` reclaimed a genuinely live
+but non-pid-joinable claimant out from under itself, so `decide_pr` anchors on
+`max(claim_labeled_at, most_recent_claim_activity_at)`. #4638 shipped that
+second term as "the newest comment since the claim that is not a marker-tagged
+stand-down note" — the same conflation the agent side carried as
+`COMMENTS_AFTER`, where a routine Builder post-push note or a Champion notice
+reads as proof the *claimant* is alive. #6514 fixed that on the agent side
+(`defaults/scripts/claim-staleness.sh`); #6523 brings the daemon into line, so
+**one definition of liveness now applies to both**:
+
+> A comment counts as claimant activity **iff** it carries that claim's own
+> marker — `<!-- loom:claim-activity claim=$CLAIMED_AT -->`, keyed on the
+> `labeled` event's timestamp — and is not a stand-down comment.
+
+On the Rust side this is `CLAIM_ACTIVITY_MARKER_PREFIX` / `claim_activity_marker()`
+/ `most_recent_claim_activity_at()` in `claim_reconciliation.rs`, documented as
+matching `claim-staleness.sh`'s `ACTIVITY_PREFIX` byte-for-byte (the string its
+`marker` subcommand prints); `forge::fetch_most_recent_claim_activity_at` only
+*narrows* the `gh` query, the predicate itself is the pure, unit-tested
+function. Consequences, all shared with the agent side:
+
+- Every other comment — Builder status notes, Champion notices, human chatter,
+  bots — neither pins **nor extends** the claim.
+- A heartbeat **resets an idle clock** rather than pinning: because the anchor
+  is a `max()` of timestamps, one heartbeat buys exactly one more
+  `LOOM_STALE_REVIEWING_MINUTES` / `LOOM_STALE_TREATING_MINUTES` window measured
+  from the heartbeat's own timestamp.
+- A marker left over from an **earlier** claim generation (before a reclaim +
+  re-claim) does not refresh the new claim — both sides match on the claim's own
+  labeled-at timestamp, not on the marker prefix alone.
+
+This narrowing only ever makes the daemon reclaim *sooner*. The per-label age
+floors below are untouched and remain the veto no comment-activity outcome can
+bypass — the protection against the #4618 double-claim race that #4790 showed is
+load-bearing (`decide_pr_age_floor_vetoes_reclaim_regardless_of_comment_activity`
+covers it, including for a dead joined pid). A **live** joined pid still
+short-circuits to `Keep` ahead of the age gate entirely.
 
 Thresholds are minutes-scale, not hours, and env-overridable:
 

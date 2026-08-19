@@ -6379,10 +6379,18 @@ fi
 # shell-separator set the pre-check's own trailing class already accepted.
 # =============================================================================
 _stash_is_recover=false
+_stash_is_pop=false
 _stash_is_create=false
 if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`]|[[:space:]])git[[:space:]]+stash([[:space:]]|[;&|)`]|$)'; then
     if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`]|[[:space:]])git[[:space:]]+stash[[:space:]]+(pop|drop|clear)([[:space:]]|[;&|)`]|$)'; then
         _stash_is_recover=true
+    fi
+    # `pop` alone has a scriptable safe equivalent (safe-stash-pop.sh, #6501);
+    # `drop`/`clear` do not — they destroy an entry outright with nothing to
+    # verify afterwards. Track it separately so the main-checkout ask only
+    # names the wrapper when the wrapper actually applies.
+    if echo "$COMMAND_ASK_SCAN" | grep -qE '(^|[;&|(`]|[[:space:]])git[[:space:]]+stash[[:space:]]+pop([[:space:]]|[;&|)`]|$)'; then
+        _stash_is_pop=true
     fi
     if stash_create_invoked "$COMMAND_ASK_SCAN"; then
         _stash_is_create=true
@@ -6432,7 +6440,23 @@ if [[ "$_stash_is_recover" == true || "$_stash_is_create" == true ]] \
         # create has nothing to be redirected to and stays allowed exactly as
         # before — the create-side deny (#5754) is worktree-only by design.
         if [[ "$_stash_is_recover" == true ]]; then
-            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false in .loom/config.json, or export LOOM_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline 'LOOM_GUARD_STASH_SCOPE=0 git stash pop' prefix does not reach this hook, which runs as a separate process)" "stash-scope:main-checkout"
+            # RECOMMENDED-PATH HINT (#6501). A raw main-checkout `git stash pop`
+            # is not just a stack-ownership hazard — it is also the mechanism
+            # behind #6499/#6502, where a conflicting pop left live
+            # `<<<<<<<`/`=======`/`>>>>>>>` markers in a tracked
+            # `.loom/config.json` that were then committed, silently breaking
+            # the daemon's config parse fleet-wide. `safe-stash-pop.sh` is the
+            # verified replacement. Named only when it PROVABLY exists and
+            # actually applies (pop, not drop/clear) — the same discipline the
+            # create-side redirect below uses before printing a literal
+            # replacement command. This stays an ASK, not a deny: `refs/stash`
+            # has no sanctioned reader other than a pop, so denying would
+            # strand work rather than protect it.
+            _stash_pop_hint=""
+            if [[ "$_stash_is_pop" == true && -f "$_stash_common_parent/.loom/scripts/safe-stash-pop.sh" ]]; then
+                _stash_pop_hint=" If you do need this entry back, use the verified wrapper instead of a raw pop: './.loom/scripts/safe-stash-pop.sh' — it snapshots the pre-pop tree, pops, verifies no conflict markers or unmerged index entries were left behind, and rolls the tree back (keeping the stash entry) when the pop conflicts, so it can never leave a tracked file carrying unresolved conflict markers for someone to commit (#6501; add --no-restore to keep a conflicted tree for manual resolution)."
+            fi
+            ask "Command requires confirmation: $COMMAND (git stash pop/drop/clear in the MAIN checkout can destroy operator-preserved state — the main checkout's stash stack is operator-owned, not scratch space for an integration check. Run test-merges in an isolated worktree instead; set guards.stashScope:false in .loom/config.json, or export LOOM_GUARD_STASH_SCOPE=0 in the agent's OWN environment before the session — an inline 'LOOM_GUARD_STASH_SCOPE=0 git stash pop' prefix does not reach this hook, which runs as a separate process)${_stash_pop_hint}" "stash-scope:main-checkout"
         fi
     elif [[ -n "$_stash_toplevel" && -n "$_stash_common_parent" ]]; then
         # cwd is a linked worktree, not the main checkout. Count OTHER

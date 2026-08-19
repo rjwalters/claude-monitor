@@ -859,6 +859,23 @@ none of them removes an entry from the stack. Stash *creation* (`git stash`,
 is **denied** inside a managed worktree — see "Create-side redirect (#5754)"
 below.
 
+**Recommended path for a main-checkout pop (#6501).** The ask is not only about
+stack ownership — a raw `git stash pop` that conflicts also writes
+`<<<<<<<`/`=======`/`>>>>>>>` markers into tracked files and walks away, which is
+how commit `7d169a06` landed a `.loom/config.json` full of conflict markers and
+broke the daemon's config parse fleet-wide (#6499/#6502). When the command is a
+**`pop`** (not `drop`/`clear`) and `<main>/.loom/scripts/safe-stash-pop.sh`
+actually exists, the ask message now names that wrapper as the replacement —
+the same "never print a replacement command that isn't there" discipline the
+create-side redirect below uses. `safe-stash-pop.sh` snapshots the pre-pop tree,
+pops, verifies no markers or unmerged index entries were left behind, and rolls
+the tree back (keeping the stash entry) if the pop conflicted; see
+[`troubleshooting.md`](troubleshooting.md) for its exit-code contract. The
+verdict stays an **ask**, deliberately: `refs/stash` has no sanctioned reader
+other than a pop, so a deny would strand work rather than protect it. Invoking
+the wrapper itself is not a raw stash command and is therefore ungated, exactly
+like `worktree.sh stash-pop`.
+
 The main-checkout test compares `git rev-parse --show-toplevel` against
 `git rev-parse --git-common-dir/..`, both resolved from the command's cwd: they
 are equal only when cwd **is** the main checkout, and diverge when cwd is a

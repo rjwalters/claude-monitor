@@ -124,6 +124,7 @@ test-merge-pr-unstable-fallback.sh
 test-merge-pr-worktree-awk.sh
 test-merge-pr-worktree-path.sh
 test-merge-pr-worktree-remove-diagnosis.sh
+test-nextest-daemon-guard.sh
 test-operator-only-subkind.sh
 test-pr-worktree-isolation.sh
 test-probe-tokens-fallback.sh
@@ -137,6 +138,7 @@ test-require-complexity-marker.sh
 test-resolve-tier-model.sh
 test-resync-installed.sh
 test-run-ci-suites-daemon-guard.sh
+test-safe-stash-pop.sh
 test-safehoused-service.sh
 test-spawn-generic.sh
 test-spawn-worker.sh
