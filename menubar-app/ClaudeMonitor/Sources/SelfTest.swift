@@ -98,6 +98,11 @@ enum SelfTest {
         testRankingExportCarriesProvider()
         testRankingExportMarksAbsentIdentity()
         testNamedLimitsRoundTrip()
+        testHistoryDecimationKeepsFirstLastAndBigJumps()
+        testFullHistoryDecimationMatchesLoadHistory()
+        testFullHistoryDecimationAlwaysKeepsNilWeeklyPercent()
+        testHistoryCutoffExcludesOlderRows()
+        testTokenHistoryRoundTripAndCutoff()
         testOpenAIImportResolvesExistingAccountByEmail()
         testExportAccountsEnvIncludesAllProviders()
         testExportAccountsEnvExcludesTokenlessCodexAccount()
@@ -2521,6 +2526,222 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("named limits round-trip test threw: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Chart-history loaders (#179)
+    //
+    // `loadHistory`/`loadFullHistory`/`loadTokenHistory` were, before #179,
+    // exercised only by the macOS UI (`UsageChartView.swift`) — never by this
+    // suite. #179 extracted the decimation loop shared by `loadHistory` and
+    // `loadFullHistory` into one generic `decimate<T>` helper (plus a shared
+    // `cutoffISOString` for all four loaders); these tests close that
+    // coverage gap directly against the public loader entry points, since
+    // `decimate`/`cutoffISOString` are private to `UsageStore`.
+
+    /// Builds an ISO8601 (fractional-seconds) timestamp `secondsAgo` seconds
+    /// before now — the same format `cutoffISOString`/`UsageRecord.parseISO`
+    /// use, so rows this writes sort and parse exactly like production rows.
+    private static func isoTimestamp(secondsAgo: Double) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: Date().addingTimeInterval(-secondsAgo))
+    }
+
+    /// `loadHistory`'s decimation must keep the first and last point
+    /// unconditionally, drop an interior point whose change from both
+    /// neighbors is below `minChangePercent`, and keep an interior point that
+    /// crosses the threshold in either direction. Five points, oldest to
+    /// newest: a flat run (10.0 -> 10.3 -> 10.6, all sub-threshold deltas)
+    /// followed by a big jump (10.6 -> 20.0) and a final flat point (20.5).
+    /// With the default `minChangePercent` of 1.0, only the 10.3 point should
+    /// be dropped.
+    private static func testHistoryDecimationKeepsFirstLastAndBigJumps() {
+        withSelfTestTempDir("history-decimation") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+
+                let points: [(Double, Double)] = [
+                    (300, 10.0), (240, 10.3), (180, 10.6), (120, 20.0), (60, 20.5),
+                ]
+                for (secondsAgo, percent) in points {
+                    try db.run("""
+                        INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, is_synthetic)
+                        VALUES ('acct-decimation', ?, ?, 0)
+                    """, isoTimestamp(secondsAgo: secondsAgo), percent)
+                }
+
+                let history = store.loadHistory(for: "acct-decimation")
+                let kept = history.map { $0.weeklyPercent }
+                expectEqual(kept, [10.0, 10.6, 20.0, 20.5],
+                            "decimation keeps first/last and any point crossing minChangePercent, drops the flat 10.3 point")
+            } catch {
+                checks += 1
+                failures.append("loadHistory decimation test threw: \(error)")
+            }
+        }
+    }
+
+    /// `loadFullHistory` shares the same `decimate` helper as `loadHistory`
+    /// (extracted in #179) and must reproduce the identical keep/drop pattern
+    /// when driven by `weekly_all_percent`.
+    private static func testFullHistoryDecimationMatchesLoadHistory() {
+        withSelfTestTempDir("full-history-decimation") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+
+                let points: [(Double, Double)] = [
+                    (300, 10.0), (240, 10.3), (180, 10.6), (120, 20.0), (60, 20.5),
+                ]
+                for (secondsAgo, percent) in points {
+                    try db.run("""
+                        INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, is_synthetic)
+                        VALUES ('acct-full-decimation', ?, ?, 0)
+                    """, isoTimestamp(secondsAgo: secondsAgo), percent)
+                }
+
+                let history = store.loadFullHistory(for: "acct-full-decimation")
+                let kept = history.map { $0.weeklyAllPercent }
+                expectEqual(kept, [10.0, 10.6, 20.0, 20.5],
+                            "loadFullHistory decimates identically to loadHistory for the same numeric series")
+            } catch {
+                checks += 1
+                failures.append("loadFullHistory decimation test threw: \(error)")
+            }
+        }
+    }
+
+    /// `decimate`'s nil-percent branch (only reachable through
+    /// `FullUsageDataPoint.weeklyAllPercent`, since `loadHistory`'s `Double`
+    /// is never optional) must always keep the point rather than attempting a
+    /// comparison — this is the drift #179's issue body flagged between the
+    /// two pre-refactor implementations.
+    private static func testFullHistoryDecimationAlwaysKeepsNilWeeklyPercent() {
+        withSelfTestTempDir("full-history-nil-percent") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, session_percent, is_synthetic)
+                    VALUES ('acct-nil-percent', ?, 10.0, NULL, 0)
+                """, isoTimestamp(secondsAgo: 180))
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, session_percent, is_synthetic)
+                    VALUES ('acct-nil-percent', ?, NULL, 55.0, 0)
+                """, isoTimestamp(secondsAgo: 120))
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, session_percent, is_synthetic)
+                    VALUES ('acct-nil-percent', ?, 10.05, NULL, 0)
+                """, isoTimestamp(secondsAgo: 60))
+
+                let history = store.loadFullHistory(for: "acct-nil-percent")
+                expectEqual(history.count, 3,
+                            "an interior point with no weekly_all_percent is always kept, never dropped by comparison")
+                expect(history[1].weeklyAllPercent == nil,
+                       "the nil-percent interior point survives decimation with its nil intact")
+                expectEqual(history[1].sessionPercent, 55.0,
+                            "its other fields round-trip unchanged")
+            } catch {
+                checks += 1
+                failures.append("loadFullHistory nil-percent test threw: \(error)")
+            }
+        }
+    }
+
+    /// The shared `cutoffISOString(daysBack:)` helper must exclude a row
+    /// older than the window and include one inside it — exercised through
+    /// `loadHistory` since the helper itself is private to `UsageStore`.
+    private static func testHistoryCutoffExcludesOlderRows() {
+        withSelfTestTempDir("history-cutoff") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, is_synthetic)
+                    VALUES ('acct-cutoff', ?, 5.0, 0)
+                """, isoTimestamp(secondsAgo: 400 * 24 * 3600))
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, is_synthetic)
+                    VALUES ('acct-cutoff', ?, 30.0, 0)
+                """, isoTimestamp(secondsAgo: 60))
+
+                let history = store.loadHistory(for: "acct-cutoff", daysBack: 30)
+                expectEqual(history.count, 1, "a row outside the daysBack window is excluded")
+                expectEqual(history.first?.weeklyPercent, 30.0, "the in-window row is the one returned")
+            } catch {
+                checks += 1
+                failures.append("loadHistory cutoff test threw: \(error)")
+            }
+        }
+    }
+
+    /// `loadTokenHistory` had zero coverage before #179; this confirms it
+    /// still maps `token_usage`/`token_sessions` rows correctly and applies
+    /// the shared cutoff after the extraction. `token_usage`/`token_sessions`
+    /// are not part of `UsageStore.ensureDatabase()`'s own schema (they are
+    /// populated by a separate ingestion path), so this test creates them
+    /// directly with exactly the columns `loadTokenHistory`'s SQL reads.
+    private static func testTokenHistoryRoundTripAndCutoff() {
+        withSelfTestTempDir("token-history") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let db = try openDatabase(dbPath)
+
+                try db.execute("""
+                    CREATE TABLE token_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        override_account_id TEXT,
+                        inferred_account_id TEXT
+                    );
+                    CREATE TABLE token_usage (
+                        session_id TEXT,
+                        timestamp TEXT,
+                        input_tokens INTEGER,
+                        output_tokens INTEGER,
+                        cache_creation_tokens INTEGER,
+                        cache_read_tokens INTEGER
+                    );
+                """)
+                try db.run("""
+                    INSERT INTO token_sessions (session_id, override_account_id, inferred_account_id)
+                    VALUES ('sess-1', NULL, 'acct-token')
+                """)
+                try db.run("""
+                    INSERT INTO token_usage
+                        (session_id, timestamp, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+                    VALUES ('sess-1', ?, 100, 50, 10, 5)
+                """, isoTimestamp(secondsAgo: 60))
+                // Well outside the 30-day window below — must not contribute.
+                try db.run("""
+                    INSERT INTO token_usage
+                        (session_id, timestamp, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+                    VALUES ('sess-1', ?, 999, 999, 999, 999)
+                """, isoTimestamp(secondsAgo: 400 * 24 * 3600))
+
+                let store = UsageStore(dbPath: dbPath)
+                let history = store.loadTokenHistory(for: "acct-token", daysBack: 30)
+                expectEqual(history.count, 1, "the out-of-window token_usage row is excluded")
+                expectEqual(history.first?.inputTokens, 100, "input_tokens round-trips")
+                expectEqual(history.first?.outputTokens, 50, "output_tokens round-trips")
+                expectEqual(history.first?.cacheCreationTokens, 10, "cache_creation_tokens round-trips")
+                expectEqual(history.first?.cacheReadTokens, 5, "cache_read_tokens round-trips")
+                expectEqual(history.first?.billableTokens, 160, "billableTokens excludes cache reads")
+            } catch {
+                checks += 1
+                failures.append("loadTokenHistory round-trip test threw: \(error)")
             }
         }
     }

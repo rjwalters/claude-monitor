@@ -1127,6 +1127,57 @@ class UsageStore: ObservableObject {
         }
     }
 
+    /// The ISO8601 cutoff-date string shared by every `daysBack`-windowed history
+    /// query below (`WHERE timestamp >= ?`). Pure — touches no instance state —
+    /// so it stays callable from the `nonisolated` `loadNamedLimitHistory`.
+    nonisolated private func cutoffISOString(daysBack: Int) -> String {
+        let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: cutoffDate)
+    }
+
+    /// Shared decimation filter used by `loadHistory` and `loadFullHistory` to
+    /// reduce chart point counts while preserving shape: always keeps the first
+    /// and last point, and keeps any interior point whose change from either
+    /// neighbor is >= `minChangePercent`. `percent` extracts the comparison
+    /// value from each point; when it returns `nil` for the current point (only
+    /// possible for `FullUsageDataPoint.weeklyAllPercent` — `loadHistory`'s
+    /// `Double` is never optional, so this branch is unreachable there), the
+    /// point is always kept rather than compared.
+    nonisolated private func decimate<T>(
+        _ points: [T],
+        minChangePercent: Double,
+        percent: (T) -> Double?
+    ) -> [T] {
+        var filteredPoints: [T] = []
+        var lastKeptPercent: Double?
+
+        for i in 0..<points.count {
+            let point = points[i]
+            let isFirst = i == 0
+            let isLast = i == points.count - 1
+
+            if isFirst || isLast {
+                filteredPoints.append(point)
+                lastKeptPercent = percent(point)
+            } else if let currentPercent = percent(point), let lastPercent = lastKeptPercent {
+                let changeFromPrev = abs(currentPercent - lastPercent)
+                let nextPercent = percent(points[i + 1]) ?? currentPercent
+                let changeToNext = abs(nextPercent - currentPercent)
+
+                if changeFromPrev >= minChangePercent || changeToNext >= minChangePercent {
+                    filteredPoints.append(point)
+                    lastKeptPercent = currentPercent
+                }
+            } else {
+                filteredPoints.append(point)
+            }
+        }
+
+        return filteredPoints
+    }
+
     func loadHistory(for accountId: String, daysBack: Int = 7, minChangePercent: Double = 1.0) -> [UsageDataPoint] {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
@@ -1134,12 +1185,7 @@ class UsageStore: ObservableObject {
             }
 
             let db = try openDatabase(dbPath, readonly: true)
-
-            // Calculate the cutoff date for time-based filtering
-            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let cutoffString = formatter.string(from: cutoffDate)
+            let cutoffString = cutoffISOString(daysBack: daysBack)
 
             let stmt = try db.prepare(
                 "SELECT timestamp, weekly_all_percent FROM usage_history WHERE account_id = ? AND timestamp >= ? ORDER BY timestamp ASC"
@@ -1155,28 +1201,7 @@ class UsageStore: ObservableObject {
             }
 
             // Apply change filter to reduce data points while preserving chart shape
-            var filteredPoints: [(Date, Double)] = []
-            var lastKeptPercent: Double?
-
-            for i in 0..<rawPoints.count {
-                let (date, percent) = rawPoints[i]
-                let isFirst = i == 0
-                let isLast = i == rawPoints.count - 1
-
-                if isFirst || isLast {
-                    filteredPoints.append((date, percent))
-                    lastKeptPercent = percent
-                } else if let lastPercent = lastKeptPercent {
-                    let changeFromPrev = abs(percent - lastPercent)
-                    let nextPercent = rawPoints[i + 1].1
-                    let changeToNext = abs(nextPercent - percent)
-
-                    if changeFromPrev >= minChangePercent || changeToNext >= minChangePercent {
-                        filteredPoints.append((date, percent))
-                        lastKeptPercent = percent
-                    }
-                }
-            }
+            let filteredPoints = decimate(rawPoints, minChangePercent: minChangePercent) { $0.1 }
 
             var dataPoints: [UsageDataPoint] = []
             for i in 0..<filteredPoints.count {
@@ -1209,11 +1234,7 @@ class UsageStore: ObservableObject {
             }
 
             let db = try openDatabase(dbPath, readonly: true)
-
-            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let cutoffString = formatter.string(from: cutoffDate)
+            let cutoffString = cutoffISOString(daysBack: daysBack)
 
             let stmt = try db.prepare(
                 "SELECT timestamp, session_percent, weekly_all_percent FROM usage_history WHERE account_id = ? AND timestamp >= ? ORDER BY timestamp ASC"
@@ -1231,30 +1252,7 @@ class UsageStore: ObservableObject {
                 }
             }
 
-            var filteredPoints: [FullUsageDataPoint] = []
-            var lastKeptPercent: Double?
-
-            for i in 0..<rawPoints.count {
-                let point = rawPoints[i]
-                let isFirst = i == 0
-                let isLast = i == rawPoints.count - 1
-
-                if isFirst || isLast {
-                    filteredPoints.append(point)
-                    lastKeptPercent = point.weeklyAllPercent
-                } else if let currentPercent = point.weeklyAllPercent, let lastPercent = lastKeptPercent {
-                    let changeFromPrev = abs(currentPercent - lastPercent)
-                    let nextPercent = rawPoints[i + 1].weeklyAllPercent ?? currentPercent
-                    let changeToNext = abs(nextPercent - currentPercent)
-
-                    if changeFromPrev >= minChangePercent || changeToNext >= minChangePercent {
-                        filteredPoints.append(point)
-                        lastKeptPercent = currentPercent
-                    }
-                } else {
-                    filteredPoints.append(point)
-                }
-            }
+            let filteredPoints = decimate(rawPoints, minChangePercent: minChangePercent) { $0.weeklyAllPercent }
 
             return filteredPoints
 
@@ -1282,10 +1280,7 @@ class UsageStore: ObservableObject {
             let db = try openDatabase(dbPath, readonly: true)
             guard tableColumns(db, "named_limits").contains("limit_name") else { return [:] }
 
-            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let cutoffString = formatter.string(from: cutoffDate)
+            let cutoffString = cutoffISOString(daysBack: daysBack)
 
             let stmt = try db.prepare("""
                 SELECT limit_name, timestamp, used_percent FROM named_limits
@@ -1316,11 +1311,7 @@ class UsageStore: ObservableObject {
             }
 
             let db = try openDatabase(dbPath, readonly: true)
-
-            let cutoffDate = Date().addingTimeInterval(-Double(daysBack) * 24 * 60 * 60)
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let cutoffString = formatter.string(from: cutoffDate)
+            let cutoffString = cutoffISOString(daysBack: daysBack)
 
             let sql = """
                 SELECT
