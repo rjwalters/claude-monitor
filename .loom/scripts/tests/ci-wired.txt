@@ -36,6 +36,7 @@ test-build-slot.sh
 test-champion-ci-checks-no-checks-signal.sh
 test-champion-critical-file-check.sh
 test-check-ci-status.sh
+test-check-config-no-host-paths.sh
 test-check-duplicate.sh
 test-check-conflict-markers.sh
 test-check-git-identity.sh
