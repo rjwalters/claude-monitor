@@ -49,6 +49,27 @@
 # contest the peer's claim -- the label/claim is left alone; that is out of
 # scope for this phase.
 #
+# ## Yielded leases are excluded from "freshest" (Issue #6485)
+#
+# A lease comment whose own `(host, sweep)` pair has a LATER
+# `<!-- loom:lease-yield host=... sweep=... earliest_host=... -->` comment on
+# the same issue (Issue #6287's claim-then-verify-order tie-break standdown)
+# is never eligible to be picked as "the freshest lease" -- it is dropped
+# from the candidate pool entirely before the freshest-by-`updated_at`
+# selection runs. Without this, a stood-down dispatcher whose renewal loop
+# keeps PATCHing its own (abandoned) lease record -- or, per #6485's own
+# incident, ANOTHER host's renewal loop that mistakenly targets it under
+# "newest wins" (see `sweep-lease-renew.sh`) -- can look artificially
+# fresher than the tie-break WINNER's own, correctly-owned, but less
+# frequently renewed lease, fencing the winner out of its own push/PR-open.
+# This is matched by exact `(host, sweep)` pair, not by host alone, so a
+# host that legitimately re-claims the SAME issue later (a brand new lease
+# comment, a different `sweep=`) is never excluded by an unrelated, older
+# yield from a past claim episode on that same host. A genuinely abandoned
+# lease that was never yielded (no `loom:lease-yield` record at all) is
+# NEVER excluded by this rule -- it still ages out purely via the ordinary
+# EXPIRED path below, so this does not weaken TTL-based reclamation.
+#
 # On success (or when there is simply no evidence to fence against -- see
 # "Fail-open cases" below), `check` exits 0 and the caller proceeds exactly
 # as it would have before this script existed.
@@ -115,6 +136,7 @@
 set -euo pipefail
 
 LEASE_MARKER_PREFIX="<!-- loom:lease host="
+YIELD_MARKER_PREFIX="<!-- loom:lease-yield host="
 DEFAULT_TTL_MINUTES="${LOOM_LEASE_TTL_MINUTES:-15}"
 
 # --- Opaque host id (Issue #6322) -------------------------------------------
@@ -249,6 +271,30 @@ parse_lease_marker_line() {
     printf '%s\t%s' "$host" "$sweep_id"
 }
 
+# --- Parse `host=`/`sweep=` out of a lease-YIELD marker's literal first line
+# (Issue #6485): "host=<H> sweep=<S> earliest_host=<EH> earliest_sweep=<ES>
+# -->". The earliest_host/earliest_sweep fields identify who WON the
+# tie-break, not who is yielding, so they are parsed off and discarded here.
+# Prints "host<TAB>sweep" on success, nothing on a malformed marker.
+parse_lease_yield_marker_line() {
+    local first_line="$1" rest host sweep_id
+    rest="${first_line#"$YIELD_MARKER_PREFIX"}"
+    [[ "$rest" == "$first_line" ]] && return 1 # prefix did not match
+    case "$rest" in
+        *" sweep="*)
+            host="${rest%% sweep=*}"
+            sweep_id="${rest#* sweep=}"
+            sweep_id="${sweep_id%% earliest_host=*}"
+            sweep_id="${sweep_id% }"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    [[ -n "$host" && -n "$sweep_id" ]] || return 1
+    printf '%s\t%s' "$host" "$sweep_id"
+}
+
 cmd_check() {
     local issue="${1:-}"
     shift || true
@@ -297,10 +343,13 @@ cmd_check() {
     # re-invokes the `--jq` filter once per response page (#4637), so an
     # array-literal filter would emit `[...][...]` across a multi-page
     # result -- not valid JSON. NDJSON has no wrapper to corrupt.
+    # NDJSON of BOTH marker shapes (lease AND lease-yield, Issue #6485) --
+    # fetched together in ONE round trip so the yield-exclusion filter below
+    # never needs a second `gh api` call.
     local comments_ndjson
     if ! comments_ndjson="$(gh api "${repo_args[@]}" "repos/{owner}/{repo}/issues/${issue}/comments" \
         --paginate --jq \
-        ".[] | select(.body != null and (.body | startswith(\"${LEASE_MARKER_PREFIX}\"))) | {updated_at: .updated_at, body: .body}" \
+        ".[] | select(.body != null and ((.body | startswith(\"${LEASE_MARKER_PREFIX}\")) or (.body | startswith(\"${YIELD_MARKER_PREFIX}\")))) | {updated_at: .updated_at, body: .body}" \
         2>&1)"; then
         echo "PASS: could not fetch comments for issue #${issue} (${comments_ndjson}) -- unverifiable, failing open (proceeding with push/PR-open)" >&2
         exit 0
@@ -311,12 +360,63 @@ cmd_check() {
         exit 0
     fi
 
-    # Pick the freshest by `updated_at` across the ALREADY-DOWNLOADED,
-    # already page-concatenated NDJSON -- this second jq call is NOT run
-    # through `gh --paginate`, so it sees the full multi-page result as one
-    # input and the #4637 hazard above does not apply here.
+    # Split into lease-marker and lease-yield-marker candidates. Neither jq
+    # call goes through `gh --paginate --jq` (that already happened above),
+    # so the #4637 per-page re-invocation hazard does not apply here -- each
+    # call sees the full, already-concatenated NDJSON as one input.
+    local lease_ndjson yield_ndjson
+    lease_ndjson="$(jq -c --arg p "$LEASE_MARKER_PREFIX" 'select(.body | startswith($p))' <<< "$comments_ndjson" 2> /dev/null || true)"
+    yield_ndjson="$(jq -c --arg p "$YIELD_MARKER_PREFIX" 'select(.body | startswith($p))' <<< "$comments_ndjson" 2> /dev/null || true)"
+
+    if [[ -z "$(printf '%s' "$lease_ndjson" | tr -d '[:space:]')" ]]; then
+        echo "PASS: no lease comment found on issue #${issue} (predates the lease feature, a manually-launched sweep, or a lease write that failed) -- no evidence to fence against; proceeding with push/PR-open" >&2
+        exit 0
+    fi
+
+    # Yield-exclusion (Issue #6485): drop any lease comment whose OWN
+    # (host, sweep) -- parsed from its own first line -- has a matching
+    # `loom:lease-yield` record on this issue. See the "Yielded leases are
+    # excluded" section in this script's header comment for why.
+    local yield_first_lines=""
+    if [[ -n "$(printf '%s' "$yield_ndjson" | tr -d '[:space:]')" ]]; then
+        yield_first_lines="$(jq -r '.body | split("\n")[0]' <<< "$yield_ndjson" 2> /dev/null || true)"
+    fi
+
+    local filtered_ndjson=""
+    while IFS= read -r lease_line; do
+        [[ -z "$lease_line" ]] && continue
+        local lbody lfirst lparsed lhost lsweep lyielded="0"
+        lbody="$(jq -r '.body // empty' <<< "$lease_line" 2> /dev/null || true)"
+        [[ -z "$lbody" ]] && continue
+        lfirst="$(printf '%s\n' "$lbody" | head -n1)"
+        lparsed="$(parse_lease_marker_line "$lfirst" || true)"
+        if [[ -n "$lparsed" && -n "$yield_first_lines" ]]; then
+            lhost="${lparsed%%$'\t'*}"
+            lsweep="${lparsed#*$'\t'}"
+            while IFS= read -r yield_first_line; do
+                [[ -z "$yield_first_line" ]] && continue
+                local yparsed
+                yparsed="$(parse_lease_yield_marker_line "$yield_first_line" || true)"
+                [[ -z "$yparsed" ]] && continue
+                if [[ "${yparsed%%$'\t'*}" == "$lhost" && "${yparsed#*$'\t'}" == "$lsweep" ]]; then
+                    lyielded="1"
+                    break
+                fi
+            done <<< "$yield_first_lines"
+        fi
+        if [[ "$lyielded" == "0" ]]; then
+            filtered_ndjson+="${lease_line}"$'\n'
+        fi
+    done <<< "$lease_ndjson"
+
+    if [[ -z "$(printf '%s' "$filtered_ndjson" | tr -d '[:space:]')" ]]; then
+        echo "PASS: every lease comment found on issue #${issue} belongs to a (host, sweep) that has since posted its own loom:lease-yield standdown record for this issue (#6485) -- no non-yielded evidence to fence against; proceeding with push/PR-open" >&2
+        exit 0
+    fi
+
+    # Pick the freshest by `updated_at` among the non-yielded candidates.
     local freshest_json
-    freshest_json="$(jq -s -c 'sort_by(.updated_at) | last' <<< "$comments_ndjson" 2>/dev/null || true)"
+    freshest_json="$(jq -s -c 'sort_by(.updated_at) | last' <<< "$filtered_ndjson" 2> /dev/null || true)"
     if [[ -z "$freshest_json" || "$freshest_json" == "null" ]]; then
         echo "PASS: lease comments on issue #${issue} failed to parse -- no evidence to fence against; proceeding with push/PR-open" >&2
         exit 0

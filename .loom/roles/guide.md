@@ -2414,7 +2414,7 @@ Automated document maintenance by the Guide triage agent.
 
 ### Context
 This PR is generated automatically by the Guide role as part of its triage cycle.
-See issue #1784 for the feature specification.
+See rjwalters/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
 
 ---
 *Automated by Guide role - document maintenance phase*

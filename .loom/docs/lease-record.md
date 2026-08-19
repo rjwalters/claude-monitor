@@ -254,3 +254,63 @@ without touching the `loom:building` label or contesting the peer's claim.
 Absence of a matching lease comment, a malformed marker, or a `gh` fetch
 failure all fail OPEN (exit `0`, proceed) — this doc's own "no lease comment
 == no evidence either way" contract, applied identically to this new reader.
+
+## Yield/renewal/fence coordination gap, closed (Issue #6485)
+
+Phase 1 (renewal), Phase 2 (yield), and Phase 3 (fencing) above were each
+implemented and tested independently, and a real incident (#6470, 2026-08-18)
+showed they were never actually cross-wired: a dispatcher that lost the
+Phase 2 claim-then-verify-order tie-break and posted its own
+`<!-- loom:lease-yield ... -->` standdown record still had a lease comment
+that kept looking freshly renewed, while the tie-break WINNER's own lease
+comment never advanced — so Phase 3's `sweep-lease-fence.sh check`, which
+only ever compared the single freshest `updated_at` across all lease
+comments with no notion of yield status, fenced the winner out of its own
+push/PR-open (`ABORT: SUPERSEDED`) even though it was the host that actually
+did the work.
+
+**Root cause, more precisely than "the loser kept renewing its own lease".**
+Reading `loom-daemon/src/sweep_registry/dispatch.rs`'s dispatch flow shows a
+losing tie-break dispatcher returns *before* spawning a builder or entering
+`sweep.md`'s Step 1a (where `sweep-lease-renew.sh start` is invoked) — so in
+the ordinary single-dispatch-attempt path, a yielded dispatcher never starts
+a renewal loop of its own at all. What was actually happening in the
+#6470 incident: `sweep-lease-renew.sh start`, invoked with no
+`--host`/`--sweep-id`, uses `renew-once`'s "newest wins" fallback — it
+PATCHes whichever lease comment on the issue currently has the highest
+comment `id`, regardless of which host posted it. When a peer's dispatch
+posted a lease comment with a higher `id` shortly after this sweep's own
+(the exact shape of a near-simultaneous acquisition race), THIS sweep's own
+renewal loop silently started renewing the PEER's comment on every cycle
+instead of its own — so the winner's own lease never advanced, while the
+peer's (soon-to-be-yielded) lease kept looking fresh, renewed by the
+winner's own, correctly-running loop.
+
+Both `sweep-lease-renew.sh` and `sweep-lease-fence.sh` were fixed together
+(defense in depth):
+
+- **`sweep-lease-renew.sh`**: `start` now defaults to resolving its OWN
+  `--host`/`--sweep-id` (from `$LOOM_HOST_ID`'s opaque form and
+  `$LOOM_TERMINAL_ID`'s `daemon-<sweep-id>` shape) whenever both can be
+  resolved, so `renew-once` uses exact-match targeting instead of "newest
+  wins" by default — closing the actual misdirection observed above. As a
+  second, independent layer, `renew-once` also refuses to PATCH ANY
+  candidate lease (whether selected by exact match or by "newest wins")
+  whose own `(host, sweep)` has a matching `loom:lease-yield` record on the
+  same issue (a new exit code, `4`), and `start`'s loop stops renewing
+  immediately once a cycle reports that outcome, rather than waiting for its
+  watched PID to die.
+- **`sweep-lease-fence.sh`**: `check` now excludes, from the "freshest
+  lease" candidate pool, any lease comment whose own `(host, sweep)` has a
+  LATER `loom:lease-yield` record on the same issue — matched by the exact
+  `(host, sweep)` pair, not by host alone, so a host that legitimately
+  re-claims the same issue later (a brand new lease comment, a different
+  `sweep=`) is never excluded by an unrelated, older yield from a past claim
+  episode. A lease that was never yielded still ages out purely through the
+  ordinary TTL/EXPIRED path — this does not weaken that path.
+
+With either fix alone the #6470 incident's fence failure would not have
+recurred; both are applied together because the fence-side fix is the
+correctness backstop (defends even if a future code path re-introduces a
+misdirected or intentionally-left-running renewal loop) and the renew-side
+fix addresses the actual mechanism observed in the incident.

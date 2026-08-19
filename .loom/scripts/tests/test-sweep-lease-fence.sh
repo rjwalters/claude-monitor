@@ -31,6 +31,12 @@
 #       LOOM_HOST_ID, not the raw value (#6322)
 #   (n) a lease comment carrying the raw hostname no longer matches the
 #       opaque default resolution -> ABORT SUPERSEDED (#6322)
+#   (o) a yielded (host, sweep)'s lease is excluded from "freshest" and the
+#       check falls back to the next-freshest, non-yielded lease (#6485)
+#   (p) every lease comment on the issue has yielded -> PASS, fail-open
+#   (q) a yield record for a DIFFERENT sweep on the SAME host does not
+#       exclude a later, legitimately-reclaimed lease from that host --
+#       matched by exact (host, sweep), not by host alone (#6485)
 #
 # Usage:
 #   ./.loom/scripts/tests/test-sweep-lease-fence.sh
@@ -275,6 +281,50 @@ cat > "$STUB_DIR/comments.json" <<'JSON'
 JSON
 LOOM_HOST_ID="opaque-test-host" LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309
 assert_eq "4" "$RC" "(n) a raw-hostname lease comment does not match the opaque default -> ABORT SUPERSEDED"
+
+# --- (o) a lease excluded by a same (host, sweep) loom:lease-yield record
+# (#6485) falls back to the next-freshest, non-yielded candidate -- here
+# that candidate is this sweep's OWN, older lease, so the check still
+# PASSES even though the freshest comment overall belongs to a peer.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[
+  {"id": 1, "updated_at": "2026-08-15T15:50:00Z", "body": "<!-- loom:lease host=studio-host sweep=sweep-own -->\nprose"},
+  {"id": 2, "updated_at": "2026-08-15T15:51:30Z", "body": "<!-- loom:lease host=peer-host sweep=sweep-peer -->\nprose"},
+  {"id": 3, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease-yield host=peer-host sweep=sweep-peer earliest_host=studio-host earliest_sweep=sweep-own -->\nprose"}
+]
+JSON
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
+assert_eq "0" "$RC" "(o) the freshest lease belongs to a yielded (host, sweep) -- excluded, falls back to this host's own older lease -> PASS"
+assert_contains "$ERR" "host=studio-host" "(o) stderr confirms the match landed on studio-host's own lease"
+
+# --- (p) EVERY lease comment on the issue has yielded -> PASS, fail-open
+# (no non-yielded evidence to fence against at all).
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[
+  {"id": 1, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=studio-host sweep=sweep-a -->\nprose"},
+  {"id": 2, "updated_at": "2026-08-15T15:51:30Z", "body": "<!-- loom:lease-yield host=studio-host sweep=sweep-a earliest_host=peer-host earliest_sweep=sweep-b -->\nprose"}
+]
+JSON
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
+assert_eq "0" "$RC" "(p) every lease comment has yielded -> PASS, fail-open"
+assert_contains "$ERR" "loom:lease-yield" "(p) stderr explains the all-yielded fail-open reason"
+
+# --- (q) a yield record for a DIFFERENT sweep on the SAME host does NOT
+# exclude a later, legitimately-reclaimed lease from that host -- matched
+# by exact (host, sweep) pair, not by host alone.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[
+  {"id": 1, "updated_at": "2026-08-15T15:40:00Z", "body": "<!-- loom:lease host=studio-host sweep=sweep-old -->\nprose"},
+  {"id": 2, "updated_at": "2026-08-15T15:40:30Z", "body": "<!-- loom:lease-yield host=studio-host sweep=sweep-old earliest_host=peer-host earliest_sweep=sweep-peer-old -->\nprose"},
+  {"id": 3, "updated_at": "2026-08-15T15:51:00Z", "body": "<!-- loom:lease host=studio-host sweep=sweep-new -->\nprose"}
+]
+JSON
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
+assert_eq "0" "$RC" "(q) a stale yield for a DIFFERENT (older) sweep on the same host does not block this host's brand new lease"
+assert_contains "$ERR" "sweep=sweep-new" "(q) stderr confirms the match is the new sweep's lease, not the old yielded one"
 
 # --- (j) --ttl-minutes overrides the default TTL ---------------------------
 reset_state

@@ -64,6 +64,17 @@
 #       sequence of each race, pushed.log contains EXACTLY one entry --
 #       never zero (the winner must still succeed) and never two (the
 #       fencing check must actually block the loser).
+#   (5) Issue #6485's own race shape: two lease comments within the same
+#       second, the LATER one's host posts its own `loom:lease-yield`
+#       standdown record and then keeps its lease looking fresh (as if a
+#       misdirected renewal loop kept PATCHing it after the standdown) --
+#       the EARLIER (tie-break-winning) host's fencing check must still
+#       PASS even though its own lease was never renewed at all.
+#   (6) Edge case guarding (5): the SAME fixture shape with the yield
+#       record removed -- a genuinely fresher peer lease that never
+#       yielded must still correctly SUPERSEDE the earlier host. This is
+#       the negative check that (5)'s fix has not weakened ordinary
+#       fencing for a lease that simply never yielded.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-sweep-lease-fence-race.sh
@@ -306,6 +317,60 @@ simulate_sweep_attempt 7003 studio-host winner-after
 assert_eq "0" "$ATTEMPT_RC" "(3) winner still PASSes after the loser's attempt ran first against the same store"
 assert_contains "$ATTEMPT_ERR" "lease fence OK" "(3) winner's PASS is genuine (fresh + owned), not a fail-open artifact of the loser's run"
 assert_eq "1" "$(pushed_log_count)" "(3) still exactly one push/PR-open -- order of attempts does not change the outcome"
+
+# ============================================================================
+# Scenario 4: Issue #6485's own race shape -- a yielded-but-still-renewed
+# loser must not fence out the tie-break winner
+# ============================================================================
+#
+# Two lease comments posted within the same second: host-winner (id 10,
+# EARLIER by forge comment order -- wins Issue #6287's claim-then-verify
+# tie-break) and host-loser (id 11, one second later -- loses the tie-break
+# and posts its own `loom:lease-yield` standdown record, id 12). Despite
+# yielding, host-loser's lease comment (id 11) keeps looking freshly
+# renewed -- modeling the exact #6485 incident where a renewal loop (either
+# the yielded host's own, or another host's misdirected "newest wins" loop)
+# kept PATCHing it well after the standdown. host-winner's OWN lease (id 10)
+# is never renewed at all. Per the issue's own acceptance criteria, the
+# winner's fencing check must still PASS.
+echo ""
+echo "--- Scenario 4: yielded-but-still-renewed loser must not fence out the tie-break winner (#6485) ---"
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[
+  {"id": 10, "updated_at": "2026-08-15T15:58:57Z", "body": "<!-- loom:lease host=host-winner sweep=sweep-issue-9001-winner -->\nprose"},
+  {"id": 11, "updated_at": "2026-08-15T15:59:30Z", "body": "<!-- loom:lease host=host-loser sweep=sweep-issue-9001-loser -->\nprose"},
+  {"id": 12, "updated_at": "2026-08-15T15:59:00Z", "body": "<!-- loom:lease-yield host=host-loser sweep=sweep-issue-9001-loser earliest_host=host-winner earliest_sweep=sweep-issue-9001-winner -->\nprose"}
+]
+JSON
+
+simulate_sweep_attempt 9001 host-winner yielded-race-winner
+assert_eq "0" "$ATTEMPT_RC" "(5) tie-break winner's fencing check PASSes even though its own lease (id 10) was never renewed"
+assert_contains "$ATTEMPT_ERR" "lease fence OK" "(5) winner's stderr confirms a genuine PASS"
+assert_contains "$ATTEMPT_ERR" "host=host-winner" "(5) winner's stderr confirms the match was against its OWN lease, not the yielded loser's fresher one"
+assert_eq "1" "$(pushed_log_count)" "(5) the winner's push/PR-open proceeds"
+
+# ============================================================================
+# Scenario 5 (edge case guarding Scenario 4): the SAME shape MINUS the yield
+# record -- a genuinely fresher, never-yielded peer lease must still
+# correctly SUPERSEDE the earlier host. Proves the #6485 fix has not
+# weakened ordinary fencing for a lease that simply never yielded.
+# ============================================================================
+echo ""
+echo "--- Scenario 5: without a yield record, the fresher peer lease still correctly SUPERSEDES (edge case guard) ---"
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[
+  {"id": 10, "updated_at": "2026-08-15T15:58:57Z", "body": "<!-- loom:lease host=host-winner sweep=sweep-issue-9002-winner -->\nprose"},
+  {"id": 11, "updated_at": "2026-08-15T15:59:30Z", "body": "<!-- loom:lease host=host-loser sweep=sweep-issue-9002-loser -->\nprose"}
+]
+JSON
+
+simulate_sweep_attempt 9002 host-winner unyielded-race-loser
+assert_eq "4" "$ATTEMPT_RC" "(6) without a yield record, the earlier host correctly loses to the genuinely fresher peer lease (ABORT SUPERSEDED)"
+assert_contains "$ATTEMPT_ERR" "ABORT: SUPERSEDED" "(6) stderr names the SUPERSEDED reason"
+assert_contains "$ATTEMPT_ERR" "host-loser" "(6) stderr names the superseding (never-yielded) host"
+assert_eq "0" "$(pushed_log_count)" "(6) no push/PR-open happens for the correctly-superseded host"
 
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"

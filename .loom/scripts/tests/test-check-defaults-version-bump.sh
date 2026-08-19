@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # test-check-defaults-version-bump.sh - Smoke tests for
-# check-defaults-version-bump.sh (#5874).
+# check-defaults-version-bump.sh (#5874, #6480).
 #
 # Constructs a throwaway local git repo with a `defaults/` tree and a
 # `VERSION` file, then exercises:
@@ -14,6 +14,12 @@
 #   - missing --base -> exit 2
 #   - unknown base ref -> exit 2
 #   - --help prints usage
+# Plus custom-watch-path checks (#6480):
+#   - --paths: change under a custom watched path, no bump -> FAIL
+#   - --paths: change outside the watched paths only        -> PASS
+#   - VERSION_BUMP_WATCH_PATHS env var behaves like --paths
+#   - no --paths / no env var: default behavior unchanged (covered by the
+#     original (a)-(f) cases above, which never set either)
 #
 # Usage:
 #   ./.loom/scripts/tests/test-check-defaults-version-bump.sh
@@ -54,7 +60,8 @@ export GIT_COMMITTER_NAME="test" GIT_COMMITTER_EMAIL="test@example.com"
 
 REPO="$WORKDIR/repo"
 
-# Fresh repo with a base commit carrying defaults/foo.md and VERSION=1.0.0,
+# Fresh repo with a base commit carrying defaults/foo.md, install.sh (a
+# stand-in for a consumer repo's own installable surface), and VERSION=1.0.0,
 # tagged "base". Callers add more commits on top and diff against "base".
 make_fixture() {
     rm -rf "$REPO"
@@ -62,6 +69,7 @@ make_fixture() {
     git -C "$REPO" checkout -q -b main
     mkdir -p "$REPO/defaults/scripts"
     echo "hello" > "$REPO/defaults/scripts/foo.md"
+    echo "#!/bin/sh" > "$REPO/install.sh"
     echo "1.0.0" > "$REPO/VERSION"
     echo "unrelated" > "$REPO/README.md"
     git -C "$REPO" add -A
@@ -205,6 +213,110 @@ if printf '%s' "$help_out" | grep -qi "Usage"; then
     pass "--help mentions Usage"
 else
     fail "--help did not mention Usage. Got: $help_out"
+fi
+
+# -------- Test 10: --paths, change under a watched path, no bump -> FAIL --------
+echo "Test 10: --paths custom watch, change under it without a bump fails"
+make_fixture
+echo "changed" >> "$REPO/install.sh"
+git -C "$REPO" commit -q -am "install.sh change, no bump"
+rc=0
+err_out="$(cd "$REPO" && "$SCRIPT" --base base --paths install.sh 2>&1 >/dev/null)" || true
+( cd "$REPO" && "$SCRIPT" --base base --paths install.sh >/dev/null 2>&1 ) || rc=$?
+if [[ "$rc" -eq 1 ]]; then
+    pass "--paths install.sh: unbumped change under watched path exits 1"
+else
+    fail "--paths install.sh: expected exit 1, got $rc"
+fi
+if printf '%s' "$err_out" | grep -q "install.sh"; then
+    pass "--paths install.sh: failure output lists the changed file"
+else
+    fail "--paths install.sh: failure output missing changed file. Got: $err_out"
+fi
+if printf '%s' "$err_out" | grep -q "install.sh"; then
+    pass "--paths install.sh: failure output names the actual watched path, not 'defaults/'"
+else
+    fail "--paths install.sh: failure output missing watched-path name. Got: $err_out"
+fi
+
+# -------- Test 11: --paths, change outside the watched paths -> PASS --------
+echo "Test 11: --paths custom watch, change outside it passes"
+make_fixture
+echo "changed" >> "$REPO/defaults/scripts/foo.md"
+git -C "$REPO" commit -q -am "defaults/ change, not watched"
+out="$(cd "$REPO" && "$SCRIPT" --base base --paths install.sh 2>&1)"
+rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    pass "--paths install.sh: change outside watched paths exits 0"
+else
+    fail "--paths install.sh: expected exit 0, got $rc. Output: $out"
+fi
+
+# -------- Test 12: --paths with a VERSION bump -> PASS --------
+echo "Test 12: --paths custom watch, change under it with a bump passes"
+make_fixture
+echo "changed" >> "$REPO/install.sh"
+echo "1.0.1" > "$REPO/VERSION"
+git -C "$REPO" commit -q -am "install.sh change, bumped"
+out="$(cd "$REPO" && "$SCRIPT" --base base --paths install.sh 2>&1)"
+rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    pass "--paths install.sh: bumped change under watched path exits 0"
+else
+    fail "--paths install.sh: expected exit 0, got $rc. Output: $out"
+fi
+
+# -------- Test 13: VERSION_BUMP_WATCH_PATHS env var, change under it, no bump -> FAIL --------
+echo "Test 13: VERSION_BUMP_WATCH_PATHS env var, unbumped change under it fails"
+make_fixture
+echo "changed" >> "$REPO/install.sh"
+git -C "$REPO" commit -q -am "install.sh change via env var, no bump"
+rc=0
+( cd "$REPO" && VERSION_BUMP_WATCH_PATHS="install.sh" "$SCRIPT" --base base >/dev/null 2>&1 ) || rc=$?
+if [[ "$rc" -eq 1 ]]; then
+    pass "VERSION_BUMP_WATCH_PATHS=install.sh: unbumped change exits 1"
+else
+    fail "VERSION_BUMP_WATCH_PATHS=install.sh: expected exit 1, got $rc"
+fi
+
+# -------- Test 14: VERSION_BUMP_WATCH_PATHS env var, change outside it -> PASS --------
+echo "Test 14: VERSION_BUMP_WATCH_PATHS env var, change outside it passes"
+make_fixture
+echo "changed" >> "$REPO/defaults/scripts/foo.md"
+git -C "$REPO" commit -q -am "defaults/ change, not watched via env var"
+out="$(cd "$REPO" && VERSION_BUMP_WATCH_PATHS="install.sh" "$SCRIPT" --base base 2>&1)"
+rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    pass "VERSION_BUMP_WATCH_PATHS=install.sh: change outside watched paths exits 0"
+else
+    fail "VERSION_BUMP_WATCH_PATHS=install.sh: expected exit 0, got $rc. Output: $out"
+fi
+
+# -------- Test 15: --paths overrides VERSION_BUMP_WATCH_PATHS -------
+echo "Test 15: --paths takes precedence over VERSION_BUMP_WATCH_PATHS"
+make_fixture
+echo "changed" >> "$REPO/defaults/scripts/foo.md"
+git -C "$REPO" commit -q -am "defaults/ change, --paths should still watch it"
+out="$(cd "$REPO" && VERSION_BUMP_WATCH_PATHS="install.sh" "$SCRIPT" --base base --paths defaults/ 2>&1 >/dev/null)"
+rc=0
+( cd "$REPO" && VERSION_BUMP_WATCH_PATHS="install.sh" "$SCRIPT" --base base --paths defaults/ >/dev/null 2>&1 ) || rc=$?
+if [[ "$rc" -eq 1 ]]; then
+    pass "--paths defaults/ overrides VERSION_BUMP_WATCH_PATHS=install.sh"
+else
+    fail "--paths defaults/ expected to override env var and exit 1, got $rc"
+fi
+
+# -------- Test 16: default behavior with no --paths / no env var unchanged -------
+echo "Test 16: default behavior (no --paths, no env var) matches original defaults/-only behavior"
+make_fixture
+echo "changed" >> "$REPO/install.sh"
+git -C "$REPO" commit -q -am "install.sh change only, default watch is defaults/"
+out="$(cd "$REPO" && "$SCRIPT" --base base 2>&1)"
+rc=$?
+if [[ "$rc" -eq 0 ]]; then
+    pass "default watch (defaults/): install.sh-only change exits 0 (not watched by default)"
+else
+    fail "default watch (defaults/): expected exit 0, got $rc. Output: $out"
 fi
 
 # -------- Summary --------

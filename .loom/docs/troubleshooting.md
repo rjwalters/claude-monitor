@@ -523,6 +523,102 @@ cat .loom/config.json.bak
 `loom-daemon init` against a workspace that already has a `.loom/config.json`, so
 repeat provisioning passes cannot re-enter this path on a tuned host.
 
+### Conflict markers left in `.loom/config.json` after a `git stash pop` (#6499)
+
+`.loom/config.json` is **tracked**, and every existing repo carries at least
+one host-specific field patched locally in the working tree (e.g.
+`safehouse.socket`, `observability.ingestKeyFile`, a stale `room` value —
+#5457 is the durable fix that will stop this). Because that patch sits
+uncommitted on top of a tracked file, a `git stash push`/`git stash pop`
+cycle against the primary checkout (whether run by a human or an agent) can
+conflict on it — and if that conflict is left unresolved, `.loom/config.json`
+ends up on disk with literal `<<<<<<<` / `=======` / `>>>>>>>` markers
+embedded in it. That is invalid JSON: `config_resolver::resolve_effective_config`
+silently falls back to `{}` for this tier, and the daemon runs on **built-in
+defaults** for every value that file carried — `observability`, `safehouse`,
+`autonomous.roleRunner`, and any other block your host's config tuned,
+disabled or reconfigured without you doing anything.
+
+**Check first, always:**
+
+```bash
+jq . .loom/config.json
+```
+
+A parse error there is definitive — jq's own error message names the exact
+line/column, and the daemon's own boot log carries the same diagnosis at
+`ERROR` (not a buried `WARN`) as of #6499:
+
+```bash
+grep 'config_resolver:.*is unreadable/malformed' ~/.loom/daemon.log
+```
+
+The daemon's periodic primary-checkout pass (`primary_checkout_reaper`, on by
+default) also logs an `ERROR` line naming the unmerged path(s) — e.g.
+`UU .loom/config.json` — on every tick the condition persists, independent of
+a restart, whenever the abandoned-conflict shape (unmerged index entries with
+no merge/rebase actually in progress) is present; see `grep
+'ABANDONED CONFLICT STATE'` / `primary_checkout_reaper:` in the same log.
+`check-main-clean.sh` (the Builder-workflow-invoked counterpart, #6162 AC3)
+reports the identical condition — `ABANDONED CONFLICT STATE` — for any
+tracked file, not just `.loom/config.json`.
+
+**Once the markers are committed, every detector above goes blind.** All three
+key on an *unmerged index entry*, and `git add` clears that — so a
+`chore: resync installed Loom surfaces` pass that sweeps the corrupted file
+into a commit makes the corruption invisible to them while leaving it live in
+the tree (exactly how the #6499 markers reached `main`). The gate for that
+case is content-level, not index-level:
+
+```bash
+./.loom/scripts/check-conflict-markers.sh          # scan every tracked file
+./.loom/scripts/check-conflict-markers.sh --dir .  # or a directory, recursively
+```
+
+It exits `2` and names each offending path with its marker line numbers.
+Detection is extension-agnostic (the gap that let a `.json` file past
+`check-shell-syntax.sh`'s `*.sh`-only `bash -n` gate, #6162) and keys only on
+line-start `<<<<<<< ` / `>>>>>>> `, so a markdown setext heading underline, a
+`=======` separator comment, and inline backticked marker text in prose (as
+in this very section) are all left alone. A fixture that genuinely must
+contain markers opts itself out by embedding the literal string
+`check-conflict-markers:allow` in its own content. This runs in CI on every
+push and PR, unfiltered by changed-path group.
+
+**Resolution is mechanical — keep the local host's own values:**
+
+1. Open the file and find the conflict hunk(s):
+   ```bash
+   grep -n '^<<<<<<<\|^=======\|^>>>>>>>' .loom/config.json
+   ```
+2. For each hunk, keep **this host's** side (the values already in local use
+   on this machine — the socket path, ingest key file path, room, etc. that
+   match this host's own filesystem layout) and delete the markers and the
+   losing side entirely. There is no "correct" side in the abstract; the
+   correct side is whichever one this host was actually running with.
+3. Verify the fix parses:
+   ```bash
+   jq . .loom/config.json
+   ```
+4. If the file is (or was) genuinely unmerged in git's own index — `git
+   status --porcelain` shows a `UU` (or `DD`/`AU`/`UD`/`UA`/`DU`/`AA`) line for
+   it, not just modified — clear that stage-conflict state too, e.g. `git add
+   .loom/config.json` once the content is fixed, or discard the whole
+   conflicted stash-pop attempt with `git reset --merge` and reapply your
+   local patch by hand from memory/backup.
+5. Restart the daemon (`loom-daemon restart`, or however this host manages
+   it) so it picks up the corrected file — the process that hit the parse
+   failure keeps running on defaults for its own lifetime; fixing the file on
+   disk alone does not retroactively fix an already-running process.
+
+If you are unsure which side is correct, do **not** guess — the two Mac
+hosts in the original #6499 incident had *different* correct answers (one
+Mac path, one Linux path) for the same key, because the "conflict" was really
+two different hosts' legitimate local patches colliding via a shared stash.
+A backup of the pre-conflict file (if one exists, e.g. an untracked
+`.loom/config.json.bak-conflict-<date>` sitting alongside it) is the most
+reliable source of truth for what this host's own values were.
+
 ### `install.sh` refuses to run: "Another Loom install is already running" (#4928)
 
 `install.sh`'s `--quick` / `--clean` paths take a per-target lock at

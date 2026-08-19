@@ -623,6 +623,37 @@ else
     warn "check-shell-syntax.sh not found at $SYNTAX_CHECK_SCRIPT — skipping the pre-resync shell-syntax gate (#6162)."
 fi
 
+# ---------- pre-resync conflict-marker gate (#6499) -----------------------
+#
+# The gate above proves shell sources PARSE, but it can only speak for `*.sh`
+# — `bash -n` has nothing to say about a doc, a role prompt, or a runtime
+# `*.json`. #6499 is the same corruption shape (an abandoned `git stash pop`
+# leaving live `<<<<<<<` / `=======` / `>>>>>>>` markers) landing in a
+# non-shell file, where it stayed invisible until a daemon boot failed to
+# parse it and silently fell back to built-in defaults. Every root this
+# script copies is in scope: a marker-corrupted role prompt or runtime
+# descriptor would be replicated into every consumer's `.loom/` exactly as
+# #6162's non-parsing spawn script would have been. Same failure posture as
+# the gate above: refuse before any write, and degrade to a warning (never a
+# silent skip) if the checker is missing from an older defaults/ tree.
+MARKER_CHECK_SCRIPT="$DEFAULTS_DIR/scripts/check-conflict-markers.sh"
+if [[ -x "$MARKER_CHECK_SCRIPT" ]]; then
+    marker_check_dirs=()
+    for _marker_root in hooks scripts docs roles runtimes bin .claude; do
+        [[ -d "$DEFAULTS_DIR/$_marker_root" ]] && marker_check_dirs+=(--dir "$DEFAULTS_DIR/$_marker_root")
+    done
+    if [[ "${#marker_check_dirs[@]}" -gt 0 ]]; then
+        if ! marker_check_out="$("$MARKER_CHECK_SCRIPT" --quiet "${marker_check_dirs[@]}" 2>&1)"; then
+            err "Refusing to resync: one or more source files carry live git conflict markers."
+            printf '%s\n' "$marker_check_out" >&2
+            err "Resolve the conflict(s) under $DEFAULTS_DIR before re-running this script — nothing was copied."
+            exit 1
+        fi
+    fi
+else
+    warn "check-conflict-markers.sh not found at $MARKER_CHECK_SCRIPT — skipping the pre-resync conflict-marker gate (#6499)."
+fi
+
 # Current source version (from the resolved SOURCE_ROOT's package.json). Used
 # by restamp_metadata() / resync_claude_md_version_header() below AND by the
 # #5980 crash-detection marker, so it is defined here — as soon as

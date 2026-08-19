@@ -5,6 +5,10 @@
 # `git stash pop` conflict left live conflict markers in an installed shell
 # script — nothing asserted that installed shell surfaces actually parse).
 #
+# This file deliberately embeds literal conflict-marker fixtures, so it opts
+# itself out of check-conflict-markers.sh (#6499) with that script's in-file
+# sentinel: check-conflict-markers:allow
+#
 # Verified behavior:
 #   - exit 0 when every scanned *.sh file parses cleanly
 #   - exit 2 when a *.sh file has conflict markers / does not parse, naming

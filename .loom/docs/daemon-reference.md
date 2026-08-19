@@ -5041,6 +5041,19 @@ rather than act — under-acting here is recoverable on the next tick,
 over-acting is not (this switches an operator's actual working tree, not a
 disposable worktree directory). See `loom-daemon/src/primary_checkout_reaper.rs`.
 
+**Abandoned-conflict detection (#6499).** Every pass also checks — before and
+independent of the switch gates above — for unmerged index entries (`git
+status --porcelain` `XY` in `DD`/`AU`/`UD`/`UA`/`DU`/`AA`/`UU`) with no
+merge/rebase/cherry-pick actually in progress: the signature of an abandoned
+`git stash pop` (or merge/cherry-pick) left unresolved, likely leaving live
+`<<<<<<<`/`=======`/`>>>>>>>` conflict markers in a tracked file. When found,
+it logs a specific `ERROR` (`ABANDONED CONFLICT STATE`, naming the path) on
+every tick the condition persists — report-only, never a restore attempt;
+this is the periodic counterpart to `check-main-clean.sh`'s own #6162 AC3
+detection, which is Builder-workflow-invoked rather than periodic. See
+[`troubleshooting.md` → Conflict markers left in `.loom/config.json` after a
+`git stash pop`](troubleshooting.md#conflict-markers-left-in-loomconfigjson-after-a-git-stash-pop-6499).
+
 ### Autonomous periodic support-role runner (#4015)
 
 Before this loop, the periodic **standalone** support roles — Champion,

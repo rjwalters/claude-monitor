@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # test-resync-installed.sh - Smoke tests for resync-installed.sh (#3777, #4239)
 #
+# This file deliberately embeds a literal conflict-marker fixture (the #6162
+# pre-resync syntax-gate case), so it opts itself out of
+# check-conflict-markers.sh (#6499) with that script's in-file sentinel:
+# check-conflict-markers:allow
+#
 # Constructs throwaway git repos with synthetic defaults/ and installed .loom/
 # trees so it can deterministically exercise the load-bearing cases:
 #   (a) already in sync     -> exit 0, "Already in sync", no writes
@@ -2179,6 +2184,67 @@ if [[ $RC -eq 0 ]] \
     pass "(#6162) a normal apply on a fixture with only valid scripts is unaffected by the new gate"
 else
     fail "(#6162) the syntax gate introduced friction on a clean/valid tree (rc=$RC); out=$OUT"
+fi
+
+# --- pre-resync conflict-marker gate (#6499) ---------------------------------
+#
+# #6162's gate is `bash -n` on `*.sh` only, so the identical corruption in a
+# doc / role prompt / runtime descriptor sails straight through it and gets
+# replicated into every consumer's .loom/. Same fixture discipline as group
+# 26: place a REAL copy of the checker at the exact path the gate looks for,
+# otherwise it degrades to a WARN and these tests would pass vacuously.
+echo "Test group 27: pre-resync conflict-marker gate refuses to copy a marker-corrupted NON-shell source file"
+REPO="$(make_fixture)"
+cp "$HELPERS_DIR/check-conflict-markers.sh" "$REPO/defaults/scripts/check-conflict-markers.sh"
+chmod +x "$REPO/defaults/scripts/check-conflict-markers.sh"
+mkdir -p "$REPO/defaults/docs"
+# Built with printf so this test file's own source carries no line-start
+# markers beyond the group-26 fixture it already opts out for.
+{
+    printf '# Troubleshooting\n'
+    printf '<<<<<<< Updated upstream\n'
+    printf 'mac guidance\n'
+    printf '=======\n'
+    printf 'linux guidance\n'
+    printf '>>>>>>> Stashed changes\n'
+} > "$REPO/defaults/docs/corrupted-doc.md"
+
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 1 ]]; then
+    pass "(#6499) resync hard-fails (exit 1) on a marker-corrupted non-shell source file"
+else
+    fail "(#6499) expected exit 1 on a marker-corrupted .md source (got $RC)"
+fi
+if grep -q "corrupted-doc.md" <<<"$OUT"; then
+    pass "(#6499) the offending non-shell file is named in the output"
+else
+    fail "(#6499) the offending non-shell file was not named in the output; out=$OUT"
+fi
+if [[ "$(cat "$REPO/.loom/hooks/guard.sh")" == "OLD" ]]; then
+    pass "(#6499) refuses to resync: drifted hooks/guard.sh left UNCHANGED (nothing copied)"
+else
+    fail "(#6499) hooks/guard.sh was copied despite the marker corruption elsewhere"
+fi
+
+OUT="$(cd "$REPO" && bash "$SCRIPT" --dry-run 2>&1)"
+RC=$?
+if [[ $RC -eq 1 ]] && grep -q "corrupted-doc.md" <<<"$OUT"; then
+    pass "(#6499) --dry-run also refuses on a marker-corrupted source file (exit 1)"
+else
+    fail "(#6499) --dry-run did not refuse on a marker-corrupted source file (got $RC)"
+fi
+
+echo "Test group 27b: pre-resync conflict-marker gate adds no friction on a clean tree"
+REPO="$(make_fixture)"
+cp "$HELPERS_DIR/check-conflict-markers.sh" "$REPO/defaults/scripts/check-conflict-markers.sh"
+chmod +x "$REPO/defaults/scripts/check-conflict-markers.sh"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && ! grep -qi "conflict markers" <<<"$OUT"; then
+    pass "(#6499) a normal apply on a marker-free fixture is unaffected by the new gate"
+else
+    fail "(#6499) the conflict-marker gate introduced friction on a clean tree (rc=$RC); out=$OUT"
 fi
 
 # --- summary -----------------------------------------------------------------
