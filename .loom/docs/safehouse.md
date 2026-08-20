@@ -708,13 +708,46 @@ what feeds the public fleet feed. Loom is the producer:
        at install time anyway.
 - **`meta` (`completion-v1`)**: `{schema, agent, repo, ref, result, started_at,
   completed_at}` required, plus optional `issue`/`tokens`/`tokens_by_model`/
-  `title`/`additions`/`deletions` (envelope-v1 preserves unknown `meta` keys,
-  so no schema rev is needed for extensions). `body` stays required human
-  prose — a room reader sees a sentence, `meta` is the machine view.
+  `title`/`additions`/`deletions`/`visibility` (envelope-v1 preserves unknown
+  `meta` keys, so no schema rev is needed for extensions). `body` stays required
+  human prose — a room reader sees a sentence, `meta` is the machine view.
 - **`repo` is the forge `owner/repo` slug** (`gh repo view --json
-  nameWithOwner`, cached per workspace for the daemon's lifetime), deliberately
-  **not** the path-basename convention above: the feed links `ref` (the PR URL)
-  and displays the forge identity.
+  nameWithOwner,isPrivate`, cached per workspace for the daemon's lifetime),
+  deliberately **not** the path-basename convention above: the feed links `ref`
+  (the PR URL) and displays the forge identity.
+- **`visibility` is the public-egress gate's input (#6596)** — `"public"` or
+  `"private"`, from the `isPrivate` field of that same `gh repo view` call (no
+  extra round-trip). The egress subsystem mirrors well-formed `completion`
+  envelopes to a **public** sink with no visibility check of its own, so until
+  #6596 the only thing keeping a private repo's PR titles off a public page was
+  an accident: the daemon's credential could not read those repos at all (see
+  the per-owner credential note below). Loom is the **producer** half of the
+  gate only:
+  - **Private repos still narrate**, exactly as before, into the (private)
+    signal room — the tag withholds *egress*, never the room post.
+  - **The consumer half must fail closed**: an egress that publishes only on an
+    explicit `visibility == "public"` degrades safely when the key is absent (a
+    `gh` too old to know `isPrivate` falls back to the `nameWithOwner`-only
+    query, and an older Loom emits no tag at all). Treating an absent tag as
+    public would reinstate the leak.
+  - `validate_completion_meta` refuses any third value, so a consumer only ever
+    has to reason about `"public"`, `"private"`, and absence. The consumer-side
+    gate itself lives in the safehouse repo (rjwalters/safehouse#155) — this
+    tag is inert until it lands.
+  - **Staleness caveat**: the tag is cached alongside the slug for the daemon's
+    lifetime, so flipping a repo public → private mid-run keeps the stale
+    `public` tag until the daemon restarts.
+- **Per-owner credential (#6596)**: every forge lookup in this module — the
+  merge check, the slug/visibility resolution, the reconciliation pass, and the
+  dispatch-line issue-title fetch — runs under the **workspace owner's**
+  `GH_CONFIG_DIR` (`credential_preflight::apply_gh_config_for_root_async`), the
+  same per-owner credential the three dispatch paths hand their sweep children
+  (#5401/#5508/#5522/#6529). The daemon process itself runs under the *primary*
+  installation's credential (#4458), which answers `Could not resolve to a
+  Repository` for a **private** repo owned by another org — so before this,
+  every private cross-owner workspace was permanently and invisibly absent from
+  the completion feed. A total no-op for single-owner fleets and the root
+  owner's own repos.
 - **Display fields (#4497)** feed the site's row format
   `<repo>#<issue>: <title> +A −D · <dur> · <tokens> tok`, i.e. the
   development-cost-of-quality-code view:
@@ -857,15 +890,21 @@ what feeds the public fleet feed. Loom is the producer:
   `owner/repo` slug, `ref` an absolute http(s) URL, `result` ∈
   {`success`,`failure`}, both timestamps RFC3339 with `completed_at >=
   started_at`, `issue`/`tokens`/`additions`/`deletions` non-negative integers
-  when present, `title` a non-empty string when present). Nothing here relies on
-  server-side validation.
+  when present, `title` a non-empty string when present, `visibility` ∈
+  {`public`,`private`} when present). Nothing here relies on server-side
+  validation.
 - **Redaction is downstream.** Every `meta` string — `title` included — is
   published as an ordinary JSON string, so safehoused's egress deny-pattern pass
   redacts it exactly like `repo`/`ref`. Loom applies no bespoke encoding that
   could let a value slip past that pass.
 - **Same degradation contract**: a failing/absent/slow `gh`, an unreachable
   safehoused, or a rejected envelope drops the completion silently and never
-  affects the sweep.
+  affects the sweep — but a failed `gh` lookup now leaves **one `warn` per
+  `(call, workspace)`** in the daemon log (repeats drop to `debug`, so a
+  persistently unauthorized workspace cannot flood it across reconciliation
+  ticks), quoting a capped one-line stderr head. The behavior stays silent; the
+  *diagnosis* does not have to be (#6596: catching the daemon's child `gh` in
+  `ps` and replaying it by hand was the only way to see this class of failure).
 
 ## Wire protocol (envelope v1)
 

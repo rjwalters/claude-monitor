@@ -249,6 +249,14 @@ directly, on a live fleet host).
   this host (live daemon present)" — do **not** file a bug, and do **not**
   work around the guard by invoking those two binaries' package/binary
   directly to "just check".
+- `integration_basic` is a related but DIFFERENT case (#6607): the guard
+  never excludes it (it is non-destructive — `cleanup_test_sessions()`, not
+  `cleanup_all_loom_sessions()`), but it drives the SAME shared `-L loom`
+  tmux socket a live daemon uses, so it can flake with `Timeout reading
+  response` / `deadline has elapsed` under that contention on a live-daemon
+  host. If it fails on such a host, do **not** file a bug from that single
+  run — re-run on a host with no live daemon (e.g. CI) first; only file if it
+  still fails there.
 - If `nextest-daemon-guard.sh` does not exist in a repo you are auditing (it
   is Loom-specific), this subsection does not apply there — but apply the
   same reasoning to any Rust test group in that repo whose setup/teardown

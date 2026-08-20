@@ -62,7 +62,7 @@ echo "desired=true" > "$FAKE_HOME/.loom/autonomy-desired"
 # Neutralize the ambient agent-session state vars for every case (the real
 # values point at THIS host's live daemon — exactly what must never be read or
 # written from a test).
-NEUTRAL_ENV='unset LOOM_PID_FILE LOOM_AUTONOMY_MARKER LOOM_SOCKET_PATH LOOM_WORKSPACE LOOM_MACHINE_CHECKOUT LOOM_DAEMON_BIN LOOM_DAEMON_BIN_DIR'
+NEUTRAL_ENV='unset LOOM_PID_FILE LOOM_AUTONOMY_MARKER LOOM_SOCKET_PATH LOOM_WORKSPACE LOOM_MACHINE_CHECKOUT LOOM_DAEMON_BIN LOOM_DAEMON_BIN_DIR LOOM_LAUNCHD_LABEL LOOM_WATCHDOG_LABEL'
 
 # ============================================================
 # 1. live_state_sandbox_init redirects every state path into the sandbox dir
@@ -250,8 +250,13 @@ check "$([[ "${snap_size:-0}" -ge 6 ]] && echo 0 || echo 1)" \
 #    resolves to the REAL production identity must fail the guard too.
 # ============================================================
 
-# 9a. A scratch label passes cleanly.
-check "$(live_state_sandbox_assert_supervisor_scoped "com.example.scratch-1234" && echo 0 || echo 1)" \
+# 9a. A scratch label passes cleanly. Both args are passed explicitly (scratch
+#     values) so this case never relies on live_state_sandbox_assert_supervisor_scoped's
+#     default-to-ambient behavior -- if the ambient LOOM_WATCHDOG_LABEL happens
+#     to be the real production watchdog label (e.g. this suite is run on a
+#     host with a live daemon), the default-to-ambient second arg would
+#     otherwise make this case spuriously fail.
+check "$(live_state_sandbox_assert_supervisor_scoped "com.example.scratch-1234" "com.example.scratch-1234-watchdog" && echo 0 || echo 1)" \
     "a scratch LOOM_LAUNCHD_LABEL passes the supervisor-identity guard"
 
 # 9b. The REAL production launchd label fails loudly.

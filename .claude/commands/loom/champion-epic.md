@@ -324,9 +324,111 @@ This changes behavior only for `epic-complete-unpromoted` — an epic whose
 external blocker is genuinely still in progress or not yet decomposed
 continues to hold exactly as it did before this section existed.
 
+### Step 2.75: Pre-Creation Existence Check for Phase Issues (#6601)
+
+**Run this immediately before the `gh issue create` loop, at BOTH creation
+sites — Step 3 (Phase 1) below and "Creating Next Phase Issues" (Phase N+1)
+under "Phase Progression" — never only at one.**
+
+**Problem this section fixes (#6601)**: neither creation site had *any*
+pre-creation existence check. On example-org/tool-repo#372, Champion's approval
+comment created the canonical Phase 1 set (product-repo#79/#80/#81); those issues
+were completed, closed, and their PRs merged; a later pass re-ran phase-issue
+creation for the same phase and, having nothing to consult, created a second,
+duplicate set (product-repo#84/#85/#86) carrying the identical
+`<!-- loom:epic:372:phase:1 -->` marker. This is a straightforward
+missing-idempotency-check bug, not a concurrency race — the two creations were
+~2 hours apart, not simultaneous — so the fix is a query, not a lock (see
+"Why this alone is sufficient — no mutex change" below).
+
+```bash
+EPIC_NUMBER=<number>
+PHASE=<N>   # 1 at Step 3; N+1 at "Creating Next Phase Issues"
+PHASE_MARKER="<!-- loom:epic:$EPIC_NUMBER:phase:$PHASE -->"
+
+# Any state — a materialized-and-CLOSED phase must dedupe exactly like an
+# open one (that's precisely the incident this fixes: the canonical set was
+# closed-complete, not open, when the duplicate was created). This is the
+# same query "Detecting Phase Completion" already uses below, so the two
+# call sites can never disagree about what "already exists" means. Cached
+# (${GH_READ:-gh}) — this is a content check, not claim arbitration.
+EXISTING_PHASE_ISSUES=$(${GH_READ:-gh} issue list \
+  --label="loom:epic-phase" \
+  --state=all \
+  --limit=500 \
+  --search="loom:epic:$EPIC_NUMBER:phase:$PHASE in:body" \
+  --json number,title,state \
+  --jq '.')
+EXISTING_COUNT=$(printf '%s\n' "$EXISTING_PHASE_ISSUES" | jq 'length')
+
+if [ "$EXISTING_COUNT" -gt 0 ]; then
+  # Already materialized. CLOSED counts exactly the same as OPEN — a phase
+  # closed as merged-and-shipped AND a phase closed as "not planned" both
+  # count as materialized: either way the set of issues for this phase
+  # already exists and must never be recreated. (Explicit AC decision,
+  # #6601: "not planned" is not treated differently from "merged" here —
+  # both are simply CLOSED to this state==all query.)
+  STANDDOWN_MARKER="<!-- champion:epic-phase-standdown:$EPIC_NUMBER:$PHASE -->"
+  ALREADY_COMMENTED=$(${GH_READ:-gh} issue view "$EPIC_NUMBER" --json comments \
+    --jq --arg m "$STANDDOWN_MARKER" '[.comments[] | select(.body | contains($m))] | length')
+  if [ "$ALREADY_COMMENTED" -eq 0 ]; then
+    ISSUE_LIST=$(printf '%s\n' "$EXISTING_PHASE_ISSUES" | jq -r '.[] | "- #\(.number) (\(.state)): \(.title)"')
+    gh issue comment "$EPIC_NUMBER" --body "$STANDDOWN_MARKER
+**Champion: Phase $PHASE Issues Already Exist — Skipping Creation**
+
+Found $EXISTING_COUNT existing issue(s) already carrying \`$PHASE_MARKER\`:
+
+$ISSUE_LIST
+
+Not creating a duplicate set. If this phase is not actually complete, resolve
+the issues above rather than re-running phase creation.
+
+---
+*Automated by Champion role*"
+  fi
+  # Do NOT run the gh issue create loop below for this phase. Continue to the
+  # next epic (Step 3) or fall through to "Epic Completion" (phase progression).
+else
+  # No existing issues carry this phase's marker in any state — proceed with
+  # creation below exactly as documented.
+  :
+fi
+```
+
+#### Why this alone is sufficient — no mutex change (#6601, addresses the mutex-scope AC)
+
+The `#3707` `IssueCreationMutex` (`loom-daemon/src/issue_creation_mutex.rs`) is
+an in-process `tokio::sync::Mutex`, acquired only inside `epic_supervisor.rs`'s
+own dispatch loop — it cannot and does not serialize a plain Champion pass
+(a separate `claude` process reading this prose file, dispatched via the role
+runner or a GH Actions cron job) against the daemon's opt-in epic supervisor;
+those are different OS processes with no shared memory to hold a `Mutex` in.
+Extending it to cover that boundary would need a persistent, forge-visible
+lock (e.g. a claim label), which is a materially bigger change than this
+incident's actual failure mode calls for.
+
+That failure mode was **not** two creators racing simultaneously — the two
+creations on example-org/tool-repo#372 were ~2 hours apart (15:31Z and 17:42Z)
+with the first phase fully closed in between. The existence check above closes exactly
+that gap: any pass, no matter how far apart, now queries the forge
+immediately before creating and finds the already-closed canonical set. The
+narrower residual — two creators evaluating this same check in the same
+instant, both observing `EXISTING_COUNT=0`, and both proceeding to create —
+is the same class of already-accepted risk the "Idempotency Guard for
+Unrevised Epics" above documents for its own marker check ("If two Champion
+hosts ever do evaluate the same epic at once, the body-hash marker still
+bounds the outcome to one extra comment rather than an unbounded stream"):
+bounded to one extra (dedupable-on-next-pass, since the marker itself is now
+present the moment either burst completes) duplicate set rather than an
+unbounded, indefinitely-repeating one. No incident evidence implicates that
+narrower window, so this PR treats the existence check as sufficient on its
+own and does not extend mutex coverage.
+
 ### Step 3: Approve and Create Phase 1 Issues
 
 If all 6 criteria pass (and Step 2.5 above did not hold this phase):
+
+> **Run "Step 2.75: Pre-Creation Existence Check for Phase Issues" above FIRST, with `PHASE=1`.** If it stood down (existing Phase 1 issues found), stop here — do not run the creation loop below.
 
 > **Serialize this phase-issue creation loop against any other issue-creating agent (#3707).** Do not run the `gh issue create` loop below while another issue-creating agent (Architect / Curator-decomposition / another Champion epic-phase run) is filing issues in the same repo — concurrent `gh issue create` bursts race on server-assigned issue numbers and cross-contaminate bodies. One filer must finish its full burst before the next starts. See `sweep.md` → "Execution Model → Only Builders parallelize" for the invariant.
 
@@ -522,7 +624,12 @@ fi
 
 ### Creating Next Phase Issues
 
-When Phase N completes, create Phase N+1 issues following the same pattern as Step 3 above, but with:
+**Run "Step 2.75: Pre-Creation Existence Check for Phase Issues" above FIRST,
+with `PHASE=N+1`.** If it stood down (existing Phase N+1 issues found — for
+example because a prior pass already created them and this is a re-scan,
+`#6601`), stop here — do not create a duplicate set.
+
+Otherwise, when Phase N completes, create Phase N+1 issues following the same pattern as Step 3 above, but with:
 - Updated phase number — **including the marker**: emit `<!-- loom:epic:<epic-number>:phase:<N+1> -->` in each new body so phase-completion detection can find them
 - Dependencies referencing Phase N completion
 - Updated epic comment showing progress
