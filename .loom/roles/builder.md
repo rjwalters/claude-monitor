@@ -555,7 +555,7 @@ rewriting the main checkout's installed copies, not for a Builder mid-issue.
 (A separate `--output <dir>` staging mode, #6106, exists for an operator who
 needs a complete resync generated safely while the fleet is live — it is also
 not for a Builder mid-issue: see
-[`.loom/docs/troubleshooting.md`](../../../.loom/docs/troubleshooting.md) if you land
+`.loom/docs/troubleshooting.md` if you land
 here as the human operator rather than a Builder subagent.)
 
 ### Working with gh CLI from a Worktree

@@ -56,6 +56,34 @@
 # `env: PR_BODY: ${{ github.event.pull_request.body }}`); the commit-message
 # path needs no extra plumbing beyond --base/--head.
 #
+# CAVEATS for the calling CI job (#6577 -- both bit a real PR, #6576):
+#   - Commit-message path: `git log --format=%B "${BASE}..${HEAD}"` can only
+#     see commits actually present in the local checkout. A default
+#     `actions/checkout@v7` run on a `pull_request` event fetches a SHALLOW,
+#     single-commit checkout of the synthetic `refs/pull/<N>/merge` ref --
+#     whose own commit message is "Merge <head> into <base>", not any real
+#     branch commit -- so a marker placed in a genuine commit message is
+#     invisible even though `--base`/`--head` were passed correctly. The
+#     caller MUST check out with enough history (`fetch-depth: 0`, or at
+#     least deep enough to reach `--base`) AND pass an explicit `--head`
+#     (e.g. `ref: ${{ github.event.pull_request.head.sha }}` +
+#     `--head "${{ github.event.pull_request.head.sha }}"`) instead of
+#     relying on the default merge-ref checkout and the `--head` default of
+#     the literal string "HEAD".
+#   - PR_BODY path: this env var is a snapshot of the PR body captured in
+#     the webhook payload that triggered THIS workflow run. A body edit made
+#     after the triggering push (e.g. `gh pr edit --body ...` with no new
+#     commit) does not retrigger the workflow, so a marker added to the body
+#     post-push is invisible to any already-queued or already-run check --
+#     and re-running the same workflow run (`gh run rerun`) replays the
+#     ORIGINAL stored event payload, so it does NOT pick up a live body
+#     edit either. If you add the marker to the body only, after already
+#     pushing, push a new commit (an empty one is fine, e.g.
+#     `git commit --allow-empty -m 'trigger marker check'`) to retrigger
+#     `synchronize` with a fresh payload -- or just put the marker in a
+#     commit message from the start, which the commit-message path (once
+#     the caller fetches sufficient history, as above) picks up reliably.
+#
 # Exit codes:
 #   0 - nothing under the watched paths changed in the diff, OR VERSION was
 #       also changed, OR the no-surface-change marker is present.
@@ -88,7 +116,7 @@ while [[ $# -gt 0 ]]; do
       done
       ;;
     --help|-h)
-      sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,91p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
