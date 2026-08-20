@@ -64,9 +64,18 @@
 # from a genuine live peer sharing that PID. `heartbeat` starts equal to
 # `timestamp` at registration and must be refreshed periodically by the running
 # sweep (`heartbeat <RUN_ID>`, e.g. at each wave boundary); `peers` uses PID
-# liveness to prune the genuinely dead, and — for anything alive that shares the
-# CALLER's own PID — heartbeat staleness to label a same-process zombie
-# distinctly from a same-process entry that is still actually driving work.
+# liveness to prune the genuinely dead, and heartbeat staleness to label an
+# entry that is still PID-alive but has stopped driving work distinctly from one
+# that is genuinely still sweeping.
+#
+# Heartbeat staleness applies to EVERY entry, not just same-PID ones (#6595).
+# The same "PID outlives the sweep" problem shows up under a DIFFERENT pid too:
+# an interactive session that ran a sweep which was interrupted (or ended
+# without `cleanup`) stays alive for hours or days, so its abandoned entry warned
+# a later sweep as an ordinary `live` peer for the session's whole lifetime.
+# Whether the stale entry shares the caller's PID only changes WHICH label it
+# gets (`stale-same-pid` vs `stale-heartbeat`), never whether staleness is
+# checked at all.
 #
 # Usage:
 #   sweep-run-registry.sh new [--pid P]     # print a fresh RUN_ID, register it
@@ -78,12 +87,19 @@
 # `peers` output format (one non-dead entry per line):
 #   <run_id> <pid> <timestamp> <heartbeat> <status>
 # where <status> is one of:
-#   live             - a different PID than the caller's; an ordinary live peer.
+#   live             - a different PID than the caller's, heartbeat still fresh;
+#                       an ordinary live peer.
 #   live-same-pid    - the SAME PID as the caller, heartbeat still fresh
 #                       (genuinely still driving work in this process).
 #   stale-same-pid:Nm - the SAME PID as the caller, heartbeat stale for N minutes
 #                       (>= SWEEP_RUN_HEARTBEAT_STALE_SECS, default 900) — almost
 #                       certainly a pre-`/clear` zombie, not a live peer.
+#   stale-heartbeat:Nm - a different PID than the caller's, PID still alive, but
+#                       heartbeat stale for N minutes (#6595) — most likely an
+#                       interrupted sweep inside a session process that is still
+#                       running, not a genuine concurrent sweep.
+# A stale entry is only ever RELABELED, never deleted: per #4691 only confirmed
+# PID death (ESRCH) authorizes removing another run's state.
 # Empty output means "no live peer sweeps" — the single-sweep (no-peer) case.
 # The caller's OWN entry (matched by RUN_ID, not PID) is always excluded,
 # regardless of status.
@@ -214,8 +230,8 @@ iso_now() {
 # Heartbeat staleness (#5896)
 # ---------------------------------------------------------------------------
 #
-# How many seconds without a heartbeat refresh before a same-PID entry is
-# labeled `stale-same-pid` in `peers` output. Overridable for tests/tuning;
+# How many seconds without a heartbeat refresh before an entry is labeled stale
+# (`stale-same-pid` / `stale-heartbeat`) in `peers` output. Overridable for tests/tuning;
 # default 15 minutes aligns with the documented "refresh at each wave
 # boundary" cadence in the sweep skill — a wave can legitimately take a few
 # minutes, so the threshold must clear ordinary inter-wave gaps.
@@ -235,7 +251,7 @@ iso_to_epoch() {
 # Age, in seconds, of a heartbeat timestamp relative to now. Non-zero exit
 # (and no stdout) if the timestamp cannot be parsed — the caller must treat
 # that as "unknown", never as "stale" (fail-safe: an unparseable heartbeat
-# must never manufacture a false stale-same-pid label).
+# must never manufacture a false stale label).
 heartbeat_age_secs() {
     local hb="${1:-}" hb_epoch now_epoch
     hb_epoch=$(iso_to_epoch "$hb") || return 1
@@ -366,7 +382,7 @@ cmd_peers() {
         echo "ERROR: peers requires a RUN_ID argument" >&2
         exit 1
     fi
-    local dir file rid pid ts hb self_pid self_file
+    local dir file rid pid ts hb hb_present self_pid self_file
     dir="$(registry_dir)"
     [[ -d "$dir" ]] || return 0
 
@@ -401,10 +417,14 @@ cmd_peers() {
         # Backward compat: an entry written by a pre-#5896 registry has no
         # "heartbeat" field — treat its registration time as the last known
         # activity rather than failing the age computation.
-        [[ -n "$hb" ]] || hb="$ts"
+        hb_present=1
+        if [[ -z "$hb" ]]; then
+            hb_present=0
+            hb="$ts"
+        fi
 
+        local age_secs age_min
         if [[ "$pid" == "$self_pid" ]]; then
-            local age_secs age_min
             if age_secs=$(heartbeat_age_secs "$hb") && ((age_secs >= HEARTBEAT_STALE_SECS)); then
                 age_min=$((age_secs / 60))
                 echo "$rid $pid $ts $hb stale-same-pid:${age_min}m"
@@ -413,7 +433,22 @@ cmd_peers() {
                 # stale on an unknown age) — a genuinely live same-process run.
                 echo "$rid $pid $ts $hb live-same-pid"
             fi
+        elif ((hb_present)) &&
+            age_secs=$(heartbeat_age_secs "$hb") &&
+            ((age_secs >= HEARTBEAT_STALE_SECS)); then
+            # Different PID, PID alive, but nothing has refreshed this entry in
+            # a long time (#6595): an interrupted sweep whose session process is
+            # still around. Label it distinctly so a consumer can present it as
+            # "probably not a real peer" instead of an alarming live-peer
+            # warning — but never prune it here; only PID death (ESRCH) may
+            # delete another run's state (#4691's keep-when-ambiguous bias).
+            age_min=$((age_secs / 60))
+            echo "$rid $pid $ts $hb stale-heartbeat:${age_min}m"
         else
+            # Fresh heartbeat, unparseable age, or a pre-#5896 entry with no
+            # heartbeat field at all (such a run never refreshes, so its
+            # registration age says nothing about whether it is still sweeping):
+            # report an ordinary live peer, the fail-safe answer.
             echo "$rid $pid $ts $hb live"
         fi
     done
