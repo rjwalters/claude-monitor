@@ -2768,7 +2768,7 @@ parse_force_ops() {
 # false-NEGATIVE direction out of this issue's scope) — only a `cd <dir>`
 # prefix is.
 resolve_stash_cwd() {
-    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK"'
+    printf '%s' "$1" | awk -v startcwd="$2" -v home="$HOME" "$_QSPLIT_AWK""$_CDEXPAND_AWK""$_CDQUOTE_AWK""$_MASKWS_AWK"'
     BEGIN { curcwd = startcwd; found = 0 }
     {
         $0 = qsplit($0)   # quote-aware segmentation (#3755)
@@ -2779,8 +2779,22 @@ resolve_stash_cwd() {
             sub(/^sudo[ \t]+/, "", seg)
             sub(/^[ \t]+/, "", seg)
             if (seg == "") continue
-            m = split(seg, toks, /[ \t]+/)
+            # Quote-aware whitespace masking (#6552, same technique as
+            # extract_write_targets()'"'"'s #4934/mask_ws() fix): mask a
+            # space/tab INSIDE a quoted span with a non-whitespace
+            # placeholder before the plain `/[ \t]+/` split runs, so a
+            # quoted `cd` argument containing a literal space (e.g. `cd
+            # "/Users/me/Real Estate CRM/wt"`) yields exactly ONE token
+            # instead of truncating at the first embedded space and being
+            # misclassified as relative (which fed a bogus cwd join and a
+            # spurious cd-unresolved ask). unmask_ws() restores the real
+            # whitespace bytes afterward, so toks[] still carries the RAW,
+            # quote-intact text -- preserving the #5372 contract that
+            # curcwd is built from the raw cdarg, not an early-unquoted copy.
+            wseg = mask_ws(seg)
+            m = split(wseg, toks, /[ \t]+/)
             if (m == 0) continue
+            for (j = 1; j <= m; j++) toks[j] = unmask_ws(toks[j])
             # Thread a `cd <dir>` prefix through LATER segments of this same
             # compound command (mirrors parse_force_ops above). Classification
             # uses strip_cd_quoting() (#5363/#5372) so a fully or partially

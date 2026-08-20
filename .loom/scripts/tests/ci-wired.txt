@@ -133,6 +133,7 @@ test-probe-tokens-fallback.sh
 test-provision-codex-hooks.sh
 test-provision-hooks.sh
 test-provision-skills.sh
+test-random-file.sh
 test-rebase-stacked-children.sh
 test-recover-orphaned-shepherds-diagnostics.sh
 test-reconcile-stack.sh
