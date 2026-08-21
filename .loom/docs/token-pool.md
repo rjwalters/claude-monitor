@@ -570,6 +570,56 @@ remedy is re-dispatching with the `model` param omitted (inheriting the
 session default), not a cost-ladder walk, because a spend cap's scope
 (account-wide vs. per-tier) is not knowable from the signature alone.
 
+### A REVOKED token is fatal on the first occurrence (#6614)
+
+An operator running `/login` on the host revokes the pooled OAuth credential the
+fleet is riding on. Every in-flight child then dies with the JSON-enveloped
+signature quoted above:
+
+```text
+Failed to authenticate. API Error: 401 {"type":"authentication_error","message":"OAuth access token has been revoked."}
+```
+
+That wording used to match **nothing** in the classifier — the
+`401[^a-z]*authentication_error` pattern cannot cross the `{"type":"` envelope
+(the gap excludes letters), and no pattern mentioned "revoked" — so it fell
+through to the generic `RECOVERABLE` catch-all and `claude-wrapper.sh` retried
+the **same revoked token** `LOOM_MAX_RETRIES` (5) times before dying. A revoked
+credential cannot recover, so every one of those retries was pure latency plus a
+duplicated 401 in the logs.
+
+It now classifies as `TOKEN_EXPIRED` on the first occurrence — matched via the
+`"type":"authentication_error"` JSON field and the `token has been revoked` /
+`token was revoked` phrases — so `is_account_auth_dead` marks the account bad
+(`auth`, permanent) and rotates immediately, consuming **no** retry attempt.
+
+## Dispatch pauses when the whole pool is unusable (#6614)
+
+The per-issue dispatch backoff (#4485) bounds how often *one* issue is retried;
+it plateaus at 900s and repeats at that cadence forever. That is the wrong shape
+for a machine-level fault: with an empty pool **every** candidate issue dies
+identically at `spawn-claude.sh`'s token-selection step, so a per-issue brake
+just spreads the same doomed dispatch across the backlog — a quiet ~15-minute
+crash-loop with no signal above per-sweep logs.
+
+The daemon now counts **distinct issues** whose dispatch died at token selection
+inside a trailing window. At/above the threshold this trips the existing
+workspace pre-flight advisory (#4386) and its half-open dispatch gate (#5030):
+new dispatch to that workspace is **held** except one probe per cooldown, and one
+`ERROR` line plus a `daemon.preflight.advisory` event name the cause and the
+remedy. The first dispatch that gets past token selection (with a named account)
+clears it automatically — no operator action.
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `LOOM_EMPTY_POOL_BREAKER_THRESHOLD` | `3` | Distinct issues that must die at token selection before dispatch is paused |
+| `LOOM_EMPTY_POOL_BREAKER_WINDOW_SECS` | `1800` | Trailing window over which those distinct issues are counted |
+
+**Distinct issues, not raw failures**, is load-bearing in both directions: one
+unlucky issue cycling through its own backoff can never pause the fleet, and N
+*different* issues dying at the identical step cannot be explained by any one
+issue — only by the pool.
+
 ## Worktree handling
 
 When invoked from a worktree, `spawn-claude.sh` resolves the canonical repo root
@@ -856,6 +906,23 @@ error: All 3 tokens in ~/.loom/tokens are marked bad, empty, or .ranking-exclude
 The `hard-excluded by .ranking status` line is the #5629 exclusion set above:
 that account is not in `.bad_tokens` at all, so `tokens unblock` will not help —
 the `.ranking` file is what rules it out, and re-probing is the recovery.
+
+**Shadowed shared pool (#6614).** The all-excluded message also says whether a
+*different*, healthy pool exists that was never consulted. `resolve_tokens_dir`
+prefers a repo-local pool merely for **having** `.token` files, regardless of
+their health, so a stale repo-local copy can shadow a healthy machine-level one
+and report "empty pool" while several good accounts sit one directory away:
+
+```
+  SHADOWED POOL: a shared machine-level pool at ~/.loom/tokens also holds .token files and was NOT consulted — a repo-local pool wins on merely HAVING token files, regardless of health. If the pool above is a stale copy, re-bootstrap or remove it (`loom-daemon tokens bootstrap --force`) so the shared pool is used.
+```
+
+When the exhausted pool *is* the shared one, the message says so instead
+(`pool identity: this IS the shared machine-level pool`), so a genuine
+exhaustion is never mistaken for a shadowing artifact. The earlier
+dir-missing / no-`.token`-files errors keep their existing "also checked"
+wording, which is accurate there because those are precisely the cases in which
+the shared pool *is* probed.
 
 `spawn-claude.sh` additionally logs the resolved daemon binary path and its
 `--version` at token-selection time, on every spawn:

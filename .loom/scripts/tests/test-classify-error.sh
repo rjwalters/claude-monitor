@@ -111,6 +111,47 @@ assert_eq "SESSION_LIMIT" \
     "SESSION_LIMIT still precedes the credit class"
 
 echo
+echo "--- classify_error: TOKEN_EXPIRED covers a REVOKED OAuth token, incl. the JSON envelope (#6614) ---"
+
+# The verbatim death-tail from the incident in #6614: an operator's `/login` on
+# the host revoked the pooled credential mid-flight. Before the fix, the JSON
+# envelope defeated the `401[^a-z]*authentication_error` pattern (the `[^a-z]*`
+# gap cannot cross `{"type":"`), nothing matched "revoked", and the death fell
+# through to the RECOVERABLE catch-all — so claude-wrapper.sh retried the same
+# revoked credential MAX_RETRIES (5) times instead of marking it bad + rotating.
+while IFS='|' read -r desc output expected; do
+    [[ -z "$desc" ]] && continue
+    actual="$(classify_error "$output" 1)"
+    assert_eq "$expected" "$actual" "$desc"
+done <<'EOF'
+the verbatim incident wording (#6614)|Failed to authenticate. API Error: 401 {"type":"authentication_error","message":"OAuth access token has been revoked."}|TOKEN_EXPIRED
+nested error envelope the API also serves|API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}}|TOKEN_EXPIRED
+prose form, no JSON at all|Failed to authenticate. API Error: 401 OAuth access token has been revoked|TOKEN_EXPIRED
+past-tense variant|Your access token was revoked|TOKEN_EXPIRED
+JSON authentication_error with some OTHER message|{"type":"authentication_error","message":"Invalid API key"}|TOKEN_EXPIRED
+pre-#6614 plain form still classifies|API Error: 401 authentication_error|TOKEN_EXPIRED
+negative: a revoked thing that is not a token|The reviewer revoked their approval and the ruleset was revoked|RECOVERABLE
+EOF
+
+# The exit-code-first guarantee (#3233) for the new phrasing, checked with the
+# real exit code rather than smuggling it through the table above.
+assert_eq "SUCCESS" \
+    "$(classify_error 'API Error: 401 {"type":"authentication_error","message":"OAuth access token has been revoked."}' 0)" \
+    "a CLEAN exit whose output quotes the revoked-token 401 stays SUCCESS (#3233)"
+
+# TOKEN_EXPIRED must be FATAL, not transient: that is what makes
+# claude-wrapper.sh mark the account bad and rotate instead of retrying the
+# same dead credential (the 5x retry loop reported in #6614).
+TESTS_RUN=$((TESTS_RUN + 1))
+if classification_is_transient TOKEN_EXPIRED; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: TOKEN_EXPIRED is NOT transient (no retry against the same revoked token)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: TOKEN_EXPIRED is NOT transient (no retry against the same revoked token)"
+fi
+
+echo
 echo "--- classification_is_transient: TOKEN_EXHAUSTED stays retryable (rotation path consumes it first) ---"
 
 for _category in TOKEN_EXHAUSTED MODEL_CREDITS_EXHAUSTED; do

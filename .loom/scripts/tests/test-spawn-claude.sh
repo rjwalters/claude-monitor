@@ -176,6 +176,19 @@ assert_eq "TOKEN_EXPIRED" "$result" "'Failed to authenticate ... socket connecti
 result=$(classify_error "socket connection was closed unexpectedly" 1)
 assert_eq "RECOVERABLE" "$result" "bare 'socket connection was closed unexpectedly' (no auth wording) stays RECOVERABLE (#6424 negative case)"
 
+# Vector #9g (issue #6614): a token REVOKED mid-flight. The verbatim death-tail
+# wraps the auth error in a JSON envelope, which the `401[^a-z]*
+# authentication_error` pattern cannot bridge (`[^a-z]*` excludes the letters in
+# `{"type":"`), and nothing matched "revoked" — so this fell through to
+# RECOVERABLE and the wrapper retried the SAME revoked credential 5 times.
+result=$(classify_error 'Failed to authenticate. API Error: 401 {"type":"authentication_error","message":"OAuth access token has been revoked."}' 1)
+assert_eq "TOKEN_EXPIRED" "$result" "revoked-token JSON 401 -> TOKEN_EXPIRED (#6614)"
+
+# Vector #9h (issue #6614, negative case): "revoked" alone, with no "token"
+# before the verb, must NOT mark an account permanently bad.
+result=$(classify_error "The reviewer revoked their approval" 1)
+assert_eq "RECOVERABLE" "$result" "a non-token 'revoked' stays RECOVERABLE (#6614 negative case)"
+
 # Vector #10: hit your limit → TOKEN_EXHAUSTED
 result=$(classify_error "You've hit your limit" 1)
 assert_eq "TOKEN_EXHAUSTED" "$result" "hit your limit -> TOKEN_EXHAUSTED"
@@ -2280,7 +2293,77 @@ STUB
       echo -e "  ${RED}FAIL${NC}: auth-dead whole-pool exhaustion exits non-zero (#6030)"
   fi
 
-  rm -rf "$AD_WS" "$AD_STUB" "$AD_WS2" "$AD_STUB2"
+  # --- #6614: a REVOKED token (JSON 401 envelope) is token-fatal on the FIRST
+  # occurrence — ZERO additional CLI invocations against the same credential.
+  #
+  # This is the end-to-end half of the classify-error fix: the incident had the
+  # wrapper burn all 5 retries against one revoked token because the JSON
+  # envelope defeated the TOKEN_EXPIRED regex. The stub counts invocations per
+  # token, so "retried the same dead token" is asserted as a COUNT (exactly 1),
+  # not merely inferred from the exit code.
+  AD_WS3="$(mktemp -d)"
+  mkdir -p "$AD_WS3/.loom/tokens"
+  chmod 700 "$AD_WS3/.loom/tokens"
+  printf '%s' "tok-alpha" > "$AD_WS3/.loom/tokens/alpha.token"
+  printf '%s' "tok-beta"  > "$AD_WS3/.loom/tokens/beta.token"
+  chmod 600 "$AD_WS3/.loom/tokens/"*.token
+
+  AD_CALLS3="$(mktemp)"
+  AD_STUB3="$(mktemp -d)"
+  cat > "$AD_STUB3/claude" <<STUB
+#!/usr/bin/env bash
+case " \$* " in
+  *" -p "*) ;;
+  *) exit 0 ;;
+esac
+printf '%s\n' "\${CLAUDE_CODE_OAUTH_TOKEN}" >> "$AD_CALLS3"
+if [[ "\${CLAUDE_CODE_OAUTH_TOKEN}" == "tok-alpha" ]]; then
+    echo 'Failed to authenticate. API Error: 401 {"type":"authentication_error","message":"OAuth access token has been revoked."}'
+    exit 1
+fi
+echo "stub-claude success on token=\${CLAUDE_CODE_OAUTH_TOKEN}"
+exit 0
+STUB
+  chmod +x "$AD_STUB3/claude"
+
+  # MAX_RETRIES=5 (the production default) on purpose: the pre-fix behavior
+  # burned all five against tok-alpha. Post-fix it must be used exactly once.
+  set +e
+  ad3_out=$(
+    LOOM_WORKSPACE="$AD_WS3" \
+    LOOM_TOKEN_NAME="alpha" \
+    CLAUDE_CODE_OAUTH_TOKEN="tok-alpha" \
+    LOOM_DAEMON_BIN="$DAEMON_BIN" \
+    LOOM_MAX_RETRIES=5 \
+    LOOM_INITIAL_WAIT=1 \
+    LOOM_SHEPHERD_TASK_ID="test-revoked-token" \
+    LOOM_STARTUP_MONITOR_WINDOW=1 \
+    PATH="$AD_STUB3:$PATH" \
+    bash "$WRAPPER" -p "ping" 2>&1
+  )
+  ad3_rc=$?
+  set -e
+
+  ad3_alpha_calls=$(grep -c '^tok-alpha$' "$AD_CALLS3" 2>/dev/null || echo 0)
+  assert_eq "1" "$ad3_alpha_calls" \
+      "a revoked-token 401 is fatal on FIRST occurrence: exactly 1 CLI call on the revoked token, zero retries (#6614)"
+  assert_contains "stub-claude success on token=tok-beta" "$ad3_out" \
+      "wrapper rotates off the revoked token and succeeds on the next account (#6614)"
+  assert_eq "0" "$ad3_rc" \
+      "wrapper exits 0 after revoked-token rotation (#6614)"
+
+  ad3_bad_file="$AD_WS3/.loom/tokens/.bad_tokens"
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if [[ -f "$ad3_bad_file" ]] && grep "alpha" "$ad3_bad_file" | grep -q "auth-dead:"; then
+      TESTS_PASSED=$((TESTS_PASSED + 1))
+      echo -e "  ${GREEN}PASS${NC}: revoked token is marked bad with an 'auth-dead:' reason (#6614)"
+  else
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      echo -e "  ${RED}FAIL${NC}: revoked token is marked bad with an 'auth-dead:' reason (#6614)"
+      echo "    .bad_tokens: $(cat "$ad3_bad_file" 2>/dev/null || echo '<missing>')"
+  fi
+
+  rm -rf "$AD_WS" "$AD_STUB" "$AD_WS2" "$AD_STUB2" "$AD_WS3" "$AD_STUB3" "$AD_CALLS3"
 fi
 
 # ============================================================

@@ -1455,9 +1455,10 @@ is_account_auth_dead() {
         return
     fi
     # Fallback if the classifier lib wasn't sourced — kept in lockstep with
-    # `lib/classify-error.sh`'s TOKEN_EXPIRED pattern.
+    # `lib/classify-error.sh`'s TOKEN_EXPIRED pattern (including #6614's
+    # JSON-envelope and revoked-token phrasings).
     [[ "${exit_code}" -ne 0 ]] && echo "${output}" \
-        | grep -qiE "401[^a-z]*authentication_error|invalid bearer token|OAuth token has expired|token has expired"
+        | grep -qiE "401[^a-z]*authentication_error|\"type\"[[:space:]]*:[[:space:]]*\"?authentication_error|token (has been|was) revoked|invalid bearer token|OAuth token has expired|token has expired"
 }
 
 # Echo a short human phrase describing why the account was considered
@@ -1465,7 +1466,13 @@ is_account_auth_dead() {
 _auth_dead_phrase() {
     local output="$1"
     local m
-    m="$(echo "${output}" | grep -ioE "401[^a-z]*authentication_error|invalid bearer token|OAuth token has expired|token has expired" | head -1)"
+    # Kept in lockstep with `lib/classify-error.sh`'s TOKEN_EXPIRED pattern.
+    # `authentication_error` appears bare (no `401` prefix, no quotes) so the
+    # JSON-enveloped 401 of #6614 yields a clean phrase for the `.bad_tokens`
+    # reason string instead of falling through to the generic default — grep
+    # returns the LEFTMOST match, so the quoted `"type":"` wrapper is never
+    # captured with it.
+    m="$(echo "${output}" | grep -ioE "401[^a-z]*authentication_error|(OAuth )?(access )?token (has been|was) revoked|authentication_error|invalid bearer token|OAuth token has expired|token has expired" | head -1)"
     echo "${m:-401/invalid credential}"
 }
 
