@@ -76,6 +76,7 @@ test-github-app-token.sh
 test-gitignore-guard.sh
 test-guard-codex-bridge.sh
 test-guard-hook-schema.sh
+test-guide-docs-pr-exclude-refresh.sh
 test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
@@ -141,6 +142,7 @@ test-require-complexity-marker.sh
 test-resolve-tier-model.sh
 test-resync-installed.sh
 test-run-ci-suites-daemon-guard.sh
+test-run-ci-suites-failure-excerpt.sh
 test-safe-stash-pop.sh
 test-safehoused-service.sh
 test-spawn-generic.sh

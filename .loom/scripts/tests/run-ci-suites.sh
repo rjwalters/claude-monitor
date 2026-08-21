@@ -15,6 +15,9 @@
 #                                    # print the live-daemon guard's derived pid-file
 #                                    # candidate list and exit (runs nothing)
 #   LOOM_CI_SUITE_TIMEOUT=180 …      # per-suite timeout in seconds (default 1200)
+#   LOOM_CI_FAIL_EXCERPT_MAX=20 …    # failure-excerpt knobs — see
+#   LOOM_CI_FAIL_CONTEXT_LINES=3 …     defaults/scripts/lib/ci-suite-excerpt.sh
+#   LOOM_CI_FAIL_TAIL_LINES=40 …       (#6662)
 #
 # ## Live-daemon guard (#6386)
 #
@@ -88,6 +91,13 @@ LIVE_DAEMON_GUARDED_SUITES="test-loom-daemon-start.sh test-loom-daemon-stop.sh t
 # defaults/scripts/lib/live-daemon-guard.sh for the full function docs.
 # shellcheck source=../lib/live-daemon-guard.sh
 source "$REPO_ROOT/defaults/scripts/lib/live-daemon-guard.sh"
+
+# print_suite_failure_excerpt — the failure excerpt printed for every failing
+# suite below. Extracted (#6662) so the excerpt's shape is testable against a
+# synthetic log without executing a real CI suite run; see that file for why
+# a bare trailing window was not enough.
+# shellcheck source=../lib/ci-suite-excerpt.sh
+source "$REPO_ROOT/defaults/scripts/lib/ci-suite-excerpt.sh"
 
 # --print-candidates: the derived candidate list and nothing else. The guard's
 # resolution is otherwise only observable through its RUN/SKIP decision, which
@@ -206,9 +216,7 @@ for suite in "${suites[@]}"; do
     else
         printf 'FAIL  %-52s %3ss (exit %s)\n' "$suite" "$dur" "$rc"
         failed=$((failed + 1)); failed_names+=("$suite")
-        echo "----- last 40 lines of $suite -----"
-        tail -40 "/tmp/ci-suite-$log_name.log"
-        echo "----- end $suite -----"
+        print_suite_failure_excerpt "$suite" "/tmp/ci-suite-$log_name.log"
     fi
 done
 
