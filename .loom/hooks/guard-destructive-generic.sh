@@ -4618,6 +4618,83 @@ rm_scope_mktemp_same_command_safe() {
 }
 
 # =============================================================================
+# rm-scope SAME-COMMAND LITERAL-PATH RESOLUTION (#6676)
+#
+# rm_scope_mktemp_same_command_safe() (above) proves ONLY the exact-string
+# `$(mktemp -d)`/`$(mktemp)` same-command RHS shape safe — a same-command
+# assignment of a LITERAL absolute path (`FARM=/tmp/nofile-bin-6662; rm -rf
+# "$FARM"`) never matches that exact-string test and previously fell straight
+# through to the fail-closed `rm-scope-unresolved-var` deny even though the
+# value is a provably static, non-command-substitution literal.
+#
+# rm_scope_literal_same_command_resolve() is a SIBLING fast path, not a
+# replacement for the mktemp one: it reuses record_assign()'s DQ/SQ-aware
+# quote-stripping logic (one layer of surrounding quotes stripped, #4881/
+# #6152) to resolve a same-command `NAME=<value>` assignment, then judges the
+# result:
+#
+#   1. Exactly ONE assignment to NAME exists anywhere in the SAME command
+#      text — mirrors the mktemp fast path's own ambiguity rule (its own doc
+#      comment, point 3, above): a second assignment to the same name — even
+#      an identical or otherwise-safe-looking one — poisons the resolution
+#      and fails closed, since the guard cannot tell which assignment's value
+#      the shell sees at the `rm` word.
+#   2. The (quote-stripped) RHS is a PURE LITERAL absolute path: starts with
+#      `/`, and contains neither `$` nor a backtick anywhere — so a RHS that
+#      itself still carries an unresolved expansion (`NAME="$OTHER/sub"`,
+#      `NAME=$(cmd)`, `` NAME=`cmd` ``) is rejected rather than trusted as a
+#      literal (fail closed).
+#
+# On success this prints the resolved literal absolute path on stdout and
+# returns 0. Unlike the mktemp fast path (which is unconditionally
+# /tmp-or-$TMPDIR-rooted and lets the CALLER skip the scope check entirely),
+# a literal path can resolve anywhere — the CALLER is responsible for
+# re-running the normal rm-scope checks (the top-level catastrophic-path deny
+# AND the repo/worktree/tmp IN_SCOPE check) against the resolved path, so it
+# is judged exactly like an equivalent literal `rm -rf /that/path` would be.
+# =============================================================================
+rm_scope_literal_same_command_resolve() {
+    local target="$1" cmdtext="$2" varname resolved
+    varname=$(_rm_scope_bare_var_name "$target") || return 1
+    [[ -n "$varname" ]] || return 1
+    resolved=$(printf '%s' "$cmdtext" | awk -v varname="$varname" "$_QSPLIT_AWK"'
+    BEGIN {
+        DQ = sprintf("%c", 34)
+        SQ = sprintf("%c", 39)
+    }
+    {
+        $0 = qsplit($0)
+        n = split($0, segs, "\n")
+        for (i = 1; i <= n; i++) {
+            seg = segs[i]
+            sub(/^[ \t]+/, "", seg)
+            sub(/[ \t]+$/, "", seg)
+            prefix = varname "="
+            plen = length(prefix)
+            if (length(seg) > plen && substr(seg, 1, plen) == prefix) {
+                total++
+                val = substr(seg, plen + 1)
+            }
+        }
+    }
+    END {
+        if (total == 1) {
+            vlen = length(val)
+            if (vlen >= 2) {
+                c1 = substr(val, 1, 1)
+                c2 = substr(val, vlen, 1)
+                if ((c1 == DQ && c2 == DQ) || (c1 == SQ && c2 == SQ)) {
+                    val = substr(val, 2, vlen - 2)
+                }
+            }
+            if (val ~ /^\// && val !~ /[$`]/) print val
+        }
+    }')
+    [[ -n "$resolved" ]] || return 1
+    printf '%s' "$resolved"
+}
+
+# =============================================================================
 # extract_write_targets() — Bash-tool write-idiom target extraction (#4178).
 #
 # Emits one "<cwd>\t<target>" line (TAB-separated, US separator 0x1f — mirrors
@@ -5529,7 +5606,31 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                     if rm_scope_mktemp_same_command_safe "$target" "$COMMAND_RM_MKTEMP_SCAN"; then
                         continue
                     fi
-                    deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime (guards.rmScope=repo). Unresolvable rm targets fail closed (mirrors rjwalters/repo#244, fixing #239). Use an explicit literal path." "rm-scope-unresolved-var"
+
+                    # Same-command LITERAL-path fast path (#6676): unlike the
+                    # mktemp form above, a resolved literal is NOT skipped
+                    # past the scope check — ABS_PATH is replaced with the
+                    # proven literal and falls through to the same
+                    # catastrophic-path deny and repo/worktree/tmp IN_SCOPE
+                    # check just below, exactly as an equivalent literal
+                    # `rm -rf /that/path` would be judged. See
+                    # rm_scope_literal_same_command_resolve()'s own doc
+                    # comment (above rm_scope_mktemp_same_command_safe()) for
+                    # the exact resolution conditions.
+                    _rm_literal_resolved=$(rm_scope_literal_same_command_resolve "$target" "$COMMAND_RM_MKTEMP_SCAN") || true
+                    if [[ -n "$_rm_literal_resolved" ]]; then
+                        ABS_PATH="$_rm_literal_resolved"
+                        if [[ "$ABS_PATH" = /* ]]; then
+                            ABS_PATH=$(normalize_abs_path "$ABS_PATH")
+                        fi
+                        if [[ "$ABS_PATH" == "/" ]] || \
+                           [[ -n "$HOME" && "$ABS_PATH" == "$HOME" ]] || \
+                           [[ "$ABS_PATH" =~ ^/[^/]+$ ]]; then
+                            deny "BLOCKED: rm on protected system path: $ABS_PATH" "rm-protected-path"
+                        fi
+                    else
+                        deny "BLOCKED: rm target '${target}' is an unexpanded shell variable from the path root down, so this guard cannot tell where it resolves at runtime (guards.rmScope=repo). Unresolvable rm targets fail closed (mirrors rjwalters/repo#244, fixing #239). Use an explicit literal path." "rm-scope-unresolved-var"
+                    fi
                 fi
 
                 IN_SCOPE=false

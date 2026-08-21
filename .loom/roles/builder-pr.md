@@ -256,9 +256,44 @@ Local verification:
 - [ ] Commits are signed off if required (`commit.signoff: true` in `.loom/config.json`, or a DCO/`sign-off` requirement — `git commit --signoff`; see "DCO sign-off" above)
 - [ ] Relevant tests pass
 - [ ] Each criterion has explicit verification (not "I think it works")
-- [ ] If this diff touches anything under `defaults/`, either `scripts/version.sh` was run to bump `VERSION` (and its five synced files), or the PR body/a commit message includes `<!-- loom:no-surface-change -->` (see `defaults/scripts/check-defaults-version-bump.sh` for the exact rule)
-- [ ] If this diff touched **any** version-bearing file for **any** reason — not only a `defaults/`-triggered bump, and whether you ran `scripts/version.sh bump`/`set` or hand-edited a file directly — run `./scripts/version.sh check` yourself and confirm it prints "All versions in sync" before opening the PR. `scripts/version.sh bump`/`set` now self-verify and fail loudly on a partial update (#6536), but that only covers runs made *through* the script; a hand-edit of one file (e.g. reverting just `Cargo.lock`) bypasses that gate entirely, and this is the exact failure mode that has repeatedly reached CI as "Installer Integration Tests" Test 63 (`'version.sh check' regressed`) instead of being caught locally
+- [ ] Ran the "defaults/ VERSION-Bump Gate" command block below (not just read it) — exited 0. It covers both: a `defaults/` change without a `VERSION` bump/marker, and any hand-edited version-bearing file `scripts/version.sh check` alone would catch.
 ```
+
+**Run the defaults/ VERSION-Bump Gate locally — an actual command, not a checklist bullet to read (#6675, recurring Judge rejection: #6598, #6599, #6610, #6611, #6630, #6668 all hit this in CI because it was never run pre-PR):**
+
+```bash
+# Run from your worktree, AFTER your last commit, BEFORE
+# ./.loom/scripts/create-pr.sh. Mirrors the CI job "defaults/ Changes
+# Require a VERSION Bump" (.github/workflows/ci.yml) — no PR exists yet at
+# Builder time, so use the merge-base with origin/main as --base instead of
+# a PR base sha.
+MERGE_BASE="$(git merge-base origin/main HEAD)"
+
+# 1. defaults/ surface-vs-VERSION gate. Exit 0 = no defaults/ change, or
+#    VERSION was bumped, or the no-surface-change marker is present; exit 1
+#    = a defaults/ path changed with neither. Since no PR body exists yet,
+#    the marker is only detectable via a commit message here — put
+#    `<!-- loom:no-surface-change -->` in a commit message, not just the
+#    future PR body, if you're relying on it at this step.
+if ! bash defaults/scripts/check-defaults-version-bump.sh --base "$MERGE_BASE" --head HEAD; then
+  echo "BLOCKER: defaults/ changed without a VERSION bump or <!-- loom:no-surface-change --> marker." >&2
+  echo "Fix: ./scripts/version.sh bump patch   (or add the marker to a commit message), then re-run this check." >&2
+  exit 1
+fi
+
+# 2. Catch a version-bearing file that was hand-edited outside
+#    `scripts/version.sh bump`/`set` (the gate above only looks at
+#    defaults/ + VERSION, not the other 5 synced files individually).
+if ! ./scripts/version.sh check; then
+  echo "BLOCKER: 'scripts/version.sh check' found a version mismatch — see MISMATCH line(s) above." >&2
+  echo "Fix: ./scripts/version.sh bump patch   (re-syncs all version-bearing files), then re-run this check." >&2
+  exit 1
+fi
+
+echo "OK: defaults/ VERSION-bump gate + version.sh check both pass."
+```
+
+**Treat any non-zero exit above as a hard local blocker** — fix it (bump the version or add the marker to a commit message) and re-run the block until it prints the final `OK:` line before calling `create-pr.sh`. Do not proceed on the strength of having merely read the checklist bullet.
 
 ### Step 4: Document Verification in PR Description
 
