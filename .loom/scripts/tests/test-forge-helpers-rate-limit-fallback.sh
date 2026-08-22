@@ -465,7 +465,16 @@ fi
 echo ""
 echo "Testing role-prompt wiring (#5047)..."
 
-PROMPT_DIR="$(cd "$HELPERS_DIR/../.claude/commands/loom" && pwd)"
+# Two `..` reaches repo-root/.claude/commands/loom for an INSTALLED copy
+# (HELPERS_DIR is .loom/scripts there); one `..` reaches defaults/.claude/
+# commands/loom when running inside this source repo (HELPERS_DIR is
+# defaults/scripts) -- the two layouts differ in depth, so probe both rather
+# than hard-coding one (#447).
+if [[ -d "$HELPERS_DIR/../../.claude/commands/loom" ]]; then
+    PROMPT_DIR="$(cd "$HELPERS_DIR/../../.claude/commands/loom" && pwd)"
+else
+    PROMPT_DIR="$(cd "$HELPERS_DIR/../.claude/commands/loom" && pwd)"
+fi
 
 TESTS_RUN=$((TESTS_RUN + 1))
 # Matches both a line-start invocation (`gh issue create ...`) and the

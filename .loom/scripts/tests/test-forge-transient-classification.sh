@@ -223,7 +223,16 @@ fi
 echo ""
 echo "Testing sweep.md documents the forge write failure diagnosis policy (#6425)..."
 
-SWEEP_MD="$(cd "$HELPERS_DIR/../.claude/commands/loom" && pwd)/sweep.md"
+# Two `..` reaches repo-root/.claude/commands/loom for an INSTALLED copy
+# (HELPERS_DIR is .loom/scripts there); one `..` reaches defaults/.claude/
+# commands/loom when running inside this source repo (HELPERS_DIR is
+# defaults/scripts) -- the two layouts differ in depth, so probe both rather
+# than hard-coding one (#447).
+if [[ -d "$HELPERS_DIR/../../.claude/commands/loom" ]]; then
+    SWEEP_MD="$(cd "$HELPERS_DIR/../../.claude/commands/loom" && pwd)/sweep.md"
+else
+    SWEEP_MD="$(cd "$HELPERS_DIR/../.claude/commands/loom" && pwd)/sweep.md"
+fi
 if [[ -r "$SWEEP_MD" ]]; then
     if grep -q "forge-transient" "$SWEEP_MD"; then
         pass "sweep.md references the forge-transient classification"

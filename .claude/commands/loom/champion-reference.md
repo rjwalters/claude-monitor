@@ -237,6 +237,33 @@ gh issue edit <number> --add-label "loom:evaluating"
 
 ---
 
+### Edge Case 5d: Capacity-Deferral Comments Re-Posted Every Pass for an Unchanged Backlog (#6729)
+
+**Scenario**: A proposal passes all 8 promotion criteria, but `champion-issue-promo.md`'s "Rate Limiting by Tier" caps the promotion (Tier 3: only 1 per iteration and only if fewer than 5 Tier 3 issues are already in the backlog; Tier 2: up to 2 per iteration). This is a **capacity deferral, not a rejection** — no revision is needed, so Edge Case 5c's `VERDICT_MARKER` is never written for it (capacity deferral is explicitly Step 3, not Step 4). Without a guard, every subsequent Champion pass re-derives the same "criteria pass, tier cap still blocks it" conclusion and posts an equivalent "Tier N backlog cap reached — deferring promotion" comment again — observed live as 10 near-identical comments on #6628 over ~22 hours, and 2-3 more on each of #6647/#6649, all citing the SAME five occupant `tier:maintenance` issues.
+
+**Handling**: `champion-issue-promo.md`'s "Step 3c: Capacity Deferral" mirrors Edge Case 5c's own mechanism, keyed to a **different** anchor because a capacity deferral has no verdict comment to PATCH a marker onto: the **tier and occupant set** that explains the deferral (`classify-capacity-defer.sh`, sourceable pure helpers `normalize_occupants` / `capacity_fingerprint`).
+
+```bash
+# FINGERPRINT is a hash of (tier, sorted-unique occupant set) — NOT of the
+# issue's own title+body (that hash belongs to Edge Case 5c's unrevised-
+# proposal check and answers a different question: "did the PROPOSAL change").
+CAP_RC=0
+./.loom/scripts/classify-capacity-defer.sh --issue "$ISSUE_NUMBER" \
+  --tier "tier:maintenance" --occupants "$OCCUPANTS" --apply || CAP_RC=$?
+```
+
+**Decision**:
+
+| `CAP_RC` | Finding | Action |
+|---|---|---|
+| `1` | `POST_COMMENT` (first deferral on this issue, or the occupant set changed since the last one) | Post the deferral comment, carrying `<!-- champion:capacity-defer:<tier>:<fingerprint> -->` + a seeded `<!-- champion:capacity-defer-seen:<fingerprint>:1 -->` counter |
+| `0` | `SKIP_COMMENT` (same tier, same occupant set as the last capacity-deferral comment on this issue) | Post nothing. `--apply` already bumped the existing comment's seen-counter in place |
+| `2` | Error (unreadable issue, bad arguments) | Fail toward the pre-#6729 behaviour — post the deferral comment as before |
+
+**Rationale**: Same *shape* of fix as Edge Case 5c/#4954 (a fingerprint anchored to the thing that actually changes suppresses a duplicate-comment loop) but a **different** anchor and **no escalation counterpart** — a capacity deferral is never a merits problem, so unlike the N=2 unrevised-proposal escalation there is nothing here for a human to decide, and the condition ends the instant the backlog composition changes, which the very next pass's fingerprint comparison detects for free without any bounded-streak mechanism. Bounding a state that already self-resolves and never needs a human would only reintroduce the noise this edge case exists to close.
+
+---
+
 ### Edge Case 6: PR Modifying Only Test Files
 
 **Scenario**: PR changes only test files (e.g., `*.test.ts`, `*.spec.rs`).
@@ -459,6 +486,7 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 | Proposal whose only recurring finding is an open, non-cycle dependency | Dependency-timing gate (`classify-dependency-block.sh --check-defer`) | **Defer, never escalate** — the condition self-clears when the blocker closes; blocker already closed → re-evaluate rather than escalate on a stale finding (#5664) |
 | Proposal stuck at `loom:operator-only` from a dependency-only escalation whose blocker has since closed | Pass 0 self-healing re-scan (`--check-unescalate --apply`) | Remove `loom:operator-only`, post one fingerprinted un-escalation comment, rejoin evaluation the same pass; merits/cycle/human-applied escalations are never touched (#5664) |
 | Proposal (parked or not) whose blocker is still open but that declares a `## Startable Subset` covering only part of its scope | Sub-issue granularity carve-out ("recurred after closure", #5664) | Criterion 2's dependency finding does not fail the whole issue; promote scoped to the declared subset (`Part of #<issue>`), or un-escalate an already-parked one via `--check-unescalate` (`SUBSET_CARVEOUT: yes`) even while the blocker stays open — `detect-startable-subset.sh` |
+| Proposal passes all 8 criteria but the tier's rate limit blocks promotion this pass | Capacity-deferral idempotency (`classify-capacity-defer.sh`, #6729) | **Post the deferral comment only on first deferral or a changed occupant set** — same tier + same occupant set as the last capacity-deferral comment → skip silently, bump the existing comment's seen-counter in place; no escalation counterpart, the condition self-resolves the moment the composition changes |
 | Test-only changes | Allow | Standard criteria apply |
 | Human holds PR (removes `loom:pr`) | Skip | Not a merge candidate without `loom:pr` |
 | Multiple linked issues | Allow | Verify all closed |

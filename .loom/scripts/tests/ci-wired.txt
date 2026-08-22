@@ -50,6 +50,7 @@ test-check-quarantine-stashes.sh
 test-check-runtime-capabilities.sh
 test-check-shell-syntax.sh
 test-check-verified-corrections-preserved.sh
+test-classify-capacity-defer.sh
 test-classify-dependency-block.sh
 test-classify-error.sh
 test-clean-stale-binary.sh

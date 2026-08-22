@@ -741,6 +741,89 @@ This issue has been evaluated and promoted to \`loom:issue\` status. All quality
 *Automated by Champion role*"
 ```
 
+**Step 3c: Capacity Deferral — the tier's rate limit blocks promotion this pass (#6729)**
+
+All 8 criteria can pass and Step 3b still not fire: "Rate Limiting by Tier"
+above caps Tier 2 at 2 promotions per iteration and Tier 3 at 1 promotion per
+iteration (and only when fewer than 5 Tier 3 issues are already in the
+backlog). When the cap is what blocks promotion — not a quality problem — this
+is a **capacity deferral, not a rejection**: no revision is needed, so Step 4's
+`VERDICT_MARKER` is never written and the proposal's label
+(`loom:curated`/`loom:architect`/`loom:hermit`/`loom:auditor`) is left
+untouched, exactly as an ordinary re-queue for next iteration.
+
+**Without a guard this repeats every pass for an issue that keeps losing the
+same capacity gate**, even though nothing about the proposal or the backlog
+composition changed — the same class of noise the dependency-timing gate
+(`classify-dependency-block.sh --check-defer`, #5664) already closed for
+open-dependency deferrals, just triggered by a different gate. Observed live:
+#6628 accumulated 10 near-identical "Tier 3 backlog cap reached" comments over
+~22 hours; #6647 and #6649 each accumulated 2-3 more, all citing the SAME five
+occupant `tier:maintenance` issues. `classify-capacity-defer.sh` closes it the
+same way the dependency gate closes its own case — keyed to the **tier and
+occupant set** that explains the deferral, since a capacity deferral has no
+verdict comment to piggyback its marker on:
+
+```bash
+# OCCUPANTS: the same backlog occupant set already computed by
+# "Backlog Balance Check" / this tier's own gh issue list query above — pass
+# it through verbatim, comma- or whitespace-separated, `#` prefix optional.
+CAP_RC=0
+./.loom/scripts/classify-capacity-defer.sh --issue "$ISSUE_NUMBER" \
+  --tier "tier:maintenance" --occupants "#6612,#6076,#6068,#5512,#4136" \
+  --apply || CAP_RC=$?
+```
+
+| `CAP_RC` | Marker | What to do |
+|---|---|---|
+| `1` | `POST_COMMENT` + `REASON: first-deferral` or `composition-changed` | **Post the deferral comment** (template below) — this is either the first time this issue hit this tier's cap, or the occupant set has changed since the last one, so an operator can still see when and why it is stuck |
+| `0` | `SKIP_COMMENT` | **Do not post a comment.** The tier and occupant set are byte-identical to the last capacity-deferral comment on this issue — `--apply` already bumped that comment's `<!-- champion:capacity-defer-seen:<fingerprint>:<n> -->` counter in place (or reported a harmless warning on stderr if nothing was found to patch; never a reason to post a fresh comment instead) |
+| `2` | — | The script could not read the issue or the arguments were malformed. Fail toward the pre-#6729 behaviour — post the deferral comment as before |
+
+**Posting the deferral comment (`CAP_RC=1`)** — carries the two markers the
+next pass's `classify-capacity-defer.sh` call needs to recognize an unchanged
+recurrence, seeded the same way the reject path seeds
+`champion:unrevised-skips:...:0`:
+
+```bash
+gh issue comment "$ISSUE_NUMBER" --body "<!-- champion:capacity-defer:tier:maintenance:$FINGERPRINT -->
+<!-- champion:capacity-defer-seen:$FINGERPRINT:1 -->
+**Champion Review: Tier 3 backlog cap reached — deferring promotion**
+
+Evaluated against all 8 promotion criteria; all pass:
+
+- [criterion-by-criterion rationale, as in a normal APPROVED verdict]
+
+**Not promoted this pass — Tier 3 (maintenance) backlog cap.** [Tier rationale.]
+The backlog currently holds exactly 5 open \`tier:maintenance\` issues (#6612,
+#6076, #6068, #5512, #4136), so this one is held back this iteration rather
+than pushed to a 6th.
+
+This is a **capacity deferral, not a rejection** — no revision is needed, so no
+verdict marker is being written and the proposal label is left untouched. A
+future Champion pass will re-evaluate it fresh once the Tier 3 backlog drops
+below 5 (or a Tier 3 promotion slot frees up).
+
+---
+*Automated by Champion role*"
+```
+
+`$FINGERPRINT` is the value the script printed — use it verbatim, do not
+recompute it by hand. Do not release `loom:evaluating` here with a *different*
+outcome than the rest of the batch loop expects: a capacity deferral is
+neither a promotion nor a rejection, so treat it the same way a skip is
+treated in "Issue Promotion Batch Processing" below — continue the loop to the
+next issue, do not count it against the tier limits (it was not promoted this
+pass, but nothing about the proposal was found wanting either).
+
+**No escalation counterpart, and none should be added.** Unlike the N=2
+unrevised-proposal escalation, a capacity deferral is never a merits problem —
+it never needs a human decision, and the condition ends the moment the
+backlog composition changes, an event the very next pass's fingerprint
+comparison detects for free. Bounding a state that already self-resolves and
+never needs a human would only reintroduce the noise this section exists to
+close.
+
 ### Step 4: Reject (One or More Criteria Fail)
 
 If any criteria fail, first check whether this rejection should **escalate** instead of posting another comment — the mechanism that stops the 6x duplicate-comment loop:
@@ -880,6 +963,8 @@ Continue evaluating issues until all have been processed or all applicable tier 
 | `FORCE_REEVALUATE=yes` (the self-healing un-escalation just cleared `loom:operator-only`) | Claim → Step 1 (Read) → Step 2 → Step 3 or 4, ignoring the marker entirely (#5664) |
 
 A skip (either the idempotency skip or a fresh-claim skip) means: continue the loop to the next issue, do not count it against the tier limits (it was neither promoted nor rejected this pass). An escalation **is** a verdict — count it as you would a rejection.
+
+**Capacity deferral (Step 3c, #6729) is a third kind of non-verdict**, distinct from both a skip and a rejection: all 8 criteria passed, but the tier's rate limit blocked promotion this pass. `classify-capacity-defer.sh` decides whether that deferral is worth a fresh comment (composition changed, or first time) or should stay silent (same tier + same occupant set as the last deferral comment on this issue) — see Step 3c above for the exact commands. Either way, continue the loop to the next issue without counting it against the tier limits — it is not a rejection (the proposal label and body are untouched, no verdict marker is written) and not a promotion.
 
 ### When NOT to Promote
 

@@ -351,7 +351,16 @@ fi
 echo ""
 echo "Testing champion-pr-merge.md wiring..."
 
-CHAMPION_MD="$HELPERS_DIR/../.claude/commands/loom/champion-pr-merge.md"
+# Two `..` reaches repo-root/.claude/commands/loom for an INSTALLED copy
+# (HELPERS_DIR is .loom/scripts there); one `..` reaches defaults/.claude/
+# commands/loom when running inside this source repo (HELPERS_DIR is
+# defaults/scripts) -- the two layouts differ in depth, so probe both rather
+# than hard-coding one (#447).
+if [[ -f "$HELPERS_DIR/../../.claude/commands/loom/champion-pr-merge.md" ]]; then
+    CHAMPION_MD="$HELPERS_DIR/../../.claude/commands/loom/champion-pr-merge.md"
+else
+    CHAMPION_MD="$HELPERS_DIR/../.claude/commands/loom/champion-pr-merge.md"
+fi
 
 TESTS_RUN=$((TESTS_RUN + 1))
 if [[ -f "$CHAMPION_MD" ]] && grep -q 'MERGE_RC' "$CHAMPION_MD" && grep -q '"\$MERGE_RC" -eq 3' "$CHAMPION_MD"; then
