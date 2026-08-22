@@ -452,6 +452,63 @@ resolve_mcp_workspace() {
     fi
 }
 
+# Protocol-level MCP health check (#5032 follow-up, issue #143 / 2am#307).
+#
+# Starts the candidate entry point, sends a standard MCP `initialize`
+# JSON-RPC request over its stdin, and checks stdout for a well-formed
+# JSON-RPC response (matching id, with a `result` or `error` field). This
+# replaces a prior implementation that grepped stderr for the literal string
+# "running on stdio" — that string is mcp-loom's OWN startup banner
+# (~/GitHub/loom/mcp-loom/src/index.ts), not part of the MCP protocol itself.
+# Any MCP server that doesn't happen to print that exact banner (e.g.
+# squad's `dist/mcp.js`, which prints nothing on a clean start) false-
+# negatived unconditionally under the old check, regardless of actual
+# health. A protocol-level handshake is used instead of extending the old
+# check into a banner-string allowlist, since an allowlist just breaks again
+# for the next MCP server implementation that doesn't emit a banner.
+#
+# Args: $1 = path to the MCP server entry point (e.g. dist/index.js)
+#       $2 = node binary to invoke it with
+# Sets (for the caller to log on failure): MCP_SMOKE_TEST_STDOUT,
+# MCP_SMOKE_TEST_STDERR.
+# Returns: 0 if a valid JSON-RPC initialize response was observed, 1 otherwise.
+_mcp_smoke_test() {
+    local mcp_entry="$1"
+    local node_bin="$2"
+
+    local init_request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"loom-mcp-preflight","version":"1.0.0"}}}'
+
+    local tmp_stdout tmp_stderr
+    tmp_stdout=$(mktemp)
+    tmp_stderr=$(mktemp)
+
+    printf '%s\n' "${init_request}" | timeout 5 "${node_bin}" "${mcp_entry}" \
+        >"${tmp_stdout}" 2>"${tmp_stderr}" || true
+
+    MCP_SMOKE_TEST_STDOUT=$(cat "${tmp_stdout}")
+    MCP_SMOKE_TEST_STDERR=$(cat "${tmp_stderr}")
+    rm -f "${tmp_stdout}" "${tmp_stderr}"
+
+    # A healthy MCP server responds to `initialize` with a JSON-RPC 2.0
+    # message carrying the same id (1) and either a `result` or `error`
+    # field, per the MCP/JSON-RPC spec — true regardless of whether the
+    # implementation also happens to print a stderr startup banner.
+    printf '%s' "${MCP_SMOKE_TEST_STDOUT}" | python3 -c "
+import json, sys
+for line in sys.stdin.read().splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(obj, dict) and obj.get('jsonrpc') == '2.0' and obj.get('id') == 1 and ('result' in obj or 'error' in obj):
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null
+}
+
 # Attempt MCP pre-flight for ONE candidate workspace directory: extract the
 # entry point from ${1}/.mcp.json, ensure it exists (rebuilding if
 # missing/stale), and smoke-test it. Split out of check_mcp_server so the
@@ -528,26 +585,28 @@ for name, srv in servers.items():
         return 1
     fi
 
-    # Smoke test: start MCP server and verify it emits the startup message
-    # The MCP server writes "Loom MCP server running on stdio" to stderr on success.
-    # Use a short timeout - we just need to see the startup message.
-    # `node` is resolved via explicit candidate paths, not a bare PATH lookup:
-    # a non-login ssh session / launchd job never sources the login profile, so
-    # /opt/homebrew/bin is not on PATH (#5032, same reasoning as #4875).
-    local mcp_stderr node_bin
+    # Smoke test: start the MCP server and perform a protocol-level handshake
+    # (see _mcp_smoke_test above) rather than grepping for a server-specific
+    # startup banner. `node` is resolved via explicit candidate paths, not a
+    # bare PATH lookup: a non-login ssh session / launchd job never sources
+    # the login profile, so /opt/homebrew/bin is not on PATH (#5032, same
+    # reasoning as #4875).
+    local node_bin
     node_bin="$(_locate_node_tool node)" || node_bin="node"
     [[ -n "${node_bin}" ]] || node_bin="node"
-    mcp_stderr=$(timeout 5 "${node_bin}" "${mcp_entry}" </dev/null 2>&1 || true)
 
-    if echo "${mcp_stderr}" | grep -qi "running on stdio"; then
+    if _mcp_smoke_test "${mcp_entry}" "${node_bin}"; then
         log_info "MCP server health check passed (${mcp_config})"
         return 0
     fi
 
     # MCP server failed to start - log the error
     log_warn "MCP server health check failed (${mcp_config})"
-    if [[ -n "${mcp_stderr}" ]]; then
-        log_warn "MCP stderr: ${mcp_stderr}"
+    if [[ -n "${MCP_SMOKE_TEST_STDERR}" ]]; then
+        log_warn "MCP stderr: ${MCP_SMOKE_TEST_STDERR}"
+    fi
+    if [[ -n "${MCP_SMOKE_TEST_STDOUT}" ]]; then
+        log_warn "MCP stdout: ${MCP_SMOKE_TEST_STDOUT}"
     fi
 
     # Attempt rebuild and retry
@@ -967,18 +1026,19 @@ _try_mcp_rebuild() {
         return 1
     fi
 
-    local mcp_stderr
     [[ -n "${node_bin}" ]] || node_bin="node"
-    mcp_stderr=$(timeout 5 "${node_bin}" "${mcp_entry}" </dev/null 2>&1 || true)
 
-    if echo "${mcp_stderr}" | grep -qi "running on stdio"; then
+    if _mcp_smoke_test "${mcp_entry}" "${node_bin}"; then
         log_info "MCP server health check passed after rebuild"
         return 0
     fi
 
     log_error "MCP server still fails after rebuild"
-    if [[ -n "${mcp_stderr}" ]]; then
-        log_error "MCP stderr after rebuild: ${mcp_stderr}"
+    if [[ -n "${MCP_SMOKE_TEST_STDERR}" ]]; then
+        log_error "MCP stderr after rebuild: ${MCP_SMOKE_TEST_STDERR}"
+    fi
+    if [[ -n "${MCP_SMOKE_TEST_STDOUT}" ]]; then
+        log_error "MCP stdout after rebuild: ${MCP_SMOKE_TEST_STDOUT}"
     fi
     return 1
 }

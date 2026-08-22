@@ -34,10 +34,20 @@ set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
-DEFAULTS_DIR="$(cd "$SCRIPTS_DIR/.." && pwd)"
-JUDGE_MD="$DEFAULTS_DIR/.claude/commands/loom/judge.md"
-CHAMPION_MD="$DEFAULTS_DIR/.claude/commands/loom/champion-pr-merge.md"
-GUIDE_MD="$DEFAULTS_DIR/.claude/commands/loom/guide.md"
+
+# Two `..` reaches repo-root/.claude/commands/loom for an INSTALLED copy
+# (SCRIPTS_DIR is .loom/scripts there); one `..` reaches defaults/.claude/
+# commands/loom when running inside this source repo (SCRIPTS_DIR is
+# defaults/scripts) -- the two layouts differ in depth, so probe both rather
+# than hard-coding one (#6725).
+if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
+    PROMPT_DIR="$(cd "$SCRIPTS_DIR/../../.claude/commands/loom" && pwd)"
+else
+    PROMPT_DIR="$(cd "$SCRIPTS_DIR/../.claude/commands/loom" && pwd)"
+fi
+JUDGE_MD="$PROMPT_DIR/judge.md"
+CHAMPION_MD="$PROMPT_DIR/champion-pr-merge.md"
+GUIDE_MD="$PROMPT_DIR/guide.md"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

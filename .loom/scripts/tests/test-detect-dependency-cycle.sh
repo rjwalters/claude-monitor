@@ -30,10 +30,20 @@ set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
-DEFAULTS_DIR="$(cd "$SCRIPTS_DIR/.." && pwd)"
 DDC="$SCRIPTS_DIR/detect-dependency-cycle.sh"
-CHAMPION_MERGE_MD="$DEFAULTS_DIR/.claude/commands/loom/champion-pr-merge.md"
-CHAMPION_PROMO_MD="$DEFAULTS_DIR/.claude/commands/loom/champion-issue-promo.md"
+
+# Two `..` reaches repo-root/.claude/commands/loom for an INSTALLED copy
+# (SCRIPTS_DIR is .loom/scripts there); one `..` reaches defaults/.claude/
+# commands/loom when running inside this source repo (SCRIPTS_DIR is
+# defaults/scripts) -- the two layouts differ in depth, so probe both rather
+# than hard-coding one (#6725).
+if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
+    PROMPT_DIR="$(cd "$SCRIPTS_DIR/../../.claude/commands/loom" && pwd)"
+else
+    PROMPT_DIR="$(cd "$SCRIPTS_DIR/../.claude/commands/loom" && pwd)"
+fi
+CHAMPION_MERGE_MD="$PROMPT_DIR/champion-pr-merge.md"
+CHAMPION_PROMO_MD="$PROMPT_DIR/champion-issue-promo.md"
 
 # Source the script for its pure helpers BEFORE defining our own colors - the
 # script's own `[[ -t 2 ]]` block defines RED/YELLOW/BLUE/NC, so sourcing first

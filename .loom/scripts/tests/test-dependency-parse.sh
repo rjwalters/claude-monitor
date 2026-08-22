@@ -40,11 +40,21 @@ set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
-DEFAULTS_DIR="$(cd "$SCRIPTS_DIR/.." && pwd)"
-GUIDE_MD="$DEFAULTS_DIR/.claude/commands/loom/guide.md"
-SWEEP_MD="$DEFAULTS_DIR/.claude/commands/loom/sweep.md"
-CHAMPION_MD="$DEFAULTS_DIR/.claude/commands/loom/champion-pr-merge.md"
-CHAMPION_COMMON_MD="$DEFAULTS_DIR/.claude/commands/loom/champion-common.md"
+
+# Two `..` reaches repo-root/.claude/commands/loom for an INSTALLED copy
+# (SCRIPTS_DIR is .loom/scripts there); one `..` reaches defaults/.claude/
+# commands/loom when running inside this source repo (SCRIPTS_DIR is
+# defaults/scripts) -- the two layouts differ in depth, so probe both rather
+# than hard-coding one (#6725).
+if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
+    PROMPT_DIR="$(cd "$SCRIPTS_DIR/../../.claude/commands/loom" && pwd)"
+else
+    PROMPT_DIR="$(cd "$SCRIPTS_DIR/../.claude/commands/loom" && pwd)"
+fi
+GUIDE_MD="$PROMPT_DIR/guide.md"
+SWEEP_MD="$PROMPT_DIR/sweep.md"
+CHAMPION_MD="$PROMPT_DIR/champion-pr-merge.md"
+CHAMPION_COMMON_MD="$PROMPT_DIR/champion-common.md"
 
 # Source warn-out-of-set-deps.sh's real parse_out_of_set_deps BEFORE defining
 # our own RED/GREEN/NC below — the script's own `[[ -t 2 ]]` color block

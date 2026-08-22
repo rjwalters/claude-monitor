@@ -6828,6 +6828,9 @@ automation — nothing fires it on its own.
 
 ```bash
 loom-daemon restart          # send RestartDaemon over the IPC socket
+loom-daemon restart --reload-supervisor   # launchd only: bootout+bootstrap the job so
+                                           # a hand-edited plist's env takes effect (#6682,
+                                           # see "Changing daemon environment variables" below)
 ```
 
 - **Mechanism (macOS):** the plist uses `KeepAlive:{SuccessfulExit:true}` and the
@@ -6966,18 +6969,69 @@ is deliberately silent; this is macOS/launchd-specific (systemd re-reads
 `Environment=` fresh via `daemon-reload` on every unit reload, so there is
 nothing to detect on that path).
 
-**The actual env-change path** is either of:
+**The actual env-change path** is one of:
 
 ```bash
-# Option A: re-render + re-bootstrap in one step (the normal path)
+# Option A (preferred): the supervised reload primitive (#6682)
+loom-daemon restart --reload-supervisor
+
+# Option B: re-render + re-bootstrap in one step (also picks up plist/label/domain changes)
 ./.loom/scripts/cli/loom-daemon-start.sh
 
-# Option B: bootout the stale bootstrapped job, then bootstrap the edited plist
+# Option C: bootout the stale bootstrapped job, then bootstrap the edited plist, by hand
 launchctl bootout gui/$(id -u)/com.rjwalters.loom-daemon
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist
 ```
 
-Both make launchd re-read the plist file, which a plain `restart` never does.
+All three make launchd re-read the plist file, which a plain `restart` never does.
+
+**Option A — `loom-daemon restart --reload-supervisor` (#6682)** is the
+supervised version of Option C: a local `launchctl bootout` immediately
+followed by `launchctl bootstrap` against the *already-installed* plist (it
+does not re-render anything — pair it with a prior `loom-daemon-start.sh` run,
+or Option B directly, if the plist itself also needs regenerating). It exists
+because doing Option C by hand is racy: `launchctl bootout` is
+**asynchronous** — it returns before the kernel has actually finished tearing
+the old job down — so an immediate `bootstrap` can fail with `Bootstrap
+failed: 5: Input/output error` even though the plist is perfectly valid,
+leaving the job **unloaded with nothing to restart it**. `--reload-supervisor`
+settles after the bootout (polling `launchctl print` until the job is
+actually gone, bounded by `LOOM_DAEMON_BOOTOUT_SETTLE_SECS`, default 5s) and
+retries the bootstrap specifically on that EIO shape (bounded by
+`LOOM_DAEMON_BOOTSTRAP_RETRY_ATTEMPTS`, default 4, `LOOM_DAEMON_BOOTSTRAP_RETRY_SECS`
+apart, default 2s) — the same retry shape `loom-daemon-start.sh` already
+proved in production for this exact race (#5081), now available against an
+**already-running** daemon rather than only at start-script invocation time.
+`already bootstrapped` (launchd error 37) is treated as a success, not a
+failure. If every retry is exhausted, it fails loudly (non-zero exit) and
+prints the exact `launchctl bootstrap <domain> <plist>` command to run by
+hand — never leaving the job unloaded silently.
+
+`--reload-supervisor` is a **local, launchctl-shelling CLI operation** — it
+never talks to the running daemon over its Unix socket at all (the whole
+point is bootstrapping a fresh process from a fresh plist read, independent
+of anything the currently-running daemon could report), and it refuses
+outright — no `launchctl` invocation at all — on a host that is not
+launchd-supervised: on systemd, a unit drop-in edit plus a plain `systemctl
+--user daemon-reload` already picks up new `Environment=` lines on the next
+restart (it re-reads the unit file fresh every time), so there is no
+equivalent gap to close there — see "Env keys carried forward across a
+re-render" below for how to trigger that restart.
+
+**No drain required first on launchd — but the reverse holds on systemd.**
+A launchd bootout tears the job down before bootstrapping it back, but an
+in-flight sweep is not killed by it: every sweep gets its own process group
+(#3800) and reparents to `launchd` (`ppid=1`) rather than dying with the job
+that spawned it — confirmed directly in the incident `--reload-supervisor`
+was built to fix. So `--reload-supervisor` needs no `--drain` first, and
+never accepts `--drain`/`--abort-drain`/`--then-exit` (it refuses the
+combination outright — those flags only make sense against the socket-based
+restart request this primitive deliberately bypasses). **This is specifically
+NOT true on systemd**: there, `restart` (with or without `--drain`) runs the
+unit's stop job over the whole cgroup, which reaps every sweep/role-run child
+that has not already reparented out of it (#5119) — so the systemd env-change
+path above should always be followed by `loom-daemon restart --drain`, not a
+plain `restart`, to finish in-flight work first.
 
 #### Env keys carried forward across a re-render (#4522, #5344)
 

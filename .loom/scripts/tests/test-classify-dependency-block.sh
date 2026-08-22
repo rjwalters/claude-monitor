@@ -29,11 +29,21 @@ set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "$TEST_DIR/.." && pwd)"
-DEFAULTS_DIR="$(cd "$SCRIPTS_DIR/.." && pwd)"
 CDB="$SCRIPTS_DIR/classify-dependency-block.sh"
-CHAMPION_PROMO_MD="$DEFAULTS_DIR/.claude/commands/loom/champion-issue-promo.md"
-CHAMPION_MD="$DEFAULTS_DIR/.claude/commands/loom/champion.md"
-CHAMPION_REF_MD="$DEFAULTS_DIR/.claude/commands/loom/champion-reference.md"
+
+# Two `..` reaches repo-root/.claude/commands/loom for an INSTALLED copy
+# (SCRIPTS_DIR is .loom/scripts there); one `..` reaches defaults/.claude/
+# commands/loom when running inside this source repo (SCRIPTS_DIR is
+# defaults/scripts) -- the two layouts differ in depth, so probe both rather
+# than hard-coding one (#6725).
+if [[ -d "$SCRIPTS_DIR/../../.claude/commands/loom" ]]; then
+    PROMPT_DIR="$(cd "$SCRIPTS_DIR/../../.claude/commands/loom" && pwd)"
+else
+    PROMPT_DIR="$(cd "$SCRIPTS_DIR/../.claude/commands/loom" && pwd)"
+fi
+CHAMPION_PROMO_MD="$PROMPT_DIR/champion-issue-promo.md"
+CHAMPION_MD="$PROMPT_DIR/champion.md"
+CHAMPION_REF_MD="$PROMPT_DIR/champion-reference.md"
 
 # Source for the pure helpers BEFORE defining our own colors (the sourced chain
 # defines RED/YELLOW/BLUE/NC itself).
