@@ -66,6 +66,13 @@ else
     loom_record_worktree_removal() { :; }
 fi
 
+# Race-safe reset helper (#6334). The "stale worktree" reset path below can
+# otherwise discard foreign work that appears in the window between the
+# staleness check and the reset itself — see the lib file for the full
+# rationale and design decision.
+# shellcheck source=lib/worktree-race-rescue.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/worktree-race-rescue.sh"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -2242,8 +2249,15 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             # worktree remains usable either way, so keep it cleanup-eligible
             # (#3548).
             write_loom_sentinel "$WORKTREE_PATH"
+            # #6334: re-check commits-ahead and tracked-diff state immediately
+            # before the destructive reset rather than trusting the
+            # point-in-time check above — a second builder (or any other
+            # process) can have landed new commits or foreign uncommitted
+            # tracked changes into this worktree in the interim. Rescue/refuse
+            # instead of silently discarding them (see lib/worktree-race-rescue.sh
+            # for the full design decision).
             if git -C "$WORKTREE_PATH" fetch origin "${BASE_BRANCH:-$DEFAULT_BRANCH}" 2>/dev/null && \
-               git -C "$WORKTREE_PATH" reset --hard "$BASE_REF" 2>/dev/null; then
+               loom_worktree_reset_or_rescue "$WORKTREE_PATH" "$BASE_REF" "issue-$ISSUE_NUMBER-stale-worktree-reset"; then
                 if [[ "$JSON_OUTPUT" != "true" ]]; then
                     print_success "Stale worktree reset to $BASE_DISPLAY"
                     echo ""

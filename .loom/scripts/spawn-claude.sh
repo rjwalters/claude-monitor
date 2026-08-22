@@ -781,6 +781,32 @@ fi
 : "${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:=0}"
 export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS
 
+# --- Headless-session marker for the Stop guard (issue #6645) ---
+# `guard-background-subagents.sh` blocks a stop that would orphan a background
+# child. That block is correct in headless `-p` mode (ending the turn kills the
+# process) and a pure false positive in an interactive session (children
+# survive the turn boundary), so the guard must be able to tell the two apart.
+# Its primary signal is the owning `claude` process's own argv, but this export
+# is the defense-in-depth belt: this script is the SOLE sanctioned headless
+# dispatch path in Loom, so a marker set here classifies every Loom-dispatched
+# sweep correctly even if the harness's argv shape changes.
+#
+# Set ONLY when print mode is actually requested — an interactive `claude`
+# launched through this script (no `-p`/`--print` in the passthrough args) must
+# NOT be marked headless, or it inherits exactly the friction #6645 removes.
+# Env vars set before `exec` are inherited by the replacing process image, and
+# the harness passes its own environment down to hook subprocesses.
+_loom_print_mode=false
+for _arg in ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}; do
+    case "$_arg" in
+        -p | --print | --print=*) _loom_print_mode=true; break ;;
+    esac
+done
+if [[ "$_loom_print_mode" == "true" ]]; then
+    export LOOM_HEADLESS_SESSION=1
+fi
+unset _loom_print_mode
+
 # --- Optional safehouse MCP server injection (issue #3999) ---
 # When the `safehouse` config block is enabled and a socket + launch command
 # resolve, inject a session-scoped MCP config that adds the `safehouse` stdio

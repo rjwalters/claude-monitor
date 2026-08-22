@@ -65,6 +65,7 @@ test-detect-dependency-cycle.sh
 test-detect-startable-subset.sh
 test-disk-headroom.sh
 test-docs-guide-lock.sh
+test-docs-only-fast-path.sh
 test-docs-worktree.sh
 test-fleet-check.sh
 test-fleet-send.sh
@@ -169,6 +170,7 @@ test-worktree-hookspath.sh
 test-worktree-json-purity.sh
 test-worktree-local-branch-upstream-tracking.sh
 test-worktree-nested-symlinks.sh
+test-worktree-race-rescue.sh
 test-worktree-remote-branch-tracking.sh
 test-worktree-remove-squash-merge.sh
 test-worktree-remove.sh

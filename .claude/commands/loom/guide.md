@@ -2463,6 +2463,7 @@ Automated document maintenance by Guide triage agent."
     --title "docs: Guide document maintenance update" \
     --label "loom:review-requested" \
     --body "$(cat <<'PRBODY'
+<!-- loom:docs-only-fast-path -->
 ## Summary
 
 Automated document maintenance by the Guide triage agent.
@@ -2475,6 +2476,14 @@ Automated document maintenance by the Guide triage agent.
 ### Context
 This PR is generated automatically by the Guide role as part of its triage cycle.
 See rjwalters/loom#1784 for the feature specification (this template ships to every Loom-managed repo, so the reference must be fully qualified).
+
+This PR only ever stages `WORK_LOG.md`/`WORK_PLAN.md`/`README.md` (see
+`create_docs_pr()`'s `git add` above), so it always qualifies for the
+docs-only fast path (rjwalters/loom#6134) Judge and Champion apply to any PR
+whose changed-file list matches that exact set. The `<!-- loom:docs-only-fast-path -->`
+marker above is informational only — Judge and Champion never trust it (or
+this section's prose) and always re-derive the changed-file list themselves
+from the paginated files API before taking the fast path.
 
 ---
 *Automated by Guide role - document maintenance phase*

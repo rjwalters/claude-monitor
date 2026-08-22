@@ -382,6 +382,56 @@ they find one — scoped to a symlink whose target resolves through a
 `loom-tools` path segment and no longer exists, so a same-named script you
 authored yourself is never touched. No manual action needed on either path.
 
+### `rm` of the installed `loom-daemon` binary is denied in an agent session (#5675)
+
+**Symptom**: a self-build/reinstall verification step run from an agent session
+— `rm -f /opt/homebrew/bin/loom-daemon`, `rm -f /usr/local/bin/loom-daemon`,
+`rm -f ~/.local/bin/loom-daemon`, typically followed by an `ls` of the same path
+to confirm the rebuild replaced it — is blocked with:
+
+```
+BLOCKED: rm target outside repo scope (LOOM_RM_SCOPE=repo): /opt/homebrew/bin/loom-daemon
+```
+
+(pattern `rm-scope-outside-repo`; observed once on 2026-08-07 and triaged under
+the #3898 guard-decision telemetry policy).
+
+**This is correct and stays that way.** The path is outside the repo/worktree
+scope and on no ephemeral allowlist, so the repo-scoped `rm` guard denies it.
+The trigger was reviewed and **kept flagged** rather than allowlisted: no
+supported Loom flow needs to delete the installed binary, so allowlisting
+Loom's own install paths would widen an outside-repo delete for no gain. See
+`defaults/docs/guard-hooks.md` → "Repo-Scoped rm Guard" → "Removing an installed
+`loom-daemon` binary — denied, and never necessary".
+
+**Remedy — overwrite, don't delete**:
+
+```bash
+loom update                                  # machine-level install (~/.local/bin)
+./.loom/scripts/cli/loom-daemon-update.sh    # the same delegate, called directly
+loom-daemon --version                        # baked-in commit confirms which build is live
+```
+
+Both paths provision with `install -m 755` (falling back to `cp -f` +
+`chmod 755`) straight over the existing file — the binary is replaced in place,
+so there is never a delete step to run. If your installed binary is **not** at
+the machine-level default, point the updater at it instead of removing it:
+
+```bash
+LOOM_DAEMON_BIN=/opt/homebrew/bin/loom-daemon ./.loom/scripts/cli/loom-daemon-update.sh
+# or: LOOM_DAEMON_BIN_DIR=/opt/homebrew/bin ...
+```
+
+**If what you actually need is to remove a shadowing binary** — a second
+`loom-daemon` earlier on `PATH` than the one Loom provisions (the #4079
+stale-entry-point shape that the previous entry describes for `loom-*` shims) —
+that is an **operator** action, not an agent one. `loom-daemon-update.sh` warns
+about each such entry point on every run and deliberately deletes nothing. Do
+the removal yourself in a plain shell outside the hooked agent session; a
+headless agent has no sanctioned way through this deny, and the script-file
+workaround is an unsanctioned guard bypass (`defaults/docs/guard-hooks.md` →
+"When a Legitimate Operation Is Pattern-Blocked").
+
 ### Corrupted local git identity (`...github.comecho`, "cannot overwrite multiple values") (#4369)
 
 **Symptom**: `git config user.email <value>` fails with `error: cannot

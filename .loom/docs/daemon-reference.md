@@ -3820,6 +3820,9 @@ knobs not yet audited here.
 | `autonomous.roleRunner.architectMaxProposals` | `LOOM_ARCHITECT_MAX_PROPOSALS` | `5` | **Per-invocation** cap on how many proposal issues one `architect` dispatch may file (#5656) — the actuator-saturation limit of the idle-edge control loop. Passed to the session as `/loom:architect --max-proposals <n>`, which `architect.md` enforces as a hard ceiling. Per-repo on purpose (the workable cap grows with a repo's maturity — ~5 while work is narrow, 7+ once it fans out), so it is read from each root's own config. Zero/negative/non-integer at either tier drops to the next one (a cap of `0` would spend a whole session forbidden from producing anything). Ignored for every other role |
 | `autonomous.roleRunner.collisionDetection` | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | inherits `autonomous.collisionDetection.enabled`, else `false` | Cross-host role-tick collision baseline (#4623). Detection only — a pre-tick probe of that role's own label queue, logged/counted, never acted on. Absent → falls through to #4085's shared toggle; see [Cross-host role-tick collision detection](#cross-host-role-tick-collision-detection-4623) |
 | `autonomous.roleRunner.collisionWindowSecs` | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | that role's tick interval | Lookback window for the #4623 probe, clamped to `[60, 3600]`. Zero/invalid dropped to the next tier |
+| *(host-local tiers only — see below)* | `LOOM_ROLE_RUNNER_SHARD_INDEX` | *(unset)* | **This host's** 0-based role-runner shard index (#6374). Must **differ** per host, so it belongs in the service unit next to `LOOM_ROLE_RUNNER`, never in the tracked `.loom/config.json` — a committed `autonomous.roleRunner.shardIndex` gives every host the same index and leaves every other slice with zero owners fleet-wide, so the daemon **refuses** it (logs `error!`, falls back to unsharded). Requires `shardCount`; out-of-range/malformed → unsharded. See [Role-runner host sharding](#role-runner-host-sharding-6374) |
+| `autonomous.roleRunner.shardCount` | `LOOM_ROLE_RUNNER_SHARD_COUNT` | *(unset)* | Fleet-wide number of role-runner shards (#6374) — must be **identical** on every host, which is why the tracked config is a fine home for it. `0`/`1`/malformed → unsharded (every host rotates every workspace, the pre-#6374 behavior). Requires `shardIndex` |
+| `autonomous.roleRunner.shardKey` | *(config only)* | `owner/repo` from `origin`, else the root's basename | Explicit cross-host-stable key hashed to pick a workspace's owning shard (#6374). Must be identical fleet-wide. Set it when the derived key would diverge between hosts — the basename fallback does exactly that if two hosts cloned the same repo into differently-named directories. `status` reports the resolved key and its tier so two hosts can be diffed |
 | `autonomous.idleExit.enabled` | `LOOM_AUTONOMOUS_IDLE_EXIT_ENABLED` | `false` | End the daemon cleanly after the idle window so a host guard can take over. Independent of Work Finder; never invokes a power command |
 | `autonomous.idleExit.idleMinutes` | `LOOM_AUTONOMOUS_IDLE_EXIT_MINUTES` | `60` | Continuous idle/starvation window. Zero/invalid → default |
 | `autonomous.idleExit.onTokenStarvation` | `LOOM_AUTONOMOUS_IDLE_EXIT_ON_TOKEN_STARVATION` | `true` | Also exit after zero healthy accounts for the full window with no sweep in flight, even if roles keep cycling |
@@ -4488,6 +4491,80 @@ a clean exit that made no checkpoint progress, publishing the usual
   the same resting state attempt-cap exhaustion produces, reached without
   burning the attempts first.
 
+### Role-runner host sharding (#6374)
+
+Collision *detection* above tells you a peer host ran the same role tick you
+did. Host sharding stops it happening: on a fleet, each workspace's role
+rotation runs on **exactly one host per interval**.
+
+**Why.** The role runner is a per-host loop with no cross-host coordination, so
+on N dispatchers every workspace's rotation runs N times per interval — N
+`claude` sessions over the same forge queue. On the 2AMLogic fleet (4
+dispatchers × 27 workspaces × 900s) that drew the token pool down to 2/17
+available with role ticks failing ~20/hour, and it is the shape of the #6332
+docs-PR race and the #6352 narration duplication. The operator mitigation was
+`LOOM_ROLE_RUNNER=0` on some hosts — correct in direction, but all-or-nothing:
+it cannot spread 27 workspaces over 4 hosts. Sharding is the first-class
+version of that knob, and `LOOM_ROLE_RUNNER=0` is its degenerate case.
+
+**Mechanism.** Each host carries a shard index in `0..count`. A workspace's
+rotation runs on the host whose index equals `fnv1a64(shardKey) % count`.
+Because every host computes the same hash over the same key and the indices
+partition the ring, exactly one host owns each workspace **by construction** —
+no election, no lease, no window in which a workspace has zero or two owners.
+FNV-1a is used rather than `DefaultHasher` deliberately: the invariant requires
+two different processes, on different machines and possibly different Rust
+versions, to agree on the value, and `DefaultHasher`'s algorithm and seeding are
+both unspecified.
+
+**The two knobs have deliberately opposite homes:**
+
+| Knob | Where it belongs | Why |
+|---|---|---|
+| `shardIndex` | **host-local only** — `LOOM_ROLE_RUNNER_SHARD_INDEX` in the service unit (systemd `Environment=` / launchd `EnvironmentVariables`), next to where `LOOM_ROLE_RUNNER` is set today, or an untracked config tier | It must **differ** per host. Two hosts sharing an index own the same slice, and nobody owns the rest |
+| `shardCount` | either — env or the tracked `.loom/config.json` | It must be **identical** fleet-wide, and a committed file is identical fleet-wide by construction |
+| `shardKey` | tracked `.loom/config.json` | Same reason |
+
+Declaring `shardIndex` in the **tracked** `.loom/config.json` is the one
+misconfiguration that breaks the fleet in the worst direction — every host reads
+the same file, resolves the same index, and every workspace not hashing to it
+gets **zero** role ticks anywhere. The daemon detects that case specifically and
+**refuses to shard**, logging at `error!` and falling back to unsharded. An
+index supplied via `LOOM_ROLE_RUNNER_SHARD_INDEX` is per-host by construction
+and legitimately overrides the (ignored) tracked value.
+
+**Shard key precedence**, highest first: `autonomous.roleRunner.shardKey` >
+`owner/repo` from the workspace's `origin` remote > the workspace root's
+basename. The basename fallback is the one place the invariant can still break —
+two hosts that cloned the same repo into differently-named directories hash
+differently — so the resolved key **and its tier** are surfaced in `status`
+(`key_source`: `config` / `git-remote` / `basename`) precisely so two hosts'
+output can be diffed.
+
+**Fail-safe direction.** Every malformed, incomplete, or contradictory
+configuration resolves to *unsharded*, which owns **every** workspace — i.e. the
+pre-#6374 behavior. Duplicating is wasteful but survivable and visible; the
+opposite failure (a slice with no owner) silently stops role rotation and is
+much harder to notice. `LOOM_ROLE_RUNNER=0` is checked **before** sharding, so
+the blunt kill switch is never weakened or second-guessed by shard state. Both
+dispatch surfaces are gated — the interval cadence and the `onIdle` edge —
+because an idle edge fires on every host that observes it.
+
+**Visibility.** `loom-daemon status` prints a `Role runner (sharding): …` header
+whenever sharding is *configured* (including every misconfiguration — silence is
+exactly how the `LOOM_ROLE_RUNNER=0` mitigation became invisible), and a per-root
+line naming the owning shard, the key, and the key's tier. Unconfigured
+single-host installs print neither. `--json` carries the same under
+`role_runner_shard` (report-level) and `per_repo[].role_runner_shard`.
+
+**Static, not roster-driven (deferred).** The assignment comes from
+`(shardIndex, shardCount)`, not from a live host roster. Killing a host does
+**not** automatically reassign its slice — those workspaces stop rotating until
+an operator lowers `shardCount` or points a survivor at the vacated index.
+Automatic reassignment needs a liveness protocol whose failure modes are exactly
+the zero-or-two-owner races this static scheme rules out arithmetically, so it is
+deliberately a follow-up (#6704) rather than part of the same change.
+
 ### Completion narration → public fleet feed (#4426)
 
 When a sweep exits, the narration sink additionally asks the forge whether that
@@ -4747,11 +4824,22 @@ merge script ran.
 runs it with `safe: true, force: false`, which preserves a worktree on any of:
 a live spawn-loop task or claim-lock, a `.loom-in-use` marker, a process whose
 cwd is inside it, an editable pip install pointing into it, an open issue, an
-open / unmerged / absent PR, an unreadable forge probe, a merge still inside the
-grace period, or any uncommitted change. It adds **one gate the CLI does not
-have**: the `.loom-managed` sentinel is *required*. An unattended remover has
-nobody at the keyboard to say no, so a user-provisioned worktree is never
-touched.
+open/absent PR, an unreadable forge probe, a merge still inside the grace
+period, or any uncommitted change. It adds **one gate the CLI does not have**:
+the `.loom-managed` sentinel is *required*. An unattended remover has nobody at
+the keyboard to say no, so a user-provisioned worktree is never touched.
+
+**A closed-without-merge PR's worktree eventually reclaims too (#6418).**
+Unlike a merged PR, `main` never holds a closed-without-merge branch's
+commits, so this case is gated by two conditions layered on top of the
+grace-period check: its own 30-day grace period since the PR **closed**
+(`CLOSED_NO_MERGE_GRACE_PERIOD_SECS`, deliberately much longer than the
+10-minute merged-PR default — not currently configurable), and proof that
+every commit on the branch is reachable from some remote ref (`git rev-list
+--count <branch> --not --remotes` returning `0`) — the same check `clean
+--safe`'s stale-branch pass (#5737) already uses. Either gate failing (no
+resolvable close timestamp, or an unpushed/partially-pushed branch) keeps the
+worktree indefinitely, same as before this issue.
 
 **REST, not GraphQL.** The forge probes use `gh api repos/{owner}/{repo}/...`
 rather than `gh issue view` / `gh pr list`. GraphQL quota exhaustion under
@@ -5280,6 +5368,8 @@ leaves the daemon's behavior byte-for-byte unchanged:
 | `LOOM_ARCHITECT_MAX_PROPOSALS` | `autonomous.roleRunner.architectMaxProposals` | env > config > default | `5` (per-invocation architect proposal cap, #5656) |
 | `LOOM_ROLE_RUNNER_DETECT_COLLISIONS` | `autonomous.roleRunner.collisionDetection` | env > config > `autonomous.collisionDetection.enabled` > default | `false` (off) |
 | `LOOM_ROLE_RUNNER_COLLISION_WINDOW_SECS` | `autonomous.roleRunner.collisionWindowSecs` | env > config > default | that role's tick interval, clamped to `[60, 3600]` |
+| `LOOM_ROLE_RUNNER_SHARD_INDEX` | `autonomous.roleRunner.shardIndex` — **host-local tiers only**; a value in the *tracked* `.loom/config.json` is refused, not honored (#6374) | env > config > default | *(unset ⇒ unsharded)* |
+| `LOOM_ROLE_RUNNER_SHARD_COUNT` | `autonomous.roleRunner.shardCount` | env > config > default | *(unset ⇒ unsharded)* |
 
 The last two rows are the role runner's half of the cross-host collision
 baseline — detection only, opt-in, and fully described under

@@ -505,6 +505,7 @@ cat > "$STUB_DIR/claude" <<'STUB'
 echo "stub-claude got token=${CLAUDE_CODE_OAUTH_TOKEN}"
 echo "stub-claude args=$*"
 echo "stub-claude ceiling=${CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS:-unset}"
+echo "stub-claude headless=${LOOM_HEADLESS_SESSION:-unset}"
 exit 0
 STUB
 chmod +x "$STUB_DIR/claude"
@@ -582,6 +583,36 @@ assert_contains "stub-claude args=-p /loom:sweep 4111 --claim-owned 4111 --dange
     "spawn-claude forwards the -p prompt (with embedded --claim-owned) verbatim to claude (#4111/#4120)"
 assert_contains "spawn-claude: LOOM_SWEEP_CLAIM_OWNED=4111" "$output" \
     "spawn-claude still logs the env var when the --claim-owned flag is also present (#4111 backward compat)"
+
+# ------------------------------------------------------------------
+# Headless-session marker for the Stop guard (issue #6645)
+#
+# `guard-background-subagents.sh` must block a stop that would orphan a
+# background child in headless `-p` mode, and must NOT block it in an
+# interactive session (where children survive the turn boundary). This marker
+# is the Loom-owned signal it reads. It is set ONLY for print mode: marking an
+# interactive session headless would reintroduce exactly the friction #6645
+# removes, and is therefore asserted as its own negative case.
+#
+# Every case below strips an ambient LOOM_HEADLESS_SESSION with `env -u`: this
+# suite may itself be running inside a headless sweep whose own wrapper already
+# exported the marker, which would otherwise leak in and make the negative case
+# pass for the wrong reason (same hazard as LOOM_SWEEP_CLAIM_OWNED above).
+# ------------------------------------------------------------------
+output=$(env -u LOOM_HEADLESS_SESSION LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" \
+    PATH="$STUB_DIR:$PATH" "$SCRIPTS_DIR/spawn-claude.sh" -p "ping" 2>&1 || true)
+assert_contains "stub-claude headless=1" "$output" \
+    "spawn-claude exports LOOM_HEADLESS_SESSION=1 for a -p spawn (#6645)"
+
+output=$(env -u LOOM_HEADLESS_SESSION LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" \
+    PATH="$STUB_DIR:$PATH" "$SCRIPTS_DIR/spawn-claude.sh" --print "ping" 2>&1 || true)
+assert_contains "stub-claude headless=1" "$output" \
+    "spawn-claude exports LOOM_HEADLESS_SESSION=1 for a --print spawn (#6645)"
+
+output=$(env -u LOOM_HEADLESS_SESSION LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" \
+    PATH="$STUB_DIR:$PATH" "$SCRIPTS_DIR/spawn-claude.sh" --dangerously-skip-permissions 2>&1 || true)
+assert_contains "stub-claude headless=unset" "$output" \
+    "spawn-claude leaves an interactive (no -p/--print) spawn UNMARKED (#6645)"
 
 # Test: explicit CLAUDE_CODE_OAUTH_TOKEN bypasses selection
 output=$(LOOM_WORKSPACE="$TEST_WS" LOOM_DAEMON_BIN="$DAEMON_BIN" PATH="$STUB_DIR:$PATH" \
@@ -1916,6 +1947,43 @@ line two
 Execution error" "max retries (2) exceeded" 2>&1
 DRIVER
 ee_death=$(WRAPPER="$WRAPPER" bash "$EE_DIR/death-driver.sh" 2>&1)
+# --- Unit: export_headless_session_marker() (issue #6645) -------------------
+#
+# The daemon spawns claude-wrapper.sh DIRECTLY (verified live: the process
+# chain is loom-daemon -> claude-wrapper.sh -p ... -> claude -p ...), never via
+# spawn-claude.sh, so the wrapper needs its own copy of the print-mode marker
+# the Stop guard reads. Driven through the SOURCE_ONLY seam because `main`
+# itself runs the full pre-flight.
+cat > "$EE_DIR/headless-driver.sh" <<'DRIVER'
+#!/usr/bin/env bash
+CLAUDE_WRAPPER_SOURCE_ONLY=1 source "$WRAPPER"
+set +e
+run_case() {
+    local label="$1"; shift
+    (
+        unset LOOM_HEADLESS_SESSION
+        export_headless_session_marker "$@" >/dev/null 2>&1
+        echo "${label}=${LOOM_HEADLESS_SESSION:-unset}"
+    )
+}
+run_case PRINT_SHORT -p "/loom:sweep 1"
+run_case PRINT_LONG --print "/loom:sweep 1"
+run_case PRINT_EQ --print=text "/loom:sweep 1"
+run_case INTERACTIVE --dangerously-skip-permissions "/loom:judge 1"
+run_case NOARGS
+DRIVER
+ee_headless=$(WRAPPER="$WRAPPER" bash "$EE_DIR/headless-driver.sh" 2>&1)
+assert_contains "PRINT_SHORT=1" "$ee_headless" \
+    "claude-wrapper exports LOOM_HEADLESS_SESSION=1 for -p (#6645)"
+assert_contains "PRINT_LONG=1" "$ee_headless" \
+    "claude-wrapper exports LOOM_HEADLESS_SESSION=1 for --print (#6645)"
+assert_contains "PRINT_EQ=1" "$ee_headless" \
+    "claude-wrapper exports LOOM_HEADLESS_SESSION=1 for --print=<fmt> (#6645)"
+assert_contains "INTERACTIVE=unset" "$ee_headless" \
+    "claude-wrapper leaves a slash-command (script -q, interactive) run UNMARKED (#6645)"
+assert_contains "NOARGS=unset" "$ee_headless" \
+    "claude-wrapper leaves an argument-less run UNMARKED (#6645)"
+
 assert_contains "permanent death (max retries (2) exceeded)" "$ee_death" \
     "log_permanent_death labels the reason (#4255)"
 assert_contains "exit_code=42" "$ee_death" \

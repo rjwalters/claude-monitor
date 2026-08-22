@@ -279,6 +279,76 @@ gh pr diff "$PR_NUMBER"
 gh pr view "$PR_NUMBER" --json comments --jq '.comments[] | select(.body | test("Judge"; "i")) | .body'
 ```
 
+**Docs-only fast path (#6134)** — run this check immediately after the
+sticky-hold precheck above and before judging the four axes below. If the
+PR's entire changed-file list is an exact-match subset of `{WORK_LOG.md,
+WORK_PLAN.md, README.md}` (three root-level filenames, matched exactly —
+never a substring or nested path, so `docs/README.md` and
+`mcp-loom/README.md` do NOT qualify), criterion #2 is satisfied without
+judging the axes at all: there is no "load-bearing hunk" to name, blast
+radius is provably confined to non-executing docs, and `git revert
+<squash-sha>` trivially undoes it. This is a shortcut on **this criterion
+only** — it never substitutes for, and is always subordinate to, the
+sticky-hold precheck (a prior hold on this PR, for whatever reason, is never
+bypassed by this fast path) and criteria #1/#3/#4/#5/#6, all of which still
+run normally.
+
+**Never trust a marker, label, or the PR body's stated intent — including
+Judge's own `<!-- loom:docs-fast-path-evaluation -->` comment.** Always
+re-derive the file list yourself, in this pass, from the paginated files API
+(the same #4613 truncation guard as the evidence-gathering read above and
+criterion #3 below). This is independent verification, not trust-on-relay: a
+compromised or buggy Judge pass claiming "docs only" must not be sufficient
+to skip Champion's own check.
+
+```bash
+# Mirrors judge.md's "Docs-Only Fast Path" allowlist exactly (mirrored, not
+# shared — a divergence between the two copies is a visible drift, not a
+# silent gap; see test-docs-only-fast-path.sh which pins both).
+DOCS_FAST_PATH_ALLOWLIST=("WORK_LOG.md" "WORK_PLAN.md" "README.md")
+
+docs_only_fast_path_check() {
+  local file matched
+  local saw_any=0
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    saw_any=1
+    matched=0
+    for allowed in "${DOCS_FAST_PATH_ALLOWLIST[@]}"; do
+      if [ "$file" = "$allowed" ]; then
+        matched=1
+        break
+      fi
+    done
+    if [ "$matched" -ne 1 ]; then
+      echo "NOT ELIGIBLE: $file"
+      return 0
+    fi
+  done
+  if [ "$saw_any" -eq 0 ]; then
+    echo "NOT ELIGIBLE: empty file list"
+    return 0
+  fi
+  echo "ELIGIBLE"
+}
+
+# Plain `gh` — freshly fetched in THIS pass, same discipline as the evidence
+# read above.
+FAST_PATH_FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+FAST_PATH_RESULT=$(printf '%s\n' "$FAST_PATH_FILES" | docs_only_fast_path_check)
+
+if [ "$FAST_PATH_RESULT" = "ELIGIBLE" ]; then
+  echo "PASS (docs-only fast path, #6134): criterion #2 satisfied without axis judgment — changed files: $FAST_PATH_FILES"
+  # Use this as the ONE_LINE_RATIONALE in Step 2's pre-merge comment, e.g.
+  # "docs-only fast path (#6134): diff confined to WORK_LOG.md/WORK_PLAN.md/
+  # README.md, verified via the paginated files API". Continue to criterion
+  # #3 — do NOT evaluate the four-axis table below for this PR.
+fi
+```
+
+If `$FAST_PATH_RESULT` is anything other than `ELIGIBLE`, this PR is not
+fast-path eligible — fall through to the normal four-axis judgment below.
+
 **The four risk axes** — answer each; **any red answer holds the PR**:
 
 | Axis | Green (safe to auto-merge) | Red (hold for a human) |
@@ -289,6 +359,7 @@ gh pr view "$PR_NUMBER" --json comments --jq '.comments[] | select(.body | test(
 | **Revertability** | `git revert <squash-sha>` fully undoes the change: no data/schema migration, no published artifact, no state written outside the repo. | The change performs a one-way action when it runs (deletes branches/worktrees, rewrites installed files, publishes a release, migrates data, moves credentials), so reverting the commit does not undo the effect. |
 
 **Decision rule**:
+- Docs-only fast path found `ELIGIBLE` **and** no prior hold is still in force -> **PASS**, continue to criterion #3 — the axes are not judged for this PR (see "Docs-only fast path" above).
 - All four axes green **and** no prior hold is still in force -> **PASS**, continue to criterion #3.
 - All four axes green **but** the sticky-hold precheck found a hold still in force -> **HOLD** (skip silently; the axes do not get a vote here — see "Sticky holds" below).
 - Any axis red -> **HOLD** (see hold behavior below).
