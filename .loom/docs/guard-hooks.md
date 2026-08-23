@@ -389,6 +389,99 @@ LOOM_GUARD_REVERSIBLE_GH=1 gh pr close 42       # ASK
 LOOM_GUARD_REVERSIBLE_GH=0 gh issue close 100   # allowed
 ```
 
+### Cargo Clean Scope Guard (`guards.cargoCleanScope` / `LOOM_GUARD_CARGO_CLEAN`)
+
+A bare `cargo clean` looks like a local operation, but on a host whose
+`~/.cargo/config.toml` (or an ancestor `.cargo/config.toml`) sets a **shared**
+`build.target-dir` — e.g. routed to one directory on an external volume after
+the internal disk hit ENOSPC — it deletes the build output of **every project
+on that host**, including whatever sweep is compiling concurrently elsewhere
+(#6684, hit live on robb-studio 2026-08-21: a benchmarking script's `cargo
+clean` between timed builds collapsed a dozen unrelated crates mid-build with
+an error — `error writing dependencies to ... No such file or directory` —
+that names nothing about the real cause). The cost is "only" recompilation
+(build output is derived state), but it lands on unrelated in-flight work with
+no way to attribute it.
+
+`guard-destructive.sh` asks for confirmation on a bare, **unscoped** `cargo
+clean` only when the resolved `build.target-dir` is **outside** the current
+repo. `cargo clean -p <pkg>` / `--package <pkg>` (package-scoped) and a
+repo-local target dir are completely unaffected — no resolution is even
+attempted, so this adds zero friction to the common case.
+
+Detection reads cargo's own resolution precedence, not a config-file grep:
+
+1. A same-command `CARGO_TARGET_DIR=<value> cargo clean` assignment, or the
+   guard's own process `CARGO_TARGET_DIR` env var. Either form is always
+   treated as an explicit, deliberate scoping decision and **never asks**,
+   however it resolves — it is the exact fix the ask message itself
+   recommends, so treating it as unsafe would defeat its own purpose.
+2. `cargo config get build.target-dir` (best-effort; this cargo subcommand is
+   unstable on some toolchains, so a failure here is expected and silent).
+3. A manual walk-up from the command's cwd to the filesystem root looking for
+   `.cargo/config.toml` / `.cargo/config`, mirroring cargo's own ancestor
+   search — the closest ancestor that sets `build.target-dir` wins.
+4. `$CARGO_HOME/config.toml` (default `~/.cargo/config.toml`) as the final,
+   lowest-precedence fallback — the actual file the #6684 incident hit.
+5. Cargo's own default, `<repo>/target` — always in-repo, never asks.
+
+Only a target-dir resolved from steps 2-4 above (a **config**-derived value)
+is ever compared against the repo root; steps 1 and 5 never ask.
+
+That comparison resolves symlinks on **both** sides before deciding. The repo
+root comes from `git rev-parse --show-toplevel`, which always reports the
+symlink-resolved spelling, while a config-derived target-dir is built from the
+command's own cwd with symlinks intact — so a repo reached through a symlinked
+ancestor produced two different-looking strings for one directory and a
+genuinely repo-local target-dir read as "outside the repo". That is the
+**default** state of any `$TMPDIR`/`mktemp -d` repo on macOS, where `/var` is a
+symlink to `/private/var`. Both spellings must agree that the target-dir is
+outside the repo before the ask fires; the ask message still names the path as
+you configured it, not its resolved form.
+
+The cargo-clean-scope guard is **on by default**. It is resolved in this order
+(highest precedence first):
+
+1. **`LOOM_GUARD_CARGO_CLEAN` env var** — `0`/`false`/`no` disables the guard;
+   `1`/`true`/`yes` forces it on. Overrides the config value.
+2. **`.loom/config.json`** — `guards.cargoCleanScope` (default `true` when
+   absent). Set it to `false` to disable:
+   ```json
+   {
+     "guards": {
+       "cargoCleanScope": false
+     }
+   }
+   ```
+3. **Default** — `true` (guard on).
+
+The config read is best-effort: a missing, empty, or malformed
+`.loom/config.json` falls through to guard-ON and never causes the hook to
+exit non-zero.
+
+**Examples**:
+
+```bash
+# Repo-local target/ (or no .cargo/config.toml at all) — always allowed:
+cargo clean
+
+# .cargo/config.toml sets build.target-dir to a path outside the repo — ASKS:
+cargo clean
+# -> "target-dir is shared at '/Volumes/Stripe/cargo-target'; this clears
+#     every project on this host, including in-flight sweeps — use
+#     'cargo clean -p <pkg>' or set CARGO_TARGET_DIR"
+
+# Package-scoped clean — unaffected even with a shared target-dir:
+cargo clean -p mypkg
+
+# Explicit CARGO_TARGET_DIR override — unaffected even though it resolves
+# outside the repo, because it is a deliberate, visible-in-the-command choice:
+CARGO_TARGET_DIR=/tmp/scratch-target cargo clean
+
+# Disable for a whole repo whose shared target-dir is intentional:
+#   .loom/config.json  ->  { "guards": { "cargoCleanScope": false } }
+```
+
 ### Worktree Isolation Guard Opt-Out (`guards.worktreeIsolation` / `LOOM_GUARD_WORKTREE_ISOLATION`)
 
 `guard-worktree-paths.sh` (issue #4007) denies Edit/Write tool calls whose target resolves into the **main** repository checkout while a Loom-managed worktree exists (path-derived — see the guard inventory bullet above for the mechanism). This is the mechanical enforcement behind "never work on main branch": a builder that used a repo-relative path after a cwd reset, or that otherwise escaped its issue worktree, is denied instead of silently corrupting the main checkout.

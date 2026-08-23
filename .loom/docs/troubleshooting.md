@@ -69,6 +69,47 @@ behavior — a forge outage never blocks worktree creation. The #4823 in-flight
 case (remote branch exists, not yet merged, possibly diverged from base) is
 unaffected and still reused exactly as before.
 
+### `git push --force-with-lease` prints a rejection for a ref update that landed (#6695)
+
+On a repository using Git LFS, `git push --force-with-lease=<branch>:<old-sha>
+origin <branch>` can print a rejection —
+
+```
+! [rejected]        <branch> -> <branch> (stale info)
+error: failed to push some refs to '...'
+remote rejected ... is at <new-sha> but expected <old-sha>
+```
+
+— even though the ref update actually **landed** (confirmed by `git
+ls-remote` and the `origin/<branch>` reflog showing an `update by push`
+entry). Suspected cause: the **LFS pre-push hook** races the lease
+re-check — the hook uploads LFS objects and the ref update proceeds on the
+remote, while the printed rejection reflects a lease comparison read at a
+different (already-stale) moment. Both known occurrences were on branches
+with pending LFS objects to upload; a same-session push with nothing to
+upload did not exhibit it.
+
+**Do not treat this message as an automatic retry/re-rebase signal.** An
+agent that trusts the printed rejection alone may retry the push, re-rebase,
+or report failure against a ref that already moved — all of which turn a
+clean state into a confusing one. Before reacting to a `force-with-lease`
+rejection, check the *live* remote ref yourself:
+
+```bash
+git ls-remote origin "refs/heads/<branch>"   # compare against your local tip
+```
+
+If they already match, the push landed — do nothing further. Loom's own
+stacked-PR automation (`reconcile-stack.sh`, `rebase-stacked-children.sh`)
+performs exactly this check via the shared
+`defaults/scripts/lib/push-lease-verify.sh` helper
+(`push_landed_despite_rejection`) whenever a `--force-with-lease` push
+reports failure, and logs the condition with a greppable
+`PUSH-LEASE-RACE-DETECTED` marker so it is never silently folded into an
+ordinary failure. A genuine rejection (the ref really did not move) is still
+reported and handled as a failure — the check only reclassifies a reported
+rejection whose ref update is confirmed to have landed.
+
 ### Cleaning Up Stale Worktrees and Branches
 
 Use the `loom-clean` command to restore your repository to a clean state:
@@ -169,6 +210,59 @@ stands:
 So: build wherever you like, but **install** what you run — copy the binary to
 `~/.local/bin` (or a package path) and point the unit at that. `loom-daemon`
 itself was only ever immune to this by that accident of install location.
+
+### `.loom/logs/` retention (#6655)
+
+`.loom/logs/` has no bound of its own — every sweep writes its own per-issue
+log (`sweep-issue-<N>.log` from `claude-wrapper.sh`,
+`loom-daemon-sweep-issue-<N>-<ts>.log` from `loom-daemon`) directly into that
+directory, and nothing removed them before this. On a saturated fleet host
+this grows unbounded (one incident: 310 MB across 4,114 `.log` files, the
+oldest six months stale). `archive-logs.sh`'s own `--retention-days` (default
+7, invoked via `loom-daemon cleanup logs`) does **not** cover this — it only
+prunes its own dated `.loom/logs/YYYY-MM-DD/` archive subdirectories (task
+output archives + daemon-state snapshots), a different mechanism entirely.
+
+**`loom-clean` (and the scheduled `com.rjwalters.loom-fleet-clean` launchd
+job, which already runs it) now also prunes stale per-issue logs** as part of
+its normal "Cleaning Stale Logs" phase — no separate flag needed, and
+`--dry-run` lists what it would remove without deleting anything:
+
+```bash
+loom-clean --dry-run   # lists stale logs it would remove, alongside worktrees/branches
+loom-clean --force     # actually removes them
+```
+
+Only files directly under `.loom/logs/` whose name embeds an issue number
+(the `sweep-issue-<N>.log` / `loom-daemon-sweep-issue-<N>-<ts>.log` /
+`issue-<N>-<role>.log` conventions) are ever candidates — singleton
+accumulator logs with no issue number (`role-<name>.log`,
+`guard-decisions.log`, `hook-errors.log`, `daemon-start.log`,
+`main-quarantine.log`, `worktree-removals.log`, …) and anything under a
+subdirectory (`archive-logs.sh`'s own dated archives, `skill-router-seen/`,
+…) are never touched by this pass. A candidate log is removed only once ALL
+of:
+
+1. Its mtime is older than the retention window (below).
+2. Its issue has no live sweep right now (no `.loom/locks/issue-<N>/` claim
+   lock, no `.loom/spawn-loop-state.json` entry).
+3. Its issue has no `.loom/sweep-checkpoint/issue-<N>.json` — a resumable
+   sweep (even one not currently running) keeps its log regardless of age.
+
+**Retention window** — precedence **env > config > default (30 days)**:
+
+```jsonc
+// .loom/config.json
+{ "logs": { "retentionDays": 14 } }
+```
+
+```bash
+LOOM_LOGS_RETENTION_DAYS=14 loom-clean --dry-run
+```
+
+A non-positive or unparseable value at either tier is treated as absent (falls
+through to the next tier), never as "disable retention" — a config typo can
+never silently turn this pass into a no-op.
 
 **Backlog of pre-existing `[gone]` local branches (#4100)**: `merge-pr.sh` deletes
 the local feature branch for every PR it merges as of #4100, but repos that ran

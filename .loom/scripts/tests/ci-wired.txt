@@ -68,6 +68,7 @@ test-disk-headroom.sh
 test-docs-guide-lock.sh
 test-docs-only-fast-path.sh
 test-docs-worktree.sh
+test-filing-lock.sh
 test-fleet-check.sh
 test-fleet-send.sh
 test-forge-helpers.sh
@@ -101,6 +102,7 @@ test-install-stash-scope.sh
 test-install-sync-labels.sh
 test-judge-fallback-cap.sh
 test-judge-fanout-experiment.sh
+test-label-preflight.sh
 test-live-state-sandbox.sh
 test-locate-daemon-bin.sh
 test-loom-daemon-launchd-plist.sh
@@ -159,6 +161,7 @@ test-sweep-lease-fence-race.sh
 test-sweep-lease-renew.sh
 test-sweep-pr-mode.sh
 test-sweep-run-registry.sh
+test-sync-labels-check.sh
 test-sync-labels-repo-flag.sh
 test-urgent-flip-guard.sh
 test-verdict-staleness-guard.sh

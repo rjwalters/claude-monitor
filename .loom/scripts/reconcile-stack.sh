@@ -197,8 +197,20 @@ fi
 #    worktree the rebase ran in, so the current branch there is the child branch.
 info "Step 2/3: push --force-with-lease"
 if ! run "${GIT_C[@]}" push --force-with-lease; then
-    err "Force-with-lease push was rejected (someone else pushed to $CHILD_BRANCH). Fetch, review, and retry."
-    exit 2
+    # A reported rejection is not always a real one (#6695): Git LFS's
+    # pre-push hook can race the lease re-check on a branch with pending LFS
+    # objects, so the ref update lands while the printed rejection reflects a
+    # stale read. Verify the LIVE remote ref before trusting the reported
+    # failure — never a local remote-tracking ref, which is not re-fetched here.
+    PUSH_RACE_SHA="$("${GIT_C[@]}" rev-parse "$CHILD_BRANCH" 2>/dev/null || true)"
+    # shellcheck source=lib/push-lease-verify.sh
+    source "$SCRIPT_DIR/lib/push-lease-verify.sh"
+    if [[ "$DRY_RUN" != "true" ]] && push_landed_despite_rejection origin "$CHILD_BRANCH" "$PUSH_RACE_SHA" "${GIT_C[@]}"; then
+        warn "PUSH-LEASE-RACE-DETECTED: push --force-with-lease reported a rejection for '$CHILD_BRANCH', but origin already reflects the update ($PUSH_RACE_SHA) — likely the Git LFS pre-push hook racing the lease re-check (#6695). Treating as landed and continuing."
+    else
+        err "Force-with-lease push was rejected (someone else pushed to $CHILD_BRANCH). Fetch, review, and retry."
+        exit 2
+    fi
 fi
 
 # 3. Retarget the child PR's base to the default branch.

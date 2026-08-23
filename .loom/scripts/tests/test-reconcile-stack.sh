@@ -91,6 +91,7 @@ REMOTE=""
 MAIN=""
 GH_STUB_DIR=""
 GH_EDIT_LOG=""
+GIT_STUB_DIR=""
 
 git_q() { git -c advice.detachedHead=false -c protocol.file.allow=always "$@"; }
 
@@ -180,6 +181,34 @@ echo "stub gh: unhandled: \$*" >&2
 exit 3
 STUB
     chmod +x "$GH_STUB_DIR/gh"
+
+    # Stub `git` that transparently delegates to the REAL git for everything
+    # except a --force-with-lease push made while LOOM_TEST_FAKE_REJECT=1: in
+    # that one case it runs the real push (so the remote genuinely updates,
+    # exactly like the LFS-hook race in #6695), then discards the real exit
+    # code and prints a synthetic rejection instead — modeling a push that
+    # reports failure even though it landed.
+    GIT_STUB_DIR="$SANDBOX/gitbin"
+    mkdir -p "$GIT_STUB_DIR"
+    REAL_GIT="$(command -v git)"
+    cat > "$GIT_STUB_DIR/git" <<STUB
+#!/usr/bin/env bash
+REAL_GIT="$REAL_GIT"
+if [[ "\$1" == "push" && "\${LOOM_TEST_FAKE_REJECT:-0}" == "1" ]]; then
+    "\$REAL_GIT" "\$@"
+    rc=\$?
+    if [[ \$rc -eq 0 ]]; then
+        echo "To $REMOTE" >&2
+        echo " ! [rejected]        $CHILD_BR -> $CHILD_BR (stale info)" >&2
+        echo "error: failed to push some refs to '$REMOTE'" >&2
+        echo "remote rejected $CHILD_BR -> $CHILD_BR (is at deadbeefcafe but expected 0000000)" >&2
+        exit 1
+    fi
+    exit "\$rc"
+fi
+exec "\$REAL_GIT" "\$@"
+STUB
+    chmod +x "$GIT_STUB_DIR/git"
 }
 
 teardown_sandbox() {
@@ -196,8 +225,9 @@ run_reconcile() {
     RUN_RC=0
     RUN_OUT="$(
         cd "$cwd" &&
-        PATH="$GH_STUB_DIR:$PATH" \
+        PATH="$GIT_STUB_DIR:$GH_STUB_DIR:$PATH" \
         LOOM_DEFAULT_BRANCH="main" \
+        LOOM_TEST_FAKE_REJECT="${LOOM_TEST_FAKE_REJECT:-0}" \
         GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="protocol.file.allow" GIT_CONFIG_VALUE_0="always" \
         bash "$RECONCILE" "$CHILD_PR" "$PARENT_BR" 2>&1
     )" || RUN_RC=$?
@@ -258,6 +288,70 @@ assert_not_contains "$RUN_OUT" "still exists" \
 teardown_sandbox
 
 # ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "Scenario C: push --force-with-lease reports a rejection but the ref landed (#6695)"
+setup_sandbox
+
+# LOOM_TEST_FAKE_REJECT=1 makes the git stub run the REAL push (so origin
+# genuinely advances, exactly like the LFS pre-push hook race) and then
+# discard the real (successful) exit code in favor of a synthetic rejection —
+# modeling the observed failure mode.
+LOOM_TEST_FAKE_REJECT=1 run_reconcile "$MAIN"
+
+assert_eq "0" "$RUN_RC" \
+  "C: reconcile still exits 0 — the push-lease-verify check treats the landed ref as success"
+assert_contains "$RUN_OUT" "PUSH-LEASE-RACE-DETECTED" \
+  "C: the race is logged with the greppable PUSH-LEASE-RACE-DETECTED marker"
+assert_not_contains "$RUN_OUT" "Force-with-lease push was rejected (someone else pushed" \
+  "C: the reported rejection is NOT treated as an ordinary failure"
+
+# The remote must actually carry the rebased child tip — confirms the push
+# really did land, not just that the script decided to proceed anyway.
+LOCAL_CHILD_SHA="$(git_q -C "$MAIN" rev-parse "$CHILD_BR")"
+REMOTE_CHILD_SHA="$(git_q -C "$REMOTE" rev-parse "$CHILD_BR")"
+assert_eq "$LOCAL_CHILD_SHA" "$REMOTE_CHILD_SHA" \
+  "C: origin/$CHILD_BR actually equals the local child tip after the 'rejected' push"
+
+# The base retarget still ran (script proceeded past the false rejection).
+assert_contains "$(cat "$GH_EDIT_LOG")" "pr edit $CHILD_PR --base main" \
+  "C: child PR base still retargeted after the race was detected"
+
+teardown_sandbox
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo ""
+echo "Scenario D: push --force-with-lease is genuinely rejected (real conflicting push)"
+setup_sandbox
+
+# Simulate a concurrent pusher landing a DIFFERENT commit on the child branch,
+# directly against the bare remote, behind $MAIN's back (no fetch in $MAIN).
+CONFLICT_CLONE="$SANDBOX/conflict-clone"
+git_q clone --quiet "$REMOTE" "$CONFLICT_CLONE"
+git_q -C "$CONFLICT_CLONE" checkout -q "$CHILD_BR"
+echo "concurrent" > "$CONFLICT_CLONE/conflict.txt"
+git_q -C "$CONFLICT_CLONE" add conflict.txt
+git_q -C "$CONFLICT_CLONE" commit -q -m "concurrent push (not from \$MAIN)"
+git_q -C "$CONFLICT_CLONE" push -q origin "$CHILD_BR"
+
+# $MAIN's rebase in Step 1 still runs locally against its (stale) view, so the
+# subsequent --force-with-lease push genuinely conflicts with the real,
+# already-landed concurrent commit above — a TRUE rejection, not a race.
+run_reconcile "$MAIN"
+
+assert_eq "2" "$RUN_RC" "D: a genuine rejection still exits 2 (never treated as success)"
+assert_contains "$RUN_OUT" "Force-with-lease push was rejected (someone else pushed to $CHILD_BR)" \
+  "D: genuine rejection is reported as an ordinary failure"
+assert_not_contains "$RUN_OUT" "PUSH-LEASE-RACE-DETECTED" \
+  "D: a real rejection is never mislabeled as the race condition"
+# The concurrent pusher's commit remains on origin — $MAIN's push did not land.
+REMOTE_CHILD_SHA_D="$(git_q -C "$REMOTE" rev-parse "$CHILD_BR")"
+CONFLICT_SHA="$(git_q -C "$CONFLICT_CLONE" rev-parse "$CHILD_BR")"
+assert_eq "$CONFLICT_SHA" "$REMOTE_CHILD_SHA_D" \
+  "D: origin/$CHILD_BR still holds the concurrent commit, unaffected by the rejected push"
+
+teardown_sandbox
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Source guards: fail loudly if a refactor drops either fix.
 echo ""
 echo "Source guards on reconcile-stack.sh"
@@ -268,6 +362,10 @@ assert_contains "$src" "git -C" \
   "reconcile-stack.sh runs the rebase/push in the worktree via git -C"
 assert_contains "$src" "git ls-remote" \
   "reconcile-stack.sh uses a live ls-remote check for the stale-origin advisory"
+assert_contains "$src" "push_landed_despite_rejection" \
+  "reconcile-stack.sh verifies the actual remote ref state after a rejected --force-with-lease push (#6695)"
+assert_contains "$src" "PUSH-LEASE-RACE-DETECTED" \
+  "reconcile-stack.sh logs a greppable marker when a reported rejection is actually landed"
 
 # ─────────────────────────────────────────────────────────────────────────────
 echo ""

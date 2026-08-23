@@ -2247,6 +2247,120 @@ else
     fail "(#6499) the conflict-marker gate introduced friction on a clean tree (rc=$RC); out=$OUT"
 fi
 
+# --- forge label drift check + safe auto-create (#6716) ---------------------
+#
+# resync-installed.sh's new labels step is a thin dispatcher onto whatever
+# sync-labels.sh ends up installed at .loom/scripts/sync-labels.sh (via the
+# widened "walk scripts" resync exercised by earlier groups) -- it does not
+# re-derive drift/report semantics itself. So rather than re-proving
+# sync-labels.sh's own --check behavior (already covered end-to-end by
+# test-sync-labels-check.sh), these groups install a scriptable STUB as
+# defaults/scripts/sync-labels.sh and assert only on the WIRING: when the
+# stub is called, with/without --check, and how its exit code changes the
+# resync's own reporting and control flow.
+add_labels_stub() {
+    local repo="$1"
+    mkdir -p "$repo/.github"
+    cat > "$repo/.github/labels.yml" <<'EOF'
+- name: loom:issue
+  description: "Approved and ready for a Builder"
+  color: "3B82F6"
+EOF
+    cat > "$repo/defaults/scripts/sync-labels.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STUB_LOG:?STUB_LOG not set}"
+if printf '%s\n' "$*" | grep -q -- '--check'; then
+    exit "${LOOM_TEST_LABELS_CHECK_RC:-0}"
+fi
+exit "${LOOM_TEST_LABELS_SYNC_RC:-0}"
+STUB
+    chmod +x "$repo/defaults/scripts/sync-labels.sh"
+}
+
+echo "Test group 28: forge label check -- already in sync (#6716)"
+REPO="$(make_fixture)"
+add_labels_stub "$REPO"
+STUB_LOG="$WORKDIR/stub28.log"; : > "$STUB_LOG"
+OUT="$(cd "$REPO" && STUB_LOG="$STUB_LOG" LOOM_TEST_LABELS_CHECK_RC=0 bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -qi "unchanged.*forge labels" <<<"$OUT"; then
+    pass "(#6716) an in-sync live label set is reported unchanged"
+else
+    fail "(#6716) in-sync case not reported as unchanged (rc=$RC); out=$OUT"
+fi
+if [[ "$(grep -c -- '--check' "$STUB_LOG" || true)" -eq 1 && "$(wc -l < "$STUB_LOG")" -eq 1 ]]; then
+    pass "(#6716) in-sync case calls sync-labels.sh exactly once, with --check"
+else
+    fail "(#6716) unexpected sync-labels.sh invocation count/shape: $(cat "$STUB_LOG")"
+fi
+
+echo "Test group 28b: forge label check -- drift found, real run fixes it (#6716)"
+REPO="$(make_fixture)"
+add_labels_stub "$REPO"
+STUB_LOG="$WORKDIR/stub28b.log"; : > "$STUB_LOG"
+OUT="$(cd "$REPO" && STUB_LOG="$STUB_LOG" LOOM_TEST_LABELS_CHECK_RC=3 LOOM_TEST_LABELS_SYNC_RC=0 bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -qi "drift detected" <<<"$OUT" && grep -qi "updated.*forge labels" <<<"$OUT"; then
+    pass "(#6716) drift is reported and then fixed on a real run"
+else
+    fail "(#6716) drift-then-fix not reported as expected (rc=$RC); out=$OUT"
+fi
+if [[ "$(wc -l < "$STUB_LOG")" -eq 2 ]] && grep -q -- '--check' "$STUB_LOG" && grep -qv -- '--check' "$STUB_LOG"; then
+    pass "(#6716) a real run with drift calls sync-labels.sh twice: once with --check, once without"
+else
+    fail "(#6716) unexpected sync-labels.sh invocation shape for drift-then-fix: $(cat "$STUB_LOG")"
+fi
+
+echo "Test group 28c: forge label check -- drift found, --dry-run previews without fixing (#6716)"
+REPO="$(make_fixture)"
+add_labels_stub "$REPO"
+STUB_LOG="$WORKDIR/stub28c.log"; : > "$STUB_LOG"
+OUT="$(cd "$REPO" && STUB_LOG="$STUB_LOG" LOOM_TEST_LABELS_CHECK_RC=3 bash "$SCRIPT" --dry-run 2>&1)"
+if grep -qi "drift detected" <<<"$OUT" && grep -qi "would run.*sync-labels.sh" <<<"$OUT"; then
+    pass "(#6716) --dry-run previews the label fix instead of applying it"
+else
+    fail "(#6716) --dry-run did not preview the label fix as expected; out=$OUT"
+fi
+if [[ "$(wc -l < "$STUB_LOG")" -eq 1 ]] && grep -q -- '--check' "$STUB_LOG"; then
+    pass "(#6716) --dry-run calls sync-labels.sh only once (--check), never the mutating path"
+else
+    fail "(#6716) --dry-run made an unexpected sync-labels.sh call: $(cat "$STUB_LOG")"
+fi
+
+echo "Test group 28d: forge label check -- the fix itself fails -> loud warning, not a resync failure (#6716)"
+REPO="$(make_fixture)"
+add_labels_stub "$REPO"
+STUB_LOG="$WORKDIR/stub28d.log"; : > "$STUB_LOG"
+OUT="$(cd "$REPO" && STUB_LOG="$STUB_LOG" LOOM_TEST_LABELS_CHECK_RC=3 LOOM_TEST_LABELS_SYNC_RC=1 bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -qi "could not fully apply" <<<"$OUT"; then
+    pass "(#6716) a failed label fix is a loud warning, not a resync-wide failure"
+else
+    fail "(#6716) a failed label fix was not reported as a soft warning (rc=$RC); out=$OUT"
+fi
+
+echo "Test group 28e: forge label check -- the check itself errors -> loud warning, not a resync failure (#6716)"
+REPO="$(make_fixture)"
+add_labels_stub "$REPO"
+STUB_LOG="$WORKDIR/stub28e.log"; : > "$STUB_LOG"
+OUT="$(cd "$REPO" && STUB_LOG="$STUB_LOG" LOOM_TEST_LABELS_CHECK_RC=1 bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && grep -qi "skipped forge label" <<<"$OUT"; then
+    pass "(#6716) a --check lookup error is a loud warning, not a resync-wide failure"
+else
+    fail "(#6716) a --check lookup error was not reported as a soft warning (rc=$RC); out=$OUT"
+fi
+
+echo "Test group 28f: forge label check -- no .github/labels.yml -> silently skipped (#6716)"
+REPO="$(make_fixture)"
+OUT="$(cd "$REPO" && bash "$SCRIPT" 2>&1)"
+RC=$?
+if [[ $RC -eq 0 ]] && ! grep -qi "forge label" <<<"$OUT"; then
+    pass "(#6716) a repo with no .github/labels.yml is unaffected by the new step"
+else
+    fail "(#6716) a repo with no labels.yml unexpectedly mentioned forge labels (rc=$RC); out=$OUT"
+fi
+
 # --- summary -----------------------------------------------------------------
 echo ""
 echo "========================================"

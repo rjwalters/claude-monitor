@@ -41,6 +41,17 @@
 #   1 - Creation failed (message on stderr). A non-rate-limit failure is
 #       reported as-is and is NEVER retried over REST.
 #   2 - Invalid arguments.
+#  75 - DEFERRED (#6714): the machine-wide issue-filing lock could not be
+#       acquired within its bounded wait, so NOTHING WAS FILED. The caller
+#       should defer this filing burst to its next tick and try again. This is
+#       deliberately fail-SAFE rather than fail-open: filing unserialized is
+#       what corrupted five issue bodies on 2026-08-08 (see lib/filing-lock.sh).
+#
+# Serialization (#6714): every create goes through the machine-wide filing
+# lock, so two issue-creating agents -- in the SAME repo or in DIFFERENT ones,
+# which is the case #3707's documentation-only mitigation missed -- can never
+# interleave their `gh issue create` calls. See `lib/filing-lock.sh` for the
+# protocol, the tiers (host = hard, fleet = soft advisory), and the knobs.
 #
 # NOTE: this is GitHub-specific, like the other `*_rl_safe` helpers. On a
 # Gitea forge it exits 2 with a pointer to `gh`/`tea` -- Gitea does not have
@@ -51,9 +62,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck source=./lib/forge-helpers.sh
 source "$SCRIPT_DIR/lib/forge-helpers.sh"
+# shellcheck source=./lib/filing-lock.sh
+source "$SCRIPT_DIR/lib/filing-lock.sh"
 
 usage() {
-  sed -n '2,47p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '2,58p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 TITLE=""
@@ -134,6 +147,22 @@ on $FORGE_TYPE file the issue with your forge's own CLI (Gitea has no split \
 GraphQL/REST quota, so it has no equivalent failure mode)." >&2
   exit 2
 fi
+
+# --- #6714: serialize the actual filing ------------------------------------
+# The lock is taken as late as possible (after every argument/forge validation
+# above) and held for exactly the one create below, so a burst's serialization
+# window is as short as it can be while still being airtight. A role that wants
+# to hold it across an ENTIRE burst can source lib/filing-lock.sh itself and
+# acquire once — the lock is re-entrant, so the per-call acquire here becomes a
+# no-op inside that hold.
+_filing_lock_rc=0
+loom_filing_lock_acquire "${LOOM_FILING_LOCK_LABEL:-create-issue}" || _filing_lock_rc=$?
+if [[ "$_filing_lock_rc" -eq "$LOOM_FILING_LOCK_DEFER_RC" ]]; then
+  # Fail-SAFE: nothing was filed. The caller retries on its next tick.
+  exit "$LOOM_FILING_LOCK_DEFER_RC"
+fi
+# Release on every exit path, including a failed create or an interrupt.
+trap 'loom_filing_lock_release' EXIT INT TERM
 
 if ! forge_gh_create_issue_rl_safe "$REPO_NWO" "$TITLE" "$BODY" "${LABELS[@]+"${LABELS[@]}"}"; then
   exit 1

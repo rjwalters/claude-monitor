@@ -115,6 +115,12 @@ fi
 # shellcheck disable=SC1090
 source "$FUNCS_FILE"
 
+# push_landed_despite_rejection() is normally sourced by rebase-stacked-children.sh
+# itself from lib/push-lease-verify.sh (outside the extracted run()..main span
+# above) — source the real library directly so the extracted functions can call it.
+# shellcheck disable=SC1091
+source "$HELPERS_DIR/lib/push-lease-verify.sh"
+
 # --- Stub gh on PATH ---
 #   gh api repos/OWNER/REPO/issues/N   -> cat $STUB_DIR/issue-N.json (or {})
 #   gh pr list --base B ...            -> cat $STUB_DIR/prlist-<sanitized B>.json (or [])
@@ -162,6 +168,10 @@ chmod +x "$STUB_DIR/gh"
 #   git rebase --abort                     -> record + exit 0
 #   git rebase A B                         -> record + exit $LOOM_TEST_REBASE_EXIT (default 0)
 #   git push ...                           -> record + exit $LOOM_TEST_PUSH_EXIT (default 0)
+#   git rev-parse <ref>                    -> $STUB_DIR/rev-parse-sha (default "localsha123")
+#   git ls-remote <remote> refs/heads/<b>  -> "<sha>\trefs/heads/<b>" from
+#                                             $STUB_DIR/ls-remote-sha (absent -> nothing, i.e.
+#                                             the "ref not found / could not verify" case)
 #   (anything else)                        -> record + exit 0
 cat > "$STUB_DIR/git" <<'STUB'
 #!/usr/bin/env bash
@@ -182,6 +192,17 @@ case "$1" in
     exit "${LOOM_TEST_REBASE_EXIT:-0}"
     ;;
   push) exit "${LOOM_TEST_PUSH_EXIT:-0}" ;;
+  rev-parse)
+    f="$STUB_DIR_FROM_ENV/rev-parse-sha"
+    if [[ -f "$f" ]]; then cat "$f"; else echo "localsha123"; fi
+    exit 0
+    ;;
+  ls-remote)
+    branch="${!#}"
+    f="$STUB_DIR_FROM_ENV/ls-remote-sha"
+    if [[ -f "$f" ]]; then printf '%s\t%s\n' "$(cat "$f")" "$branch"; fi
+    exit 0
+    ;;
   *) exit 0 ;;
 esac
 STUB
@@ -209,6 +230,10 @@ write_prlist()   { printf '%s\n' "$2" > "$STUB_DIR/prlist-${1//\//_}.json"; }
 clear_prlist()   { rm -f "$STUB_DIR/prlist-${1//\//_}.json"; }
 mark_uptodate()  { echo 0 > "$STUB_DIR/ancestor-origin_${1//\//_}"; }  # parent tip IS ancestor
 clear_uptodate() { rm -f "$STUB_DIR/ancestor-origin_${1//\//_}"; }     # default: stale (exit 1)
+set_rev_parse_sha()  { printf '%s' "$1" > "$STUB_DIR/rev-parse-sha"; }
+clear_rev_parse_sha() { rm -f "$STUB_DIR/rev-parse-sha"; }
+set_ls_remote_sha()   { printf '%s' "$1" > "$STUB_DIR/ls-remote-sha"; }
+clear_ls_remote_sha() { rm -f "$STUB_DIR/ls-remote-sha"; }
 
 reset_state() {
     : > "$STUB_DIR/gh-calls.log"
@@ -217,6 +242,8 @@ reset_state() {
     RSC_FAILURE=0
     unset LOOM_TEST_REBASE_EXIT
     unset LOOM_TEST_PUSH_EXIT
+    clear_rev_parse_sha
+    clear_ls_remote_sha
 }
 read_gh()  { cat "$STUB_DIR/gh-calls.log" 2>/dev/null || true; }
 read_git() { cat "$STUB_DIR/git-calls.log" 2>/dev/null || true; }
@@ -303,6 +330,48 @@ assert_contains "$(read_git)" "git rebase --abort" \
   "(g) Rebase conflict -> conflicted rebase aborted so remaining children process"
 unset LOOM_TEST_REBASE_EXIT
 
+# (h) push --force-with-lease reports a rejection, but the live remote ref
+#     (git ls-remote) already matches the pushed local sha -> treated as a
+#     landed push despite the reported rejection (#6695), logged with the
+#     greppable PUSH-LEASE-RACE-DETECTED marker, RSC_FAILURE stays 0.
+reset_state
+export LOOM_TEST_PUSH_EXIT=1
+write_prlist "feature/issue-100" '[{"number":501,"headRefName":"feature/issue-201"}]'
+clear_uptodate "feature/issue-201"   # stale
+set_rev_parse_sha "sha-landed"
+set_ls_remote_sha "sha-landed"
+OUT_H_FILE="$(mktemp)"
+_rebase_stacked_children "feature/issue-100" >"$OUT_H_FILE" 2>&1
+OUT_H="$(cat "$OUT_H_FILE")"
+rm -f "$OUT_H_FILE"
+assert_eq "0" "$RSC_FAILURE" \
+  "(h) Push reports rejection but ref landed -> RSC_FAILURE stays 0"
+assert_contains "$OUT_H" "PUSH-LEASE-RACE-DETECTED" \
+  "(h) Landed-despite-rejection push logs the greppable PUSH-LEASE-RACE-DETECTED marker"
+assert_contains "$OUT_H" "Rebased child PR #501" \
+  "(h) Processing continues past the false rejection (still reports success)"
+unset LOOM_TEST_PUSH_EXIT
+
+# (i) push --force-with-lease reports a rejection AND the live remote ref does
+#     NOT match the pushed local sha -> a genuine rejection, reported as an
+#     ordinary failure (never mislabeled as the race condition).
+reset_state
+export LOOM_TEST_PUSH_EXIT=1
+write_prlist "feature/issue-100" '[{"number":501,"headRefName":"feature/issue-201"}]'
+clear_uptodate "feature/issue-201"   # stale
+set_rev_parse_sha "sha-local"
+set_ls_remote_sha "sha-someone-else-pushed"
+OUT_I_FILE="$(mktemp)"
+_rebase_stacked_children "feature/issue-100" >"$OUT_I_FILE" 2>&1
+OUT_I="$(cat "$OUT_I_FILE")"
+rm -f "$OUT_I_FILE"
+assert_eq "2" "$RSC_FAILURE" "(i) Genuine rejection -> RSC_FAILURE=2"
+assert_contains "$OUT_I" "force-with-lease push rejected for 'feature/issue-201'" \
+  "(i) Genuine rejection is reported as an ordinary failure"
+assert_not_contains "$OUT_I" "PUSH-LEASE-RACE-DETECTED" \
+  "(i) A real rejection is never mislabeled as the race condition"
+unset LOOM_TEST_PUSH_EXIT
+
 # --- Source-contains guards (fail if a refactor drops the key behavior) ---
 echo ""
 echo "Testing rebase-stacked-children.sh source guards..."
@@ -319,6 +388,12 @@ assert_contains "$src" "run git push --force-with-lease" \
   "safe path publishes with --force-with-lease (never bare --force)"
 assert_not_contains "$src" "gh pr edit" \
   "script never retargets the child PR base (stays stacked on the parent)"
+assert_contains "$src" "push_landed_despite_rejection" \
+  "script verifies the actual remote ref state after a rejected --force-with-lease push (#6695)"
+assert_contains "$src" "PUSH-LEASE-RACE-DETECTED" \
+  "script logs a greppable marker when a reported rejection is actually landed"
+assert_contains "$src" 'source "$SCRIPT_DIR/lib/push-lease-verify.sh"' \
+  "script sources the shared push-lease-verify helper"
 
 # --- Summary ---
 echo ""
