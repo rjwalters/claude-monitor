@@ -2461,6 +2461,22 @@ This is advisory-only. The script always exits `0` and **must not block** the sw
 
 If the check warns, the operator should refresh local `main` (and re-sync installed copies if their install flow does so) before relying on stacked-dependency or auto-reconcile behavior mid-sweep.
 
+**This check is pre-wave-only — it does not cover a subagent spawned mid-sweep
+(#6718).** It runs exactly once, before the first wave/dispatch, using a live
+`git fetch` at that moment. A Builder/Judge/Doctor child spawned later in the
+same run — potentially hours and many merges afterward — never re-triggers it,
+and that child's own session context still carries whatever git-status
+snapshot was captured when *its* session started. If that child's guidance
+leads it to reason about base-branch divergence (e.g. "are my worktrees
+branching from current work?"), it must run its own live check — this
+pre-wave result and the child's own session-start context are both stale by
+construction, not evidence about the present. See
+[`troubleshooting.md` → "The base-branch trap: a session-start git snapshot is
+not evidence about the present"](../../../.loom/docs/troubleshooting.md) for
+the three-ref live check every base-branch-trap mention must point to, and for
+why a reported divergence must carry the live command output that established
+it.
+
 ## Outstanding Quarantine Stashes (#5185)
 
 `check-main-clean.sh --quarantine` (see the Wave Lifecycle "Backstop" step above) rescues contamination it finds in the main worktree into a labeled `git stash` entry — `On <branch>: loom-quarantine: run=<RUN_ID> issue=<N>` — rather than discarding it. This is correct and loses no data, but the quarantine is otherwise recorded only in the structured `.loom/logs/main-quarantine.log` JSON log; nothing surfaces that a rescue stash is outstanding. A labeled stash can therefore sit indefinitely with nobody aware there is quarantined work to reconcile — noticed, if at all, only by chance (e.g. an unrelated command that happens to count stashes).

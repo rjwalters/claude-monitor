@@ -226,11 +226,17 @@ GH_STDERR="$(mktemp)"
 trap 'rm -f "$GH_STDERR" 2>/dev/null || true' EXIT
 
 # --- Step 1: current head SHA + current labels + open/closed state ----------
-# `state` and `merged` are fetched in the SAME call as the head SHA, not a
-# second round trip: the whole point is that the PR may finish between any two
-# reads, so the state must come from the same snapshot the SHA came from.
-PR_JSON="$(gh pr view "$PR" --json headRefOid,labels,state,merged 2>"$GH_STDERR")" || {
-  echo "ERROR: 'gh pr view $PR --json headRefOid,labels,state,merged' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
+# `state` is fetched in the SAME call as the head SHA, not a second round
+# trip: the whole point is that the PR may finish between any two reads, so
+# the state must come from the same snapshot the SHA came from. `merged` is
+# deliberately NOT requested here — real `gh pr view --json` rejects it as an
+# unknown field (it only exposes `mergedAt`/`closed`, not a `merged` boolean;
+# confirmed against gh 2.97.0/2.98.0). `state` alone already reports MERGED,
+# so nothing is lost. Any `.merged` read below is defensive only, for a
+# hypothetical forge shim that emits REST-shaped JSON with a literal `merged`
+# key; on real `gh` output it is simply absent.
+PR_JSON="$(gh pr view "$PR" --json headRefOid,labels,state 2>"$GH_STDERR")" || {
+  echo "ERROR: 'gh pr view $PR --json headRefOid,labels,state' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
   exit 1
 }
 
@@ -290,9 +296,14 @@ PR_STATE_UC="$(printf '%s' "$PR_STATE" | tr '[:lower:]' '[:upper:]')"
 PR_MERGED="$(jq -r 'if (.merged // false) then "true" else "false" end' <<<"$PR_JSON" 2>/dev/null || true)"
 
 if [[ "$PR_MERGED" == "true" || ( -n "$PR_STATE_UC" && "$PR_STATE_UC" != "OPEN" ) ]]; then
-  NOT_OPEN_WHAT="merged"
-  if [[ "$PR_MERGED" != "true" ]]; then
-    NOT_OPEN_WHAT="closed without merging"
+  # Real `gh pr view --json state` reports MERGED directly, so prefer it over
+  # PR_MERGED for the human-readable distinction — PR_MERGED is permanently
+  # "false" on real gh output now that `merged` is no longer a requested
+  # field (see the Step 1 comment above), so keying off it alone would
+  # mislabel every real merge as "closed without merging".
+  NOT_OPEN_WHAT="closed without merging"
+  if [[ "$PR_MERGED" == "true" || "$PR_STATE_UC" == "MERGED" ]]; then
+    NOT_OPEN_WHAT="merged"
   fi
   emit "NOT_OPEN" "PR is $NOT_OPEN_WHAT (state=${PR_STATE:-unknown}, merged=$PR_MERGED) — verdict labels are never rewritten on a finished PR" \
     "$HEAD_SHA" "$(current_verdict_label)" "" 0 0

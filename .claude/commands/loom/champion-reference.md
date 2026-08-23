@@ -166,6 +166,14 @@ fi
 
 **Action** (single authoritative policy — implemented in `champion-pr-merge.md` → "PR Rejection Workflow → Stale PR"): post the stale notice **once**, guarded by an idempotency marker (`<!-- champion:stale-pr-notice -->`) so the 10-minute cron does not spam the PR, and **swap `loom:pr` → `loom:changes-requested`** to route the PR to Doctor for a rebase/refresh. This removes `loom:pr` (unlike the transient-failure path, which keeps it), because a stale PR cannot clear itself and must leave the auto-merge queue. See `champion-pr-merge.md` for the exact commands.
 
+**A merge-risk hold does not exempt a PR from this (#6720).** The route fires
+from a held state too — it is the only automated path from `loom:pr` to Doctor,
+and gating it behind the hold left 20 of 21 held PRs conflicting with Doctor's
+queue empty. On the held variant the `champion:merge-risk-hold` marker is
+**preserved** and `loom:operator` is **kept** (the human merge decision is still
+outstanding); on the unheld variant `loom:operator` is cleared as before
+(#5802). See `champion-pr-merge.md` → "Held-PR Health Pass".
+
 ---
 
 ### Edge Case 5b: Doctor-Cycle-Capped PR (`loom:blocked` + `loom:changes-requested`)

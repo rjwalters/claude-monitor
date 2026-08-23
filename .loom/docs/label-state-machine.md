@@ -82,6 +82,40 @@ A human can also clear `loom:operator` directly at any time by removing the
 label — the automated exit rule above is the *default* path, not the only
 one.
 
+### The stale-PR route out of `loom:pr` (#5802, narrowed by #6720)
+
+Champion's stale-PR policy swaps `loom:pr` → `loom:changes-requested` on a PR
+untouched for 24h, so it reaches Doctor for a rebase. That route now fires from
+a **held** state too — before #6720 the sticky-hold bail-out ran first and
+dropped the PR from the pass entirely, so the only automated path from `loom:pr`
+to Doctor was unreachable for exactly the PRs that most needed it (measured:
+21 held PRs, 20 `CONFLICTING`, Doctor's queue empty).
+
+`loom:operator` behaves differently on the two variants, and the split is a
+consequence of the exit rule above rather than an exception to it — the question
+is only whether the human-needed condition is *resolved* by the departure:
+
+| Stale departure to Doctor | `loom:operator` | Rationale |
+|---|---|---|
+| No hold in force (#5802) | **Removed** | Nothing outstanding requires a human; the label was never applied in the first place, so the removal is a no-op. |
+| Hold in force (#6720) | **Kept** | The hold is unresolved and the PR is expected to return still needing a human merge decision. Clearing it would assert "no human is needed" for the whole Doctor round-trip, which is false. |
+
+Keeping the label on that route is safe precisely because of `loom:operator`'s
+defining property — it is re-evaluable and **must never cause an item to be
+skipped**. The consumers confirm it: Doctor's `loom:changes-requested` queue
+excludes `loom:blocked` / `loom:operator-only`, not `loom:operator`; Judge does
+not filter on it; sweep C1c's exclusion (#6398) is a *merge*-route skip, which
+is what the hold wants; and `verdict-staleness-guard.sh` declines to un-park it
+(#5686). Doctor's *Priority 1* queue does exclude `loom:operator` (#5978, so
+autonomous work never force-pushes a held PR), but that queue is `loom:pr`-scoped
+and the routed PR has just left it.
+
+The `champion:merge-risk-hold` marker comment is **preserved** across this
+round-trip. Doctor's rebase is a genuine release *signal* (the diff moved, so the
+axes are re-judged), but the *record* of the hold must survive — it is what keeps
+`PRIOR_HOLD=true`, and therefore keeps Step 2's hold-reversal comment mandatory
+if the PR later merges. A rebase must not launder a held PR into an unheld one.
+
 ## Current implementation
 
 Only the Champion merge-risk-hold entry/exit pair is wired today:
@@ -93,6 +127,10 @@ Only the Champion merge-risk-hold entry/exit pair is wired today:
   non-empty `$HOLD_REVERSAL_BLOCK` built by the release precheck (`gh pr edit
   ... --remove-label loom:operator`, posted alongside the
   `champion:merge-risk-hold-cleared` marker).
+- **Conditional exit** — the same file's "PR Rejection Workflow → Stale PR"
+  block, which removes the label only when no hold is in force
+  (`MERGE_BLOCKED_BY_HOLD != true`) and keeps it otherwise; see "The stale-PR
+  route out of `loom:pr`" above (#5802 / #6720).
 
 Both reuse the single release precheck at `champion-pr-merge.md` ("Sticky
 holds — a hold does NOT clear on a re-read alone") rather than re-deriving

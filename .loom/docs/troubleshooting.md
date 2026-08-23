@@ -1665,6 +1665,78 @@ disabled — this knob can never block or fail a sweep.
   not reliable, per the incident above), it only stops re-printing an
   already-evaluated warning on every run.
 
+### The base-branch trap: a session-start git snapshot is not evidence about the present (#6718)
+
+**Every agent session's context includes a git status block captured once, at
+session start, and explicitly labelled as a point-in-time snapshot — it does
+not update as the session runs.** This is the harness's own environment
+context, not something any Loom role prompt injects or can suppress. Over a
+long sweep — which by construction runs for hours and merges many PRs — that
+block drifts arbitrarily far from reality: every merge the sweep performs
+moves the default branch out from under it. An agent primed by role guidance
+to watch for **the base-branch trap** (local default branch diverged from
+`origin`, starving new worktrees of recently-merged work — see "Main Branch
+Freshness (#3770)" in `sweep.md`) but holding only that stale snapshot has no
+reason to distrust it: it reports a confident, plausible, and **wrong**
+divergence. This happened twice independently in one session (#6718) — both
+reports cited the exact commit SHA present at the parent session's start,
+hours after several merges had already moved `origin`'s default branch past
+it, with local, remote-tracking, and the forge's own view all agreeing on the
+newer SHA once actually checked.
+
+The false positive is more expensive than a missed one: an agent that believes
+the base branch is starved reasonably refuses to dispatch, escalates to the
+operator, or attempts a corrective push — all three are wrong against a branch
+that is already current, and each has to be disproved by hand before the sweep
+can continue.
+
+**Any role guidance that mentions the base-branch trap (or any other
+long-running check of "is my repository fact still current") must say two
+things, not one:**
+
+1. **Branch state must be read with a live command at the moment of the
+   check** — never inferred from a `git status`/`git log` block already
+   sitting in context, however recent it looks. A block captured at session
+   start is a snapshot of that moment, not a fact about now, and nothing
+   refreshes it for the rest of the session.
+2. **The check must compare three refs, not one, and all three must agree**
+   before concluding the branch is current:
+   - the **local branch** (`git rev-parse <branch>` / `git log -1 <branch>`,
+     run now, not recalled),
+   - the **remote-tracking ref, after an explicit `git fetch`** (a
+     remote-tracking ref you didn't just fetch is a second stale snapshot,
+     not a live fact), and
+   - **the forge's own view** — `gh api repos/<owner>/<repo>/branches/<branch>`
+     or `gh repo view --json defaultBranchRef` for default-branch freshness,
+     `gh pr view`/`gh pr list` for a PR branch — the one source not subject to
+     local clock or fetch skew.
+
+   `./.loom/scripts/check-main-freshness.sh` already performs exactly this
+   bounded fetch-and-compare for the sweep-preflight instance of this check
+   (see "Main Branch Freshness (#3770)" in `sweep.md`) — reach for it, or its
+   pattern, rather than hand-rolling a weaker one-ref comparison. It is
+   **pre-wave-only**: it runs once before the first wave/dispatch and does not
+   re-fire for a Builder/Judge/Doctor subagent spawned mid-sweep, potentially
+   hours and many merges later — that subagent must run its own live check
+   before treating anything about branch freshness as established, not trust
+   the pre-wave result or its own session-start context.
+3. **A reported divergence must carry the live command output that
+   established it** — paste the actual `git fetch` + ref comparison (or
+   `check-main-freshness.sh`'s own output) into the report, not just the
+   conclusion. This lets a downstream orchestrator or human tell a
+   freshly-derived finding apart from one recalled from stale context, without
+   re-deriving it themselves.
+
+This generalizes beyond branch state: any long-running role that reasons about
+a repository fact captured once at session start (a worktree's HEAD, a PR's
+mergeability, a label set) is exposed to the identical failure — branch
+divergence is simply where Loom's own guidance happens to prime agents to look
+hardest. Because the stale snapshot is harness-injected context rather than
+something a role `.md` file adds, no role brief can opt out of *receiving* it;
+the only lever available at the role-prompt layer is strengthening the
+guidance above so agents distrust it by default, which is why it is written
+here once and pointed to, rather than restated per role.
+
 ### Keeping installed `.loom/` copies fresh after a pull (#3770 detect → #3777/#4239 resync)
 
 The installed Loom surfaces the harness actually executes/reads are synced from

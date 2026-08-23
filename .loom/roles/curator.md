@@ -276,6 +276,16 @@ be careful:
 > 2. Read dependency files from `origin/main` directly (`git show origin/main:path/to/file`) rather than the local checkout, which may pre-date sibling merges in the same /sweep session.
 > 3. If your verification finds that "Phase N didn't deliver X", explicitly check whether X is on `origin/main` before filing it as a blocker.
 
+This is the same discipline the base-branch trap requires: a fact about the
+repository read once at session start (your local checkout, or anything in
+your own context) is a snapshot, not a live fact, and drifts further from
+reality the longer a sweep runs. See [`troubleshooting.md` → "The base-branch
+trap: a session-start git snapshot is not evidence about the
+present"](../../../.loom/docs/troubleshooting.md) for the general form of this check
+(three refs that must agree: local, remote-tracking after an explicit fetch,
+and the forge's own view) and why a reported divergence should carry the live
+command output that established it.
+
 ### Priority 2: Triage & Unlabeled Issues (Fallback)
 
 If no Priority 1 issues exist, find issues awaiting enhancement. The intake label

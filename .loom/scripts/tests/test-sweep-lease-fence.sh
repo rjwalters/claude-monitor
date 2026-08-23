@@ -11,8 +11,11 @@
 #
 # Covers:
 #   (a) fresh lease owned by this sweep's own host -> PASS (exit 0)
-#   (b) expired lease (age > ttl) -> ABORT EXPIRED (exit 3)
+#   (b) expired lease, owned by THIS sweep's own host -> ABORT EXPIRED (exit 3)
 #   (c) fresh lease owned by a DIFFERENT host -> ABORT SUPERSEDED (exit 4)
+#   (r) expired lease owned by a DIFFERENT host (an abandoned, never-yielded
+#       peer lease, #6783) -> PASS, not ABORT (exit 0) -- distinguishes this
+#       from (b): only an EXPIRED lease that is also THIS sweep's OWN aborts
 #   (d) no lease comment at all -> PASS, fail-open (exit 0)
 #   (e) a lease comment whose marker fails to parse -> PASS, fail-open
 #   (f) a `gh api` fetch failure -> PASS, fail-open
@@ -187,9 +190,27 @@ cat > "$STUB_DIR/comments.json" <<'JSON'
 ]
 JSON
 LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
-assert_eq "3" "$RC" "(b) expired lease -> exit 3 (ABORT EXPIRED)"
+assert_eq "3" "$RC" "(b) expired lease, owned by THIS sweep's own host -> exit 3 (ABORT EXPIRED)"
 assert_contains "$ERR" "ABORT: EXPIRED" "(b) stderr distinguishes EXPIRED from SUPERSEDED"
 assert_contains "$ERR" "2026-08-15T15:30:00Z" "(b) stderr includes the observed lease timestamp"
+
+# --- (r) expired lease owned by a DIFFERENT, now-abandoned host -> PASS,
+# NOT ABORT (#6783). Reproduces the #6694/PR #6773 incident shape: the
+# freshest (and only) lease record belongs to a different, dead host and is
+# well past the TTL -- with no live competitor, this must no longer
+# permanently fence out this (successor) sweep's push/PR-open.
+reset_state
+cat > "$STUB_DIR/comments.json" <<'JSON'
+[
+  {"id": 1, "updated_at": "2026-08-15T15:30:00Z", "body": "<!-- loom:lease host=dead-host sweep=sweep-issue-6694-1787458405 -->\nprose"}
+]
+JSON
+LOOM_LEASE_FENCE_NOW="$NOW_EPOCH" run_script check 6309 --host studio-host
+assert_eq "0" "$RC" "(r) expired lease owned by a DIFFERENT host -> exit 0 (PASS, not ABORT -- #6783)"
+assert_contains "$ERR" "PASS" "(r) stderr reports a PASS, not an ABORT"
+assert_contains "$ERR" "EXPIRED" "(r) stderr still names the EXPIRED condition it is passing through"
+assert_contains "$ERR" "dead-host" "(r) stderr names the abandoned lease's owning host"
+assert_contains "$ERR" "DIFFERENT host" "(r) stderr explains why this expired lease is not fenced against"
 
 # --- (c) fresh lease owned by a DIFFERENT host -> ABORT SUPERSEDED --------
 reset_state

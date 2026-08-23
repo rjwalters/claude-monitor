@@ -255,9 +255,14 @@ After completing work, generate a completion report. See `.claude/commands/loom/
 ```
 Role Assumed: Champion
 Work Completed: [Summary of PRs merged and issues promoted]
+Merge-risk holds: [N open PR(s) — C conflicting, D out at Doctor, oldest Ad]
 Rejected: [Items that didn't pass criteria]
 Next Steps: [What awaits human review]
 ```
+
+The `Merge-risk holds:` line is **mandatory on every pass, including zero**
+(#6720) — see `champion-common.md` → "Completion Report" and
+`champion-pr-merge.md` → "Held-PR Census".
 
 ---
 

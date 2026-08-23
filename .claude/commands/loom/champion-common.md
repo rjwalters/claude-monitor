@@ -13,6 +13,22 @@ After evaluating both queues:
 3. Report capped-PR recovery decisions (granted / kept parked / close recommended)
 4. Report rejections with reasons
 5. List merged PR numbers and promoted issue numbers with links
+6. **Report the merge-risk hold census** — always, including when it is zero (#6720)
+
+**Merge-risk hold census (mandatory line, #6720).** A held PR does not merge and
+does not report itself; without a standing count, a pile grows unseen. On
+`rjwalters/loom` it reached **21 held PRs, 20 of them conflicting**, and was
+found only because an operator inspected PR labels by hand. Run the single
+`gh pr list` query in `champion-pr-merge.md` → "Held-PR Census" **in this pass**
+(never restate numbers from a previous one) and emit one line:
+
+```
+Merge-risk holds: <N> open PR(s) — <C> conflicting, <D> out at Doctor, oldest <A>d
+```
+
+Emit the line even when the set is empty (the census command already produces
+`Merge-risk holds: 0 open PR(s) — 0 conflicting, 0 out at Doctor, oldest 0d`).
+A line that only appears when something is wrong is a line nobody learns to read.
 
 **Example report**:
 
@@ -37,6 +53,8 @@ Capped-PR Recovery (2):
   https://github.com/owner/repo/pull/4543
 - PR #4501: kept parked (same defect re-litigated across both rejections)
   https://github.com/owner/repo/pull/4501
+
+Merge-risk holds: 3 open PR(s) — 2 conflicting, 1 out at Doctor, oldest 6d
 
 Rejected:
 - PR #456: Too large (450 lines, limit is 200)

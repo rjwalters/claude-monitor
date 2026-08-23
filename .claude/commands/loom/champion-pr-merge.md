@@ -361,8 +361,8 @@ fast-path eligible — fall through to the normal four-axis judgment below.
 **Decision rule**:
 - Docs-only fast path found `ELIGIBLE` **and** no prior hold is still in force -> **PASS**, continue to criterion #3 — the axes are not judged for this PR (see "Docs-only fast path" above).
 - All four axes green **and** no prior hold is still in force -> **PASS**, continue to criterion #3.
-- All four axes green **but** the sticky-hold precheck found a hold still in force -> **HOLD** (skip silently; the axes do not get a vote here — see "Sticky holds" below).
-- Any axis red -> **HOLD** (see hold behavior below).
+- All four axes green **but** the sticky-hold precheck found a hold still in force -> **HOLD the merge** (silently; the axes do not get a vote here — see "Sticky holds" below). The PR is **not** dropped from this pass: continue to the **Held-PR Health Pass** (#6720).
+- Any axis red -> **HOLD the merge** (see hold behavior below), then continue to the **Held-PR Health Pass** (#6720).
 - **Unsure on any axis -> HOLD.** Conservative bias: a held PR costs one human merge; a bad auto-merge costs a revert on `main`.
 - Merging a PR that ever carried a hold marker -> **PASS + mandatory reversal comment** (Step 2 must state what changed; see "Sticky holds").
 
@@ -390,6 +390,13 @@ block Step 2 is required to post):
 ```bash
 PR_NUMBER=<number>
 HOLD_MARKER="<!-- champion:merge-risk-hold -->"
+
+# Reset per PR, FIRST thing in the precheck (#6720). In the batch loop this
+# flag decides whether the Held-PR Health Pass runs and whether the stale
+# route keeps `loom:operator` — leaking a `true` from the previous PR would
+# silently mis-route the next one. Re-initialize it for every PR, never once
+# per pass.
+MERGE_BLOCKED_BY_HOLD=false
 
 # Plain `gh` — NOT "$GH_READ". This read gates the merge (see "Cached forge
 # reads"): a cached answer can miss both the hold and the push/comment that
@@ -499,9 +506,16 @@ else
 fi
 
 if [ "$PRIOR_HOLD" = true ] && [ -z "$RELEASE_REASON" ]; then
+  MERGE_BLOCKED_BY_HOLD=true
   echo "STICKY HOLD: #$PR_NUMBER was held at $HOLD_AT and nothing has changed since — not merging"
   # Post NOTHING (the hold notice is already on the PR — see Hold behavior's
-  # idempotency guard) and skip this PR for this pass, whatever the axes say.
+  # idempotency guard) and do NOT merge this PR this pass, whatever the axes say.
+  #
+  # #6720: do NOT `continue` / drop the PR here. A hold governs *merging*, not
+  # *health reporting* — criteria #4 (conflict), #5 (recency) and #6 (CI) are
+  # mechanical states with their own automated remedies and MUST still be
+  # evaluated. Fall through to "Held-PR Health Pass" below; only criterion #3
+  # and Steps 2-3 (comment + merge) are skipped.
 fi
 ```
 
@@ -510,9 +524,9 @@ fi
 | Precheck result | What criterion #2 does |
 |---|---|
 | `PRIOR_HOLD=false` | Judge the four axes normally. No behavior change from before #4742. |
-| `PRIOR_HOLD=true`, no `RELEASE_REASON` | **HOLD, silently.** Skip the PR for this pass regardless of how the axes read this tick. No comment (anti-spam guard already covers it). |
+| `PRIOR_HOLD=true`, no `RELEASE_REASON` | **HOLD the merge, silently.** The PR is not merged this pass regardless of how the axes read this tick, and no comment is posted (anti-spam guard already covers it). It is **not** skipped, though: `MERGE_BLOCKED_BY_HOLD=true` routes it to the **Held-PR Health Pass** (#6720), which still evaluates criteria #4/#5/#6. |
 | `PRIOR_HOLD=true`, released by `loom:auto-merge-ok` (`HOLD_OVERRIDE=true`) | Criterion #2 **PASS** by override — the axes are not re-scored. Continue to #3. Step 2's reversal block is **mandatory**. |
-| `PRIOR_HOLD=true`, released by (b), (c), or (d) | Re-judge the four axes normally. Still red -> hold persists, skip silently. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. |
+| `PRIOR_HOLD=true`, released by (b), (c), or (d) | Re-judge the four axes normally. Still red -> the hold persists: the re-hold is silent (the notice's idempotency guard already covers it), `MERGE_BLOCKED_BY_HOLD=true`, and the **Held-PR Health Pass** runs. Now green -> **PASS**, continue to #3, and Step 2's reversal block is **mandatory**. |
 
 **Once released, stays released.** A release signal is consumed by the change
 itself, not by a counter: after a new commit lands, later ticks keep seeing
@@ -638,7 +652,12 @@ fi
 # (loom:auto-merge-ok / operator comment / new push / new Judge review, all
 # above) can still fire and clear it. Never applied in place of loom:pr.
 gh pr edit "$PR_NUMBER" --add-label "loom:operator" 2>/dev/null || true
-# Skip this PR for this pass — do not merge.
+
+# Do NOT merge this PR this pass. But do NOT drop it from the pass either
+# (#6720): a hold blocks the merge, it does not suspend the mechanical health
+# criteria. Mark it and fall through to the "Held-PR Health Pass" below, which
+# runs criteria #4/#5/#6 for reporting and routing.
+MERGE_BLOCKED_BY_HOLD=true
 ```
 
 The concern must be **specific and falsifiable**. Good: *"touches `merge-pr.sh`'s ordering guard — a regression there can delete a worktree branch before the merge lands"*. Bad: *"large PR"*, *"seems risky"*, *"too many lines changed"*.
@@ -824,6 +843,11 @@ echo "PASS: No merge conflicts"
 
 **Rationale**: Conflicting PRs require human resolution before merging
 
+**This criterion runs even when the merge is blocked by a hold (#6720).** A held
+PR that drifts into `CONFLICTING` is a *mechanical* state, not a hold condition
+— see "Held-PR Health Pass" below for the idempotent conflict notice it must
+produce. Never let a hold be the reason a conflict goes unreported.
+
 ### 5. Recency Check
 - [ ] PR updated within last 24 hours
 
@@ -856,6 +880,12 @@ echo "PASS: Recently updated ($HOURS_AGO hours ago)"
 **Rationale**: Ensures PR reflects recent state of main branch and hasn't gone stale.
 
 **On failure**: a stale PR is handled by the dedicated stale-PR policy (see "PR Rejection Workflow → Stale PR"), not the transient-failure path — it is commented once (idempotently) and routed out of the queue via `loom:pr` → `loom:changes-requested` so it reaches Doctor rather than being re-commented every cron tick.
+
+**This criterion runs even when the merge is blocked by a hold (#6720)**, and the
+stale route fires from a held state too — it is the *only* automated path from
+`loom:pr` to Doctor, so gating it behind the hold is what let held PRs rot for
+days (20 of 21 held PRs `CONFLICTING`, Doctor's queue empty). The stale-PR block
+below is hold-aware: it preserves the hold marker and keeps `loom:operator`.
 
 ### 6. CI Status Check
 - [ ] If CI checks exist, all checks must be passing
@@ -968,11 +998,226 @@ echo "PASS: All CI checks passing"
 
 ---
 
+## Held-PR Health Pass (#6720)
+
+**A merge-risk hold governs *merging*. It does not suspend *health reporting*.**
+
+Before this section existed, a hold was a one-way door: criterion #2's
+sticky-hold bail-out dropped the PR from the pass entirely, so criteria #4
+(conflict), #5 (recency) and #6 (CI) were **never evaluated on a held PR**.
+Because criterion #5's stale route is the *only* automated path from `loom:pr`
+to `loom:changes-requested` — i.e. the only way a `loom:pr` PR ever reaches
+Doctor — a held PR could not self-heal and nothing ever said so. Measured on
+`rjwalters/loom` (2026-08-22): **21 open PRs carried `loom:pr` + `loom:operator`
+and 20 of the 21 were `CONFLICTING`**, two of them untouched for 63 hours, while
+Doctor's `loom:changes-requested` queue was **empty**. Every one of those holds
+was *correct*; what was wrong is that a correct hold also disabled the unrelated
+machinery that keeps a PR healthy while it waits.
+
+### When this pass runs
+
+Whenever `MERGE_BLOCKED_BY_HOLD=true` — set by criterion #2 on **either** hold
+outcome:
+
+- the **sticky** hold (`PRIOR_HOLD=true`, no `RELEASE_REASON`), and
+- a **fresh** hold posted this tick (any red axis, or "unsure on any axis").
+
+Both block the merge identically, so both get the health pass identically. Do
+not implement this for the sticky case only — a first-tick hold rots exactly the
+same way.
+
+### What runs, and what does not
+
+| Criterion | Under a hold | Why |
+|---|---|---|
+| #1 Label check | Already ran (it gates entry to #2) | — |
+| #2 Merge-risk judgment | **Held** — this is the block | The hold itself |
+| #3 Critical-file exclusion | **Skipped** | Pure merge gate: it has no remedy and no routing consequence, so evaluating it under a hold would only burn a paginated file read |
+| #4 Merge conflict | **Runs** | Mechanical state with a remedy (rebase); must be surfaced |
+| #5 Recency | **Runs** | Mechanical state with a remedy (route to Doctor); the only automated exit from `loom:pr` |
+| #6 CI status | **Runs** | Mechanical state; a held PR whose CI broke underneath it must not do so silently |
+| Step 2 / Step 3 (pre-merge comment + merge) | **Skipped** | The PR is not merging this pass |
+
+Evaluate #4, then #5, then #6 — in that order, so the conflict diagnosis is on
+the PR before the routing decision that acts on it.
+
+### #4 under a hold — surface the conflict, idempotently
+
+```bash
+PR_NUMBER=<number>
+# Plain `gh` — the same live read criterion #4 already performs.
+MERGEABLE=$(gh pr view "$PR_NUMBER" --json mergeable --jq '.mergeable')
+
+if [ "$MERGEABLE" = "CONFLICTING" ] && [ "${MERGE_BLOCKED_BY_HOLD:-false}" = true ]; then
+  CONFLICT_MARKER="<!-- champion:held-pr-conflict-notice -->"
+  # Idempotency guard — same discipline as the hold / stale-PR / verdict-janitor
+  # notices: one comment per conflict episode, not one per 10-minute tick.
+  # `startswith`, not a bare substring match (#5371): a later comment quoting
+  # this marker in prose must never suppress the real notice.
+  # Cached ("$GH_READ") — a marker grep only answers "did I already post this?".
+  if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$CONFLICT_MARKER\"))")" = "true" ]; then
+    echo "Held-PR conflict notice already posted for #$PR_NUMBER — skipping"
+  else
+    gh pr comment "$PR_NUMBER" --body "$CONFLICT_MARKER
+**Champion: Held PR Has Drifted Into Conflict**
+
+This PR is on a merge-risk hold (see the \`champion:merge-risk-hold\` notice above) **and** \`main\` has since moved: \`mergeable\` now reads \`CONFLICTING\`.
+
+The hold is unchanged and still governs the merge — this notice reports *health*, not permission. It is posted so the conflict is visible without anyone enumerating \`mergeable\` by hand.
+
+**What happens next, without any human action:**
+- The hold keeps binding; Champion will not auto-merge a conflicted PR either way (criterion #4).
+- Once this PR passes the 24h recency window it is routed to Doctor (\`loom:pr\` → \`loom:changes-requested\`) for a rebase, **with the hold marker preserved** — a rebase does not launder a held PR into an unheld one.
+
+**What a human can do now**, if this should not wait for that window:
+- Rebase it yourself, or
+- Clear the hold (start a comment with \`clear the hold — <why>\`) and let the normal conflict/Doctor flow take over.
+
+---
+*Automated by Champion role*"
+    "$GH_READ" --clear-cache   # your own write must not be masked by your own cache
+    echo "Posted held-PR conflict notice on #$PR_NUMBER"
+  fi
+fi
+```
+
+**Why a notice and not an immediate route to Doctor.** Doctor's *Priority 1*
+queue is exactly "`loom:pr` + `CONFLICTING`", and it deliberately excludes
+`loom:operator` (#5978) so autonomous Finding Work never rebases and force-pushes
+a PR a human is holding. That exclusion is correct and this section does **not**
+reverse it: a held+conflicting PR is *surfaced* here, and only becomes Doctor's
+work through the recency route below (which lands it on `loom:changes-requested`
+— Doctor's *Priority 2* queue, which excludes only `loom:blocked` /
+`loom:operator-only`, **not** `loom:operator`). Conflict alone is a report;
+conflict plus staleness is a route.
+
+### #5 under a hold — route to Doctor, keep the hold
+
+Run the recency check exactly as criterion #5 specifies. On failure, use the
+**Stale PR** block in "PR Rejection Workflow" below — it is hold-aware and keys
+off `MERGE_BLOCKED_BY_HOLD`. Two invariants it guarantees, both load-bearing:
+
+1. **The `<!-- champion:merge-risk-hold -->` marker is preserved.** Never delete,
+   edit, or minimize the hold comment on this path. The marker is what makes
+   `PRIOR_HOLD=true` on the tick *after* Doctor's rebase returns the PR to the
+   merge queue — which in turn is what makes Step 2's reversal comment
+   **mandatory** if the PR ever does merge. Clearing it would launder a held PR
+   into a never-held one and re-open the exact silent-reversal hole #4742 closed.
+   (Doctor's push is a legitimate release signal under "Sticky holds" path (c) —
+   the diff genuinely moved, so the axes get re-judged. That is re-judgment, not
+   laundering: if blast radius is still red the PR is simply re-held, and the
+   idempotency guard keeps that silent. What must never happen is the *marker*
+   disappearing.)
+2. **`loom:operator` is kept** — see the decision below.
+
+### `loom:operator` on the held-and-stale route: KEEP it (#6720)
+
+The unheld stale path clears `loom:operator` (#5802). That reversal is **not**
+extended to the held path, and the difference is deliberate:
+
+| Departure to Doctor | `loom:operator` | Why |
+|---|---|---|
+| Stale, **no** hold in force (#5802) | **Removed** | The PR leaves the auto-merge queue with no outstanding human decision attached to it. Removing a label the hold never applied is a harmless no-op. |
+| Stale, **hold in force** (#6720) | **Kept** | The hold is unresolved. The PR is expected to come back still needing a human merge decision, so asserting "no human is needed" for the duration of the Doctor round-trip would be false. |
+
+`loom:operator` is safe to keep here because it is, by definition, the
+**re-evaluable** human-needed state: "applying it must never cause
+sweep/shepherd to skip the item" (`.loom/docs/label-state-machine.md`). Verified
+mechanically against the consumers, not assumed:
+
+- **Doctor Priority 2** (`loom:changes-requested`) excludes `loom:blocked` and
+  `loom:operator-only` — **not** `loom:operator`. The routed PR is visible to
+  Doctor with the label kept. (Doctor Priority 1 *does* exclude it, but that
+  queue is `loom:pr`-scoped and the PR has just left it.)
+- **Judge** does not filter on `loom:operator`, so the re-review after Doctor's
+  fix proceeds normally.
+- **Sweep C1c** skips routing a `loom:pr` + `loom:operator` PR to *Merge*
+  (#6398) — a merge-route skip, which is precisely the behavior the hold wants.
+- **`verdict-staleness-guard.sh`** already declines to un-park a `loom:operator`
+  PR (#5686), so the round-trip cannot silently re-queue it for review either.
+
+Keeping the label also makes the held-PR census below a single label query
+rather than N comment reads, including the PRs currently out at Doctor.
+
+### #6 under a hold — report a broken build, idempotently
+
+If criterion #6 reports failing/cancelled checks on a held PR, post the ordinary
+rejection comment from "PR Rejection Workflow → Rejection Comment" with
+`CRITERION_KEY="ci-status"`. That path's `REASON_KEY` is already the sorted list
+of failing check names, so it comments once per distinct failure and stays silent
+across ticks while the failure is unchanged (#4818). Change no labels: a broken
+build on a held PR is a report, and the hold plus criterion #6 both already
+prevent the merge.
+
+`SKIP` outcomes (pending checks, or the ambiguous-empty-read fail-closed of
+#6211) produce **no** comment on this path — they are transient by construction
+and resolve themselves.
+
+### What this pass must never do
+
+- **Never merge.** `MERGE_BLOCKED_BY_HOLD=true` means Steps 2 and 3 do not run,
+  full stop. Nothing in this section is a release signal.
+- **Never clear the hold.** The four release signals in "Sticky holds" are the
+  only ones there are, and Champion cannot release its own hold.
+- **Never remove or rewrite the hold comment.**
+- **Never re-post the hold notice.** The hold-notice idempotency guard still
+  governs; this pass adds its own separately-keyed markers precisely so it does
+  not collide with it.
+
+---
+
+## Held-PR Census (report every pass, #6720)
+
+A hold is invisible unless someone counts them. The 21-deep pile above was found
+only because an operator happened to inspect PR labels by hand. Run this once per
+Champion pass — one `gh pr list` call, no per-PR reads — and put its output in the
+completion summary (see `champion-common.md` → "Completion Report").
+
+```bash
+# Cached ("$GH_READ") — an observation scan, never a merge gate.
+# `loom:operator` is Champion's hold label and, per the decision above, it is
+# preserved across the Doctor round-trip — so this single query covers both the
+# PRs sitting in the merge queue AND the ones currently out for a rebase.
+HELD_JSON=$("$GH_READ" pr list --label "loom:operator" --state open --limit 500 \
+  --json number,title,createdAt,updatedAt,mergeable,labels)
+
+HELD_COUNT=$(printf '%s\n' "$HELD_JSON" | jq 'length')
+HELD_CONFLICTING=$(printf '%s\n' "$HELD_JSON" | jq '[.[] | select(.mergeable == "CONFLICTING")] | length')
+HELD_AT_DOCTOR=$(printf '%s\n' "$HELD_JSON" | jq '[.[] | select([.labels[].name] | index("loom:changes-requested"))] | length')
+# Oldest by PR creation — the age of the head of the pile.
+OLDEST_CREATED=$(printf '%s\n' "$HELD_JSON" | jq -r 'min_by(.createdAt) | .createdAt // empty')
+if [ -n "$OLDEST_CREATED" ]; then
+  OLDEST_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$OLDEST_CREATED" +%s 2>/dev/null || \
+              date -d "$OLDEST_CREATED" +%s 2>/dev/null)
+  OLDEST_DAYS=$(( ($(date +%s) - OLDEST_TS) / 86400 ))
+else
+  OLDEST_DAYS=0
+fi
+
+echo "Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d"
+```
+
+**Report it even when it is zero** — the command above already emits
+`Merge-risk holds: 0 open PR(s) — 0 conflicting, 0 out at Doctor, oldest 0d` for
+an empty set; copy that line verbatim rather than omitting it. A line that
+only appears when something is wrong is a line nobody learns to read; the whole
+point is that a *growing* pile is visible in the ordinary summary before anyone
+goes looking. Never state these numbers from memory or from a previous pass —
+run the query in the pass you report it in.
+
+---
+
 ## Auto-Merge Workflow
 
 ### Step 1: Verify Safety Criteria
 
 For each candidate PR, check ALL 6 criteria in order. If any criterion fails, skip to rejection workflow.
+
+**One branch, not a skip (#6720)**: if criterion #2 sets
+`MERGE_BLOCKED_BY_HOLD=true`, this PR does **not** merge and Steps 2-3 do not
+run — but it is not dropped from the pass either. Run the **Held-PR Health
+Pass** (criteria #4/#5/#6 for reporting and routing), then continue to the next
+PR in the queue.
 
 ### Step 2: Add Pre-Merge Comment
 
@@ -1730,9 +1975,30 @@ fi
 
 A stale PR (>24h) will never clear on its own, and under the 10-minute cron a bare "keep the label + comment" loop would re-comment on the same PR **every tick forever**. Instead, **comment once (idempotently)** and **swap `loom:pr` → `loom:changes-requested`** so the PR leaves the auto-merge queue and is picked up by Doctor for a rebase/refresh. This is the single, authoritative stale-PR policy — `champion-reference.md` Edge Case 5 defers to it.
 
+**This path fires from a held state too (#6720)** — it is reached from the
+Held-PR Health Pass as well as from an ordinary criterion-#5 failure, and it is
+the *only* automated route from `loom:pr` to Doctor. Gating it behind a hold is
+what produced the 20-of-21-conflicting pile. The block below is hold-aware in
+exactly two places, both keyed on `MERGE_BLOCKED_BY_HOLD`: the notice text, and
+the `loom:operator` reversal. **The `champion:merge-risk-hold` marker comment is
+never touched on either variant** — the hold must survive the round-trip.
+
 ```bash
 PR_NUMBER=<number>
 STALE_MARKER="<!-- champion:stale-pr-notice -->"
+# From criterion #2 (sticky precheck or a fresh hold posted this pass); false
+# / unset on the ordinary unheld path.
+HELD="${MERGE_BLOCKED_BY_HOLD:-false}"
+
+if [ "$HELD" = true ]; then
+  STALE_HOLD_NOTE="
+
+**This PR is on a merge-risk hold, and the hold is preserved.** Routing it to Doctor addresses staleness only — it is not a release signal and does not clear the hold. The \`champion:merge-risk-hold\` marker stays on this PR, so if a later tick merges it, Champion must still post the mandatory hold-reversal comment naming what changed (#4742). Rebasing a held PR does not make it an unheld one.
+
+\`loom:operator\` is **kept** for the same reason: the human merge decision this PR is waiting on is still outstanding. It does not block Doctor — Doctor's \`loom:changes-requested\` queue excludes \`loom:blocked\` / \`loom:operator-only\`, not \`loom:operator\` (#6720)."
+else
+  STALE_HOLD_NOTE=""
+fi
 
 # Idempotency guard: only comment + relabel once. If a prior tick already
 # posted the stale notice, do nothing (prevents per-tick comment spam).
@@ -1751,22 +2017,45 @@ This PR has not been updated within the recency window (24h), so it has been rou
 **Next steps:**
 - Rebase onto the latest \`main\` and resolve any drift
 - Re-request Judge review to return it to the auto-merge queue
+$STALE_HOLD_NOTE
 
 ---
 *Automated by Champion role*"
-  # Route to Doctor: leave the auto-merge queue.
+  # Route to Doctor: leave the auto-merge queue. Identical on both variants —
+  # the hold changes what the PR carries, never whether it gets routed.
   gh pr edit "$PR_NUMBER" --remove-label "loom:pr" --add-label "loom:changes-requested"
-  # loom:operator reversal (#5802): this path unconditionally exits the
-  # merge-risk hold — the PR leaves the auto-merge queue either way (see
-  # "Merge-Risk Judgment → Sticky holds / Hold behavior") — so clear
-  # loom:operator here too if present, mirroring the merge-success reversal
-  # above. Unlike that reversal, this is NOT gated on $HOLD_REVERSAL_BLOCK
-  # (only set on the merge-success path): a PR that never held loom:operator
-  # is already covered by the `2>/dev/null || true` no-op below.
-  gh pr edit "$PR_NUMBER" --remove-label "loom:operator" 2>/dev/null || true
+
+  # loom:operator: the reversal is now conditional on whether a hold is still
+  # in force (#6720, narrowing #5802).
+  #
+  #   HELD=false — #5802's original case, unchanged. The premise "this path
+  #     unconditionally exits the merge-risk hold" holds: no hold binds, so
+  #     nothing outstanding needs a human, and clearing a label the hold never
+  #     applied is a no-op (`2>/dev/null || true`).
+  #
+  #   HELD=true — #5802's premise is FALSE here. The hold is unresolved and the
+  #     PR is expected to return still needing a human merge decision, so
+  #     asserting "no human is needed" for the whole Doctor round-trip would be
+  #     a lie. Keep the label. It does not strand the PR: `loom:operator` is
+  #     the re-evaluable human-needed state and must never make sweep/shepherd
+  #     skip an item (.loom/docs/label-state-machine.md), and Doctor's
+  #     `loom:changes-requested` queue filters `loom:blocked` /
+  #     `loom:operator-only`, NOT `loom:operator`.
+  if [ "$HELD" = true ]; then
+    echo "Kept loom:operator on #$PR_NUMBER — the merge-risk hold is unresolved (#6720)"
+  else
+    gh pr edit "$PR_NUMBER" --remove-label "loom:operator" 2>/dev/null || true
+  fi
   echo "Routed stale PR #$PR_NUMBER to Doctor (loom:pr → loom:changes-requested)"
 fi
 ```
+
+**Never delete or edit the `champion:merge-risk-hold` comment here** (or
+anywhere else). Preserving the marker is what keeps `PRIOR_HOLD=true` on the
+tick after Doctor's rebase returns the PR to the merge queue, which is what
+makes Step 2's hold-reversal comment mandatory if it ever merges. A rebase is a
+legitimate release *signal* — the axes get re-judged against a diff that
+genuinely moved — but it must never erase the *record* that a hold existed.
 
 ---
 

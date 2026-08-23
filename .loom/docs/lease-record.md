@@ -248,12 +248,31 @@ still within `ttl_minutes` of now (default 15, same TTL Phase 2 uses) and (b)
 its `host=` field still names this sweep's own host. It is wired into the
 Builder phase immediately before `git push` + opening the PR
 (`defaults/roles/builder-pr.md` § "Lease Fencing: Confirm You Still Own the
-Claim") — on either failure (expired, exit `3`; superseded by a different
-host, exit `4`) the Builder aborts before doing anything externally-visible,
-without touching the `loom:building` label or contesting the peer's claim.
-Absence of a matching lease comment, a malformed marker, or a `gh` fetch
-failure all fail OPEN (exit `0`, proceed) — this doc's own "no lease comment
-== no evidence either way" contract, applied identically to this new reader.
+Claim") — on either failure (expired AND owned by this sweep's own host,
+exit `3`; superseded by a *fresh* lease from a different host, exit `4`) the
+Builder aborts before doing anything externally-visible, without touching
+the `loom:building` label or contesting the peer's claim. Absence of a
+matching lease comment, a malformed marker, a `gh` fetch failure, or an
+EXPIRED lease owned by a *different* host all fail OPEN (exit `0`, proceed)
+— this doc's own "no lease comment == no evidence either way" contract,
+applied identically to this new reader.
+
+**Issue #6783: an abandoned, never-yielded lease no longer fences forever.**
+Prior to #6783, `check` aborted with exit `3` (EXPIRED) whenever the
+*freshest* lease comment was stale, regardless of which host wrote it — but
+EXPIRED is an abort, not a pass, so a dead sweep's lease record (never
+renewed again, never yielded) never stopped being the freshest comment on
+the issue and permanently fenced out every future dispatch that did not
+itself write a lease (observed on issue #6694 / PR #6773: a dead sweep's
+lease from a different, dead host blocked a legitimate successor sweep with
+zero live competitors). An expired lease is, by definition, not evidence of
+a *live* peer — closer to "no evidence" (this doc's own reader contract)
+than to "a peer owns this". `check` now distinguishes the two cases: expired
+**and** owned by *this* sweep's own host still aborts (exit `3` — a sweep
+whose own renewal loop died should not trust its claim), while expired **and**
+owned by a *different* host now PASSes (exit `0`) as no-longer-live evidence.
+Exit `4` (SUPERSEDED — a different, *fresh* lease from a live peer) is
+unaffected.
 
 ## Yield/renewal/fence coordination gap, closed (Issue #6485)
 
@@ -307,7 +326,9 @@ Both `sweep-lease-renew.sh` and `sweep-lease-fence.sh` were fixed together
   re-claims the same issue later (a brand new lease comment, a different
   `sweep=`) is never excluded by an unrelated, older yield from a past claim
   episode. A lease that was never yielded still ages out purely through the
-  ordinary TTL/EXPIRED path — this does not weaken that path.
+  ordinary TTL/EXPIRED path (see "Issue #6783" above for what "ages out"
+  now means: ABORT only for this sweep's own expired lease, PASS for a
+  different host's) — this does not weaken that path.
 
 With either fix alone the #6470 incident's fence failure would not have
 recurred; both are applied together because the fence-side fix is the
