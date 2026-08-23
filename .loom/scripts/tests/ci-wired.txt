@@ -146,6 +146,7 @@ test-provision-hooks.sh
 test-provision-skills.sh
 test-random-file.sh
 test-rebase-stacked-children.sh
+test-record-noop-release.sh
 test-recover-orphaned-shepherds-diagnostics.sh
 test-reconcile-stack.sh
 test-require-complexity-marker.sh

@@ -3801,7 +3801,7 @@ knobs not yet audited here.
 | `autonomous.workFinder.dispatchBackoff.baseSecs` | `LOOM_DISPATCH_BACKOFF_BASE_SECS` | `60` | Backoff applied after the **first** failed dispatch of an issue; doubles per consecutive failure. Zero/invalid → default |
 | `autonomous.workFinder.dispatchBackoff.maxSecs` | `LOOM_DISPATCH_BACKOFF_MAX_SECS` | `900` | Ceiling on the doubling — also the idle window after which an issue's consecutive-failure tally restarts at zero. Zero/invalid → default; clamped up to `baseSecs` |
 | `autonomous.workFinder.noopCooldown.enabled` | `LOOM_WORK_FINDER_NOOP_COOLDOWN` | `true` | No-op re-dispatch cooldown on/off (#6670). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config |
-| `autonomous.workFinder.noopCooldown.cooldownSecs` | `LOOM_WORK_FINDER_NOOP_COOLDOWN_SECS` | `3600` | How long a self-reported no-op release (`loom-daemon noop-cooldown record` / `RecordNoopRelease`) holds an issue out of dispatch. Flat, non-exponential — every record re-arms the same window. Zero/invalid → default. **Currently inert in practice** — nothing in this repo's own tooling calls `noop-cooldown record` yet; #6748 tracks wiring an actual caller into `/loom:sweep` |
+| `autonomous.workFinder.noopCooldown.cooldownSecs` | `LOOM_WORK_FINDER_NOOP_COOLDOWN_SECS` | `3600` | How long a self-reported no-op release (`loom-daemon noop-cooldown record` / `RecordNoopRelease`) holds an issue out of dispatch. Flat, non-exponential — every record re-arms the same window. Zero/invalid → default. `/loom:sweep`'s Builder phase is the first in-repo caller via `defaults/scripts/record-noop-release.sh` (#6740) — see "No-op re-dispatch cooldown (#6670)" below |
 | `autonomous.workFinder.extraSkipLabels` | `LOOM_WORK_FINDER_EXTRA_SKIP_LABELS` (comma-separated) | `[]` | Per-workspace/per-repo **additional** label names (#6685) the work-finder treats as a skip/park signal, beyond the hardcoded `loom:blocked` / `loom:operator-only` (`PARK_LABELS`) — e.g. a repo-local `blocked-upstream` label that will never be renamed to a `loom:*` name. Purely additive to `SKIP_LABELS`' candidate-query filter (`WorkItem::is_skipped_with_extra`); it does **not** extend the separate dispatch()-level park-label guard (#4444) above, which stays keyed on `PARK_LABELS` only. Env replaces config entirely when set (even to an empty string); resolved once per workspace, live on the next tick (a cheap `.loom/config.json` read, no daemon restart needed). **`loom:building` can never be added to the resolved list** — filtered out defensively even if named explicitly in config/env, so a misconfiguration can never re-introduce the "an in-flight claim is treated as a park" regression `SKIP_LABELS`' own doc comment warns against |
 | *(env only)* | `LOOM_OPEN_PR_MEMO` | `true` | Verified-open-PR memo for the #4123 open-PR dispatch guard (#6788). Falsy (`0`/`false`/`no`/`off`) disables; anything else (including unset) enables. When on, the guard (a) reuses a verified "issue #N has open linked PR #M" answer for 15 minutes instead of re-running the closes-graph query on every work-finder tick, and (b) when **both** the GraphQL probe and its #5911 REST fallback fail, re-verifies that one known PR over a single `GET repos/{owner}/{repo}/pulls/{M}` before conceding. The documented fail-open contract is unchanged: with no memo, or if that recheck also cannot answer, the guard still proceeds. In-memory only — a daemon restart clears it. Disable only to restore the exact pre-#6788 probe |
 | *(env only)* | `LOOM_EMPTY_POOL_BREAKER_THRESHOLD` | `3` | How many **distinct** issues must die in `spawn-claude.sh`'s token-selection step (exit 78) inside the window below before new dispatch to that workspace is paused (#6614). Distinct *issues*, not raw failures: one issue cycling through its own `dispatchBackoff` can never trip it. Crossing it trips the existing pre-flight advisory (#4386) + half-open dispatch gate (#5030) — one loud `ERROR` plus a `daemon.preflight.advisory` event — and the first dispatch that gets past token selection clears it. Zero/invalid → default |
@@ -4163,22 +4163,36 @@ This mechanism is deliberately **call-through only** — unlike quarantine and
 dispatch backoff, nothing in `reap_once`'s own terminal-outcome
 classification infers it automatically. A sweep (or the `/loom:sweep`
 orchestrator driving it) that reaches "no actionable delta this pass" reports
-that back explicitly: `loom-daemon noop-cooldown record --issue <N> --reason
-"..."` (or the underlying `RecordNoopRelease` IPC request), mirroring how
-`build-gate.sh` calls `loom-daemon dispatch-backoff record` on a step timeout
-(#6192). Each call arms (or refreshes) a flat `cooldownSecs` window — unlike
-the backoff's exponential doubling, repeated no-op reports never grow the
-window, they just re-arm the same one. The work finder drops a
-cooling-down candidate before the capacity gate exactly like quarantine and
-backoff (reported as `noop-cooldown-skip` on the per-tick summary line), and
-the three mechanisms are fully independent: an issue can be quarantined,
-backed off, and cooling down all at once, and clearing one never touches the
-others. `loom-daemon quarantine clear <issue>` releases a no-op cooldown too,
-the same "let this run now" operator lever it already applies to the dispatch
-backoff. Any dispatch that goes on to make real checkpoint progress on the
-issue clears its cooldown automatically. Defaults **on**; disable with
+that back explicitly: `loom-daemon noop-cooldown record <N> --reason "..."`
+(a positional issue argument, not an `--issue` flag — or the underlying
+`RecordNoopRelease` IPC request), mirroring how `build-gate.sh` calls
+`loom-daemon dispatch-backoff record` on a step timeout (#6192). Each call
+arms (or refreshes) a flat `cooldownSecs` window — unlike the backoff's
+exponential doubling, repeated no-op reports never grow the window, they just
+re-arm the same one. The work finder drops a cooling-down candidate before
+the capacity gate exactly like quarantine and backoff (reported as
+`noop-cooldown-skip` on the per-tick summary line), and the three mechanisms
+are fully independent: an issue can be quarantined, backed off, and cooling
+down all at once, and clearing one never touches the others. `loom-daemon
+quarantine clear <issue>` releases a no-op cooldown too, the same "let this
+run now" operator lever it already applies to the dispatch backoff. Any
+dispatch that goes on to make real checkpoint progress on the issue clears
+its cooldown automatically. Defaults **on**; disable with
 `LOOM_WORK_FINDER_NOOP_COOLDOWN=0` or
 `autonomous.workFinder.noopCooldown.enabled = false`.
+
+**First in-repo caller (#6740).** `defaults/scripts/record-noop-release.sh`
+is the shell helper that actually makes this call — resolving the daemon
+binary defensively (same `lib/locate-daemon-bin.sh` resolution
+`build-gate.sh` uses) and treating a missing/unreachable/older `loom-daemon`
+as a silent no-op, so the caller never fails on its account.
+`/loom:sweep`'s Builder phase invokes it (see `sweep.md` → "Genuine no-op
+conclusion vs. builder failure") right before releasing a `loom:building`
+claim back to `loom:issue` when the builder's worktree carries an untracked
+`.no-changes-needed` marker (builder.md → "Signaling No Changes Needed") and
+no PR was opened — the exact "checkpoint written, claim released cleanly,
+zero forge/issue mutation" shape this section describes. Hermetic call-shape
+test: `defaults/scripts/tests/test-record-noop-release.sh`.
 
 **Verified-open-PR memo (#6788).** The three brakes above bound how often an
 issue is *re-dispatched*. A fourth, narrower problem sits one layer down, in the
@@ -4214,13 +4228,13 @@ after a daemon restart), or if the recheck itself cannot answer, or if the PR is
 no longer open, the probe still concedes and dispatch still proceeds — a genuine
 forge outage can never wedge the daemon. Disable with `LOOM_OPEN_PR_MEMO=0`.
 
-**Note on #6748.** `noop_cooldown` above is *dispatcher-armed*: it only takes
+**Note on #6740.** `noop_cooldown` above is *dispatcher-armed*: it only takes
 effect once a completed sweep pass self-reports "no actionable delta this
-time" via `loom-daemon noop-cooldown record`. As of this writing nothing in
-this repo's own `/loom:sweep` orchestrator makes that call, so the mechanism
-is inert in practice — #6748 tracks wiring an actual caller. The two knobs
-below are independent of that gap: they take effect immediately, with no
-caller wiring required.
+time" via `loom-daemon noop-cooldown record`. `/loom:sweep`'s Builder phase
+makes that call via `defaults/scripts/record-noop-release.sh` (#6740, see
+"No-op re-dispatch cooldown (#6670)" above for the full mechanism and call
+site). The two knobs below are independent of that wiring: they take effect
+immediately, with no caller involvement required.
 
 **Repo-local skip-label list (#6685).** `PARK_LABELS` / `SKIP_LABELS` (the
 work-finder's own candidate-query filter, not the **Park-label dispatch

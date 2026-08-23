@@ -2093,6 +2093,23 @@ That entry goes to stderr and is appended to `.loom/logs/main-quarantine.log` (o
 
 If the builder failed (no PR opened), do NOT write a checkpoint — leave the checkpoint at the previous phase (typically `curator-done`) so the next sweep retries the builder from scratch.
 
+**Genuine no-op conclusion vs. builder failure (#6670, first in-repo caller #6740).** No PR opened is not automatically a failure — distinguish two cases before deciding what to do next:
+
+- **Builder failure** (build error, test failure, unrecoverable conflict, crash) — no PR, and no `.no-changes-needed` marker in the issue's worktree (`.loom/worktrees/issue-N/.no-changes-needed`). Leave the checkpoint as described above and fall through to "Per-builder failure isolation" below.
+- **Genuine no-op** — the worktree carries an untracked `.no-changes-needed` marker (builder.md → "Signaling No Changes Needed"): the builder investigated and deliberately concluded no code changes are required this pass, rather than crashing or erroring out. This is a self-reported "no actionable delta this pass" conclusion — exactly the shape `autonomous.workFinder.noopCooldown` (#6670) exists to suppress immediate re-dispatch on (see `daemon-reference.md` → "No-op re-dispatch cooldown (#6670)"). Handle it as its own outcome, distinct from a failure:
+  1. **Before releasing the claim**, record the no-op so the work finder does not immediately re-offer the same candidate:
+     ```bash
+     ./.loom/scripts/record-noop-release.sh N --reason "$(head -c 200 .loom/worktrees/issue-N/.no-changes-needed)"
+     ```
+     This call is best-effort and defensive, mirroring `build-gate.sh`'s `dispatch-backoff record` arm (#6192): a missing, unreachable, or older `loom-daemon` makes it a silent no-op and never fails the sweep.
+  2. **Release the claim** back to `loom:issue` — do NOT close the issue (the marker records "nothing to do this pass," not "this issue is resolved"):
+     ```bash
+     gh issue edit N --remove-label "loom:building" --add-label "loom:issue"
+     gh issue comment N --body "Builder found no actionable changes this pass: $(head -c 200 .loom/worktrees/issue-N/.no-changes-needed). Releasing the claim; a self-reported no-op cooldown was recorded so this issue is not immediately re-offered (#6670)."
+     ```
+  3. **Do NOT write a `builder-done` checkpoint** — leave it at the previous phase, exactly like the failure path. The marker is untracked and never committed, so nothing about this outcome is durable on the branch itself; the checkpoint staying at `curator-done` is what lets a future sweep pass re-evaluate the issue fresh (the noop-cooldown window from step 1, not the checkpoint, is what actually suppresses the immediate re-dispatch).
+  4. Record it as `no-op (no changes needed)` in the wave summary — distinct from `blocked (builder failed)` — so an operator scanning the summary does not mistake a deliberate conclusion for an error.
+
 **Per-builder failure isolation.** If builder for issue `#A` fails to open a PR (build error, test failure, unrecoverable conflict, etc.), log it and **continue** with the other builders' PRs in this wave. The failed issue is recorded as `blocked (builder failed)` in the summary. Do NOT abort the wave. Do NOT skip Judge for the other PRs.
 
 **Mid-builder kill semantics (#3373).** If sweep is killed during the Builder phase, the next invocation will see `CHECKPOINT_PHASE == "curator-done"` (no `builder-done` was written), so the Builder dispatches again from scratch. The worktree from the killed run is preserved by `worktree.sh`'s idempotency — `./.loom/scripts/worktree.sh N` is a no-op if `.loom/worktrees/issue-N` already exists. The builder re-enters the worktree, sees the partial diff, and decides whether to commit / amend / discard. **Sweep itself does not introspect the partial diff** — that's the builder's job.

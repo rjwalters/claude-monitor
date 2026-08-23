@@ -611,6 +611,8 @@ The marker file should contain a brief explanation of why no changes are needed.
 
 **Why this matters:** Without this marker file, sweep orchestration cannot distinguish between "builder deliberately decided no changes are needed" and "builder crashed/was killed before doing anything." An empty worktree without the marker is treated as a builder failure, not a deliberate decision.
 
+**What sweep orchestration does with it:** on your exit, `/loom:sweep`'s Builder phase checks for this marker before treating a PR-less exit as a failure (see `sweep.md` → "Genuine no-op conclusion vs. builder failure", #6670/#6740) — it records a self-reported no-op release (`loom-daemon noop-cooldown record`, via `./.loom/scripts/record-noop-release.sh`) so the work finder does not immediately re-offer the same issue, then releases your `loom:building` claim back to `loom:issue` without closing it. You do not need to do any of that yourself — writing the marker and exiting is your entire responsibility here.
+
 **Do NOT create this file if:**
 - You made code changes (even if you later reverted them)
 - You're unsure whether changes are needed
