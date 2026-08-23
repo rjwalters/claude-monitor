@@ -3719,7 +3719,8 @@ concurrency ceiling 5" and share it with the team:
       "noopCooldown": {
         "enabled": true,
         "cooldownSecs": 3600
-      }
+      },
+      "extraSkipLabels": ["blocked-upstream"]
     },
     "hostBreaker": {
       "enabled": true,
@@ -3800,7 +3801,8 @@ knobs not yet audited here.
 | `autonomous.workFinder.dispatchBackoff.baseSecs` | `LOOM_DISPATCH_BACKOFF_BASE_SECS` | `60` | Backoff applied after the **first** failed dispatch of an issue; doubles per consecutive failure. Zero/invalid → default |
 | `autonomous.workFinder.dispatchBackoff.maxSecs` | `LOOM_DISPATCH_BACKOFF_MAX_SECS` | `900` | Ceiling on the doubling — also the idle window after which an issue's consecutive-failure tally restarts at zero. Zero/invalid → default; clamped up to `baseSecs` |
 | `autonomous.workFinder.noopCooldown.enabled` | `LOOM_WORK_FINDER_NOOP_COOLDOWN` | `true` | No-op re-dispatch cooldown on/off (#6670). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config |
-| `autonomous.workFinder.noopCooldown.cooldownSecs` | `LOOM_WORK_FINDER_NOOP_COOLDOWN_SECS` | `3600` | How long a self-reported no-op release (`loom-daemon noop-cooldown record` / `RecordNoopRelease`) holds an issue out of dispatch. Flat, non-exponential — every record re-arms the same window. Zero/invalid → default |
+| `autonomous.workFinder.noopCooldown.cooldownSecs` | `LOOM_WORK_FINDER_NOOP_COOLDOWN_SECS` | `3600` | How long a self-reported no-op release (`loom-daemon noop-cooldown record` / `RecordNoopRelease`) holds an issue out of dispatch. Flat, non-exponential — every record re-arms the same window. Zero/invalid → default. **Currently inert in practice** — nothing in this repo's own tooling calls `noop-cooldown record` yet; #6748 tracks wiring an actual caller into `/loom:sweep` |
+| `autonomous.workFinder.extraSkipLabels` | `LOOM_WORK_FINDER_EXTRA_SKIP_LABELS` (comma-separated) | `[]` | Per-workspace/per-repo **additional** label names (#6685) the work-finder treats as a skip/park signal, beyond the hardcoded `loom:blocked` / `loom:operator-only` (`PARK_LABELS`) — e.g. a repo-local `blocked-upstream` label that will never be renamed to a `loom:*` name. Purely additive to `SKIP_LABELS`' candidate-query filter (`WorkItem::is_skipped_with_extra`); it does **not** extend the separate dispatch()-level park-label guard (#4444) above, which stays keyed on `PARK_LABELS` only. Env replaces config entirely when set (even to an empty string); resolved once per workspace, live on the next tick (a cheap `.loom/config.json` read, no daemon restart needed). **`loom:building` can never be added to the resolved list** — filtered out defensively even if named explicitly in config/env, so a misconfiguration can never re-introduce the "an in-flight claim is treated as a park" regression `SKIP_LABELS`' own doc comment warns against |
 | *(env only)* | `LOOM_EMPTY_POOL_BREAKER_THRESHOLD` | `3` | How many **distinct** issues must die in `spawn-claude.sh`'s token-selection step (exit 78) inside the window below before new dispatch to that workspace is paused (#6614). Distinct *issues*, not raw failures: one issue cycling through its own `dispatchBackoff` can never trip it. Crossing it trips the existing pre-flight advisory (#4386) + half-open dispatch gate (#5030) — one loud `ERROR` plus a `daemon.preflight.advisory` event — and the first dispatch that gets past token selection clears it. Zero/invalid → default |
 | *(env only)* | `LOOM_EMPTY_POOL_BREAKER_WINDOW_SECS` | `1800` | Trailing window over which those distinct token-selection deaths are counted (#6614) — twice the `dispatchBackoff.maxSecs` plateau, so a systemic fault always accumulates while isolated failures spaced further apart never do. Zero/invalid → default |
 | `autonomous.hostBreaker.enabled` | `LOOM_HOST_BREAKER` | `true` | Host-distress circuit breaker on/off (#4235). A safety backstop — **defaults on**. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle (#5963). See [Host-distress circuit breaker](#host-distress-circuit-breaker-4235) below |
@@ -4176,6 +4178,54 @@ backoff. Any dispatch that goes on to make real checkpoint progress on the
 issue clears its cooldown automatically. Defaults **on**; disable with
 `LOOM_WORK_FINDER_NOOP_COOLDOWN=0` or
 `autonomous.workFinder.noopCooldown.enabled = false`.
+
+**Note on #6748.** `noop_cooldown` above is *dispatcher-armed*: it only takes
+effect once a completed sweep pass self-reports "no actionable delta this
+time" via `loom-daemon noop-cooldown record`. As of this writing nothing in
+this repo's own `/loom:sweep` orchestrator makes that call, so the mechanism
+is inert in practice — #6748 tracks wiring an actual caller. The two knobs
+below are independent of that gap: they take effect immediately, with no
+caller wiring required.
+
+**Repo-local skip-label list (#6685).** `PARK_LABELS` / `SKIP_LABELS` (the
+work-finder's own candidate-query filter, not the **Park-label dispatch
+guard** documented below under
+[Cross-host dispatch-collision detection and enforcement](#cross-host-dispatch-collision-detection-and-enforcement-4085-phase-0-of-4028-enforcement-added-by-5789))
+are a hardcoded `loom:blocked` / `loom:operator-only` pair — there was
+previously no way for a repo whose own label taxonomy uses a different name
+(e.g. `blocked-upstream`, observed on `rjwalters/vibesql#6399`) to get the
+same durable-park treatment without renaming the label to a `loom:*` name.
+`autonomous.workFinder.extraSkipLabels` (env `LOOM_WORK_FINDER_EXTRA_SKIP_LABELS`,
+comma-separated) supplies additional label names checked alongside
+`SKIP_LABELS` via `WorkItem::is_skipped_with_extra`, resolved with the same
+env > config > default precedence every other `workFinder.*` knob uses. See
+the config table above for the full contract, including the `loom:building`
+exclusion guard.
+
+**Self-declared re-check interval (#6685).** Distinct from `noop_cooldown`
+above in one important way: that mechanism is armed only *after* a sweep
+pass observes "no delta," so a tracking issue known **up front** to need
+infrequent polling still gets dispatched at full cadence until enough no-op
+passes accumulate. A tracker issue can instead declare its own minimum
+re-check interval directly in its body, in the spirit of the Curator's
+`<!-- loom:complexity=<tier> -->` marker:
+
+```
+<!-- loom:recheck-interval=6h -->
+```
+
+The value is a bare duration — an integer optionally followed by `s`
+(seconds, the default), `m` (minutes), `h` (hours), or `d` (days). The
+work-finder skips a candidate carrying this marker whenever its own forge
+`updatedAt` timestamp (already returned by the ETag-cached issue listing at
+zero extra cost) is still within the declared interval — every dispatch and
+every sweep-appended comment advances `updatedAt`, so it doubles as a
+"last checked" clock without the work finder maintaining a separate one.
+Reported as `recheck-interval-skip` on the per-tick summary line. Checked
+independently of and without reading `noop_cooldown` state — an issue can be
+in neither, either, or both cooldowns simultaneously, and clearing/setting
+one never touches the other. No config knob: this is a per-issue, not
+per-workspace, declaration, and lives entirely in the issue body.
 
 ### Host-distress circuit breaker (#4235)
 

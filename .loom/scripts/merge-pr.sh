@@ -2207,6 +2207,27 @@ _find_worktree_by_branch() {
     '
 }
 
+# _worktree_branch_fully_captured <branch> <expected_head_sha>
+#
+# True (rc 0) when the LOCAL branch's tip commit equals expected_head_sha —
+# every commit on the branch was part of the just-merged PR, so nothing on
+# disk under that branch is unmerged. This is the exact criterion
+# `_maybe_delete_local_branch` below already uses to safely upgrade `git
+# branch -d` to `-D` after a squash merge (where `git branch --merged` never
+# returns true, #4100); it is factored out here (#6694) so the
+# worktree-preserve decision can reuse it too, not just the branch-delete
+# safety check. `git merge-base --is-ancestor branch default` is NOT an
+# equivalent substitute — it is false for a squash-merged branch even though
+# every one of its commits made it into the merge — so this stays keyed on
+# the merged PR's head SHA rather than default-branch ancestry.
+_worktree_branch_fully_captured() {
+  local branch="$1" expected_head_sha="${2:-}"
+  [[ -z "$branch" || -z "$expected_head_sha" ]] && return 1
+  local local_tip
+  local_tip="$(git -C "$REPO_ROOT" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null || echo "")"
+  [[ -n "$local_tip" ]] && [[ "$local_tip" == "$expected_head_sha" ]]
+}
+
 # Delete the matching local branch (#4100).
 #
 # _maybe_delete_local_branch <branch> [expected_head_sha]
@@ -2253,13 +2274,9 @@ _maybe_delete_local_branch() {
 
   local delete_flag="-d"
   local safety_note=""
-  if [[ -n "$expected_head_sha" ]]; then
-    local local_tip
-    local_tip="$(git -C "$REPO_ROOT" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null || echo "")"
-    if [[ -n "$local_tip" ]] && [[ "$local_tip" == "$expected_head_sha" ]]; then
-      delete_flag="-D"
-      safety_note=" (tip matches merged PR head SHA — safe force-delete)"
-    fi
+  if _worktree_branch_fully_captured "$branch" "$expected_head_sha"; then
+    delete_flag="-D"
+    safety_note=" (tip matches merged PR head SHA — safe force-delete)"
   fi
 
   local delete_output
@@ -2591,8 +2608,22 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       # unset (the pr-<N> path) this check is skipped entirely — unchanged
       # behavior.
       if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-        warning "Preserving worktree at $DEFAULT_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER and its live state is not CLOSED"
-        info "This is the partial-increment case (#3667) or an issue-state lookup failure; cleanup will be retried by a future merge that actually closes #$ISSUE_NUM, or run 'loom-clean' manually once it does"
+        # #6694: the issue-close gate above says "preserve", but that is only
+        # correct while the worktree/branch might still be needed. When the
+        # branch's tip is already the merged PR's head SHA, every commit on
+        # it made it into the merge — the worktree holds nothing unmerged
+        # regardless of whether the ISSUE itself ever closes. Without this
+        # check, a programme issue intentionally designed to accumulate
+        # `Part of #N` increments forever (every merge non-closing by
+        # design) would preserve this worktree/branch indefinitely, since
+        # _issue_is_closed_for_cleanup never flips true for it.
+        if _worktree_branch_fully_captured "$PR_BRANCH" "$PR_HEAD_SHA"; then
+          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' tip matches PR #$PR_NUMBER's merged head — its content is already on the default branch, so the worktree holds nothing unmerged; removing it (#6694)"
+          _remove_loom_worktree "$DEFAULT_WT_PATH"
+        else
+          warning "Preserving worktree at $DEFAULT_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' carries local commits beyond merged PR #$PR_NUMBER's head"
+          info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DEFAULT_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
+        fi
       else
         _remove_loom_worktree "$DEFAULT_WT_PATH"
       fi
@@ -2618,8 +2649,17 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
           # sentinel says it's safe to remove — unless the close-target-aware
           # gate (#4186) says preserve.
           if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-            warning "Preserving discovered worktree at $DISCOVERED_WT — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER and its live state is not CLOSED"
-            info "This is the partial-increment case (#3667) or an issue-state lookup failure; cleanup will be retried by a future merge that actually closes #$ISSUE_NUM, or run 'loom-clean' manually once it does"
+            # #6694: see the matching comment at the default-path call site
+            # above — reuse the tip-matches-merged-head check so a
+            # never-closing programme issue does not preserve this
+            # non-standard-path worktree forever either.
+            if _worktree_branch_fully_captured "$PR_BRANCH" "$PR_HEAD_SHA"; then
+              info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' tip matches PR #$PR_NUMBER's merged head — its content is already on the default branch, so the discovered worktree holds nothing unmerged; removing it (#6694)"
+              _remove_loom_worktree "$DISCOVERED_WT"
+            else
+              warning "Preserving discovered worktree at $DISCOVERED_WT — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' carries local commits beyond merged PR #$PR_NUMBER's head"
+              info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DISCOVERED_WT\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
+            fi
           else
             info "Discovered Loom-managed worktree at non-standard path: $DISCOVERED_WT"
             _remove_loom_worktree "$DISCOVERED_WT"
@@ -2653,8 +2693,17 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     # eligibility, which is likewise branch-state-independent.
     if [[ -n "$JUDGE_PR_WT_PATH" ]] && [[ -d "$JUDGE_PR_WT_PATH" ]]; then
       if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
-        warning "Preserving Judge/Doctor review worktree at $JUDGE_PR_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER and its live state is not CLOSED"
-        info "This is the partial-increment case (#3667) or an issue-state lookup failure; cleanup will be retried by a future merge that actually closes #$ISSUE_NUM, or run 'loom-clean' manually once it does"
+        # #6694: see the matching comment at the default-path call site
+        # above — reuse the tip-matches-merged-head check so a never-closing
+        # programme issue does not preserve this Judge/Doctor review
+        # worktree forever either.
+        if _worktree_branch_fully_captured "$PR_BRANCH" "$PR_HEAD_SHA"; then
+          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' tip matches PR #$PR_NUMBER's merged head — its content is already on the default branch, so the Judge/Doctor review worktree holds nothing unmerged; removing it (#6694)"
+          _remove_loom_worktree "$JUDGE_PR_WT_PATH"
+        else
+          warning "Preserving Judge/Doctor review worktree at $JUDGE_PR_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' carries local commits beyond merged PR #$PR_NUMBER's head"
+          info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$JUDGE_PR_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
+        fi
       else
         info "Found co-existing Judge/Doctor review worktree at $JUDGE_PR_WT_PATH (PR #$PR_NUMBER, alongside issue-$ISSUE_NUM handling above) — removing (#6264)"
         _remove_loom_worktree "$JUDGE_PR_WT_PATH"

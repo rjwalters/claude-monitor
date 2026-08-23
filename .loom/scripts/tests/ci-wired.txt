@@ -29,6 +29,7 @@
 test-app-permission-fallback.sh
 test-archive-transcripts.sh
 test-blame-issue.sh
+test-body-repo-affinity.sh
 test-bounded-run.sh
 test-build-gate-timeout.sh
 test-build-rs-watchset.sh
@@ -64,10 +65,12 @@ test-default-branch.sh
 test-dependency-parse.sh
 test-detect-dependency-cycle.sh
 test-detect-startable-subset.sh
+test-detect-unlabeled-epics.sh
 test-disk-headroom.sh
 test-docs-guide-lock.sh
 test-docs-only-fast-path.sh
 test-docs-worktree.sh
+test-epic-label-preserved-on-escalation.sh
 test-filing-lock.sh
 test-fleet-check.sh
 test-fleet-send.sh

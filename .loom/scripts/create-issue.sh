@@ -148,6 +148,22 @@ GraphQL/REST quota, so it has no equivalent failure mode)." >&2
   exit 2
 fi
 
+# Detection backstop (#6771, deferred from #6714's filing-lock): warn -- never
+# block -- when the body cites several repo-local identifiers and NONE of them
+# resolve in the repo being filed into. This is the independent check that
+# would catch a cross-repo body mismatch if the lock (#6714) ever has a gap;
+# it must never change this script's exit status. Only runs when filing into
+# the current working directory's repo (no --repo override) -- with an
+# explicit --repo, the target repo's checkout is not necessarily local, so
+# there is nothing to check against. Runs before the filing lock below so the
+# lock's own held duration stays as short as possible (see its comment).
+if [[ -z "$REPO_NWO" ]]; then
+  _bra_script="$SCRIPT_DIR/lib/body-repo-affinity.sh"
+  if [[ -x "$_bra_script" ]]; then
+    "$_bra_script" --body "$BODY" --repo-root "$(pwd)" || true
+  fi
+fi
+
 # --- #6714: serialize the actual filing ------------------------------------
 # The lock is taken as late as possible (after every argument/forge validation
 # above) and held for exactly the one create below, so a burst's serialization

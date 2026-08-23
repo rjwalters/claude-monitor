@@ -526,6 +526,16 @@ issues instead of phases).
   && gh issue edit <number> --add-label "loom:operator-only,loom:operator-decision"
 ```
 
+**Anti-regression caveat (#6715): the escalation `gh issue edit` above is
+add-only and must never also remove `loom:epic`.** It names only the
+operator-only pair in its `--add-label` argument — the whole point of
+escalating is to park the epic for a human while it stays discoverable as an
+epic. Stripping `loom:epic` here would make the epic invisible to every
+subsequent Champion pass (which discovers epics by that label), including any
+pass that runs **after** a human revises it, since nothing would ever
+re-apply the label. If a future edit to this block adds a label-removal flag
+for any reason, that flag must never target `loom:epic`.
+
 When you arrive here via `ESCALATE_UNREVISED=yes` you have **not** re-run the 6
 criteria, and must not: the epic's title and body are byte-identical to the
 revision the prior verdict was written against, so the verdict is unchanged by

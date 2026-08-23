@@ -516,9 +516,11 @@ _wt_extract_shell_fn() {
     ' "$src"
 }
 
-# Load `_maybe_delete_local_branch` (+ its three worktree-introspection
-# dependencies: `_primary_worktree_path`, `_is_primary_worktree_path`,
-# `_find_worktree_by_branch`) from the live merge-pr.sh source into this
+# Load `_maybe_delete_local_branch` (+ its four dependencies: the three
+# worktree-introspection helpers `_primary_worktree_path`,
+# `_is_primary_worktree_path`, `_find_worktree_by_branch`, and the tip-match
+# safety predicate `_worktree_branch_fully_captured` its `-d` → `-D` upgrade
+# delegates to, #6694) from the live merge-pr.sh source into this
 # process. The loaded body reads globals `$REPO_ROOT` / `$DEFAULT_BRANCH_NAME`
 # and calls `info`/`warning`/`success` — the caller must set/define all five
 # before invoking `_maybe_delete_local_branch`. Returns 1 (never hard-fails)
@@ -534,16 +536,21 @@ _wt_load_branch_safety_helper() {
     [[ -n "$fn_src" ]] || return 1
 
     local dep_fn dep_src dep_fns=""
-    for dep_fn in _primary_worktree_path _is_primary_worktree_path _find_worktree_by_branch; do
+    for dep_fn in _primary_worktree_path _is_primary_worktree_path _find_worktree_by_branch \
+                  _worktree_branch_fully_captured; do
         dep_src="$(_wt_extract_shell_fn "$dep_fn" "$merge_pr_script")"
         if [[ -n "$dep_src" ]]; then
             dep_fns+="$dep_src"$'\n'
         else
             # Upstream renamed/removed the helper: degrade to the generic
-            # "checked out somewhere" warning path instead of aborting.
+            # "checked out somewhere" warning path instead of aborting. The
+            # two predicates shim to `return 1` — for
+            # `_worktree_branch_fully_captured` that means "not provably
+            # captured", which keeps the conservative `git branch -d`.
             case "$dep_fn" in
-                _is_primary_worktree_path) dep_fns+="$dep_fn() { return 1; }"$'\n' ;;
-                *)                         dep_fns+="$dep_fn() { :; }"$'\n' ;;
+                _is_primary_worktree_path|_worktree_branch_fully_captured)
+                    dep_fns+="$dep_fn() { return 1; }"$'\n' ;;
+                *)  dep_fns+="$dep_fn() { :; }"$'\n' ;;
             esac
         fi
     done

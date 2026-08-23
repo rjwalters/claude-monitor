@@ -51,6 +51,21 @@
 #              auto-cleaned.
 #          (j) CLEANUP_PRIMARY_CHECKOUT=false (--no-cleanup-primary) opts out
 #              even when otherwise fully safe.
+#   3. The never-closing-programme-issue case (#6694) — an issue that is OPEN,
+#      is not a close target of this PR, and never will be (every merge to it
+#      is `Part of #N` by design), so the issue-close cleanup gate can never
+#      flip true and the pre-#6694 worktree/branch preserve was permanent:
+#      (k) the shared `_worktree_branch_fully_captured` predicate the
+#          worktree-preserve decision and the `-d` -> `-D` upgrade now BOTH
+#          key on, exercised directly: true only for an exact tip match; false
+#          for local commits beyond the merged head, a missing branch, and an
+#          empty expected SHA.
+#      (l) end-to-end ordering: the branch delete is gated on the WORKTREE
+#          being gone, never on the issue closing — refused while the
+#          fully-captured worktree is present, force-deleted by the identical
+#          call once merge-pr.sh removes it, with the issue still open.
+#      This is deliberately distinct from the closed-issue reaping path
+#      covered by test-merge-pr-closed-issue-cleanup.sh.
 #
 # This is the companion to test-merge-pr-worktree-path.sh (wiring/discovery)
 # and test-merge-pr-primary-worktree-guard.sh (the extract-and-eval pattern
@@ -138,6 +153,10 @@ error()   { echo "ERROR: $*" >&2; return 1; }
 eval "$(extract_fn _primary_worktree_path "$MERGE_PR")"
 eval "$(extract_fn _is_primary_worktree_path "$MERGE_PR")"
 eval "$(extract_fn _find_worktree_by_branch "$MERGE_PR")"
+# #6694: _maybe_delete_local_branch's tip-match check now delegates to this
+# shared helper (also reused by the worktree-preserve decision) — extract it
+# too so the real code path (not a stub) drives the tip-match assertions.
+eval "$(extract_fn _worktree_branch_fully_captured "$MERGE_PR")"
 eval "$(extract_fn _maybe_delete_local_branch "$MERGE_PR")"
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/loom-merge-local-branch.XXXXXX")"
@@ -358,6 +377,101 @@ else
 fi
 git -C "$REPO" checkout -q main
 git -C "$REPO" branch -D feature/issue-800 >/dev/null 2>&1 || true
+
+# --- Test 4: never-closing programme issue (#6694) ---
+#
+# Distinct from the closed-issue reaping path (covered by
+# test-merge-pr-closed-issue-cleanup.sh): here the issue is OPEN, is not a
+# close target of this PR, and never will close — every merge to it is
+# `Part of #N` by design. Pre-#6694 that meant the worktree was preserved
+# forever, which in turn made the unconditional _maybe_delete_local_branch
+# call a guaranteed no-op ("checked out (current HEAD or another worktree)"),
+# so the local branch survived forever too. These cases pin the two halves of
+# the fix: the shared predicate itself, and the fact that the branch delete
+# succeeds once the fully-captured worktree is removed — with no dependence
+# on the issue's state.
+echo ""
+echo "Test 4: never-closing programme issue — branch/worktree cleanup (#6694)"
+
+# --- (k) _worktree_branch_fully_captured predicate, exercised directly.
+# The worktree-preserve decision keys on this and NOTHING about the issue, so
+# it must be true exactly when the branch tip is the merged PR's head SHA. ---
+git -C "$REPO" checkout -q -b feature/issue-900
+echo "captured work" >> "$REPO/README.md"
+git -C "$REPO" commit -q -am "issue 900 work (merged as this PR's head)"
+CAPTURED_SHA="$(git -C "$REPO" rev-parse feature/issue-900)"
+git -C "$REPO" checkout -q main
+
+if _worktree_branch_fully_captured "feature/issue-900" "$CAPTURED_SHA"; then
+    pass "(k1) tip == merged PR head SHA is reported fully captured"
+else
+    fail "(k1) expected fully-captured for a tip matching the merged PR head SHA"
+fi
+
+git -C "$REPO" checkout -q feature/issue-900
+echo "unpushed follow-up" >> "$REPO/README.md"
+git -C "$REPO" commit -q -am "local work beyond the merged head"
+git -C "$REPO" checkout -q main
+
+if _worktree_branch_fully_captured "feature/issue-900" "$CAPTURED_SHA"; then
+    fail "(k2) a branch carrying local commits beyond the merged head must NOT be fully captured"
+else
+    pass "(k2) local commits beyond the merged head are not fully captured (preserve stays correct)"
+fi
+
+if _worktree_branch_fully_captured "feature/issue-901-nonexistent" "$CAPTURED_SHA"; then
+    fail "(k3) a nonexistent local branch must not be reported fully captured"
+else
+    pass "(k3) nonexistent local branch is not fully captured"
+fi
+
+if _worktree_branch_fully_captured "feature/issue-900" ""; then
+    fail "(k4) an empty expected head SHA must not be reported fully captured"
+else
+    pass "(k4) empty expected head SHA is not fully captured (no accidental blanket removal)"
+fi
+git -C "$REPO" branch -D feature/issue-900 >/dev/null 2>&1 || true
+
+# --- (l) end-to-end ordering: the branch delete is gated on the WORKTREE being
+# gone, never on the issue closing. While the fully-captured worktree is still
+# present the delete is refused (the pre-#6694 permanent state for a
+# never-closing issue); once merge-pr.sh removes it — which #6694 now does on
+# the fully-captured criterion alone, with the issue still OPEN and still not a
+# close target — the very same call force-deletes the branch. ---
+git -C "$REPO" branch feature/issue-902
+WT_NEVER_CLOSING="$TMP_ROOT/wt-never-closing"
+git -C "$REPO" worktree add -q "$WT_NEVER_CLOSING" feature/issue-902 >/dev/null 2>&1
+echo "increment" >> "$WT_NEVER_CLOSING/README.md"
+git -C "$WT_NEVER_CLOSING" commit -q -am "Part of #902 — one increment of a programme issue"
+NEVER_CLOSING_SHA="$(git -C "$REPO" rev-parse feature/issue-902)"
+
+out_l1="$(_maybe_delete_local_branch "feature/issue-902" "$NEVER_CLOSING_SHA" 2>&1)"
+if [[ "$out_l1" == *"WARN:"* ]] \
+   && [[ "$out_l1" == *"checked out (current HEAD or another worktree)"* ]] \
+   && git -C "$REPO" show-ref --verify --quiet refs/heads/feature/issue-902; then
+    pass "(l1) while the worktree is preserved the branch delete is refused (the pre-#6694 permanent state)"
+else
+    fail "(l1) expected checked-out refusal while the worktree exists; got: $out_l1"
+fi
+
+# The branch really is fully captured — this is exactly the predicate #6694
+# has merge-pr.sh consult to remove the worktree despite the open issue.
+if _worktree_branch_fully_captured "feature/issue-902" "$NEVER_CLOSING_SHA"; then
+    pass "(l2) the never-closing issue's branch is fully captured, so the worktree is removable"
+else
+    fail "(l2) expected the never-closing issue's branch to be fully captured"
+fi
+
+git -C "$REPO" worktree remove "$WT_NEVER_CLOSING" --force >/dev/null 2>&1 || true
+
+out_l3="$(_maybe_delete_local_branch "feature/issue-902" "$NEVER_CLOSING_SHA" 2>&1)"
+if [[ "$out_l3" == *"OK: Local branch 'feature/issue-902' deleted"* ]] \
+   && [[ "$out_l3" == *"safe force-delete"* ]] \
+   && ! git -C "$REPO" show-ref --verify --quiet refs/heads/feature/issue-902; then
+    pass "(l3) once the fully-captured worktree is removed the branch is deleted — no dependence on the issue closing"
+else
+    fail "(l3) expected force-delete after worktree removal; got: $out_l3"
+fi
 
 # --- Summary ---
 echo ""

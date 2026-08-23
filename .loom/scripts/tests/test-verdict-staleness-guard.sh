@@ -84,7 +84,8 @@ STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 
 # --- Stub gh on PATH ---------------------------------------------------
-#   gh pr view <N> --json headRefOid,labels -> cat $STUB_DIR/pr-<N>.json
+#   gh pr view <N> --json headRefOid,labels,state,merged
+#                                           -> cat $STUB_DIR/pr-<N>.json
 #                                              (fails if pr-view-fail-<N> exists)
 #   gh api repos/{owner}/{repo}/issues/<N>/comments --paginate
 #                                           -> cat $STUB_DIR/comments-<N>.json (or "[]")
@@ -112,7 +113,7 @@ case "$1" in
           echo "gh: A new release of gh is available: 2.0.0 -> 2.1.0" >&2
         fi
         canned="$STUB_DIR_FROM_ENV/pr-$pr_num.json"
-        if [[ -f "$canned" ]]; then cat "$canned"; else echo '{"headRefOid":"0000000000000000000000000000000000000000","labels":[]}'; fi
+        if [[ -f "$canned" ]]; then cat "$canned"; else echo '{"headRefOid":"0000000000000000000000000000000000000000","state":"OPEN","merged":false,"labels":[]}'; fi
         exit 0
         ;;
       comment)
@@ -171,15 +172,35 @@ SHA_A="1111111111111111111111111111111111111111"
 SHA_B="2222222222222222222222222222222222222222"
 SHA_C="3333333333333333333333333333333333333333"
 
-pr_json() {
-    # pr_json <pr-number> <head-sha> [label ...]
-    local num="$1" sha="$2"; shift 2
+labels_json() {
+    # labels_json [label ...] -> the `labels` array body
     local labels="" l
     for l in "$@"; do
         [[ -n "$labels" ]] && labels="$labels,"
         labels="$labels{\"name\":\"$l\"}"
     done
-    printf '{"headRefOid":"%s","labels":[%s]}' "$sha" "$labels" > "$STUB_DIR/pr-$num.json"
+    printf '%s' "$labels"
+}
+
+pr_json_state() {
+    # pr_json_state <pr-number> <head-sha> <state> <merged:true|false> [label ...]
+    local num="$1" sha="$2" state="$3" merged="$4"; shift 4
+    printf '{"headRefOid":"%s","state":"%s","merged":%s,"labels":[%s]}' \
+        "$sha" "$state" "$merged" "$(labels_json "$@")" > "$STUB_DIR/pr-$num.json"
+}
+
+pr_json() {
+    # pr_json <pr-number> <head-sha> [label ...] — an OPEN, unmerged PR (the
+    # only shape that may reach the FRESH/STALE comparison since #6781).
+    local num="$1" sha="$2"; shift 2
+    pr_json_state "$num" "$sha" "OPEN" "false" "$@"
+}
+
+pr_json_no_state() {
+    # pr_json_no_state <pr-number> <head-sha> [label ...] — the pre-#6781 shape
+    # a forge shim that does not report `state`/`merged` would return.
+    local num="$1" sha="$2"; shift 2
+    printf '{"headRefOid":"%s","labels":[%s]}' "$sha" "$(labels_json "$@")" > "$STUB_DIR/pr-$num.json"
 }
 
 verdict_comment() {
@@ -583,6 +604,124 @@ assert_eq "11" "$RC" "(o8) No --anchor -> exit 11 as before"
 assert_eq "0" "$(get_field "$OUT" ANCHORED)" "(o8) ANCHORED=0 without --anchor"
 assert_eq "" "$COMMENTS_POSTED" "(o8) No comment without --anchor"
 assert_eq "" "$WRITES" "(o8) No label writes without --anchor"
+
+# --- #6781: NOT_OPEN, the merged/closed short-circuit ----------------------
+#
+# THE #6781 INCIDENT (2026-08-23, PR #6772): a sweep read PR #6772 as open and
+# `loom:pr`, then waited out a GraphQL rate-limit reset for ~2.5 minutes. In
+# that window the daemon's Champion merged it. The sweep then ran the guard
+# with --clear; the guard never looked at `state`, compared the approval's
+# marker SHA against the merged head SHA (different — a commit had landed
+# between approval and merge), concluded STALE, and stripped `loom:pr` +
+# re-added `loom:review-requested` on an ALREADY-MERGED PR.
+#
+# A merged PR's head SHA differing from the SHA its approval was rendered
+# against is normal, not suspicious — so without the state check this misfires
+# on the ordinary "completed externally" race (#4884), not on an exotic one.
+
+# (p) The incident, reproduced: merged PR, approval marker at the pre-merge
+#     SHA, --clear passed -> NOT_OPEN (exit 14) and NOTHING is written.
+reset_state
+pr_json_state 227 "$SHA_B" "MERGED" "true" "loom:pr"
+{ echo "["; verdict_comment "2026-08-23T06:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-227.json"
+run_guard 227 --clear
+assert_eq "14" "$RC" "(p) Merged PR with a mismatched marker -> exit 14"
+assert_eq "NOT_OPEN" "$(get_field "$OUT" DECISION)" "(p) DECISION=NOT_OPEN, not STALE"
+assert_eq "" "$WRITES" "(p) No label writes on a merged PR"
+assert_eq "" "$COMMENTS_POSTED" "(p) No comment posted on a merged PR"
+assert_eq "0" "$(get_field "$OUT" CLEARED)" "(p) CLEARED=0"
+assert_eq "0" "$(get_field "$OUT" ANCHORED)" "(p) ANCHORED=0"
+assert_eq "loom:pr" "$(get_field "$OUT" VERDICT_LABEL)" "(p) VERDICT_LABEL still reported for the operator"
+assert_eq "$SHA_B" "$(get_field "$OUT" HEAD_SHA)" "(p) HEAD_SHA reported"
+
+# (p1) The specific criterion from #6781: `loom:review-requested` must NEVER be
+#      added to a merged PR. Asserted directly against the recorded writes.
+assert_not_contains "$WRITES" "loom:review-requested" "(p1) Merged PR is never re-queued for review"
+assert_not_contains "$WRITES" "--remove-label loom:pr" "(p1) Merged PR's approval label is never stripped"
+
+# (p2) Closed WITHOUT merging (state=CLOSED, merged=false): same short-circuit.
+#      An abandoned PR is just as finished as a merged one.
+reset_state
+pr_json_state 228 "$SHA_C" "CLOSED" "false" "loom:changes-requested" "loom:ci-failure"
+{ echo "["; verdict_comment "2026-08-23T06:00:00Z" "$SHA_A" "changes-requested"; echo "]"; } > "$STUB_DIR/comments-228.json"
+run_guard 228 --clear
+assert_eq "14" "$RC" "(p2) Closed-unmerged PR -> exit 14"
+assert_eq "NOT_OPEN" "$(get_field "$OUT" DECISION)" "(p2) DECISION=NOT_OPEN"
+assert_contains "$OUT" "closed without merging" "(p2) REASON distinguishes closed from merged"
+assert_eq "" "$WRITES" "(p2) No label writes on a closed PR"
+assert_eq "" "$COMMENTS_POSTED" "(p2) No comment posted on a closed PR"
+
+# (p3) --anchor is short-circuited too: an unmarked verdict on a merged PR gets
+#      no anchor comment. Anchoring a finished PR would be pure comment spam —
+#      there is no future force-push left to catch.
+reset_state
+pr_json_state 229 "$SHA_B" "MERGED" "true" "loom:pr"
+{ echo "["; plain_comment "2026-08-23T06:00:00Z" "LGTM."; echo "]"; } > "$STUB_DIR/comments-229.json"
+run_guard 229 --clear --anchor
+assert_eq "14" "$RC" "(p3) Unmarked verdict on a merged PR -> exit 14, not 13"
+assert_eq "NOT_OPEN" "$(get_field "$OUT" DECISION)" "(p3) DECISION=NOT_OPEN, not ANCHORED"
+assert_eq "" "$COMMENTS_POSTED" "(p3) No anchor comment on a merged PR"
+assert_eq "" "$WRITES" "(p3) No label writes on a merged PR"
+
+# (p4) NOT_OPEN outranks NO_VERDICT: a merged PR with no verdict label at all
+#      still reports NOT_OPEN, so the state answer is never masked by the
+#      label answer.
+reset_state
+pr_json_state 230 "$SHA_B" "MERGED" "true" "loom:review-requested"
+run_guard 230 --clear
+assert_eq "14" "$RC" "(p4) Merged PR with no verdict label -> exit 14, not 10"
+assert_eq "NOT_OPEN" "$(get_field "$OUT" DECISION)" "(p4) DECISION=NOT_OPEN takes priority over NO_VERDICT"
+assert_eq "" "$(get_field "$OUT" VERDICT_LABEL)" "(p4) VERDICT_LABEL empty"
+
+# (p5) The short-circuit happens BEFORE the comments fetch: with the comment
+#      API rigged to fail, a guard that still fetched comments would exit 1.
+#      Exit 14 proves the finished PR costs exactly one API call.
+reset_state
+pr_json_state 231 "$SHA_B" "MERGED" "true" "loom:pr"
+touch "$STUB_DIR/comments-fail-231"
+run_guard 231 --clear
+assert_eq "14" "$RC" "(p5) Short-circuits before the comments fetch"
+assert_eq "" "$WRITES" "(p5) No label writes"
+
+# (p6) REST-shaped state (a forge shim returning lowercase `closed` alongside
+#      `merged: true`, the shape quoted in #6781) is recognized too.
+reset_state
+pr_json_state 232 "$SHA_B" "closed" "true" "loom:pr"
+{ echo "["; verdict_comment "2026-08-23T06:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-232.json"
+run_guard 232 --clear
+assert_eq "14" "$RC" "(p6) Lowercase REST state -> exit 14"
+assert_eq "" "$WRITES" "(p6) No label writes"
+
+# (p7) merged=true with state still reported OPEN (a forge that reports the
+#      merge before flipping the state) is not open either.
+reset_state
+pr_json_state 233 "$SHA_B" "OPEN" "true" "loom:pr"
+{ echo "["; verdict_comment "2026-08-23T06:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-233.json"
+run_guard 233 --clear
+assert_eq "14" "$RC" "(p7) merged=true wins over a stale state=OPEN -> exit 14"
+assert_eq "" "$WRITES" "(p7) No label writes"
+
+# (p8) An OPEN, unmerged PR is completely unaffected: the stale approval is
+#      still cleared and re-queued exactly as before #6781.
+reset_state
+pr_json_state 234 "$SHA_C" "OPEN" "false" "loom:pr"
+{ echo "["; verdict_comment "2026-08-23T06:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-234.json"
+run_guard 234 --clear
+assert_eq "12" "$RC" "(p8) Open PR with a stale approval -> still exit 12"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(p8) Still cleared on an open PR"
+assert_contains "$WRITES" "--add-label loom:review-requested" "(p8) Still re-queued on an open PR"
+
+# (p9) Fail-open on a MISSING state field: a forge shim that reports neither
+#      `state` nor `merged` keeps the pre-#6781 behavior. Failing closed here
+#      would silently disable stale-verdict clearing on such a forge, which
+#      reinstates the #5686 hazard (a stale approval standing on a LIVE PR) —
+#      strictly worse than mislabeling PRs that are already finished.
+reset_state
+pr_json_no_state 235 "$SHA_C" "loom:pr"
+{ echo "["; verdict_comment "2026-08-23T06:00:00Z" "$SHA_A" "approved"; echo "]"; } > "$STUB_DIR/comments-235.json"
+run_guard 235 --clear
+assert_eq "12" "$RC" "(p9) Absent state field -> pre-#6781 behavior (exit 12)"
+assert_eq "1" "$(get_field "$OUT" CLEARED)" "(p9) Stale approval still cleared when state is unknown"
 
 # --- Summary -------------------------------------------------------------
 echo ""

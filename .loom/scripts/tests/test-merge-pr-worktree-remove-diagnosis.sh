@@ -106,6 +106,8 @@ loom_record_worktree_removal() { :; }  # no-op stub; ledger writes are out of sc
 
 eval "$(extract_fn _primary_worktree_path "$MERGE_PR")"
 eval "$(extract_fn _worktree_branch_for   "$MERGE_PR")"
+# #6694: _maybe_delete_local_branch delegates its tip-match check here.
+eval "$(extract_fn _worktree_branch_fully_captured "$MERGE_PR")"
 eval "$(extract_fn _maybe_delete_local_branch "$MERGE_PR")"
 eval "$(extract_fn _remove_loom_worktree  "$MERGE_PR")"
 

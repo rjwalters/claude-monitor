@@ -174,7 +174,11 @@ if [[ -n "$pr_branches" ]]; then
     # branch is still checked out in a live review worktree (exactly the
     # population this pass targets) aborts the whole script with
     # `_find_worktree_by_branch: command not found` under `set -e` (#4405).
-    _MAYBE_DELETE_DEPS=(_primary_worktree_path _is_primary_worktree_path _find_worktree_by_branch)
+    # `_worktree_branch_fully_captured` is the tip-match safety predicate the
+    # `-d` → `-D` upgrade delegates to since #6694 — extracted for the same
+    # reason: without it the force-delete path dies with "command not found".
+    _MAYBE_DELETE_DEPS=(_primary_worktree_path _is_primary_worktree_path _find_worktree_by_branch
+                        _worktree_branch_fully_captured)
     _MAYBE_DELETE_DEP_FNS=""
     if [[ -f "$MERGE_PR_SCRIPT" ]]; then
         _MAYBE_DELETE_FN="$(_extract_shell_fn _maybe_delete_local_branch "$MERGE_PR_SCRIPT")"
@@ -184,12 +188,15 @@ if [[ -n "$pr_branches" ]]; then
                 _MAYBE_DELETE_DEP_FNS+="$_dep_src"$'\n'
             else
                 # Upstream renamed/removed the helper: degrade to the generic
-                # "checked out somewhere" warning instead of crashing. Both
+                # "checked out somewhere" warning instead of crashing. All
                 # shims are safe under `set -e` — the path shims print nothing
-                # and succeed, and the predicate is only used as an `if` test.
+                # and succeed, and the predicates are only used as `if` tests
+                # (a `return 1` for `_worktree_branch_fully_captured` means
+                # "not provably captured", keeping the conservative `-d`).
                 case "$_dep_fn" in
-                    _is_primary_worktree_path) _MAYBE_DELETE_DEP_FNS+="$_dep_fn() { return 1; }"$'\n' ;;
-                    *)                         _MAYBE_DELETE_DEP_FNS+="$_dep_fn() { :; }"$'\n' ;;
+                    _is_primary_worktree_path|_worktree_branch_fully_captured)
+                        _MAYBE_DELETE_DEP_FNS+="$_dep_fn() { return 1; }"$'\n' ;;
+                    *)  _MAYBE_DELETE_DEP_FNS+="$_dep_fn() { :; }"$'\n' ;;
                 esac
             fi
         done
