@@ -632,7 +632,13 @@ list.
 Token selection resolves the effective pool as: the **per-repo** pool
 `<repo>/.loom/tokens/` when it holds `*.token` files, else the **shared
 machine-level pool** `~/.loom/tokens/` (override `LOOM_SHARED_TOKENS_DIR`; set it
-empty to disable the fallback). This lets a consumer repo the daemon dispatches
+empty to disable the fallback). **This precedence is presence-based, not
+health-based**: a per-repo pool wins by merely *having* `.token` files present,
+regardless of whether any of its accounts are actually usable — so a per-repo
+pool whose every account has since gone bad-marked or `.ranking`-excluded still
+shadows a healthy shared pool rather than falling back to it (issue #6758; the
+empty-pool error names the shared pool and, since #6758, whether it currently
+holds a usable account). This lets a consumer repo the daemon dispatches
 into — which has no pool of its own — spawn against the shared pool instead of
 hard-failing with `EX_CONFIG`. Crucially, the pool **state** files (`.bad_tokens`,
 `.failure_counts`, `.ranking`, `.allowlist`) are read/written in whichever pool was
