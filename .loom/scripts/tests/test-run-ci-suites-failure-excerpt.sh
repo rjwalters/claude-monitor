@@ -150,6 +150,84 @@ out6="$(print_suite_failure_excerpt "bullet.sh" "$LOG6" 2>&1)"
 grep -q "guard skips the daemon suites when a pid file exists" <<<"$(failure_section "$out6")"
 check "$?" "bullet-style (U+2717) failure lines are matched as failures" "$(failure_section "$out6")"
 
+# ---------- 6b. the other cross-mark bullets are recognized too (#6745) ----------
+# #6639's inline excerpt matched `✗|✘|✖|FAIL:|^not ok`; when it was reverted in
+# favor of this extracted library (#6662) the marker set narrowed to `FAIL|✗`.
+# These fixtures carry the lost shapes forward. Each log's ONLY failure line is
+# the marker under test, and it sits ~60 lines above the trailing window — so a
+# match can only come from the failure-anchored section, never from the tail.
+#
+# The three markers are byte-distinct despite rendering alike:
+#   ✗ U+2717 BALLOT X            (covered by fixture 6)
+#   ✘ U+2718 HEAVY BALLOT X
+#   ✖ U+2716 HEAVY MULTIPLICATION X
+assert_marker_recognized() { # <label> <marker> <message>
+    local label="$1" marker="$2" msg="$3"
+    local log="$WORKDIR/marker-$label.log" out sec i
+    {
+        echo "✓ an earlier check passed"
+        echo "$marker $msg"
+        for i in $(seq 1 60); do echo "✓ later check $i"; done
+    } > "$log"
+    out="$(print_suite_failure_excerpt "$label.sh" "$log" 2>&1)"
+    sec="$(failure_section "$out")"
+    grep -q "$msg" <<<"$sec"
+    check "$?" "$label failure lines are matched as failures" "$sec"
+}
+
+assert_marker_recognized "heavy-ballot-x (U+2718)" "✘" \
+    "heavy ballot X marks the failed assertion"
+assert_marker_recognized "heavy-multiplication-x (U+2716)" "✖" \
+    "heavy multiplication X marks the failed assertion"
+
+# TAP producers emit `not ok <n> - <description>` at line start.
+LOG6D="$WORKDIR/tap.log"
+{
+    echo "1..62"
+    echo "ok 1 - the first assertion"
+    echo "not ok 2 - TAP reports the failed assertion here"
+    for i in $(seq 3 62); do echo "ok $i - later assertion"; done
+} > "$LOG6D"
+out6d="$(print_suite_failure_excerpt "tap.sh" "$LOG6D" 2>&1)"
+grep -q "TAP reports the failed assertion here" <<<"$(failure_section "$out6d")"
+check "$?" "TAP-style 'not ok' failure lines are matched as failures" "$(failure_section "$out6d")"
+
+# ...but ONLY at line start. An unanchored `not ok` would match ordinary prose,
+# flooding the excerpt with lines that report nothing. This log contains the
+# substring three times and must still be reported as "nothing matched".
+LOG6E="$WORKDIR/not-ok-prose.log"
+{
+    echo "checking whether the fixture is not ok before proceeding"
+    echo "the operator said the result was not ok"
+    for i in $(seq 1 50); do echo "step $i"; done
+    echo "  not ok — indented, so still not a TAP result line"
+} > "$LOG6E"
+out6e="$(print_suite_failure_excerpt "prose.sh" "$LOG6E" 2>&1)"
+grep -q "failed without emitting a recognizable" <<<"$out6e"
+check "$?" "'not ok' is anchored: mid-line prose occurrences do NOT match" "$out6e"
+
+# ---------- 6f. a marker-dense log still respects the cap ----------
+# The pattern is deliberately substring-loose on FAIL, so benign lines carrying
+# the token (FAILSAFE, FAILOVER, …) do match. That is accepted — a diagnostic
+# prefers a false positive to a false negative — but the cap is what keeps such
+# a log from burying the real failure, so pin that it still holds after the
+# widening.
+LOG6F="$WORKDIR/marker-dense.log"
+{
+    echo "FAIL: the assertion that actually failed"
+    for i in $(seq 1 40); do echo "note $i: FAILSAFE mode is enabled"; done
+    echo "Total: 41  Passed: 40  Failed: 1"
+} > "$LOG6F"
+out6f="$( LOOM_CI_FAIL_EXCERPT_MAX=5 LOOM_CI_FAIL_CONTEXT_LINES=0 \
+    print_suite_failure_excerpt "dense.sh" "$LOG6F" 2>&1 )"
+sec6f="$(failure_section "$out6f")"
+n6f="$(grep -c "FAIL" <<<"$sec6f")"
+if [[ "$n6f" -le 5 ]]; then rc6f=0; else rc6f=1; fi
+check "$rc6f" "widened pattern still honors the cap on a marker-dense log (got $n6f, cap 5)" "$sec6f"
+
+grep -q "FAIL: the assertion that actually failed" <<<"$sec6f"
+check "$?" "the real failure survives at the head of a marker-dense excerpt" "$sec6f"
+
 # ---------- 7. a suite that failed with no recognizable failure line ----------
 # A crash / timeout kill / non-zero exit before any assertion ran must produce
 # an explicit note, never a silently empty failure section.

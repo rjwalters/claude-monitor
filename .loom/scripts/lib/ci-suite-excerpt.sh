@@ -39,14 +39,32 @@
 #   LOOM_CI_FAIL_CONTEXT_LINES trailing context per match   (default 3)
 #   LOOM_CI_FAIL_TAIL_LINES    trailing-window size         (default 40)
 
-# Pattern for "this line reports a failure". Covers both conventions in use
-# across this repo's suites: the `FAIL:` / `FAILED:` prefix (assert_eq-style
-# suites, e.g. tests/install/*) and the `✗` bullet (check/pass/fail-style
-# suites, e.g. defaults/scripts/tests/test-run-ci-suites-daemon-guard.sh).
+# Pattern for "this line reports a failure". Covers the conventions in use
+# across this repo's suites plus the ones a suite can plausibly adopt:
+#
+#   FAIL      the `FAIL:` / `FAILED:` prefix (assert_eq-style suites,
+#             e.g. tests/install/*)
+#   ✗         U+2717 BALLOT X — the bullet used by this repo's
+#             check/pass/fail-style suites (e.g.
+#             defaults/scripts/tests/test-run-ci-suites-daemon-guard.sh)
+#   ✘         U+2718 HEAVY BALLOT X
+#   ✖         U+2716 HEAVY MULTIPLICATION X
+#   ^not ok   TAP-style result lines
+#
+# The last three are proactive (#6745): as of 2026-08-23 no wired suite emits
+# them, so this closes the gap the moment one adopts a different convention
+# rather than after another blind CI run. They come from the inline excerpt in
+# PR #6639, which matched `✗|✘|✖|FAIL:|^not ok`; that block was reverted in
+# favor of this library (#6662) and the wider marker set was lost with it.
+#
 # Deliberately substring-loose on FAIL so a color-wrapped `\033[0;31mFAIL\033[0m:`
 # still matches — the excerpt is a diagnostic, so a false positive costs a few
-# extra printed lines while a false negative costs another blind CI run.
-LOOM_CI_FAIL_PATTERN='FAIL|✗'
+# extra printed lines while a false negative costs another blind CI run. The
+# same latitude is NOT extended to `not ok`: unlike `FAIL` and the cross-mark
+# bullets it is ordinary lowercase English, so an unanchored match would fire on
+# any prose containing the phrase and bury the real failure. It is anchored to
+# line start, where TAP puts it. `-m "$max"` caps whatever does match.
+LOOM_CI_FAIL_PATTERN='FAIL|✗|✘|✖|^not ok'
 
 # print_suite_failure_excerpt <suite-label> <log-path>
 #

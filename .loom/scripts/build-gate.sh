@@ -207,7 +207,7 @@ _arm_dispatch_backoff_on_timeout() {
   fi
   echo "[build-gate] arming dispatch backoff for issue #${LOOM_SWEEP_CLAIM_OWNED} (#4485/#6192)" >&2
   "$_daemon_bin" dispatch-backoff record \
-    --issue "$LOOM_SWEEP_CLAIM_OWNED" \
+    "$LOOM_SWEEP_CLAIM_OWNED" \
     --reason "build-gate timeout: ${step_desc} (${elapsed}s elapsed, budget ${_gate_step_timeout}s)" \
     >/dev/null 2>&1 || true
   return 0

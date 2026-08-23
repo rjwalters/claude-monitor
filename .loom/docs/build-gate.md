@@ -464,8 +464,9 @@ indefinitely, and nothing the gate spawns may outlive it.
   never blends into an ordinary red-test failure.
 - **A timeout arms the dispatch backoff (#4485).** When the gate is running
   inside a daemon-dispatched sweep (`LOOM_SWEEP_CLAIM_OWNED` is set) it calls
-  `loom-daemon dispatch-backoff record --issue <N> --reason "build-gate
-  timeout: …"`, so the issue's next dispatch is **deferred** instead of racing
+  `loom-daemon dispatch-backoff record <N> --reason "build-gate
+  timeout: …"` (the issue number is positional, not an `--issue` flag), so the
+  issue's next dispatch is **deferred** instead of racing
   a fresh retry against a still-wedged host — the pile-up mechanism from the
   incident. This is strictly best-effort: no claim, no daemon binary, or an
   unreachable daemon socket are all silently skipped and never change the

@@ -5646,12 +5646,29 @@ if echo "$COMMAND_ASK_SCAN" | grep -qE 'rm[[:space:]]+-[a-zA-Z]*[rf]'; then
                 continue ;;
         esac
 
+        # Shell-accurate quote removal, for the classification only (#4926,
+        # mirrored here for the rm-scope path by #6814): extract_rm_targets()
+        # emits tokens with their quote characters preserved verbatim
+        # (qsplit's contract), so a quoted absolute target (`'/opt/evil'`,
+        # `"/opt/evil"`) reaches here starting with a quote character rather
+        # than `/` — the `= /*` test below would then misclassify it as
+        # RELATIVE and cwd-prefix it into `<repo-root>/'/opt/evil'`, which
+        # lexically starts with $REPO_ROOT and so passes the IN_SCOPE
+        # prefix check further down, silently ADMITTING an out-of-repo
+        # target by simply quoting it. Unquote a COPY for the classification
+        # only: the allowlist `case "$target"` above and the deny messages
+        # below still use the raw, quote-preserved `$target`. An unterminated
+        # quote falls back to the raw token (today's verdict), never
+        # widening a deny into an allow.
+        _rmclassify="$target"
+        strip_target_quoting "$target" && _rmclassify="$_UNQUOTED_TARGET"
+
         # Resolve path to absolute (raw — normalization happens next).
         ABS_PATH=""
-        if [[ "$target" = /* ]]; then
-            ABS_PATH="$target"
+        if [[ "$_rmclassify" = /* ]]; then
+            ABS_PATH="$_rmclassify"
         elif [[ -n "$CWD" ]]; then
-            ABS_PATH="$CWD/$target"
+            ABS_PATH="$CWD/$_rmclassify"
         fi
 
         # Lexically normalize the absolute target BEFORE the protected-path
