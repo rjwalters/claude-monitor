@@ -311,6 +311,23 @@ Wired call sites: `create-pr.sh` (PR creation), `create-issue.sh` /
 (comments), `forge_gh_swap_label_rl_safe` (label edits), and the sweep's
 own Builder-recovery PR creation.
 
+**The merge itself is wired too (#6752).** `merge-pr.sh`'s primary merge path
+calls the *native* `loom-daemon forge auto-merge`, whose forge-write code lives
+in Rust entirely outside this bash ladder, and its synchronous path issued a
+bare `gh api … -X PUT`. Both hard-failed on the integration-403 until #6752 —
+observed on 2026-08-22 (`/loom:sweep 6746`, PR #6751), where comment/label
+writes recovered through the ladder but the merge died, and the operator had to
+`unset GH_CONFIG_DIR` by hand (rung 3, performed manually) to finish it. The
+ladder is now command-agnostic: `forge_cmd_perm_safe <cmd> …` runs the same
+three rungs around **any** command whose credential comes from the environment
+(`loom-daemon forge …` shells out to `gh`, so the same `GH_TOKEN` /
+`GH_CONFIG_DIR` swap reaches it), and `forge_gh_perm_safe` is now just its
+`gh`-prefixed spelling — one implementation, so the two cannot drift. The
+wrapped command's exit code is preserved verbatim, so `loom-daemon forge
+auto-merge`'s meaningful codes (3 = forge declined → shell fallback, 4 =
+head-SHA mismatch → re-queue) still reach `merge-pr.sh` unretried and
+unrewritten.
+
 **Builders never lose work to this window.** `create-pr.sh` adopts an
 already-open PR for the head branch instead of creating a second one, and the
 sweep's Builder validation now opens the PR from an **already-pushed** branch

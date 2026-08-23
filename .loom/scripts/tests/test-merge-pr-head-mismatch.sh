@@ -405,8 +405,12 @@ fi
 # The native dispatch's `_AM_RC -eq 4` branch must call error_head_moved
 # BEFORE the `_AM_RC -ne 3` (Gitea-decline) check further down, so a 4 never
 # falls through and gets misclassified as a generic native failure.
+#
+# The anchor tolerates the optional `forge_cmd_perm_safe ` prefix the native
+# call carries since #6752 (the App-token 403 escalation ladder): the wrapper
+# preserves the exit code verbatim, so this ordering contract is unchanged.
 native_dispatch_order=$(awk '
-  /AUTO_MERGE_OUTPUT=\$\(loom-daemon forge auto-merge/ { indispatch=1 }
+  /AUTO_MERGE_OUTPUT=\$\((forge_cmd_perm_safe )?loom-daemon forge auto-merge/ { indispatch=1 }
   indispatch && /_AM_RC -eq 4/ { print "mismatch"; exit }
   indispatch && /_AM_RC -ne 3/ { print "decline_check"; exit }
 ' "$MERGE_PR_SRC")
@@ -414,7 +418,7 @@ assert_eq "mismatch" "$native_dispatch_order" "native _AM_RC dispatch checks the
 
 TESTS_RUN=$((TESTS_RUN + 1))
 if awk '
-  /AUTO_MERGE_OUTPUT=\$\(loom-daemon forge auto-merge/ { indispatch=1; next }
+  /AUTO_MERGE_OUTPUT=\$\((forge_cmd_perm_safe )?loom-daemon forge auto-merge/ { indispatch=1; next }
   indispatch && /_AM_RC -eq 4/ { found=1 }
   found && /error_head_moved "PR #\$PR_NUMBER: \$AUTO_MERGE_OUTPUT"/ { print "ok"; exit }
   indispatch && /^    fi$/ { exit }

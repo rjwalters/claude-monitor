@@ -347,13 +347,20 @@ forge_merge_pr() {
         -d '{"Do":"squash","delete_branch_after_merge":false}'
     fi
   else
+    # Routed through the #6074 permission ladder (#6752): a stale/scope-limited
+    # App installation token 403s this PUT with "Resource not accessible by
+    # integration", which is recoverable with a stronger credential -- the
+    # failure that killed the merge of PR #6751 on 2026-08-22. Every other
+    # failure (409 head-mismatch, "Base branch was modified", 405 merge in
+    # progress) carries no such signature and falls through unretried, so the
+    # callers' existing substring classifiers are unaffected.
     if [[ -n "$expected_head_sha" ]]; then
-      gh api "repos/$nwo/pulls/$pr_number/merge" \
+      forge_gh_perm_safe api "repos/$nwo/pulls/$pr_number/merge" \
         -X PUT \
         -f merge_method=squash \
         -f sha="$expected_head_sha" 2>&1
     else
-      gh api "repos/$nwo/pulls/$pr_number/merge" \
+      forge_gh_perm_safe api "repos/$nwo/pulls/$pr_number/merge" \
         -X PUT \
         -f merge_method=squash 2>&1
     fi
@@ -566,10 +573,13 @@ forge_auto_merge() {
     node_id=$(gh api "repos/$nwo/pulls/$pr_number" --jq '.node_id' 2>/dev/null) || return 1
     [[ -z "$node_id" ]] && return 1
 
+    # The mutation (a WRITE) goes through the #6074 permission ladder (#6752),
+    # like the native `loom-daemon forge auto-merge` this shell path stands in
+    # for; the node_id lookup above is a read and needs no escalation.
     if [[ -n "$expected_head_sha" ]]; then
       local mutation_with_oid='mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!, $expectedHeadOid: GitObjectID) { enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod, expectedHeadOid: $expectedHeadOid}) { pullRequest { number autoMergeRequest { enabledAt } } } }'
 
-      gh api graphql \
+      forge_gh_perm_safe api graphql \
         -f "query=$mutation_with_oid" \
         -F "pullRequestId=$node_id" \
         -F "mergeMethod=SQUASH" \
@@ -577,7 +587,7 @@ forge_auto_merge() {
     else
       local mutation='mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}) { pullRequest { number autoMergeRequest { enabledAt } } } }'
 
-      gh api graphql \
+      forge_gh_perm_safe api graphql \
         -f "query=$mutation" \
         -F "pullRequestId=$node_id" \
         -F "mergeMethod=SQUASH" 2>/dev/null
@@ -943,6 +953,18 @@ is_rate_limit_error() {
 # Every other failure -- including a 403 that is a genuine permission
 # misconfiguration on a personal token, or a 404, or a rate limit -- falls
 # straight through unretried, exactly as before.
+#
+# #6752 widened the ladder from "`gh` invocations" to "any command whose
+# credential comes from the environment". The merge itself was the hole: on
+# 2026-08-22 `merge-pr.sh --auto` on PR #6751 died with the exact
+# integration-403 above, because BOTH of its merge writes bypassed this ladder
+# -- the native `loom-daemon forge auto-merge` (its own Rust code path) and the
+# shell `forge_merge_pr` REST PUT. The orchestrator recovered by hand with
+# `unset GH_CONFIG_DIR`, i.e. rung 3, done manually. `forge_cmd_perm_safe`
+# below is the same ladder with the `gh` literal lifted out, so the native
+# subcommand escalates through the identical rungs (`loom-daemon forge` shells
+# out to `gh`, so it reads the same GH_TOKEN/GH_CONFIG_DIR the rungs swap);
+# `forge_gh_perm_safe` is now just its `gh`-prefixed spelling.
 
 # is_app_permission_error <text> -> 0 when the text carries GitHub's
 # App-installation permission-scope rejection. Matched on the distinctive
@@ -1095,46 +1117,54 @@ _forge_gh_app_fresh_token() {
   printf '%s' "$token"
 }
 
-# _forge_gh_attempt <mode> <token> <stdout_file> <stderr_file> <gh args...>
-# Runs one rung of the ladder. `env` (not a bash var-assignment prefix) does
-# the credential swap so the override is unambiguously in the child's
-# environment and nowhere else -- this shell's own env is never mutated.
-_forge_gh_attempt() {
+# _forge_cmd_attempt <mode> <token> <stdout_file> <stderr_file> <cmd> [args...]
+# Runs one rung of the ladder for an ARBITRARY command. `env` (not a bash
+# var-assignment prefix) does the credential swap so the override is
+# unambiguously in the child's environment and nowhere else -- this shell's own
+# env is never mutated.
+#
+# The command need not be `gh` itself (#6752): `loom-daemon forge …` shells out
+# to `gh` internally and therefore resolves its credential from exactly the same
+# `GH_TOKEN` / `GH_CONFIG_DIR` / `GITHUB_TOKEN` environment, so swapping those
+# for the child escalates the native path identically to the shell path.
+_forge_cmd_attempt() {
   local mode="$1" token="$2" out_file="$3" err_file="$4"
   shift 4
   local rc=0
   case "$mode" in
     ambient)
-      gh "$@" >"$out_file" 2>"$err_file" || rc=$?
+      "$@" >"$out_file" 2>"$err_file" || rc=$?
       ;;
     app-token)
-      env GH_TOKEN="$token" gh "$@" >"$out_file" 2>"$err_file" || rc=$?
+      env GH_TOKEN="$token" "$@" >"$out_file" 2>"$err_file" || rc=$?
       ;;
     personal-token)
-      env -u GITHUB_TOKEN -u GH_CONFIG_DIR GH_TOKEN="$token" gh "$@" >"$out_file" 2>"$err_file" || rc=$?
+      env -u GITHUB_TOKEN -u GH_CONFIG_DIR GH_TOKEN="$token" "$@" >"$out_file" 2>"$err_file" || rc=$?
       ;;
     personal-ambient)
-      env -u GH_TOKEN -u GITHUB_TOKEN -u GH_CONFIG_DIR gh "$@" >"$out_file" 2>"$err_file" || rc=$?
+      env -u GH_TOKEN -u GITHUB_TOKEN -u GH_CONFIG_DIR "$@" >"$out_file" 2>"$err_file" || rc=$?
       ;;
   esac
   return "$rc"
 }
 
-# Run `gh <args...>`, escalating the credential on -- and ONLY on -- an
-# App-installation permission-scope 403 (#6074). Every write call site that a
-# Builder depends on (PR create, issue comment, label edit) routes through
-# this.
+# Run `<cmd> <args...>`, escalating the credential on -- and ONLY on -- an
+# App-installation permission-scope 403 (#6074, generalized beyond `gh` by
+# #6752). The command's own exit code is preserved verbatim on every rung, so a
+# caller that assigns meaning to specific codes (`loom-daemon forge auto-merge`
+# exits 3 = forge declined, 4 = head-SHA mismatch) still sees them: neither
+# carries the integration-403 signature, so neither is ever retried.
 #
-# Usage: forge_gh_perm_safe pr create --title T --body B ...
-# Stdout: the wrapped call's stdout (e.g. the new PR's URL).
-# Returns the last attempt's exit code; stderr carries the last attempt's
-# error text so an outer rate-limit check still sees what `gh` actually said.
-forge_gh_perm_safe() {
+# Usage: forge_cmd_perm_safe loom-daemon forge auto-merge 42 --method squash
+# Stdout: the wrapped call's stdout.
+# Returns the last attempt's exit code; stderr carries the last attempt's error
+# text so an outer rate-limit/head-mismatch check still sees what it said.
+forge_cmd_perm_safe() {
   local out_file err_file rc=0
   out_file=$(mktemp)
   err_file=$(mktemp)
 
-  _forge_gh_attempt ambient "" "$out_file" "$err_file" "$@" || rc=$?
+  _forge_cmd_attempt ambient "" "$out_file" "$err_file" "$@" || rc=$?
 
   if [[ $rc -ne 0 ]] && is_app_permission_error "$(cat "$err_file" "$out_file" 2>/dev/null)"; then
     local nwo token
@@ -1144,7 +1174,7 @@ forge_gh_perm_safe() {
     if token=$(_forge_gh_app_fresh_token "$nwo"); then
       echo "forge: 403 'not accessible by integration' — retrying with a freshly minted installation token (#6074)" >&2
       rc=0
-      _forge_gh_attempt app-token "$token" "$out_file" "$err_file" "$@" || rc=$?
+      _forge_cmd_attempt app-token "$token" "$out_file" "$err_file" "$@" || rc=$?
     fi
 
     # Rung 3: a personal token. Only worth trying when it is actually a
@@ -1154,11 +1184,11 @@ forge_gh_perm_safe() {
       if [[ -n "${LOOM_PERSONAL_GH_TOKEN:-}" ]]; then
         echo "forge: still 403 after a fresh mint — falling back to LOOM_PERSONAL_GH_TOKEN (#6074)" >&2
         rc=0
-        _forge_gh_attempt personal-token "$LOOM_PERSONAL_GH_TOKEN" "$out_file" "$err_file" "$@" || rc=$?
+        _forge_cmd_attempt personal-token "$LOOM_PERSONAL_GH_TOKEN" "$out_file" "$err_file" "$@" || rc=$?
       elif [[ -n "${GH_CONFIG_DIR:-}${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]]; then
         echo "forge: still 403 after a fresh mint — falling back to the ambient personal gh credential (#6074)" >&2
         rc=0
-        _forge_gh_attempt personal-ambient "" "$out_file" "$err_file" "$@" || rc=$?
+        _forge_cmd_attempt personal-ambient "" "$out_file" "$err_file" "$@" || rc=$?
       fi
     fi
   fi
@@ -1175,6 +1205,19 @@ forge_gh_perm_safe() {
     printf '%s\n' "$err" >&2
   fi
   return "$rc"
+}
+
+# Run `gh <args...>` through the same ladder (#6074). Every write call site that
+# a Builder depends on (PR create, issue comment, label edit) routes through
+# this; it is a thin `gh`-prefixed spelling of forge_cmd_perm_safe, so the two
+# stay behaviourally identical by construction.
+#
+# Usage: forge_gh_perm_safe pr create --title T --body B ...
+# Stdout: the wrapped call's stdout (e.g. the new PR's URL).
+# Returns the last attempt's exit code; stderr carries the last attempt's
+# error text so an outer rate-limit check still sees what `gh` actually said.
+forge_gh_perm_safe() {
+  forge_cmd_perm_safe gh "$@"
 }
 
 # Post a comment on an issue OR a pull request via `gh issue comment`, falling

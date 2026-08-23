@@ -1486,6 +1486,15 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     # and is routed straight to `error_head_moved()` below, the same
     # "re-queue, not a failure" signal `_is_head_mismatch_response()` gives
     # the shell path.
+    #
+    # #6752: the native call is wrapped in `forge_cmd_perm_safe` so a stale or
+    # scope-limited GitHub App installation token — `403 Resource not
+    # accessible by integration`, which killed this exact step on PR #6751 —
+    # escalates through the same force-mint-then-personal-token ladder the
+    # shell `gh` write sites have had since #6074, instead of hard-failing the
+    # merge. `loom-daemon forge` shells out to `gh`, so the ladder's
+    # GH_TOKEN/GH_CONFIG_DIR swap reaches it. The wrapper preserves the exit
+    # code verbatim (0/3/4/other) and escalates ONLY on that one signature.
     _AM_DECLINED=true
     if command -v loom-daemon &>/dev/null; then
       [[ $MERGE_ATTEMPT -eq 1 ]] && info "Using loom-daemon forge auto-merge (native forge-agnostic auto-merge)"
@@ -1493,7 +1502,7 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
       # and captures the native exit code (0=merged, 3=Gitea decline,
       # 4=head-SHA mismatch, else fail).
       _AM_RC=0
-      AUTO_MERGE_OUTPUT=$(loom-daemon forge auto-merge "$PR_NUMBER" --method squash --expected-head-sha "$MERGE_PRECONDITION_SHA" 2>&1) || _AM_RC=$?
+      AUTO_MERGE_OUTPUT=$(forge_cmd_perm_safe loom-daemon forge auto-merge "$PR_NUMBER" --method squash --expected-head-sha "$MERGE_PRECONDITION_SHA" 2>&1) || _AM_RC=$?
       if [[ $_AM_RC -eq 0 ]]; then
         AUTO_MERGE_OK=true
         break
