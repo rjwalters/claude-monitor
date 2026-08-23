@@ -259,7 +259,7 @@ Local verification:
 - [ ] Ran the "defaults/ VERSION-Bump Gate" command block below (not just read it) — exited 0. It covers both: a `defaults/` change without a `VERSION` bump/marker, and any hand-edited version-bearing file `scripts/version.sh check` alone would catch.
 ```
 
-**Run the defaults/ VERSION-Bump Gate locally — an actual command, not a checklist bullet to read (#6675, recurring Judge rejection: #6598, #6599, #6610, #6611, #6630, #6668 all hit this in CI because it was never run pre-PR):**
+**Run the defaults/ VERSION-Bump Gate locally — an actual command, not a checklist bullet to read (#6675, recurring Judge rejection: #6598, #6599, #6610, #6611, #6630, #6668 all hit this in CI because it was never run pre-PR). Since #6730, check 2 below (`scripts/version.sh check`) is ALSO run automatically by `./.loom/scripts/create-pr.sh` itself (it aborts with the same BLOCKER:/Fix: message if a version-bearing file — e.g. `.loom/install-metadata.json` — is out of sync), so running it here by hand is defense-in-depth, not the only line of defense; still run it locally to catch the mismatch before pushing rather than at `create-pr.sh` time:**
 
 ```bash
 # Run from your worktree, AFTER your last commit, BEFORE
@@ -284,6 +284,8 @@ fi
 # 2. Catch a version-bearing file that was hand-edited outside
 #    `scripts/version.sh bump`/`set` (the gate above only looks at
 #    defaults/ + VERSION, not the other 5 synced files individually).
+#    `create-pr.sh` also runs this exact check itself (#6730) -- this is a
+#    faster local pre-check, not the only enforcement.
 if ! ./scripts/version.sh check; then
   echo "BLOCKER: 'scripts/version.sh check' found a version mismatch — see MISMATCH line(s) above." >&2
   echo "Fix: ./scripts/version.sh bump patch   (re-syncs all version-bearing files), then re-run this check." >&2
