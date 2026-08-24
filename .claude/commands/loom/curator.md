@@ -1043,6 +1043,8 @@ There are **three, and only three**, cost-of-being-wrong strata (issue #4238 add
 
 Exit 2 means the issue body could not be fetched (both GraphQL and REST failed — usually API quota exhaustion), not that the marker is absent. Retry once quota recovers; do not re-edit the body on an exit-2.
 
+**A related but distinct marker convention** exists for `loom:operator-mechanical` items: `<!-- loom:capability=<name> -->` declares which host/credential/admin capability the item needs (#6892). It follows the identical anchored-HTML-comment parsing discipline described above but is a **separate** convention — it does not affect model routing and applies only alongside `loom:operator-mechanical`. See `defaults/docs/label-state-machine.md` → "Capability-declaration convention" for the vocabulary and parser contract. No Curator action is required by this convention today (#6892 is documentation/convention-only, with no dispatch-logic consumer yet — see #6885/#6893).
+
 ## Where to Add Enhancements
 
 **Use a hybrid approach** based on issue quality:
@@ -1512,6 +1514,37 @@ Every curated issue MUST have a `## Test Plan` section with verification steps:
 ```
 
 **Why this matters**: Builder quality validation looks for `## Test Plan` heading. Without it, Builders receive warnings and may miss important verification steps.
+
+#### Acceptance criteria that need out-of-band verification are close-blocking (#6883)
+
+Most acceptance criteria are things CI can check, and "PR merged" is then a sound
+proxy for "issue done". Some are not: a criterion that can only be satisfied by a
+**live external source**, a **real scheduled run**, or an **observation over
+time** is one a green suite says nothing about. Champion's Step 4 gate
+(`champion-pr-merge.md` → "Out-of-Band Acceptance-Criteria Gate") classifies AC
+checklist items with a fixed phrase vocabulary — `live run`, `live verification`,
+`against the live`, `real run`, `next run`, `scheduled run`, `over the next`,
+`observed over`, `in the wild`, `out-of-band`, `manual verification`, and their
+siblings — and **holds the issue open** (reopening it if GitHub already
+auto-closed it) when a matching criterion has no `<!-- loom:ac-verified
+sha=<head> -->` evidence marker.
+
+Two obligations follow for curation:
+
+- **When the criterion genuinely needs it, say so in that vocabulary.** An issue
+  of the shape "X was silently dropped / missed / not observed" almost always
+  does: the thing to verify is an *absence*, which a unit test cannot distinguish
+  from a correctly-passing filter. Write "confirm the dropped item is processed
+  on the next real run" rather than a vague "verify the fix works" — the phrasing
+  is what carries the weight, and it is **blocking, not advisory**.
+- **When the criterion is CI-checkable, do not borrow the phrasing.** "the suite
+  covers the previously-dropped shape" is a testable criterion; dressing it up as
+  "confirm it works on the next real run" holds the issue open for a step nobody
+  needed to perform, and a gate that fires on issues that did not need it is a
+  gate people learn to ignore.
+
+The full vocabulary, the marker convention, and what the gate deliberately does
+not catch are in `champion-pr-merge.md` → "Out-of-Band Acceptance-Criteria Gate".
 
 #### Affected Files Section
 

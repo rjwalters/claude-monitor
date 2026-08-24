@@ -1083,10 +1083,22 @@ the page's own output, so the test cannot fail on the defects that actually
 occur live. Where you can, capture a real response once and run the **real**
 page-parsing function over it to produce the page side of the merge; where you
 cannot, say the fixture is offline-only rather than implying it is live-equivalent.
-Judge treats an undisclosed circular fixture on browser-driving / scraper /
-DOM-parsing code as **blocking** (`judge.md` → "Live Verification for
-Browser-Driving / Scraper / DOM-Parsing PRs"), so an honest disclosure costs you
-nothing and a silent claim costs a full review cycle.
+Judge treats an undisclosed circular fixture as **blocking** (`judge.md` → "Live
+Verification and the Circular-Fixture Smell") — on browser-driving / scraper /
+DOM-parsing code, **and, since #6883, on any PR whose linked issue reports an "X
+was silently dropped / missed / not observed" failure**, where the same smell
+also covers a fixture whose external-source payload you hand-synthesized instead
+of capturing. So an honest disclosure costs you nothing and a silent claim costs
+a full review cycle.
+
+**If your issue's acceptance criteria name a live-source, real-run, or
+over-time step, that line is close-blocking (#6883).** Champion will hold the
+issue open after your PR merges unless someone posts a comment saying what was
+run and what was observed, ending with `<!-- loom:ac-verified sha=<head> -->`.
+If you performed the step, post that comment and stamp it; if you could not,
+disclose that (above) and leave the marker off — never stamp a step you did not
+perform. Full convention: `champion-pr-merge.md` → "Out-of-Band
+Acceptance-Criteria Gate".
 
 **Precedent**: walters-family-tree PR #371 was a browser-driving catalogue
 scraper verified offline only, with every fixture circular. Its first live run

@@ -1896,6 +1896,13 @@ fi
 
 After successful merge, verify that linked issues were automatically closed by GitHub.
 
+**Before confirming (or forcing) any linked issue's close, run the Out-of-Band
+Acceptance-Criteria Gate for that issue** — the subsection immediately below this
+code block defines it. Merging a PR proves the criteria CI can check; it proves
+nothing about a criterion that names a live external source, a real scheduled
+run, or an observation over time. This step is where "PR merged" becomes "issue
+done", so it is the only place that inference can be checked.
+
 ```bash
 PR_NUMBER=$1
 
@@ -1913,10 +1920,31 @@ if [ -z "$LINKED_ISSUES" ]; then
   exit 0
 fi
 
+# The head SHA this merge landed. `headRefOid` survives the merge, so this is
+# still readable here — it is the tree any `loom:ac-verified` marker must name.
+HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
+
 # Check each linked issue. Plain `gh` — NOT "$GH_READ": this runs immediately
 # after your own merge and gates a write (`gh issue close`), so it must observe
 # post-merge state (see "Cached forge reads").
 for issue in $LINKED_ISSUES; do
+  # --- Out-of-Band Acceptance-Criteria Gate (#6883) ---
+  # Classify this issue's own acceptance criteria BEFORE acting on its state.
+  # Exit codes: 0 CLEAR / 10 NO-AC / 11 SATISFIED (current-SHA marker present)
+  #             12 UNVERIFIED / 13 STALE-MARKER / 1 ERROR.
+  # 0, 10 and 11 fall through to the unchanged close logic below.
+  AC_REPORT=$(./.loom/scripts/classify-ac-verification.sh \
+    --issue "$issue" --pr "$PR_NUMBER" --head-sha "$HEAD_SHA")
+  AC_RC=$?
+
+  # 1 (ERROR) is grouped with 12/13 deliberately: "the classifier could not
+  # run" is not "the criteria are met". Fail closed — see item 5 below.
+  if [ "$AC_RC" -eq 12 ] || [ "$AC_RC" -eq 13 ] || [ "$AC_RC" -eq 1 ]; then
+    echo "Issue #$issue has an unverified out-of-band acceptance criterion — HOLDING the close"
+    hold_issue_on_unverified_ac "$issue" "$PR_NUMBER" "$HEAD_SHA" "$AC_RC" "$AC_REPORT"
+    continue   # do NOT close, do NOT confirm — next linked issue
+  fi
+
   ISSUE_STATE=$(gh issue view "$issue" --json state --jq '.state' 2>&1)
 
   if [ "$ISSUE_STATE" = "CLOSED" ]; then
@@ -1928,9 +1956,211 @@ for issue in $LINKED_ISSUES; do
 done
 ```
 
+#### Out-of-Band Acceptance-Criteria Gate (#6883)
+
+**The incident this closes.** In a consumer repo an input filter silently dropped
+items — nothing errored, so a filtered run and a genuinely empty one looked
+identical. The issue's acceptance criteria therefore named an explicit
+end-to-end step: *"confirm the dropped item is processed (or explicitly rejected
+on the merits) on the next real run — the current failure is invisible, and a fix
+that cannot be observed to work is not verified."* A PR was opened, unit tests
+passed, Judge approved, Champion merged and auto-closed the issue. **The fix did
+not work.** It rested on a wrong assumption about what the external source
+returns; the regression test passed because its fixture *fabricated* the source
+payload the fix assumed. Nobody performed the step the AC named, and nothing in
+the pipeline noticed it had not been performed. The shape generalizes: any issue
+of the form "X was silently missed / dropped / not observed" has it, because the
+thing to verify is an **absence**, and an absence is exactly what a unit test
+cannot distinguish from a correctly-passing filter.
+
+**What the gate does.** `./.loom/scripts/classify-ac-verification.sh` reads the
+linked issue's body, extracts its acceptance-criteria checklist, classifies each
+item, and looks for an evidence marker. It is the enforcement side of the
+contract this subsection states; keep the two in sync.
+
+**1. Locating the checklist — AC headings only.** An acceptance-criteria
+checklist is every markdown task-list item (`- [ ]` / `- [x]` / `* [ ]`) under a
+heading whose text contains **"acceptance criteria"** (case-insensitive) — which
+covers every heading this fleet emits: `## Acceptance Criteria`, `## Suggested
+acceptance criteria`, `### Sharpened Acceptance Criteria`. The section ends at
+the next heading of any level. A criterion's text is its bullet plus its wrapped
+continuation lines, joined into one line.
+
+`## Test Plan` and `## Dependencies` checklists are deliberately **not** swept.
+Test-plan execution is Judge's, and its posture there is explicitly non-blocking
+(`judge.md` → "Test Execution"); folding it in here would hold issues on steps
+this gate has no standing to gate. **An issue with no AC heading at all yields no
+items (exit `10`) and Step 4 behaves exactly as it did before this gate existed**
+— that is the common case and it must stay a no-op.
+
+**2. Classifying each item — a fixed phrase vocabulary, not judgment.** An item
+requires **out-of-band verification** when it contains one of these
+instruction-shaped fragments (case-insensitive substring of the joined criterion;
+the script's `OUT_OF_BAND_PHRASES` array, matched in declared order so the
+reported phrase is deterministic). Everything else is CI-checkable.
+
+| Failure shape | Phrases |
+|---|---|
+| Requires a **live external source** | `live verification`, `live run`, `live source`, `live site`, `against the live`, `against production`, `production run`, `real response`, `real page`, `real api` |
+| Requires a **real scheduled run** | `real run`, `next run`, `scheduled run`, `cron run` |
+| Requires an **observation over time** | `over the next`, `observed over`, `observe over`, `over a period`, `in the wild` |
+| **Explicitly declared** out-of-band / manual | `out-of-band`, `out of band`, `manual verification`, `manually verify`, `verify manually`, `manually confirm` |
+
+Bare words are deliberately **excluded**: `live` ("live reload"), `real`
+("real-world example"), `run` ("run the test suite"), `verify` ("verify the
+output"), `production` ("production build"), `manual`, `observe`, and
+`end-to-end` (an end-to-end *test* is ordinarily CI-checkable). Each appears in
+ordinary acceptance-criteria prose constantly, so a bare-substring vocabulary
+would flag essentially every issue and train its readers to ignore the gate —
+the same instruction-shaped-fragment discipline `warn-operator-gated.sh` applies
+to its own `PHRASES` (see `sweep.md` → "Operator-gate advisory scan").
+
+**This phrasing is close-blocking, not advisory.** An issue author or Curator who
+writes one of those fragments into an acceptance criterion is not adding
+color — they are declaring that a merged, green PR is **not** sufficient
+evidence for that line, and Champion will hold the issue open until someone
+attests the step. The converse obligation is just as real: do not reach for this
+vocabulary when a criterion genuinely is CI-checkable ("the suite covers the
+previously-dropped shape" rather than "confirm it works on the next real run"),
+or the gate becomes noise. `curator.md` → "Required Sections" carries the same
+note for the curation side.
+
+**A checked `- [x]` box is classified exactly like an unchecked one.** In the
+incident the person who checked the box was the person whose assumption was
+untested; a checkbox carries no author, no timestamp, and no binding to a tree.
+Only the marker below satisfies this gate.
+
+**3. The evidence marker: `<!-- loom:ac-verified sha=<head> -->`.** Modeled
+directly on `judge.md`'s `<!-- loom:verdict-sha sha=... verdict=... -->` (#5686),
+which answers "which tree does this verdict describe"; this one answers **"was
+the out-of-band step actually performed, and against which tree"**.
+
+- **Who posts it**: whoever actually performed the step — the Builder, the issue
+  author, the operator, or the Judge who witnessed a recorded live run
+  (`judge.md` → "Live Verification and the Circular-Fixture Smell",
+  evidence form (b)).
+- **Where**: a comment on the linked issue, a comment on the PR, or the PR body.
+  Champion searches all three.
+- **Form**: the full HTML-comment shape with a **hex** SHA of 7–40 characters,
+  `<!-- loom:ac-verified sha=<40-char or abbreviated head> -->`. Anchoring to the
+  complete comment form is what stops prose that merely quotes the syntax with a
+  `<head>` placeholder from reading as a live marker (the #4840 discipline
+  `require-complexity-marker.sh` and `extract-capability-markers.sh` both use).
+- **What it must accompany**: prose saying what was run and what was observed —
+  the same requirement a verdict comment carries. The marker is the machine-
+  readable half, not the whole claim. **Do not stamp it for a step you did not
+  perform**; that converts this gate back into the silent close it exists to
+  prevent, with a paper trail that says otherwise.
+- **SHA binding**: the marker satisfies the gate only when its SHA is the PR's
+  merged `headRefOid` (abbreviation-tolerant in either direction). A marker
+  naming a different tree is `STALE-MARKER` (exit `13`) and holds exactly like no
+  marker at all — evidence about another tree is not evidence about this one,
+  the same fail-safe the verdict-SHA convention applies.
+
+**4. Hold behavior when a criterion is unverified.** On exit `12`, `13`, or `1`,
+Champion must **not** let the issue close. The PR stays merged — this gate is
+about the issue's state, never about reversing a merge. Define the helper below
+**before** running Step 4's loop (the loop calls it by name).
+
+```bash
+# Hold the close on a linked issue whose AC needs out-of-band verification.
+# Idempotent: re-running a pass over the same PR must not re-post the comment.
+hold_issue_on_unverified_ac() {
+  local issue="$1" pr="$2" head_sha="$3" rc="$4" report="$5"
+
+  # Reopen if GitHub's own `Closes #N` linkage already closed it on merge.
+  # This is the load-bearing half: by the time Step 4 runs, the silent close
+  # has usually ALREADY happened, so holding means undoing it.
+  local state
+  state=$(gh issue view "$issue" --json state --jq '.state')
+  if [ "$state" = "CLOSED" ]; then
+    gh issue reopen "$issue"
+  fi
+
+  # Idempotency guard: one comment per (PR, head SHA) hold episode. Unlike the
+  # sticky-hold precheck's `startswith` lookup (#5371), a plain full-marker
+  # `grep -F` is sufficient here because this marker embeds BOTH the PR number
+  # and the head SHA — there is no prefix to collide on, and a later comment
+  # would have to reproduce the exact pr+sha pair to false-match.
+  # Cached ("$GH_READ") — an idempotency-marker grep, not a merge gate.
+  local marker="<!-- champion:ac-hold pr=$pr sha=$head_sha -->"
+  if "$GH_READ" issue view "$issue" --json comments \
+       --jq '.comments[].body' | grep -qF "$marker"; then
+    echo "Issue #$issue already carries the AC hold notice for $head_sha — not re-posting"
+  else
+    local reason quoted
+    case "$rc" in
+      12) reason="no \`loom:ac-verified\` marker was found on this issue or on PR #$pr" ;;
+      13) reason="a \`loom:ac-verified\` marker exists, but it names a different tree than the merged head \`$head_sha\`" ;;
+      *)  reason="the acceptance-criteria classifier could not complete, so this gate fails closed" ;;
+    esac
+    # Quote each unmet criterion VERBATIM — the whole point is that the human
+    # reading this can see exactly which sentence is outstanding.
+    quoted=$(printf '%s\n' "$report" | awk -F'\t' 'NF{printf "> - [ ] %s\n>\n>   _(matched: `%s`)_\n", $2, $1}')
+    gh issue comment "$issue" --body "$marker
+**Champion is holding this issue open.** PR #$pr merged, but this issue's own
+acceptance criteria include a step that CI structurally cannot perform, and
+$reason.
+
+Unmet criteria:
+
+$quoted
+
+A green suite is not evidence for these — merging proves the criteria CI can
+check, not a live-source, real-run, or over-time observation. See
+\`champion-pr-merge.md\` → \"Out-of-Band Acceptance-Criteria Gate\" (#6883).
+
+**To clear this**: perform the step, then post a comment on this issue (or on
+PR #$pr) saying what you ran and what you observed, ending with
+
+    <!-- loom:ac-verified sha=$head_sha -->
+
+and close the issue. If the criterion was never actually out-of-band, reword it
+so it no longer reads as live/scheduled/over-time and close normally.
+
+*Automated by Champion role*"
+  fi
+
+  # loom:operator — the first-class "the engine has stopped, a human is the only
+  # transition out" state (see .loom/docs/label-state-machine.md). Existing
+  # label, no new one: this issue is not blocked on a dependency and is not
+  # operator-only-by-right, it is waiting on a human to perform or attest one
+  # step. Idempotent, so it is safe to reassert.
+  gh issue edit "$issue" --add-label "loom:operator"
+}
+```
+
+**5. Fail closed on `1` (ERROR), never open.** An unreadable issue, a missing
+script, or an unparseable body means the gate **could not be evaluated** — which
+is not the same as "the criteria are met". Group it with `12`/`13` and hold, the
+same posture criterion #6 takes on an ambiguous CI read (#6211). The cost is
+asymmetric and that asymmetry is the whole design: a false hold leaves an issue
+open with a comment naming the criterion, which a human or a one-line marker
+clears in seconds; a false close is exactly the incident above, and nobody ever
+learns it happened.
+
+**6. What this gate does NOT catch — a clear result is not an all-clear.** The
+signal is a fixed phrase vocabulary over an AC checklist, so it cannot see: an
+out-of-band requirement stated only in the issue's **prose** rather than as a
+checklist item; one phrased in vocabulary nobody anticipated ("watch it for a
+fortnight"); or a criterion that is CI-checkable **as written** but whose test
+fabricates the external payload it asserts on — that last one is Judge's
+"circular fixture" smell (`judge.md` → "Live Verification and the
+Circular-Fixture Smell"), and the two
+mechanisms are complements, not substitutes. Do not extend the vocabulary to
+chase the semantic cases: the same reasoning `sweep.md`'s operator-gate scan
+gives under "What this scan does NOT catch" applies here — a broader bare-word
+list would still miss the next phrasing while flagging ordinary prose.
+
 ### Step 5: Unblock Dependent Issues
 
 After verifying issue closure, check for blocked issues that can now be unblocked.
+
+**Run this only for issues that actually closed.** An issue held open by Step 4's
+Out-of-Band Acceptance-Criteria Gate is, by construction, *not* done — unblocking
+its dependents would propagate the same unsound "merged ⇒ done" inference one
+level further out. Skip it in this step and pick it up on a later pass, once a
+human has cleared the hold.
 
 **Epic-aware dependency check (#5211).** This is *the* call site named first
 under "Affected Files" in issue #5211 — the bare `state != CLOSED` read below

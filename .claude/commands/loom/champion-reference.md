@@ -125,6 +125,50 @@ Verdict-State Janitor Part 2 gate.
 
 ---
 
+### Edge Case 3b: Merged PR Whose Linked Issue Names an Out-of-Band Verification (#6883)
+
+**Scenario**: a PR merges green and GitHub's `Closes #N` linkage auto-closes the
+issue — but that issue's own acceptance criteria include a step CI structurally
+cannot perform (a live external source, a real scheduled run, an observation over
+time). A green suite is not evidence for such a criterion, yet the close reads as
+if it were. In the incident behind #6883 the fix was wrong, its regression test
+fabricated the source payload the fix assumed, and the bug survived the close
+undetected until a human asked why the item still had not appeared.
+
+**Handling**: `champion-pr-merge.md` → Step 4 → "Out-of-Band Acceptance-Criteria
+Gate" runs `./.loom/scripts/classify-ac-verification.sh --issue <N> --pr <PR>
+--head-sha <head>` for every linked issue before confirming or forcing its close:
+
+- `0` CLEAR (AC list found, all items CI-checkable) / `10` NO-AC (no
+  acceptance-criteria checklist at all) / `11` SATISFIED → close exactly as
+  before. **`10` is the common case and must remain a byte-for-byte no-op.**
+- `12` UNVERIFIED (out-of-band criterion, no marker) / `13` STALE-MARKER (marker
+  names another tree) / `1` ERROR (fails closed) → **hold**: reopen the issue if
+  GitHub already closed it, post a comment quoting the unmet criterion verbatim,
+  and apply `loom:operator`. The merge itself is never reversed.
+
+**The evidence marker** — the sibling of Edge Case 3's `loom:verdict-sha`:
+
+```
+<!-- loom:ac-verified sha=<head> -->
+```
+
+`verdict-sha` answers *"which tree does this verdict describe"*;
+`ac-verified` answers *"was the out-of-band step actually performed, and against
+which tree"*. Posted by whoever performed the step (Builder, issue author,
+operator, or a Judge who witnessed a recorded live run — `judge.md` → "Live
+Verification and the Circular-Fixture Smell"), on the issue, the PR body, or a PR
+comment; Champion searches all three. It satisfies the gate only when its SHA is
+the merged `headRefOid` (abbreviation-tolerant), so evidence about a superseded
+tree holds exactly like no evidence at all.
+
+**Decision**: **Merge normally, but do not let the issue close on unverified
+out-of-band criteria.** The asymmetry is deliberate — a false hold is an open
+issue with a comment that a human or a one-line marker clears in seconds; a false
+close is a silent, permanent wrong answer.
+
+---
+
 ### Edge Case 4: Merge Conflicts Develop After Approval
 
 **Scenario**: PR was mergeable when Judge approved, but another PR merged first causing conflicts.
@@ -596,7 +640,8 @@ EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER" --limit 500)
 | Proposal passes all 8 criteria but the tier's rate limit blocks promotion this pass | Capacity-deferral idempotency (`classify-capacity-defer.sh`, #6729) | **Post the deferral comment only on first deferral or a changed occupant set** — same tier + same occupant set as the last capacity-deferral comment → skip silently, bump the existing comment's seen-counter in place; no escalation counterpart, the condition self-resolves the moment the composition changes |
 | Test-only changes | Allow | Standard criteria apply |
 | Human holds PR (removes `loom:pr`) | Skip | Not a merge candidate without `loom:pr` |
-| Multiple linked issues | Allow | Verify all closed |
+| Multiple linked issues | Allow | Verify all closed (each is gated independently by the out-of-band AC gate below) |
+| Linked issue's AC names a live-source / real-run / over-time step, with no `loom:ac-verified` marker at the merged head | **Merge, but hold the issue's close** (#6883) | `classify-ac-verification.sh` exit `12`/`13`/`1` → reopen if GitHub auto-closed, comment quoting the unmet criterion verbatim (idempotent `<!-- champion:ac-hold pr=<N> sha=<head> -->`), add `loom:operator`. Exits `0`/`10`/`11` close exactly as before — a body with no AC checklist is a byte-for-byte no-op |
 | Mixed-state CI | Fail on `fail`/`cancel` | `pending` defers; `skipping` is OK |
 | Unknown critical file | Miss | Needs pattern update |
 | Critical file matched (no version-only carve-out) | **Durable hold, not a retry** (#6879) | Comment once behind `<!-- champion:critical-file-hold -->`, add `loom:operator`, keep `loom:pr`; releases (removes `loom:operator`, posts `<!-- champion:critical-file-hold-cleared -->`) only when a later push no longer matches any critical-file pattern — `loom:auto-merge-ok` does not release it |
