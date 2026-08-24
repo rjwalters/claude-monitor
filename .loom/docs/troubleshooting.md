@@ -1398,6 +1398,86 @@ resolved without a kill-time hook, because none is available):
 termination-signal channel for Task-tool subagents, is explicitly out of scope
 for this section — see "Root cause" above for why.
 
+### A dead lock-holder PID is not evidence the requesting agent is dead (#6765)
+
+**The section above establishes one direction: a killed subagent leaves no
+teardown signal, so any lock it held keeps looking "held" in its holder
+record.** This section covers the mirror mistake, made by the *orchestrator*
+rather than the lock's own reaper: even once a lock's recorded holder PID is
+confirmed dead, that dead PID is **not** evidence that the agent which
+requested the lock has exited. The two are separate facts, and treating the
+first as proof of the second is unsafe in the direction that matters —
+it licenses acting on someone else's still-in-progress work.
+
+**Why the two facts are separate.** A lock's `holder.json`-style record
+captures whichever PID happened to make the acquiring write — not necessarily
+the dispatched agent's own PID. It can be a short-lived child process the
+agent spawned to do the acquiring, or a PID left over from an earlier dispatch
+the agent has since restarted past (e.g. a session-limit kill followed by a
+fresh dispatch on the same issue). `kill -0 <holder-pid>` only answers "is
+that specific process still running?" — a narrower question than "is the
+agent that asked for this lock still working?" — and an ESRCH from `kill -0`
+is exactly what a genuinely orphaned lock also looks like from the outside;
+the lock record alone cannot distinguish the two.
+
+**Incident.** A research subagent's first dispatch was killed by a session
+limit; a later dispatch acquired a resource lock and wrote a fresh
+`holder.json` carrying its own PID. An orchestrator status check found the
+lock's recorded PID dead, read that as "the agent is dead," reaped the lock,
+and then went further than reaping: it treated the agent's branch as
+abandoned and ran a full review-and-merge cycle against it — opened a PR,
+reviewed it, applied corrections, merged it. The agent was still alive for
+roughly three more hours and discovered the collision only at its own
+close-out, after `main` had already absorbed a competing review pass. Nothing
+was lost only because that agent happened to re-check its base before
+finishing; a less careful one would have force-pushed over the merged review
+cycle or opened a competing PR from a stale branch.
+
+**Reaping a lock and adopting the associated work are separable decisions —
+keep them separate.** Reaping an orphaned lock on a dead-PID signal alone is
+low-risk: the failure mode is "the resource was briefly unavailable while it
+didn't need to be," which self-heals. Adopting the branch or worktree the
+lock was protecting — opening a PR against it, reviewing it, merging it, or
+otherwise acting as though the agent that produced it is finished — is not
+low-risk, and a dead lock-holder PID does **not** license it on its own.
+Do not let one decision imply the other:
+
+- **Reap the lock** on the existing dead-PID basis alone — unchanged by this
+  section.
+- **Do not touch the associated branch/worktree** on that same basis. Before
+  acting on it, get a **positive "this agent is done" signal**, not an
+  inferred one:
+  - If the agent was dispatched as an in-session Task-tool subagent within
+    the *same* orchestrator session, query the harness's own task-liveness
+    surface instead of inferring from a proxy — the same non-blocking poll
+    (e.g. `TaskOutput` on the original dispatch's task id) documented in
+    `defaults/.claude/commands/loom/sweep.md` → "Task-liveness check before
+    Builder re-dispatch (#5897)". That rule was written for one call site
+    (re-dispatching a Builder after a worktree-diff proxy looked like death)
+    but the underlying principle — query positive liveness, don't infer it
+    from a proxy — applies at any point an orchestrator is about to act on
+    the assumption a dispatched subagent has died, lock reaping included.
+  - If the agent was dispatched out-of-session (a separate `loom-daemon`
+    sweep, a different host, any process this orchestrator cannot poll),
+    there is genuinely no definitive liveness signal available from here.
+    Say so explicitly rather than reaching for a proxy, and fall back to
+    checking the forge-visible state of the work itself (a pushed branch, an
+    open PR, a recent commit) to see whether it has already reached a
+    stable, reviewable state on its own terms — that is evidence about the
+    *work*, not a proxy for the *agent's* liveness, and should be read as
+    such.
+- **If no definitive signal is available either way, the conservative
+  default is: assume live, do not adopt the branch.** Wait, or leave the
+  branch for the original agent to reconcile at its own close-out (as
+  happened in the incident above), rather than risk the two-writers-on-one-branch
+  race a wrong adoption creates. This mirrors #5897's "prefer a bounded wait
+  over immediate re-dispatch absent positive evidence of death."
+
+Related: #6320 covers the adjacent case where a **daemon** reclaims an
+in-session sweep's claim because the claim itself carries no lease record —
+the same "no authoritative liveness record for in-session work" gap,
+approached from the claim-record side rather than the lock side.
+
 ## Sweep Dispatch Troubleshooting
 
 Multi-issue dispatch is driven by the Rust `loom-daemon` binary via `mcp__loom__dispatch_sweep`. The daemon holds the sweep registry, event bus, and reaper in memory — there is no on-disk orchestration state file to inspect. (The v0.9.x `spawn-loop.sh` and its `.loom/spawn-loop-state.json` state file were removed in v0.11.0.)
