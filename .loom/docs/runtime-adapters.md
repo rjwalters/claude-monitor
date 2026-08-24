@@ -949,6 +949,18 @@ unknown to known did not weaken this guard for other names.)
   seam has soaked. (The Python `loom-tools` callers this list used to name no
   longer exist — epic #4081 Phase 4, #4557.)
 
+## Session containers (pointer only)
+
+Containers as a session-persistence and containment boundary for worker
+runtimes — per-account persistent session containers for runtimes with
+mutable interactive auth (Codex), per-sweep ephemeral containers for
+stateless-auth runtimes (Claude) — are specified in
+[ADR-0017: Session-Container Architecture](https://github.com/rjwalters/loom/blob/main/docs/adr/0017-session-container-architecture.md)
+(epic #6896). Both container lifetimes dispatch through the existing
+`spawn-worker.sh` → `spawn-<runtime>.sh` seam described above with **no new
+dispatch path**; this doc's seven contract points are unchanged by that ADR.
+This is a pointer only — no contract-point changes ship with it.
+
 ## Fork mapping table
 
 The gpeyton/loom fork already built much of this as parallel special-casing. The
