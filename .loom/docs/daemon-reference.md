@@ -4450,6 +4450,22 @@ never wedge the daemon. It is GitHub-only (uses the `closedByPullRequestsReferen
 closes-graph, filtered to `state == "OPEN"`); a Gitea workspace fails open and
 keeps today's behavior.
 
+**A large held-PR backlog can masquerade as work starvation here — a distinct
+mechanism from #5715.** Because the guard keys on openness only, a PR that
+Champion has put on a merge-risk hold (`loom:pr` + `loom:operator`) is still an
+"open linked PR" as far as `pr-open-skip` is concerned, so its issue keeps
+getting correctly declined every tick. When many PRs accumulate in that held
+state, the ready queue can look starved from the outside — few or no fresh
+dispatches, a string of `pr-open-skip` counts — even though the work behind
+those issues is already done and merely stuck awaiting a human decision. This
+is **not** the [Starvation escape hatch (#5715)](#starvation-escape-hatch-5715)
+condition above: that mechanism detects host-load starvation (admission held,
+zero sweeps in flight) and has a bounded escape hatch; this one has no escape
+hatch, because bypassing it would re-dispatch and redo already-finished work.
+The only fix for a held-PR-backlog read of "starvation" is clearing the
+operator holds (merge or close the held PRs) — see `champion-pr-merge.md`'s
+"Held-PR Census" for the operator-facing view of that backlog.
+
 **Park-label dispatch guard (#4444, step 2.7).** The `loom:blocked` /
 `loom:operator-only` **park** labels are the state machine's only "take this out
 of automation" signal, and until #4444 they were enforced *only* in the

@@ -49,6 +49,7 @@ test-check-defaults-version-bump.sh
 test-check-ingest-key-file.sh
 test-check-main-clean.sh
 test-check-main-freshness.sh
+test-check-promotion-landed.sh
 test-check-quarantine-stashes.sh
 test-check-runtime-capabilities.sh
 test-check-shell-syntax.sh

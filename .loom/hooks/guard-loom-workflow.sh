@@ -676,34 +676,44 @@ mask_data_flag_values() {
 
 # Mask quoted POSITIONAL arguments (no preceding flag name) to a small
 # allowlist of known non-executing commands/scripts (issue #5155, extending
-# the #5115 fix above; extended again for echo/printf narration by #6400).
-# mask_data_flag_values only recognizes text following a named flag; it has
-# no effect on a script whose free-text arguments are purely positional, e.g.
+# the #5115 fix above; extended again for echo/printf narration by #6400;
+# extended again for jq filter programs by #6464). mask_data_flag_values only
+# recognizes text following a named flag; it has no effect on a script whose
+# free-text arguments are purely positional, e.g.
 # `./.loom/scripts/check-duplicate.sh "TITLE" "DESCRIPTION"`, `grep -n
-# "pattern" file`, or `echo "some narration text"`. `grep`/`egrep`/`fgrep`/
-# `rg` and check-duplicate.sh never EXECUTE a positional argument -- they
-# only read it as search/dedup text -- so masking a quoted argument
-# immediately following one of these command names (optionally after short
-# flags, e.g. `grep -n "..."`) can never blind this catastrophic-tier guard
-# to a real invocation. A command that WRAPS the phrase and then executes it
-# -- `sh -c "gh pr merge 123"`, `bash -c '...'`, `eval "..."` -- is NOT in
-# this allowlist and stays fully visible to the merge-redirect grep below,
-# exactly as before.
+# "pattern" file`, `echo "some narration text"`, or
+# `jq -s '[.[] | select(.command | test("^\\s*gh pr merge\\s"))] | length' file`.
+# `grep`/`egrep`/`fgrep`/`rg` and check-duplicate.sh never EXECUTE a
+# positional argument -- they only read it as search/dedup text -- so masking
+# a quoted argument immediately following one of these command names
+# (optionally after short flags, e.g. `grep -n "..."`) can never blind this
+# catastrophic-tier guard to a real invocation. A command that WRAPS the
+# phrase and then executes it -- `sh -c "gh pr merge 123"`, `bash -c '...'`,
+# `eval "..."` -- is NOT in this allowlist and stays fully visible to the
+# merge-redirect grep below, exactly as before.
 #
-# `echo`/`printf` are different from the other allowlisted commands: their
-# own quoted text CAN become a real execution vector, when piped into an
-# interpreter (`echo "gh pr merge 123" | bash`) or produced by a command
-# substitution consumed by one (`eval "$(echo ...)"`). So, unlike the other
-# allowlisted commands, an echo/printf match is masked ONLY when BOTH hold:
-#   1. The echo/printf invocation is not itself nested inside a `$(...)`/
+# `echo`/`printf`/`jq` are different from the other allowlisted commands:
+# their own quoted text CAN become a real execution vector, when piped into
+# an interpreter (`echo "gh pr merge 123" | bash`,
+# `jq -n -r '"gh pr merge 123"' | bash`) or produced by a command
+# substitution consumed by one (`eval "$(echo ...)"`,
+# `eval "$(jq -n -r '"gh pr merge 123"')"`). jq's positional argument is a jq
+# FILTER PROGRAM, not literal output text -- its output only equals the
+# argument text in the narrow, deliberately-crafted case of a `-n`/`--null-input`
+# invocation whose filter is itself a string literal -- but that narrow case is
+# exactly as real a bypass vector as echo/printf's, so jq gets the identical
+# restriction rather than the unrestricted grep/rg treatment. So, unlike the
+# unrestricted allowlisted commands, an echo/printf/jq match is masked ONLY
+# when BOTH hold:
+#   1. The echo/printf/jq invocation is not itself nested inside a `$(...)`/
 #      backtick command substitution (a strong signal its output is about to
 #      be consumed by something else, e.g. `eval`) -- decided from a
 #      precomputed per-position nesting-depth map over the whole buffer, NOT
 #      from the single character adjacent to the token, so `eval "$( echo
 #      ... )"` and its newline-separated form cannot slip through (#6400).
 #   2. The full run of quoted arguments is not immediately followed by a
-#      pipe (`|`) into another command -- `echo "..." | bash` must stay
-#      fully visible.
+#      pipe (`|`) into another command -- `echo "..." | bash` /
+#      `jq ... | bash` must stay fully visible.
 # grep/rg/check-duplicate.sh are unaffected by either restriction: they never
 # execute a positional argument regardless of context, so they keep the
 # original, simpler masking behavior.
@@ -1011,11 +1021,11 @@ mask_command_positional_args() {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
         # Command-name allowlist: known non-executing commands/scripts whose
-        # positional string arguments are search/dedup/narration text, never
-        # live shell syntax on their own. Extend only when another
+        # positional string arguments are search/dedup/narration/filter text,
+        # never live shell syntax on their own. Extend only when another
         # positional-arg consumer causes a real false positive (see #5155,
-        # #6400).
-        cmdre = "(grep|egrep|fgrep|rg|echo|printf|\\./\\.loom/scripts/check-duplicate\\.sh)"
+        # #6400, #6464).
+        cmdre = "(grep|egrep|fgrep|rg|echo|printf|jq|\\./\\.loom/scripts/check-duplicate\\.sh)"
         # Zero or more short/long flags between the command name and the
         # first quoted positional argument (e.g. `grep -n`, `rg -i`,
         # `check-duplicate.sh --include-merged-prs --issue 5155`).
@@ -1077,14 +1087,14 @@ mask_command_positional_args() {
             gsub(/^[ \t]+/, "", cmdpart)
             gsub(/[ \t]+$/, "", cmdpart)
             split(cmdpart, cparts, /[ \t]+/)
-            is_echoish = (cparts[1] == "echo" || cparts[1] == "printf")
+            is_echoish = (cparts[1] == "echo" || cparts[1] == "printf" || cparts[1] == "jq")
 
-            # echo/printf only: look ahead across the WHOLE run of quoted
+            # echo/printf/jq only: look ahead across the WHOLE run of quoted
             # positional arguments (without masking anything yet) to see
             # whether it is immediately followed by a pipe -- a real
             # execution vector this check must keep visible. Combined with
             # nested_in_subst above, this decides ONCE, for the whole run,
-            # whether this echo/printf invocation is safe to mask.
+            # whether this echo/printf/jq invocation is safe to mask.
             block_mask = 0
             if (is_echoish) {
                 if (nested_in_subst) {
@@ -1321,14 +1331,14 @@ ask() {
 # LOOM: Prefer merge-pr.sh over gh pr merge
 # =============================================================================
 
-# Match against a MASKED copy of $COMMAND (issue #5109, extended by #5155 and
-# #5172) so a mention of the phrase inside a cat-heredoc commit-message body,
-# a --search/--body/-m/etc quoted value (including the `gh api -f
-# field=value` shape), a quoted POSITIONAL argument to a known non-executing
-# command (grep/rg/check-duplicate.sh), or a heredoc assigned to a shell
-# variable and only referenced later via that variable, doesn't
-# false-positive as a real invocation. See the masking functions' doc
-# comments above for exactly what is (and is NOT) neutralized.
+# Match against a MASKED copy of $COMMAND (issue #5109, extended by #5155,
+# #5172, and #6464) so a mention of the phrase inside a cat-heredoc
+# commit-message body, a --search/--body/-m/etc quoted value (including the
+# `gh api -f field=value` shape), a quoted POSITIONAL argument to a known
+# non-executing command (grep/rg/check-duplicate.sh/jq), or a heredoc
+# assigned to a shell variable and only referenced later via that variable,
+# doesn't false-positive as a real invocation. See the masking functions'
+# doc comments above for exactly what is (and is NOT) neutralized.
 GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_command_positional_args "$(mask_var_assigned_heredoc_bodies "$(mask_cat_heredoc_bodies "$COMMAND")")")")
 if echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; then
     # Resolve the merge-pr.sh path for the current repo context. Prefer an

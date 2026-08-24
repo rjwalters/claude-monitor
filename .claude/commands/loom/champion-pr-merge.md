@@ -1125,7 +1125,10 @@ conflict plus staleness is a route.
 
 Run the recency check exactly as criterion #5 specifies. On failure, use the
 **Stale PR** block in "PR Rejection Workflow" below — it is hold-aware and keys
-off `MERGE_BLOCKED_BY_HOLD`. Two invariants it guarantees, both load-bearing:
+off `MERGE_BLOCKED_BY_HOLD`, and it reuses this same run's `$LAST_ACTIVITY` as
+the notice marker's per-episode key (#6860) — running the recency check first
+is what puts that variable in scope. Two invariants it guarantees, both
+load-bearing:
 
 1. **The `<!-- champion:merge-risk-hold -->` marker is preserved.** Never delete,
    edit, or minimize the hold comment on this path. The marker is what makes
@@ -1234,6 +1237,128 @@ only appears when something is wrong is a line nobody learns to read; the whole
 point is that a *growing* pile is visible in the ordinary summary before anyone
 goes looking. Never state these numbers from memory or from a previous pass —
 run the query in the pass you report it in.
+
+**This pile can masquerade as work starvation to the daemon's work finder
+(#4123 open-PR guard, distinct from #5715's CPU/load starvation brake).** Each
+held PR is still an *open* linked PR, so the guard correctly declines to
+re-dispatch its issue every tick — a growing `HELD_COUNT` here is the
+operator-facing symptom of the same backlog that shows up on the daemon side
+as a run of `pr-open-skip` counts with little else moving. The fix in both
+views is the same: clear the operator holds (merge or close), not tune a
+dispatch/starvation knob. See daemon-reference.md's "`pr-open-skip` (open-PR
+dispatch guard, #4123)" section for the daemon-side mechanics.
+
+### Per-PR Digest (durable across passes, #6851)
+
+The aggregate line above answers "how big is the pile"; it does not answer
+"which PRs, and why". #6848 was filed after a human found 19 held PRs by
+manually inspecting labels, despite the aggregate line having very likely been
+printing a growing count in every Champion session's own transcript all
+along — a number nobody durably records is not a tracked signal. Extend the
+*same* pass (reusing `$HELD_JSON` from above — no second `gh pr list` call)
+into a **per-PR digest** (PR number, hold reason, `mergeable` status) and
+persist it **durably across passes**, following the same idempotency-marker
+convention already used for `champion:merge-risk-hold` /
+`champion:held-pr-conflict-notice` / `champion:stale-pr-notice` above: a
+single pinned tracking issue this pass **edits in place**, never a fresh
+comment or issue every tick.
+
+**Step 1 — per-PR hold reason.** `$HELD_JSON` already carries `mergeable` and
+whether the PR is `loom:changes-requested` (out at Doctor); it does not carry
+*why* the PR was held. Read that from the PR's own
+`<!-- champion:merge-risk-hold -->` comment — the same marker the sticky-hold
+precheck (criterion #2, above) reads — one cached read per held PR, never a
+second bulk `gh pr list`:
+
+```bash
+HOLD_MARKER="<!-- champion:merge-risk-hold -->"
+DIGEST_ROWS=""
+for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r '.[].number'); do
+  ROW=$(printf '%s\n' "$HELD_JSON" | jq -c --argjson n "$PR_NUM" '.[] | select(.number == $n)')
+  PR_MERGEABLE=$(jq -r '.mergeable' <<<"$ROW")
+  AT_DOCTOR=$(jq -e '[.labels[].name] | index("loom:changes-requested")' <<<"$ROW" >/dev/null && echo true || echo false)
+
+  # Cached ("$GH_READ") — an observation read, same rule as the aggregate
+  # query above: this digest never gates a merge decision.
+  HOLD_BODY=$("$GH_READ" pr view "$PR_NUM" --json comments \
+    --jq "[.comments[] | select(.body | startswith(\"$HOLD_MARKER\"))] | last | .body // \"\"")
+  if [ -z "$HOLD_BODY" ]; then
+    REASON="reason unrecorded (no $HOLD_MARKER comment found)"
+  else
+    # The hold template's one required line: "- **<AXIS>**: <CONCERN>".
+    REASON=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
+    [ -z "$REASON" ] && REASON="hold marker present, axis bullet not parseable"
+  fi
+
+  STATUS="$PR_MERGEABLE"
+  [ "$AT_DOCTOR" = true ] && STATUS="$STATUS, out at Doctor"
+  DIGEST_ROWS="${DIGEST_ROWS}| #$PR_NUM | $REASON | $STATUS |
+"
+done
+```
+
+**Step 2 — write the digest to a durable, pinned tracking issue.** Champion
+edits this issue's **body** in place every pass (not a comment thread) — the
+current pile belongs at the top of the issue, not buried at the bottom of a
+scrollback with one comment per 10-minute tick. Find it by a fixed title plus
+a body marker, mirroring the marker-comment convention used everywhere else in
+this role:
+
+```bash
+DIGEST_TITLE="Champion: Merge-Risk Hold Digest"
+DIGEST_MARKER="<!-- champion:merge-risk-hold-digest -->"
+
+# Cached ("$GH_READ") — locating the pinned issue is itself an observation,
+# same rule as the follow-on-issue duplicate search elsewhere in this role.
+DIGEST_ISSUE=$("$GH_READ" issue list --search "\"$DIGEST_TITLE\" in:title" \
+  --state open --json number,body --limit 10 \
+  --jq "[.[] | select(.body | startswith(\"$DIGEST_MARKER\"))] | first | .number // empty")
+
+DIGEST_TABLE="${DIGEST_ROWS:-| _none_ | _none_ | _none_ |
+}"
+DIGEST_BODY="$DIGEST_MARKER
+# Merge-Risk Hold Digest
+
+Auto-maintained by Champion's Held-PR Census (#6720, #6851). This issue's body
+is **overwritten in place every pass** — it is never appended to, and it is
+**not a work item**: do not curate, build, or promote it.
+
+**Last updated**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+**Aggregate**: Merge-risk holds: $HELD_COUNT open PR(s) — $HELD_CONFLICTING conflicting, $HELD_AT_DOCTOR out at Doctor, oldest ${OLDEST_DAYS}d
+
+| PR | Hold reason | Status |
+|---|---|---|
+$DIGEST_TABLE
+---
+*Automated by Champion role*"
+
+if [ -z "$DIGEST_ISSUE" ]; then
+  # loom:blocked keeps this out of every role's work queue (Curator's
+  # Priority 2 fallback excludes it outright, and no `loom:issue` /
+  # `loom:curated` / `loom:pr` search can ever match it) while it stays a
+  # normal, findable OPEN issue for a human or Guide to read directly.
+  DIGEST_URL=$(./.loom/scripts/create-issue.sh --title "$DIGEST_TITLE" --body "$DIGEST_BODY" --label "loom:blocked")
+else
+  gh issue edit "$DIGEST_ISSUE" --body "$DIGEST_BODY"
+  DIGEST_URL="https://github.com/$(gh repo view --json nameWithOwner --jq .nameWithOwner)/issues/$DIGEST_ISSUE"
+fi
+"$GH_READ" --clear-cache   # your own write must not be masked by your own cache
+echo "Merge-risk hold digest updated: $DIGEST_URL"
+```
+
+**Report it even when it is zero, same as the aggregate line** — an empty
+`$HELD_JSON` still writes the digest issue, with a single `_none_` row; the
+issue's continued existence and fresh "Last updated" timestamp is itself the
+useful signal ("Champion is still running its census and the pile is
+currently empty") rather than a stale artifact nobody can distinguish from
+"Champion stopped running this".
+
+**Never let this block a merge decision.** The digest is a read-only summary
+of state this pass already computed for other reasons (`$HELD_JSON`, plus one
+cached comment read per held PR) — it changes no label, comments on no PR, and
+touches no Safety Criterion. If writing it fails (rate limit, transient API
+error), log the failure and continue; it never blocks or alters criterion #1-6
+evaluation for any PR.
 
 ---
 
@@ -2015,10 +2140,24 @@ never touched on either variant** — the hold must survive the round-trip.
 
 ```bash
 PR_NUMBER=<number>
-STALE_MARKER="<!-- champion:stale-pr-notice -->"
 # From criterion #2 (sticky precheck or a fresh hold posted this pass); false
 # / unset on the ordinary unheld path.
 HELD="${MERGE_BLOCKED_BY_HOLD:-false}"
+
+# Episode key: $LAST_ACTIVITY, the same value criterion #5's recency check
+# (above) just computed to decide this PR is stale in the first place —
+# mirrors the reject/park markers' own per-episode keying
+# ($CRITERION_KEY:$REASON_KEY and $LATEST_REJECTION_ID above), neither of
+# which this marker had (#6860). A staleness *episode* ends only when
+# something REAL happens — a new commit, or a comment from anyone/anything
+# other than Champion (#6843/#6844's own definition of "real activity") —
+# which is exactly what should reopen eligibility for a fresh notice if the
+# PR then goes stale again. This is safe from self-triggering: #6843/#6844
+# already made LAST_ACTIVITY exclude Champion's own comments (matched via
+# `champion:|Automated by Champion role`), and the notice posted below is
+# itself such a comment, so posting it does NOT advance LAST_ACTIVITY and
+# does not fabricate a "new" episode on the very next tick.
+STALE_MARKER="<!-- champion:stale-pr-notice:$LAST_ACTIVITY -->"
 
 if [ "$HELD" = true ]; then
   STALE_HOLD_NOTE="
@@ -2030,14 +2169,20 @@ else
   STALE_HOLD_NOTE=""
 fi
 
-# Idempotency guard: only comment + relabel once. If a prior tick already
-# posted the stale notice, do nothing (prevents per-tick comment spam).
+# Idempotency guard: only comment + relabel once PER EPISODE (same
+# LAST_ACTIVITY). If a prior tick already posted the stale notice for THIS
+# EXACT LAST_ACTIVITY value, do nothing (prevents per-tick comment spam
+# within one still-stale episode). A notice posted for an OLDER
+# LAST_ACTIVITY — a past episode that later cycled back through Doctor ->
+# Judge with real new activity and has now gone stale again — does NOT match
+# and must produce a fresh notice (#6860); marker-existence alone (ever, any
+# episode) is not the right test.
 # Cached ("$GH_READ") — idempotency-marker grep.
 # `startswith`, not a bare substring match — a later comment discussing or
 # quoting this marker must never be mistaken for the notice's own comment
 # and wrongly suppress the real post (#5371).
 if [ "$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq "[.comments[].body] | any(startswith(\"$STALE_MARKER\"))")" = "true" ]; then
-  echo "Stale-PR notice already posted for #$PR_NUMBER — skipping"
+  echo "Stale-PR notice already posted for #$PR_NUMBER for this episode (last activity $LAST_ACTIVITY) — skipping"
 else
   gh pr comment "$PR_NUMBER" --body "$STALE_MARKER
 **Champion: PR Is Stale**

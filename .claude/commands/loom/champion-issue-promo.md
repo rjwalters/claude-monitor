@@ -346,6 +346,59 @@ that is already gone.
 
 ---
 
+## Pass 0c: Approved-Without-`loom:issue` Reconciliation (#6862)
+
+**Run this once, immediately after Pass 0b above, before evaluating anything.**
+Like Pass 0 and Pass 0b, this looks at issues `champion.md`'s Priority 2/3
+discovery queries never surface on their own — this time issues that carry a
+`Champion Review: APPROVED` verdict comment but never actually received
+`loom:issue`.
+
+**The failure mode it closes.** Step 3b's promotion write used to be two
+independent, unchecked `gh` calls: the label edit, then the verdict comment.
+On issue #6464 (approved 2026-08-18) the comment posted but the label edit
+silently did not — the issue's label timeline showed only `loom:auditor` and
+`loom:evaluating` transitions, `loom:issue` was never applied. The issue sat
+"approved" in its own comment thread for 6 days, invisible to Builder (which
+filters on `loom:issue`), until a later Champion pass noticed by reading the
+label timeline by hand, then re-evaluated it from scratch under a possibly
+different tier. Step 3b now writes the label first and verifies it with a
+read-back before posting the comment (see below), which prevents NEW
+instances of this — but does nothing for issues already stuck in the old
+state, and this pass is the backstop for both.
+
+```bash
+# GitHub's `in:comments` search qualifier shortlists candidates without
+# scanning every open issue's full comment thread — mirrors Pass 0's per-label
+# loop shape, but the query itself does the label exclusion (`-label:`) so no
+# separate jq filter is needed here.
+gh issue list --search 'in:comments "Champion Review: APPROVED" -label:loom:issue' \
+  --state open --limit 200 --json number --jq '.[] | .number' \
+  | sort -un | head -n "${LOOM_MAX_PROMOTION_MISMATCH_RESCANS:-5}" | while read -r N; do
+  ./.loom/scripts/check-promotion-landed.sh --issue "$N" --apply
+done
+```
+
+`check-promotion-landed.sh --apply` decides and acts; this loop does not. Per
+issue it does exactly one of:
+
+| `DECISION` | What happened |
+|---|---|
+| `OK` | No APPROVED comment (a search false-positive, or `loom:issue` already present — a concurrent pass may have just reconciled it) — nothing done |
+| `NOT_OPEN` | Issue is closed — nothing left to reconcile |
+| `COMPLETED` | Recovered the tier from the verdict comment's "Goal Alignment" line, applied `loom:issue` + that tier, and **confirmed the addition via its own read-back** — the issue is now a normal, Builder-visible `loom:issue` |
+| `ESCALATED` | Could not safely complete (tier unrecoverable from the comment text, or the completing edit's own read-back still failed) — posted an explanatory comment and added `loom:operator-only,loom:operator-mechanical` rather than guess |
+
+Nothing here re-runs the 8 evaluation criteria or re-derives a tier from
+scratch — the original verdict already did that work; this pass only
+reconciles a write that should have landed and did not.
+`LOOM_MAX_PROMOTION_MISMATCH_RESCANS` (default **5**) bounds the per-pass cost
+the same way `LOOM_MAX_UNESCALATION_RESCANS` and `LOOM_MAX_EVALUATING_RESCANS`
+bound Pass 0 and Pass 0b — a backlog of stuck mismatches drains over several
+passes rather than spending one pass entirely on reconciliation.
+
+---
+
 ## Evaluation Criteria
 
 For each proposal issue (`loom:curated`, `loom:architect`, `loom:hermit`, or `loom:auditor`), evaluate against these **8 criteria**. All must pass for promotion:
@@ -876,21 +929,55 @@ Assess the issue's alignment with current project goals:
 
 Re-run the "Verdict-time recheck" (above) immediately before this write; abort if `loom:evaluating` is gone.
 
+**Label write FIRST, verified, THEN the comment (#6862).** The label edit and
+the verdict comment used to be two independent, unchecked `gh` calls — on
+issue #6464 the comment posted while the label edit silently did not, and the
+issue sat "approved" in its own comment thread for 6 days, invisible to
+Builder (which filters on `loom:issue`), until a later pass noticed by
+reading the label timeline by hand. Do the label write first, confirm it
+landed with a read-back (never trust the edit's exit code alone — the same
+lesson `push-lease-verify.sh` and `verdict-staleness-guard.sh` already encode
+for their own writes), and post the comment **only** once `loom:issue` is
+confirmed present — so a failed label edit can never leave behind an
+"already approved" comment that contradicts the issue's real state:
+
 ```bash
-# Add loom:issue AND the appropriate tier label; release the loom:evaluating
-# claim in the SAME command that writes the outcome.
+ISSUE_NUMBER=<number>
+TIER_LABEL="tier:goal-advancing"  # OR tier:goal-supporting OR tier:maintenance
+
+# Add loom:issue AND the tier label; release the loom:evaluating claim and
+# drop the now-superseded proposal label in the SAME command.
 # NOTE: loom:curated is preserved (indicates issue went through curation)
 # Other proposal labels (loom:architect, loom:hermit, loom:auditor) are removed
-gh issue edit <number> \
-  --remove-label "loom:architect" \
-  --remove-label "loom:hermit" \
-  --remove-label "loom:auditor" \
-  --remove-label "loom:evaluating" \
-  --add-label "loom:issue" \
-  --add-label "tier:goal-advancing"  # OR tier:goal-supporting OR tier:maintenance
+promote_labels() {
+  gh issue edit "$ISSUE_NUMBER" \
+    --remove-label "loom:architect" \
+    --remove-label "loom:hermit" \
+    --remove-label "loom:auditor" \
+    --remove-label "loom:evaluating" \
+    --add-label "loom:issue" \
+    --add-label "$TIER_LABEL"
+}
 
-# Add promotion comment with tier rationale
-gh issue comment <number> --body "**Champion Review: APPROVED**
+promote_labels
+LOOM_ISSUE_LANDED=$(gh issue view "$ISSUE_NUMBER" --json labels \
+  --jq '[.labels[].name] | any(. == "loom:issue")')
+
+if [ "$LOOM_ISSUE_LANDED" != "true" ]; then
+  # One retry — the edits are idempotent (re-adding an already-present label
+  # or re-removing an already-absent one is a no-op), so a retry can only
+  # help, never double-apply.
+  promote_labels
+  LOOM_ISSUE_LANDED=$(gh issue view "$ISSUE_NUMBER" --json labels \
+    --jq '[.labels[].name] | any(. == "loom:issue")')
+fi
+
+if [ "$LOOM_ISSUE_LANDED" != "true" ]; then
+  echo "ERROR: #$ISSUE_NUMBER — loom:issue did NOT land after 2 attempts. STOP: do NOT post the APPROVED comment — it would contradict the issue's real state. Leave the issue as-is and continue the batch loop to the next issue; a later pass (or Pass 0c's reconciliation check below) retries it."
+  # HARD STOP for this issue: no verdict comment, no further promotion steps.
+else
+  # loom:issue is CONFIRMED present — only now post the promotion comment.
+  gh issue comment "$ISSUE_NUMBER" --body "**Champion Review: APPROVED**
 
 This issue has been evaluated and promoted to \`loom:issue\` status. All quality criteria passed:
 
@@ -909,6 +996,7 @@ This issue has been evaluated and promoted to \`loom:issue\` status. All quality
 
 ---
 *Automated by Champion role*"
+fi
 ```
 
 **Step 3c: Capacity Deferral — the tier's rate limit blocks promotion this pass (#6729)**

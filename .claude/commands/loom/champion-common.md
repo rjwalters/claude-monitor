@@ -14,6 +14,7 @@ After evaluating both queues:
 4. Report rejections with reasons
 5. List merged PR numbers and promoted issue numbers with links
 6. **Report the merge-risk hold census** — always, including when it is zero (#6720)
+7. **Persist the per-PR merge-risk hold digest** — durably, across passes, not just in this transcript (#6851)
 
 **Merge-risk hold census (mandatory line, #6720).** A held PR does not merge and
 does not report itself; without a standing count, a pile grows unseen. On
@@ -29,6 +30,17 @@ Merge-risk holds: <N> open PR(s) — <C> conflicting, <D> out at Doctor, oldest 
 Emit the line even when the set is empty (the census command already produces
 `Merge-risk holds: 0 open PR(s) — 0 conflicting, 0 out at Doctor, oldest 0d`).
 A line that only appears when something is wrong is a line nobody learns to read.
+
+**Per-PR digest (mandatory, #6851) — additive to the census line above, not a
+replacement for it.** The aggregate line is a transcript-only summary: it
+tells the pipeline *how many* PRs are held, but a fresh read of it exists only
+for the length of this pass's own session. Run `champion-pr-merge.md` →
+"Held-PR Census" → "Per-PR Digest" **in this same pass** to also write PR
+number / hold reason / `mergeable` status for every currently-held PR to the
+pinned `Champion: Merge-Risk Hold Digest` tracking issue, so a human or another
+role (e.g. Guide) can read the current pile without a Champion transcript or a
+hand-run `loom:operator` label query. This is reporting/visibility only — it
+changes no Safety Criteria evaluation and no merge decision.
 
 **Example report**:
 
@@ -55,6 +67,7 @@ Capped-PR Recovery (2):
   https://github.com/owner/repo/pull/4501
 
 Merge-risk holds: 3 open PR(s) — 2 conflicting, 1 out at Doctor, oldest 6d
+Merge-risk hold digest updated: https://github.com/owner/repo/issues/6900
 
 Rejected:
 - PR #456: Too large (450 lines, limit is 200)
