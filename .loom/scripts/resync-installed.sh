@@ -565,17 +565,35 @@ fi
 # accepted, intentional narrowing of the recovery path (Acceptance Criteria,
 # #5624) — no replacement fallback is added.
 
+# A candidate source root is only usable if it actually has SOMETHING to sync
+# from — `-d "$root/defaults"` alone is not sufficient (#6780): a sidecar or
+# metadata path can point at a directory that still exists (unlike the
+# "vanished clone" case, which already fails loud below) but is stale, empty,
+# or was never a real Loom checkout — e.g. a scratch clone whose contents were
+# emptied without removing the directory itself, or an unrelated directory
+# that merely happens to contain an empty `defaults/`. Requiring a populated
+# `defaults/hooks` or `defaults/scripts` mirrors the dogfood rung's own check
+# immediately below and closes the gap that let resolve_defaults() "succeed"
+# against a source tree with nothing under it — which then made the sync walk
+# below iterate zero files and report "already in sync", a false "current"
+# verdict rather than the loud, honest failure an unresolvable source should
+# produce.
+is_usable_defaults_root() {
+    local root="$1"
+    [[ -n "$root" && ( -d "$root/defaults/hooks" || -d "$root/defaults/scripts" ) ]]
+}
+
 DEFAULTS_DIR=""
 SOURCE_ROOT=""
 resolve_defaults() {
-    if [[ -d "$REPO_ROOT/defaults/hooks" || -d "$REPO_ROOT/defaults/scripts" ]]; then
+    if is_usable_defaults_root "$REPO_ROOT"; then
         DEFAULTS_DIR="$REPO_ROOT/defaults"
         return 0
     fi
     if [[ -f "$REPO_ROOT/.loom/loom-source-path" ]]; then
         local src
         src="$(cat "$REPO_ROOT/.loom/loom-source-path" 2>/dev/null || true)"
-        if [[ -n "$src" && -d "$src/defaults" ]]; then
+        if is_usable_defaults_root "$src"; then
             DEFAULTS_DIR="$src/defaults"
             return 0
         fi
@@ -583,7 +601,7 @@ resolve_defaults() {
     if [[ -f "$REPO_ROOT/.loom/install-metadata.json" ]]; then
         local src
         src="$(sed -n 's/.*"loom_source" *: *"\(.*\)".*/\1/p' "$REPO_ROOT/.loom/install-metadata.json" 2>/dev/null | head -1)"
-        if [[ -n "$src" && -d "$src/defaults" ]]; then
+        if is_usable_defaults_root "$src"; then
             DEFAULTS_DIR="$src/defaults"
             return 0
         fi
@@ -1467,15 +1485,20 @@ restamp_metadata() {
     local meta="$WRITE_ROOT/.loom/install-metadata.json"
     [[ -f "$meta" ]] || return 0
 
-    local version commit today tmp
+    local version commit today tmp remote
     version="$(read_source_version)"
     commit="$(git -C "$SOURCE_ROOT" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
     today="$(date +%Y-%m-%d)"
+    # Refresh loom_source_remote (#6780 AC3) from the SOURCE_ROOT this resync
+    # actually resolved to, so it tracks a repointed sidecar rather than
+    # freezing whatever was recorded at install time. Best-effort: empty when
+    # SOURCE_ROOT isn't a git checkout or has no `origin` configured.
+    remote="$(git -C "$SOURCE_ROOT" remote get-url origin 2>/dev/null || true)"
     tmp="${meta}.tmp.$$"
 
     if command -v jq >/dev/null 2>&1; then
-        if jq --arg v "$version" --arg c "$commit" --arg r "$today" \
-              '.loom_version=$v | .loom_commit=$c | .last_resync=$r | del(.loom_source)' \
+        if jq --arg v "$version" --arg c "$commit" --arg r "$today" --arg src "$remote" \
+              '.loom_version=$v | .loom_commit=$c | .last_resync=$r | .loom_source_remote=$src | del(.loom_source)' \
               "$meta" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
             mv "$tmp" "$meta"
             note "  ${GREEN}re-stamped${NC} install-metadata.json (loom_version=$version, loom_commit=$commit, last_resync=$today)"
@@ -1485,7 +1508,7 @@ restamp_metadata() {
     fi
 
     if command -v python3 >/dev/null 2>&1; then
-        if META="$meta" VERSION="$version" COMMIT="$commit" TODAY="$today" \
+        if META="$meta" VERSION="$version" COMMIT="$commit" TODAY="$today" REMOTE="$remote" \
            python3 - "$tmp" <<'PY' 2>/dev/null && [[ -s "$tmp" ]]; then
 import json, os, sys
 with open(os.environ["META"]) as f:
@@ -1493,6 +1516,7 @@ with open(os.environ["META"]) as f:
 data["loom_version"] = os.environ["VERSION"]
 data["loom_commit"] = os.environ["COMMIT"]
 data["last_resync"] = os.environ["TODAY"]
+data["loom_source_remote"] = os.environ["REMOTE"]
 data.pop("loom_source", None)
 with open(sys.argv[1], "w") as f:
     json.dump(data, f, indent=2)

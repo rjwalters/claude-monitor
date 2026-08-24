@@ -1998,6 +1998,25 @@ only after (#6202). Fix: clone <https://github.com/rjwalters/loom> locally,
 then either re-run its installer against this repo or write the sidecar
 yourself: `echo /path/to/local/loom-clone > .loom/loom-source-path`.
 
+**`.loom/loom-source-path` is a DURABLE pointer — never point it into scratch
+space (#6780).** Every future `resync-installed.sh` / `check-main-freshness.sh`
+run keeps reading whatever path is recorded here, for as long as this repo is
+installed, not just for the session that wrote it. Installing from a clone
+made inside a temporary/scratch directory (`/tmp/...`, `/private/tmp/...`, an
+agent session's scratchpad, a CI job's workdir) is fine as a one-off, but
+recording that transient location as the repo's permanent upstream pointer
+turns it into a dead reference the moment the scratch area is cleaned up —
+`install.sh` and `scripts/install-loom.sh` now print a non-blocking warning at
+install time when the resolved source path looks ephemeral, so re-point the
+sidecar at a persistent clone if you see it:
+`echo /path/to/persistent/loom-clone > .loom/loom-source-path`. Both
+`resolve_defaults()` (`resync-installed.sh`) and its read-only mirror
+`resync_precondition_met()` (`check-main-freshness.sh`) also require the
+resolved path to actually contain a populated `defaults/hooks` or
+`defaults/scripts` — a sidecar pointing at a directory that still exists but
+is stale/empty (rather than fully vanished) is treated as unresolvable too,
+not silently reported as "in sync" against nothing.
+
 The same list also declares a file **repo-owned**, so the installer's reinstall
 clean sweep never deletes it — see
 [`repo-owned-files.md`](repo-owned-files.md) for the full ownership rule that

@@ -526,6 +526,63 @@ else
     fail "(m) missing source tree error message unclear"
 fi
 
+# --- (m2) .loom/loom-source-path points at a path that does not exist at all
+# -> same clear error, exit 1 (#6780 AC1: "missing directory" case) ----------
+echo "Test group 11b: .loom/loom-source-path pointing at a nonexistent directory errors clearly (#6780)"
+REPO="$(make_fixture)"
+rm -rf "$REPO/defaults"
+printf '%s/does-not-exist\n' "$REPO" > "$REPO/.loom/loom-source-path"
+rm -f "$REPO/.loom/install-metadata.json"
+RC=0; OUT="$(cd "$REPO" && bash "$SCRIPT" --dry-run 2>&1)" || RC=$?
+if [[ $RC -eq 1 ]]; then
+    pass "(m2) nonexistent loom-source-path target exits 1"
+else
+    fail "(m2) nonexistent loom-source-path target did not exit 1 (got $RC)"
+fi
+if grep -qi "could not locate" <<<"$OUT"; then
+    pass "(m2) nonexistent loom-source-path target prints a clear error"
+else
+    fail "(m2) nonexistent loom-source-path target error message unclear"
+fi
+if ! grep -qi "already in sync" <<<"$OUT"; then
+    pass "(m2) nonexistent loom-source-path target never reports a false 'already in sync'"
+else
+    fail "(m2) nonexistent loom-source-path target falsely reported 'already in sync'. Got: $OUT"
+fi
+
+# --- (m3) .loom/loom-source-path points at a directory that EXISTS (and even
+# has a `defaults/` subdirectory) but is not a real Loom checkout -- e.g. a
+# scratch clone whose contents were emptied without removing the directory
+# itself. Before #6780 this passed resolve_defaults()'s `-d "$src/defaults"`
+# check, so the sync walk below found zero files under the (empty)
+# defaults/hooks|scripts and reported a false "already in sync (0 unchanged)"
+# -- the exact "reports the install as current" bug from #6780. Must now be
+# treated exactly like a fully-missing directory: loud error, never success. -
+echo "Test group 11c: .loom/loom-source-path pointing at a stale/empty source tree errors, not a false 'in sync' (#6780)"
+REPO="$(make_fixture)"
+rm -rf "$REPO/defaults"
+STALE_SRC="$WORKDIR/stale-loom-source"
+rm -rf "$STALE_SRC"
+mkdir -p "$STALE_SRC/defaults"   # exists, but no hooks/ or scripts/ under it
+printf '%s\n' "$STALE_SRC" > "$REPO/.loom/loom-source-path"
+rm -f "$REPO/.loom/install-metadata.json"
+RC=0; OUT="$(cd "$REPO" && bash "$SCRIPT" --dry-run 2>&1)" || RC=$?
+if [[ $RC -eq 1 ]]; then
+    pass "(m3) stale/empty source tree exits 1"
+else
+    fail "(m3) stale/empty source tree did not exit 1 (got $RC)"
+fi
+if grep -qi "could not locate" <<<"$OUT"; then
+    pass "(m3) stale/empty source tree prints a clear error"
+else
+    fail "(m3) stale/empty source tree error message unclear. Got: $OUT"
+fi
+if ! grep -qi "already in sync" <<<"$OUT"; then
+    pass "(m3) stale/empty source tree never reports a false 'already in sync'"
+else
+    fail "(m3) stale/empty source tree falsely reported 'already in sync'. Got: $OUT"
+fi
+
 # --- (n) metadata re-stamp ---------------------------------------------------
 echo "Test group 12: successful apply re-stamps install-metadata.json"
 REPO="$(make_fixture)"
@@ -551,6 +608,15 @@ if grep -q '"install_date": *"2020-01-01"' "$META"; then
     pass "(n) install_date preserved (installer-owned, out of scope)"
 else
     fail "(n) install_date was altered"
+fi
+# #6780 AC3: re-stamp writes a loom_source_remote key (empty string here,
+# since the fixture's SOURCE_ROOT has no `origin` remote configured -- but
+# the key itself must always be present, never omitted, so downstream
+# tooling can distinguish "no remote" from "field never written").
+if grep -q '"loom_source_remote"' "$META"; then
+    pass "(#6780) re-stamp writes a loom_source_remote key"
+else
+    fail "(#6780) re-stamp did not write a loom_source_remote key. Got: $(cat "$META")"
 fi
 # --dry-run must NOT re-stamp
 REPO="$(make_fixture)"

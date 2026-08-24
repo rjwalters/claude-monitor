@@ -34,6 +34,10 @@
 #                            because launchd jobs and `ssh host 'cmd'` shells
 #                            never source the login profile.
 #   LOOM_NPM_BIN           - Absolute path to `npm`, same resolution rules.
+#   LOOM_PNPM_BIN          - Absolute path to `pnpm`, same resolution rules
+#                            (used for MCP self-repair when the package's own
+#                            "packageManager" field or a tracked pnpm-lock.yaml
+#                            resolves it to pnpm, issue #6779).
 #   LOOM_MODEL             - Model to pass as `claude --model <value>` (issue
 #                            #3477). An explicit `--model` in the wrapper args
 #                            always wins. The flag is appended once before the
@@ -834,15 +838,18 @@ _LOOM_NODE_TOOL_DIRS=(
     /snap/bin
 )
 
-# _locate_node_tool <node|npm> -> echoes an absolute path, or nothing (rc 1).
-# Precedence: $LOOM_NODE_BIN / $LOOM_NPM_BIN override -> PATH -> the explicit
-# candidate list above -> nvm-style versioned installs (newest first).
+# _locate_node_tool <node|npm|pnpm> -> echoes an absolute path, or nothing
+# (rc 1). Precedence: $LOOM_NODE_BIN / $LOOM_NPM_BIN / $LOOM_PNPM_BIN override
+# -> PATH -> the explicit candidate list above -> nvm-style versioned installs
+# (newest first, pnpm only — pnpm is not installed under nvm's own tree, but a
+# corepack-shimmed pnpm can land next to a per-version node install there).
 _locate_node_tool() {
     local tool="$1"
     local override=""
     case "${tool}" in
         node) override="${LOOM_NODE_BIN:-}" ;;
         npm)  override="${LOOM_NPM_BIN:-}" ;;
+        pnpm) override="${LOOM_PNPM_BIN:-}" ;;
     esac
 
     if [[ -n "${override}" && -x "${override}" ]]; then
@@ -886,6 +893,7 @@ _node_tool_search_paths() {
     case "${tool}" in
         node) echo "\$LOOM_NODE_BIN" ;;
         npm)  echo "\$LOOM_NPM_BIN" ;;
+        pnpm) echo "\$LOOM_PNPM_BIN" ;;
     esac
     echo "${tool} on \$PATH"
     local dir
@@ -895,16 +903,101 @@ _node_tool_search_paths() {
     echo "${NVM_DIR:-${HOME}/.nvm}/versions/node/*/bin/${tool}"
 }
 
+# Resolve which package manager an MCP server's dependency tree is actually
+# managed with — from the package's OWN declaration, never from which
+# lockfile a self-repair run happened to leave lying around (#6779). A prior
+# `npm ci` self-repair against a pnpm-managed package leaves an untracked
+# package-lock.json as pure residue; trusting "package-lock.json present"
+# alone made that residue re-trigger the same wrong-manager self-repair on
+# every subsequent run — pnpm install -> judged unusable -> npm ci -> fresh
+# untracked package-lock.json -> repeat.
+#
+# Precedence:
+#   1. package.json's own "packageManager" field (e.g. "pnpm@11.20.0" -> pnpm)
+#   2. Whichever manager-specific lockfile the package's OWN git history
+#      tracks (pnpm-lock.yaml / yarn.lock beat an untracked package-lock.json)
+#   3. Whichever manager-specific lockfile merely exists on disk, still
+#      preferring pnpm-lock.yaml / yarn.lock over package-lock.json — an
+#      untracked package-lock.json is exactly the self-inflicted residue this
+#      function exists to stop trusting
+#   4. npm (unchanged default when nothing above resolves)
+#
+# Echoes exactly one of: pnpm, yarn, npm
+_mcp_resolve_package_manager() {
+    local pkg_dir="$1"
+    local pkg_json="${pkg_dir}/package.json"
+
+    if [[ -f "${pkg_json}" ]]; then
+        # `timeout` is not present on a bare macOS install; degrade to a
+        # direct call rather than hanging the caller.
+        local -a _py=()
+        if command -v timeout >/dev/null 2>&1; then
+            _py=(timeout 10 "${LOOM_PYTHON}")
+        else
+            _py=("${LOOM_PYTHON}")
+        fi
+
+        local declared
+        declared=$("${_py[@]}" -c "
+import json, sys
+try:
+    with open('${pkg_json}') as f:
+        cfg = json.load(f)
+except Exception:
+    sys.exit(0)
+pm = cfg.get('packageManager')
+if isinstance(pm, str) and pm:
+    print(pm.split('@')[0].strip())
+" 2>/dev/null || echo "")
+        case "${declared}" in
+            pnpm|yarn|npm)
+                echo "${declared}"
+                return 0
+                ;;
+        esac
+    fi
+
+    # No explicit declaration — prefer a lockfile the package's own git
+    # history tracks over one that merely exists (the untracked-residue case).
+    local lock manager
+    for lock in pnpm-lock.yaml yarn.lock; do
+        if [[ -f "${pkg_dir}/${lock}" ]] && \
+           git -C "${pkg_dir}" ls-files --error-unmatch "${lock}" >/dev/null 2>&1; then
+            case "${lock}" in
+                pnpm-lock.yaml) echo "pnpm" ;;
+                yarn.lock)      echo "yarn" ;;
+            esac
+            return 0
+        fi
+    done
+
+    # Nothing tracked (not a git repo, or the tracked lockfile disagrees with
+    # what's on disk) — fall back to raw presence, pnpm/yarn still ranked
+    # ahead of package-lock.json so an untracked residue file never outranks
+    # a real pnpm/yarn lockfile.
+    if [[ -f "${pkg_dir}/pnpm-lock.yaml" ]]; then
+        echo "pnpm"
+        return 0
+    fi
+    if [[ -f "${pkg_dir}/yarn.lock" ]]; then
+        echo "yarn"
+        return 0
+    fi
+
+    echo "npm"
+}
+
 # True (rc 0) when <pkg_dir>/node_modules is missing, empty, or a broken
-# half-install — i.e. mechanically repairable by `npm ci` rather than a genuine
-# build-source error (#5032).
+# half-install — i.e. mechanically repairable by the resolved package
+# manager's install command rather than a genuine build-source error (#5032).
 #
 # "Broken half-install" is the laptop-host root cause: node_modules existed and
 # was non-empty, but node_modules/@modelcontextprotocol/sdk was an EMPTY
 # directory, so `npm run build` died with MODULE_NOT_FOUND exactly like a real
 # source error. Checking that every declared dependency resolves to a directory
-# containing its own package.json catches that case; a `require` failure for a
-# dependency the package never declared is correctly NOT treated as repairable.
+# containing its own package.json catches that case for an npm-shaped tree; a
+# `require` failure for a dependency the package never declared is correctly
+# NOT treated as repairable.
 _mcp_node_modules_unusable() {
     local pkg_dir="$1"
     local node_modules="${pkg_dir}/node_modules"
@@ -913,6 +1006,25 @@ _mcp_node_modules_unusable() {
         return 0
     fi
     if [[ -z "$(ls -A "${node_modules}" 2>/dev/null)" ]]; then
+        return 0
+    fi
+
+    # A pnpm-managed tree is a symlink farm rooted at node_modules/.pnpm (or,
+    # under node-linker=hoisted, a flat tree pnpm itself wrote and records in
+    # node_modules/.modules.yaml) — not the npm-shaped
+    # "every declared dep flattened straight into node_modules/<dep>/" layout
+    # the walk below assumes. Re-deriving usability the npm way against a
+    # correctly-installed pnpm tree is exactly what converted a healthy
+    # install into "unusable" and triggered `npm ci` on it (#6779). Trust
+    # pnpm's own install bookkeeping instead.
+    if [[ "$(_mcp_resolve_package_manager "${pkg_dir}")" == "pnpm" ]]; then
+        if [[ -d "${node_modules}/.pnpm" ]] && \
+           [[ -n "$(ls -A "${node_modules}/.pnpm" 2>/dev/null)" ]]; then
+            return 1
+        fi
+        if [[ -f "${node_modules}/.modules.yaml" ]]; then
+            return 1
+        fi
         return 0
     fi
 
@@ -949,13 +1061,35 @@ for section in ('dependencies', 'devDependencies'):
     return 1
 }
 
+# After a self-repair reports SUCCESS but the follow-up build still fails, the
+# raw error is often as unhelpful as `sh: tsc: command not found` — accurate,
+# but it leaves the two very different explanations (a devDependency's binary
+# never actually installed vs. the build ran under the wrong package manager
+# for a devDependency the OTHER manager would have provided) for an operator
+# to rediscover from scratch every time (#6779). Name both candidate causes
+# instead of only surfacing the raw tool-not-found line.
+# $1 = path to a file holding the build's combined stdout+stderr
+# $2 = the package manager the build actually ran with (pnpm|yarn|npm)
+_mcp_build_failure_hint() {
+    local build_log="$1"
+    local manager="$2"
+
+    if grep -qE 'command not found|not recognized as an internal or external command' \
+        "${build_log}" 2>/dev/null; then
+        log_error "Likely cause: a devDependency's binary is missing from node_modules/.bin (partial install), or the build ran under the wrong package manager (resolved: ${manager}) for what this package actually declares. Check package.json's \"packageManager\" field and re-run '${manager} install' by hand."
+    fi
+}
+
 # Attempt to rebuild the MCP server and re-verify.
 #
-# Before `npm run build`, self-repair a missing/empty/half-installed
-# node_modules with `npm ci` when a package-lock.json is present (#5032) —
-# without it the two very different failures (unusable dependency tree vs.
-# genuine build-source error) are indistinguishable at the call site and both
-# needed an operator to run `npm ci` by hand.
+# Before running the build, self-repair a missing/empty/half-installed
+# node_modules with the resolved package manager's install command when its
+# own lockfile is present (#5032) — without a lockfile that install command
+# cannot run at all, so fall straight through to the build and let it report
+# the error. The manager is chosen once, up front, by
+# _mcp_resolve_package_manager (#6779) — never by which lockfile happens to
+# be sitting on disk, since a prior wrong-manager self-repair can itself leave
+# a stray lockfile behind.
 _try_mcp_rebuild() {
     local mcp_entry="$1"
 
@@ -969,54 +1103,90 @@ _try_mcp_rebuild() {
         return 1
     fi
 
-    local npm_bin node_bin node_dir
-    npm_bin="$(_locate_node_tool npm)" || npm_bin=""
-    if [[ -z "${npm_bin}" ]]; then
-        log_error "npm not found - cannot rebuild the MCP bundle at ${mcp_dir}"
-        log_error "Searched: $(_node_tool_search_paths npm | tr '\n' ' ')"
-        log_error "Set \$LOOM_NPM_BIN to an absolute npm path, or install node."
+    local manager
+    manager="$(_mcp_resolve_package_manager "${mcp_dir}")"
+
+    local mgr_bin node_bin node_dir
+    mgr_bin="$(_locate_node_tool "${manager}")" || mgr_bin=""
+    if [[ -z "${mgr_bin}" ]]; then
+        log_error "${manager} not found - cannot rebuild the MCP bundle at ${mcp_dir}"
+        log_error "Searched: $(_node_tool_search_paths "${manager}" | tr '\n' ' ')"
+        case "${manager}" in
+            pnpm) log_error "Set \$LOOM_PNPM_BIN to an absolute pnpm path, or install pnpm." ;;
+            yarn) log_error "Set \$LOOM_NODE_BIN to an absolute node path and ensure yarn is on PATH, or install yarn." ;;
+            *)    log_error "Set \$LOOM_NPM_BIN to an absolute npm path, or install node." ;;
+        esac
         return 1
     fi
-    # npm's own shim execs `node`; a minimal PATH breaks it even once npm
-    # itself is resolved, so put the resolved node's directory on PATH for the
-    # build subshells.
+    # A package-manager shim execs `node`; a minimal PATH breaks it even once
+    # the manager itself is resolved, so put the resolved node's directory on
+    # PATH for the build subshells.
     node_bin="$(_locate_node_tool node)" || node_bin=""
     node_dir=""
     [[ -n "${node_bin}" ]] && node_dir="$(dirname "${node_bin}")"
 
-    log_info "Attempting MCP server rebuild in ${mcp_dir}..."
+    log_info "Attempting MCP server rebuild in ${mcp_dir} (package manager: ${manager})..."
 
-    # Self-repair: an unusable dependency tree plus a lockfile is mechanically
-    # fixable — run `npm ci` first. Without a lockfile `npm ci` cannot run at
-    # all, so fall straight through to the build and let it report the error.
+    local -a install_cmd=() build_cmd=()
+    local lockfile repair_hint
+    case "${manager}" in
+        pnpm)
+            install_cmd=(install --frozen-lockfile)
+            build_cmd=(run build)
+            lockfile="pnpm-lock.yaml"
+            repair_hint="cd ${mcp_dir} && pnpm install --frozen-lockfile && pnpm run build"
+            ;;
+        *)
+            # yarn falls through to the npm-shaped commands below rather than
+            # gaining its own self-repair path — #6779's acceptance criteria
+            # only require pnpm parity; a package declaring yarn without an
+            # npm lockfile simply reports "cannot self-repair" exactly like
+            # the pre-existing npm-without-lockfile case, and still attempts
+            # the build (unchanged behavior from before this fix).
+            install_cmd=(ci)
+            build_cmd=(run build)
+            lockfile="package-lock.json"
+            repair_hint="cd ${mcp_dir} && npm ci && npm run build"
+            ;;
+    esac
+
+    # Self-repair: an unusable dependency tree plus the manager's own lockfile
+    # is mechanically fixable — run the install command first.
     if _mcp_node_modules_unusable "${mcp_dir}"; then
-        if [[ -f "${mcp_dir}/package-lock.json" ]]; then
-            log_warn "MCP node_modules missing/incomplete in ${mcp_dir} - running 'npm ci' (self-repair)"
+        if [[ -f "${mcp_dir}/${lockfile}" ]]; then
+            log_warn "MCP node_modules missing/incomplete in ${mcp_dir} - running '${manager} ${install_cmd[*]}' (self-repair)"
             if ( set -o pipefail
                  cd "${mcp_dir}" && PATH="${node_dir:+${node_dir}:}${PATH}" \
-                     "${npm_bin}" ci 2>&1 | tail -5 ) >&2; then
-                log_info "npm ci completed - dependency tree repaired"
+                     "${mgr_bin}" "${install_cmd[@]}" 2>&1 | tail -5 ) >&2; then
+                log_info "${manager} ${install_cmd[*]} completed - dependency tree repaired"
             else
                 # No network / corrupted lockfile / registry auth failure.
-                # Abort loudly: `npm run build` on the same broken tree would
-                # only produce a confusing MODULE_NOT_FOUND.
-                log_error "npm ci failed in ${mcp_dir} - cannot repair the MCP dependency tree"
-                log_error "Repair manually: cd ${mcp_dir} && npm ci && npm run build"
+                # Abort loudly: running the build on the same broken tree
+                # would only produce a confusing MODULE_NOT_FOUND.
+                log_error "${manager} ${install_cmd[*]} failed in ${mcp_dir} - cannot repair the MCP dependency tree"
+                log_error "Repair manually: ${repair_hint}"
                 return 1
             fi
         else
-            log_warn "MCP node_modules missing/incomplete in ${mcp_dir} but no package-lock.json - cannot self-repair with 'npm ci'"
+            log_warn "MCP node_modules missing/incomplete in ${mcp_dir} but no ${lockfile} - cannot self-repair with '${manager} ${install_cmd[*]}'"
         fi
     fi
 
-    # Run npm build (suppressing verbose output)
+    # Run the build (suppressing verbose output), capturing the full combined
+    # output to a scratch file so a failure can be classified below without
+    # re-running the build.
+    local build_log
+    build_log=$(mktemp)
     if ( set -o pipefail
          cd "${mcp_dir}" && PATH="${node_dir:+${node_dir}:}${PATH}" \
-             "${npm_bin}" run build 2>&1 | tail -5 ) >&2; then
+             "${mgr_bin}" "${build_cmd[@]}" 2>&1 | tee "${build_log}" | tail -5 ) >&2; then
         log_info "MCP rebuild completed"
+        rm -f "${build_log}"
     else
         log_error "MCP rebuild failed"
-        log_error "Repair manually: cd ${mcp_dir} && npm ci && npm run build"
+        _mcp_build_failure_hint "${build_log}" "${manager}"
+        rm -f "${build_log}"
+        log_error "Repair manually: ${repair_hint}"
         return 1
     fi
 
