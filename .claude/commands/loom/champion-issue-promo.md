@@ -452,6 +452,65 @@ Use conservative judgment. **Do NOT promote** if:
 
 ---
 
+### Dependency-Defer Fast Path — run this FIRST, before the Idempotency check
+
+**Problem this section fixes.** Step 4's dependency-timing gate
+(`classify-dependency-block.sh --check-defer`) is correct, but it is
+reachable **only** from inside Step 4's escalation branch — which is itself
+reachable only after the body-hash idempotency check below has run to
+completion and decided either "no marker match" or "skip budget exhausted."
+Any pass that, for whatever reason, does not walk that exact call chain end
+to end never reaches the gate at all, and nothing then stops it from
+posting a fresh comment — even when the gate, if it HAD been consulted,
+would have returned `DEFER` on an unchanged fingerprint. (Observed in the
+wild: a proposal accumulated six duplicate "Champion Review: STILL DEFERRED
+(no change)" comments across several days even though the dependency-timing
+gate returned `DEFER` with an unchanged blocker fingerprint on every one of
+those passes — illustrative, not a fixed reference for this repo.)
+
+**The fix: check unconditionally, first, ahead of and independent of every
+other mechanism in this file.** Before the Idempotency check, before
+Step 1, before writing **any** comment on a proposal that already carries a
+Champion comment — look for the most recent recorded
+`<!-- champion:dep-defer:<fp> -->` marker and re-derive the CURRENT answer.
+If both agree the proposal is still deferred at the same fingerprint, stop
+completely for this issue this pass:
+
+```bash
+ISSUE_NUMBER=<number>
+
+# Most recent dep-defer marker recorded on ANY existing comment (not just
+# the marker's own verdict comment — a defer marker can end up patched
+# onto a comment this check does not otherwise inspect).
+ALL_COMMENTS_BODY=$("$GH_READ" issue view "$ISSUE_NUMBER" --json comments \
+  --jq '[.comments[].body] | join("\n---\n")' 2>/dev/null)
+EXISTING_DEFER_FP=$(printf '%s\n' "$ALL_COMMENTS_BODY" \
+  | grep -oE '<!-- champion:dep-defer:[0-9a-f]+ -->' \
+  | sed -E 's/<!-- champion:dep-defer:([0-9a-f]+) -->/\1/' \
+  | tail -n 1)
+
+if [ -n "$EXISTING_DEFER_FP" ]; then
+  DEP_RC=0
+  DEFER_OUT=$(./.loom/scripts/classify-dependency-block.sh --issue "$ISSUE_NUMBER" --check-defer) || DEP_RC=$?
+  CURRENT_FP=$(printf '%s\n' "$DEFER_OUT" | sed -n 's/^BLOCKER_FINGERPRINT: //p')
+
+  if [ "$DEP_RC" -eq 0 ] && [ -n "$CURRENT_FP" ] && [ "$CURRENT_FP" = "$EXISTING_DEFER_FP" ]; then
+    echo "#$ISSUE_NUMBER already deferred at fingerprint $CURRENT_FP and still DEFER — STOP. No comment, no claim, no further reasoning about this issue this pass. Continue the batch loop to the next issue."
+    # HARD STOP for this issue: do not run the Idempotency check below, do
+    # not proceed to Step 1, do not post anything.
+  fi
+fi
+```
+
+**Only two outcomes let this issue proceed past the fast path**:
+`DEP_RC=3` (`REEVALUATE` — every recorded blocker has since closed, so the
+old verdict is stale) or `CURRENT_FP` differing from `$EXISTING_DEFER_FP`
+(the blocker set itself changed). Either falls through to the Idempotency
+check and the rest of the Promotion Workflow unchanged — a changed or
+cleared blocker set must still produce a fresh evaluation.
+
+---
+
 ## Concurrency Guard and Idempotency (`loom:evaluating`)
 
 **Problem this section fixes (#4954)**: an unrevised `loom:architect` proposal re-entering the queue every cycle used to get a **full re-evaluation and a fresh "NEEDS REVISION" comment every single time** — six duplicate comments over ~6.5 hours in the incident that motivated this section — and two evaluations landed comments 40 seconds apart because nothing claimed the issue while it was being evaluated. The same three mechanisms `champion-pr-merge.md`'s Capped-PR Recovery Pass already uses for PRs (idempotency marker, escalation marker, `loom:operator-only` routing) apply here, adapted with a Curator-style (`loom:curating`) claim label instead of the full Judge-style CAS machinery — proposal evaluation runs seconds to a few minutes, not the review-duration timescale `judge.md`'s stale-claim system is sized for.
@@ -952,10 +1011,11 @@ Work through all available curated issues, applying the tier-based rate limits t
 
 Continue evaluating issues until all have been processed or all applicable tier limits are reached. This prevents issues from waiting unnecessarily across multiple 10-minute intervals when they've already met quality criteria.
 
-**Per-issue order in the loop**: run the "Idempotency check" first, then the "Claim" step (skip if a concurrent evaluation holds a fresh `loom:evaluating`, reclaim if stale) — both from "Concurrency Guard and Idempotency" above — before Step 1 (Read). The idempotency check has **three** outcomes, not two:
+**Per-issue order in the loop**: run the "Dependency-Defer Fast Path" first — before anything else, including the Idempotency check — then the "Idempotency check", then the "Claim" step (skip if a concurrent evaluation holds a fresh `loom:evaluating`, reclaim if stale) — the latter two from "Concurrency Guard and Idempotency" above — before Step 1 (Read). The idempotency check has **three** outcomes, not two:
 
 | Idempotency outcome | Next action |
 |---|---|
+| Dependency-Defer Fast Path hard-stop (recorded `dep-defer` fingerprint unchanged) | Continue the batch loop to the next issue — no comment, no claim, nothing below this row runs |
 | No marker match (new or revised proposal) | Claim → Step 1 (Read) → Step 2 (Evaluate) → Step 3 or 4 |
 | Marker match, `UNREVISED_EVALS < ${LOOM_MAX_UNREVISED_EVALUATIONS:-2}` | Tally the skip (`PATCH` the existing verdict comment), continue the loop to the next issue |
 | Marker match, budget exhausted (`ESCALATE_UNREVISED=yes`) | Claim → **Step 4's escalation branch directly** (skip Steps 1–3: the text is unchanged, so re-evaluating cannot change the verdict) — but run Step 4's **dependency-timing gate** first: `DEFER` continues the loop with no label and no comment, `REEVALUATE` sends you to Step 1 after all (#5664) |
