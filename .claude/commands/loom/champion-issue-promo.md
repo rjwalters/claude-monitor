@@ -239,6 +239,113 @@ several passes rather than spending one pass entirely on re-scanning.
 
 ---
 
+## Pass 0b: Stale `loom:evaluating` Claim Re-Scan (#6828)
+
+**Run this once, immediately after Pass 0 above, before evaluating anything.**
+Like Pass 0, this looks at issues `champion.md`'s Priority 2/3 discovery
+queries never surface on their own — this time issues carrying
+`loom:evaluating` itself, not `loom:operator-only`.
+
+**The failure mode it closes.** `champion.md`'s discovery queries exclude
+every issue carrying `loom:evaluating`, correctly — that keeps a concurrent
+Champion pass from double-claiming a proposal someone else is actively
+evaluating (#4954). The "Claim (staleness-aware...)" section above already
+reclaims a **stale** `loom:evaluating` claim — one left behind by a prior
+Champion pass that died mid-evaluation without ever writing a verdict — but
+that code only runs on an issue **after** it has already been selected by a
+discovery query. Since discovery excludes every `loom:evaluating` issue
+unconditionally, a stale claim is never selected by anything, ever, so its
+own reconciliation code is unreachable in practice: the two mechanisms assume
+each other runs, and neither can reach the other. Confirmed live on a real
+downstream repo: a `loom:evaluating` claim sat for 9 days after the Champion
+pass that set it died, invisible to every later pass, even though its stated
+blocker had long since cleared.
+
+```bash
+# One list call per tick, bounded. `loom:evaluating` is only ever added
+# alongside loom:curated/architect/hermit/auditor, so a direct label query is
+# sufficient here — no need to loop over the four proposal labels the way
+# Pass 0 does for loom:operator-only.
+gh issue list --label "loom:evaluating" --state open --limit 200 \
+  --json number --jq '.[] | .number' \
+  | sort -un | head -n "${LOOM_MAX_EVALUATING_RESCANS:-5}" | while read -r N; do
+  STALE_OUT=$(./.loom/scripts/check-evaluating-staleness.sh --issue "$N"); STALE_RC=$?
+  DECISION=$(printf '%s\n' "$STALE_OUT" | sed -n 's/^DECISION=//p')
+  AGE_MIN=$(printf '%s\n' "$STALE_OUT" | sed -n 's/^AGE_MIN=//p')
+
+  if [ "$STALE_RC" -ne 12 ]; then
+    # FRESH (a genuinely in-flight concurrent claim, #4954 — leave it alone),
+    # NOT_PRESENT (raced away between the list call and here — nothing to
+    # do), or an environment error (fail safe: do nothing rather than guess).
+    echo "#$N: $DECISION — not reclaiming"
+    continue
+  fi
+
+  RECLAIM_MARKER="<!-- champion:evaluating-stale-reclaim -->"
+  # Raw JSON, filtered with a local `jq --arg` (NOT `gh ... --jq --arg ...` —
+  # `gh`'s own --jq takes a single literal filter string with no --arg support).
+  COMMENTS_JSON=$(gh issue view "$N" --json comments)
+  PRIOR_RECLAIMS=$(printf '%s\n' "$COMMENTS_JSON" \
+    | jq --arg m "$RECLAIM_MARKER" '[.comments[] | select((.body // "") | contains($m))] | length')
+
+  if [ "$PRIOR_RECLAIMS" -ge "$(( ${LOOM_MAX_EVALUATING_RECLAIMS:-3} - 1 ))" ]; then
+    # This would be the Nth reclaim of the SAME issue — reclaiming again would
+    # only repeat the same crash-and-orphan loop. Route to a human instead of
+    # looping forever (mirrors Step 4's escalation shape for a repeatedly
+    # unrevised proposal, generalized here to a claim that keeps going stale).
+    gh issue comment "$N" --body "<!-- champion:evaluating-stale-escalated -->
+**Champion: Escalating to Operator — Repeated Stale \`loom:evaluating\` Claim**
+
+This issue's \`loom:evaluating\` claim has gone stale and been reclaimed $PRIOR_RECLAIMS time(s) already (most recently ${AGE_MIN}m old, threshold ${LOOM_STALE_EVALUATING_MINUTES:-15}m). A Champion evaluation keeps starting on this issue and dying before writing a verdict — reclaiming again would only repeat the same loop. Something is stopping evaluation from completing on this specific issue (a crash, a timeout, an environment problem), which needs a human to investigate rather than another automated retry.
+
+---
+*Automated by Champion role*" \
+      && gh issue edit "$N" --remove-label "loom:evaluating" --add-label "loom:operator-only,loom:operator-mechanical"
+  else
+    gh issue comment "$N" --body "$RECLAIM_MARKER
+**Champion: Reclaiming stale \`loom:evaluating\` claim**
+
+This issue's \`loom:evaluating\` claim is ${AGE_MIN}m old (>= the ${LOOM_STALE_EVALUATING_MINUTES:-15}m threshold) — a prior Champion evaluation likely died mid-pass without writing a verdict. Releasing the claim so the issue re-enters the normal promotion queue; a later pass evaluates it from scratch.
+
+---
+*Automated by Champion role*" \
+      && gh issue edit "$N" --remove-label "loom:evaluating"
+  fi
+done
+```
+
+**Do NOT re-evaluate inline here.** This pass only removes the stale label
+(and, on repeated staleness, escalates) — it never runs the 8 promotion
+criteria itself. Once the label is gone the issue is an ordinary candidate
+again and matches `champion.md`'s Priority 2/3 discovery query in the same or
+a later pass, so the normal idempotency/claim/evaluate machinery runs on it
+exactly once, the normal way — this pass never becomes a second, parallel
+evaluation path.
+
+`LOOM_MAX_EVALUATING_RESCANS` (default **5**) bounds the per-pass cost the
+same way `LOOM_MAX_UNESCALATION_RESCANS` bounds Pass 0 — a backlog of stuck
+claims drains over several passes rather than spending one pass entirely on
+re-scanning. `LOOM_MAX_EVALUATING_RECLAIMS` (default **3**) bounds how many
+times the SAME issue may be silently reclaimed before this pass stops
+retrying and routes it to `loom:operator-only,loom:operator-mechanical`
+instead — `loom:operator-mechanical`, not `loom:operator-decision`, because a
+claim that goes stale repeatedly on one specific issue points at something
+breaking evaluation itself (a crash, a timeout, an environment problem), not
+at a preference a human needs to weigh in on.
+
+**Race safety.** Two concurrent Pass 0b runs (or a Pass 0b run racing a
+concurrent Champion evaluation that is mid-flight) can both read the same
+issue as `STALE` and both attempt to reclaim it. `check-evaluating-staleness.sh`
+performs a fresh, uncached read on every invocation, so the loser of a race
+either reads `NOT_PRESENT` (the winner already removed the label) or `FRESH`
+(a fresh claim was re-added between the two reads) on its NEXT invocation and
+does nothing further — and `gh issue edit --remove-label` is itself
+idempotent, so even in the narrow window where both readers observed `STALE`
+before either wrote, the loser's removal is a harmless no-op against a label
+that is already gone.
+
+---
+
 ## Evaluation Criteria
 
 For each proposal issue (`loom:curated`, `loom:architect`, `loom:hermit`, or `loom:auditor`), evaluate against these **8 criteria**. All must pass for promotion:
@@ -692,35 +799,39 @@ Invariants a future edit must preserve:
 
 ### Claim (staleness-aware, run only when NOT skipped above)
 
+The staleness check below (`check-evaluating-staleness.sh`) is the SAME script the
+"Pass 0b: Stale `loom:evaluating` Claim Re-Scan" section uses (see above, and
+`champion.md`'s Priority 2/3 discovery notes) — one implementation of "how old
+is this labeled event", never two copies that can drift apart (#6828):
+
 ```bash
 ISSUE_NUMBER=<number>
 
-# Plain `gh` — claim arbitration, never "$GH_READ" (mirrors judge.md's rule for
-# its Stale Claim Check: a stale cache would reintroduce the double-claim race
-# this exists to close).
-CURRENT_LABELS=$(gh issue view "$ISSUE_NUMBER" --json labels --jq '[.labels[].name] | join(",")')
+# check-evaluating-staleness.sh does its own plain (uncached) `gh issue view` +
+# timeline read for claim arbitration — never "$GH_READ" (mirrors judge.md's
+# rule for its Stale Claim Check: a stale cache would reintroduce the
+# double-claim race #4954 closed).
+STALE_OUT=$(./.loom/scripts/check-evaluating-staleness.sh --issue "$ISSUE_NUMBER"); STALE_RC=$?
+DECISION=$(printf '%s\n' "$STALE_OUT" | sed -n 's/^DECISION=//p')
+CLAIM_AGE_MIN=$(printf '%s\n' "$STALE_OUT" | sed -n 's/^AGE_MIN=//p')
 
-if echo ",$CURRENT_LABELS," | grep -q ",loom:evaluating,"; then
-  CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$ISSUE_NUMBER/timeline" --paginate \
-    --jq '[.[] | select(.event=="labeled" and .label.name=="loom:evaluating")] | last | .created_at // empty' \
-    | sort | tail -n 1)
-  if [ -n "$CLAIMED_AT" ]; then
-    CLAIM_AGE_MIN=$(( ($(date -u +%s) - $(date -u -d "$CLAIMED_AT" +%s)) / 60 ))
-  else
-    CLAIM_AGE_MIN=0   # unknown — fail safe, treat as fresh
-  fi
-  if [ "$CLAIM_AGE_MIN" -lt "${LOOM_STALE_EVALUATING_MINUTES:-15}" ]; then
-    echo "#$ISSUE_NUMBER already claimed by a concurrent evaluation (${CLAIM_AGE_MIN}m ago) — skipping, not stomping"
-    # Continue the batch to the next issue.
-  else
-    echo "Reclaiming stale loom:evaluating claim on #$ISSUE_NUMBER (age ${CLAIM_AGE_MIN}m >= ${LOOM_STALE_EVALUATING_MINUTES:-15}m) — a prior Champion pass likely died mid-evaluation"
-  fi
+if [ "$STALE_RC" -eq 1 ]; then
+  # Usage/environment error (e.g. a `gh` call failed) — fail safe: proceed to
+  # claim as though no concurrent claim existed, exactly like the pre-#6828
+  # inline check did when its own `gh` calls could not resolve a timestamp.
+  echo "WARNING: could not determine #$ISSUE_NUMBER's loom:evaluating staleness ($STALE_OUT) — proceeding to claim"
+elif [ "$DECISION" = "FRESH" ]; then
+  echo "#$ISSUE_NUMBER already claimed by a concurrent evaluation (${CLAIM_AGE_MIN}m ago) — skipping, not stomping"
+  # Continue the batch to the next issue.
+elif [ "$DECISION" = "STALE" ]; then
+  echo "Reclaiming stale loom:evaluating claim on #$ISSUE_NUMBER (age ${CLAIM_AGE_MIN}m >= ${LOOM_STALE_EVALUATING_MINUTES:-15}m) — a prior Champion pass likely died mid-evaluation"
 fi
+# DECISION=NOT_PRESENT (STALE_RC=10) means no concurrent claim exists at all — fall straight through to claiming, same as before.
 
 gh issue edit "$ISSUE_NUMBER" --add-label "loom:evaluating"
 ```
 
-`LOOM_STALE_EVALUATING_MINUTES` (default **15**) — named to mirror `LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES`, on a shorter scale since proposal evaluation has no build/CI wait.
+`LOOM_STALE_EVALUATING_MINUTES` (default **15**) — named to mirror `LOOM_STALE_REVIEWING_MINUTES`/`LOOM_STALE_TREATING_MINUTES`, on a shorter scale since proposal evaluation has no build/CI wait. `check-evaluating-staleness.sh` reads the same env var (or an explicit `--threshold-minutes`) for its own default.
 
 **Release the claim** — `--remove-label "loom:evaluating"` — as part of the SAME `gh issue edit` command that writes the outcome (promote, reject, or escalate) in Steps 3/4 below, never as a separate call. This keeps "claimed but no verdict written yet" the only window where the label is genuinely in flight.
 
@@ -1037,7 +1148,7 @@ Regardless of quality, do NOT promote an issue if:
 
 ### When NOT to Even Claim (fresh `loom:evaluating`)
 
-Do not claim or evaluate an issue that already carries a fresh `loom:evaluating` label — a concurrent Champion pass (this process's own batch loop, a cron tick, or a role-runner tick on another host) is actively evaluating it. See "Claim (staleness-aware...)" above for the exact age check; skip and continue the batch rather than waiting.
+Do not claim or evaluate an issue that already carries a fresh `loom:evaluating` label — a concurrent Champion pass (this process's own batch loop, a cron tick, or a role-runner tick on another host) is actively evaluating it. See "Claim (staleness-aware...)" above for the exact age check; skip and continue the batch rather than waiting. **The one exception (#6828)**: "Pass 0b: Stale `loom:evaluating` Claim Re-Scan" may *remove* the label first, when — and only when — the claim itself (not the proposal's content) has gone stale, per the same age check. Once the label is gone the issue is an ordinary candidate again for the normal Priority 2/3 discovery query; while a fresh claim is present, nothing here claims or evaluates it.
 
 ---
 

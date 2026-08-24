@@ -42,6 +42,7 @@ test-check-ci-status.sh
 test-check-config-no-host-paths.sh
 test-check-duplicate.sh
 test-check-conflict-markers.sh
+test-check-evaluating-staleness.sh
 test-check-git-identity.sh
 test-check-host-sleep.sh
 test-check-defaults-version-bump.sh

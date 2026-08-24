@@ -71,6 +71,21 @@ for it, #4966):
 > opportunistic per-occurrence judgment call, not a scheduled scan like Pass 0
 > above.
 
+> **`loom:evaluating` is excluded here too, but not unexamined (#6828).**
+> `champion-issue-promo.md` → "Pass 0b: Stale `loom:evaluating` Claim Re-Scan"
+> runs immediately after Pass 0, before this discovery query, and removes the
+> label from any issue whose claim has gone stale (the labeled event's age
+> exceeds `LOOM_STALE_EVALUATING_MINUTES`, default 15 — a prior Champion pass
+> that died mid-evaluation without writing a verdict). Those issues then match
+> the query below in the same pass. Without that scan, a stale claim would be
+> permanent: the only actor that could notice the claim was abandoned is the
+> one this exclusion tells to ignore it, and `champion-issue-promo.md`'s own
+> "Claim (staleness-aware...)" reconciliation for this exact case never runs,
+> because it only fires on an issue *after* discovery has already selected it.
+> A `loom:evaluating` claim that keeps going stale on the SAME issue routes to
+> `loom:operator-only,loom:operator-mechanical` after repeated reclaims rather
+> than looping forever — see Pass 0b for the bound.
+
 ```bash
 gh issue list \
   --label="loom:curated" \

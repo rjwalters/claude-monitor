@@ -1,7 +1,8 @@
 {
-  "loom_version": "0.18.151",
-  "loom_commit": "32ac5a22",
+  "loom_version": "0.18.152",
+  "loom_commit": "81391bbf",
   "install_date": "2026-07-29",
   "installed_files": [],
-  "last_resync": "2026-08-24"
+  "last_resync": "2026-08-23",
+  "loom_source_remote": "git@github.com:rjwalters/loom.git"
 }

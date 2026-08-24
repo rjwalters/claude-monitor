@@ -530,6 +530,25 @@ assert_doc_lacks "$CHAMPION_MD" \
     "# merge-risk hold — the PR leaves the auto-merge queue either way" \
     "the stale route no longer claims it unconditionally exits the hold (#5802's stale premise)"
 
+# --- #6843: criterion #5 must not derive staleness from `updatedAt` ---
+# `updatedAt` is bumped by ANY PR write, including the Held-PR Health Pass's
+# OWN comments (conflict notices, loom:operator reasserts) — so a held PR
+# nobody but Champion touches never accumulates real staleness and the stale
+# route above (Test 1-6) never fires in practice, even though this file's
+# mirror (which takes hours_ago as a plain input) cannot see that failure
+# mode itself. These pins guard the actual verification-command literal.
+assert_doc_lacks "$CHAMPION_MD" \
+    "UPDATED_AT=\$(gh pr view <number> --json updatedAt --jq '.updatedAt')" \
+    "criterion #5 no longer derives staleness from the bot-comment-bumped updatedAt field (#6843)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'PR_DATA=$(gh pr view <number> --json createdAt,commits,comments)' \
+    "criterion #5 reads commits + comments (+ createdAt floor) instead of updatedAt (#6843)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'select((.body | test("champion:|Automated by Champion role")) | not) | .createdAt)' \
+    "criterion #5's activity computation excludes Champion's own comments, mirroring the sticky-hold precheck's exclusion test (#6843)"
+
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"
 [[ $TESTS_FAILED -eq 0 ]] || exit 1

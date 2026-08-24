@@ -853,31 +853,61 @@ produce. Never let a hold be the reason a conflict goes unreported.
 
 **Verification command**:
 ```bash
-# Get PR last update time. Plain `gh` — NOT "$GH_READ": merge-gating.
-UPDATED_AT=$(gh pr view <number> --json updatedAt --jq '.updatedAt')
+# Get PR activity data. Plain `gh` — NOT "$GH_READ": merge-gating.
+#
+# #6843: do NOT use `updatedAt` here. GitHub bumps `updatedAt` on ANY write to
+# the PR, including a comment — and the Held-PR Health Pass below posts
+# comments on this very PR every tick a hold still binds (conflict notices,
+# `loom:operator` label reasserts). That means a held+conflicting PR nobody
+# but Champion ever touches has its own staleness clock reset by Champion's
+# own writes roughly every 10 minutes, so it never accumulates 24 real hours
+# of staleness and this criterion — the *only* automated route from `loom:pr`
+# to Doctor — never fires. Verified live: 21 open PRs carrying `loom:pr` +
+# `loom:operator`, all `CONFLICTING`, oldest 8 days, `updatedAt` exactly
+# matching Champion's own most recent comment timestamp.
+#
+# "Real activity" instead means either of two things actually changing the
+# PR: a new commit, or a comment from anyone/anything other than Champion
+# itself. Commits are always real (a bot cannot push code on your behalf).
+# Comments are filtered with the same exclusion test the sticky-hold precheck
+# already uses for release signals above (`champion:|Automated by Champion
+# role` — matches the marker HTML comments and the `*Automated by Champion
+# role*` footer every Champion post carries), so a human/Judge comment still
+# counts as activity but Champion's own hold/conflict/stale notices never do.
+# `createdAt` is the floor, so a PR with no commits and no non-Champion
+# comments still ages from when it was opened rather than reading as
+# eternally fresh.
+PR_DATA=$(gh pr view <number> --json createdAt,commits,comments)
+
+LAST_ACTIVITY=$(jq -r '
+  [
+    (.commits[]?.committedDate // empty),
+    (.comments[]? | select((.body | test("champion:|Automated by Champion role")) | not) | .createdAt),
+    .createdAt
+  ] | max' <<<"$PR_DATA")
 
 # Convert to Unix timestamp
-UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
-             date -d "$UPDATED_AT" +%s 2>/dev/null)
+LAST_ACTIVITY_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$LAST_ACTIVITY" +%s 2>/dev/null || \
+                   date -d "$LAST_ACTIVITY" +%s 2>/dev/null)
 
 # Get current time
 NOW_TS=$(date +%s)
 
-# Calculate hours since update
-HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
+# Calculate hours since last real activity
+HOURS_AGO=$(( (NOW_TS - LAST_ACTIVITY_TS) / 3600 ))
 
 RECENCY_LIMIT=24
 
 # Check if within recency limit
 if [ "$HOURS_AGO" -gt "$RECENCY_LIMIT" ]; then
-  echo "FAIL: Stale PR (updated $HOURS_AGO hours ago, limit is ${RECENCY_LIMIT}h)"
+  echo "FAIL: Stale PR (last real activity $HOURS_AGO hours ago, limit is ${RECENCY_LIMIT}h)"
   exit 1
 fi
 
-echo "PASS: Recently updated ($HOURS_AGO hours ago)"
+echo "PASS: Recently active ($HOURS_AGO hours ago)"
 ```
 
-**Rationale**: Ensures PR reflects recent state of main branch and hasn't gone stale.
+**Rationale**: Ensures PR reflects recent state of main branch and hasn't gone stale from genuine inactivity — not merely from the absence of Champion's own bot commentary, which is not evidence anyone is still working the PR.
 
 **On failure**: a stale PR is handled by the dedicated stale-PR policy (see "PR Rejection Workflow → Stale PR"), not the transient-failure path — it is commented once (idempotently) and routed out of the queue via `loom:pr` → `loom:changes-requested` so it reaches Doctor rather than being re-commented every cron tick.
 
