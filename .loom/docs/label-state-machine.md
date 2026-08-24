@@ -45,14 +45,17 @@ having to remember to remove it.
 
 | Role | Trigger | Status |
 |---|---|---|
-| Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red | **Wired** — `defaults/.claude/commands/loom/champion-pr-merge.md`, "Hold behavior" |
+| Champion (PR merge) | Posts a merge-risk hold (`champion:merge-risk-hold`) because a safety axis is red (criterion #2) | **Wired** — `defaults/.claude/commands/loom/champion-pr-merge.md`, "Hold behavior" |
+| Champion (PR merge) | Posts a critical-file hold (`champion:critical-file-hold`) because criterion #3 matched a critical-file pattern | **Wired** (#6879) — `defaults/.claude/commands/loom/champion-pr-merge.md`, Safety Criteria → 3 → "Durable hold on FAIL" |
 | Builder / Doctor | Encounters work that needs credentials, infra, or a policy ruling outside automation (today's `loom:operator-only` use case) | Not yet wired — follow-up work |
 | Judge | A review surfaces a question only a human can answer | Not yet wired — follow-up work |
 | Human | Applies the label directly to any issue or PR | Always available (labels are always human-writable) |
 
-**Scope note**: this first pass (#5502) wires only the Champion merge-risk
-hold entry point end-to-end. `curator.md`, `builder.md`, `doctor.md`,
-`judge.md`, `champion.md`, `champion-common.md`, `champion-issue-promo.md`,
+**Scope note**: this first pass (#5502) wired only the Champion merge-risk
+hold entry point end-to-end; #6879 added a second Champion entry point
+(criterion #3's critical-file hold), reusing the same label and the same
+overall shape. `curator.md`, `builder.md`, `doctor.md`, `judge.md`,
+`champion.md`, `champion-common.md`, `champion-issue-promo.md`,
 `champion-reference.md`, `loom.md`, `sweep.md`, and `watch.md` all reference
 `loom:operator-only` and/or `loom:blocked` today; none of them assume that set
 is exhaustive in a way that required editing for this PR, but none of them
@@ -129,23 +132,36 @@ suspend the route" for the suspended path.
 
 ## Current implementation
 
-Only the Champion merge-risk-hold entry/exit pair is wired today:
+Two Champion entry/exit pairs are wired today, both in the same file:
 
-- **Entry** — `defaults/.claude/commands/loom/champion-pr-merge.md`, criterion
-  #2's "Hold behavior" block (`gh pr edit ... --add-label loom:operator`,
-  posted alongside the `champion:merge-risk-hold` marker).
-- **Exit** — the same file's Step 2 ("Add Pre-Merge Comment"), gated on the
-  non-empty `$HOLD_REVERSAL_BLOCK` built by the release precheck (`gh pr edit
-  ... --remove-label loom:operator`, posted alongside the
-  `champion:merge-risk-hold-cleared` marker).
-- **Conditional exit** — the same file's "PR Rejection Workflow → Stale PR"
-  block, which removes the label only when no hold is in force
-  (`MERGE_BLOCKED_BY_HOLD != true`) and keeps it otherwise; see "The stale-PR
-  route out of `loom:pr`" above (#5802 / #6720).
-
-Both reuse the single release precheck at `champion-pr-merge.md` ("Sticky
-holds — a hold does NOT clear on a re-read alone") rather than re-deriving
-release state independently.
+- **Criterion #2 (merge-risk hold)**:
+  - **Entry** — `defaults/.claude/commands/loom/champion-pr-merge.md`, criterion
+    #2's "Hold behavior" block (`gh pr edit ... --add-label loom:operator`,
+    posted alongside the `champion:merge-risk-hold` marker).
+  - **Exit** — the same file's Step 2 ("Add Pre-Merge Comment"), gated on the
+    non-empty `$HOLD_REVERSAL_BLOCK` built by the release precheck (`gh pr edit
+    ... --remove-label loom:operator`, posted alongside the
+    `champion:merge-risk-hold-cleared` marker).
+  - **Conditional exit** — the same file's "PR Rejection Workflow → Stale PR"
+    block, which removes the label only when no hold is in force
+    (`MERGE_BLOCKED_BY_HOLD != true`) and keeps it otherwise; see "The stale-PR
+    route out of `loom:pr`" above (#5802 / #6720).
+  - Reuses the release precheck at `champion-pr-merge.md` ("Sticky holds — a
+    hold does NOT clear on a re-read alone") rather than re-deriving release
+    state independently.
+- **Criterion #3 (critical-file hold, #6879)**:
+  - **Entry/exit** — `defaults/.claude/commands/loom/champion-pr-merge.md`,
+    Safety Criteria → 3 → "Durable hold on FAIL" block, run immediately after
+    criterion #3's check-loop. `gh pr edit ... --add-label loom:operator`
+    alongside the `champion:critical-file-hold` marker on FAIL;
+    `gh pr edit ... --remove-label loom:operator` alongside the
+    `champion:critical-file-hold-cleared` marker the first time a later push
+    no longer matches any critical-file pattern.
+  - Needs **no** sticky-hold precheck: criterion #3's check-loop is a
+    deterministic file-pattern match, not a judgment call, so there is no
+    "same diff scores differently on a later read" case to guard against —
+    the FAIL/PASS verdict itself, recomputed fresh every tick, is the release
+    signal.
 
 **One consumer honors the hold without ever setting it (#5686)**: the
 stale-verdict machinery (`defaults/scripts/verdict-staleness-guard.sh` and
@@ -184,6 +200,23 @@ by four sub-kind labels applied *alongside* it:
 | `loom:operator-mechanical` | Needs host or admin access, a credential, or another mechanical action — no judgement required | No (needs the action to happen) |
 | `loom:operator-decision` | The act requires authority the operator alone holds — a preference call or an authority act (binds the entity/a third party, irreversible public disclosure, spending/authorisation, credentials only the operator holds, accepting risk on the entity's behalf, physical-world action) | No (needs a human ruling) |
 | `loom:operator-objective` | The decision is determined once the operator states an objective — the item names the candidate objectives and the answer under each (#5826) | Yes — clears the moment the objective is given, and one answer often unblocks several items at once |
+
+**Dispatch semantics vs. the "no judgement required" framing (#6881).**
+"Self-clearing?" above answers a different question than "does sweep/shepherd
+skip it?" — every sub-kind, `loom:operator-mechanical` included, is skipped
+identically today, because the skip is implemented once, keyed on the *base*
+`loom:operator-only` label (`sweep.md`'s `all`-sentinel taxonomy and Mode C
+pre-flight; `loom-daemon/src/work_finder.rs`'s `PARK_LABELS`), and the
+sub-kind is additive metadata the skip logic does not currently branch on.
+`loom:operator-mechanical`'s "no judgement required" describes the *nature of
+the work* — a worker with the right host/credential/admin access could do it
+without a ruling — not a claim that it is dispatched differently than
+`loom:operator-decision` today; the base label wins for all four sub-kinds.
+Making the skip capability-aware for the mechanical sub-kind specifically —
+so a worker that holds the declared capability may attempt it instead of
+parking unconditionally — is tracked separately (#6885); until that lands,
+treat "no judgement required" as a routing hint for a future capability-aware
+pass, not as a description of today's dispatch behavior.
 
 ### The classifying question, before choosing `loom:operator-decision` (#5826)
 
@@ -245,7 +278,13 @@ judgement call as a disguise. Keep working; don't park it.
    regex — see their headers). A backtick-quoted issue reference alone (e.g.
    `` `owner/repo#123` `` in prose) does not satisfy this — the phrase itself
    must be present so a future automated pass can extract it without an LLM
-   read.
+   read. That same machine-readable line (plus an epic-phase issue's
+   `**Epic**: #N` header) is also what Curator's read-only "Checking
+   Operator-Only Premises" re-check (`curator.md`, #6849) parses to notice
+   when a parked issue's named blocker or parent epic has since closed — it
+   posts a comment surfacing the finding and never touches this label or its
+   sub-kind, so naming the blocker here is what makes that re-check possible
+   at all.
 4. **When the sub-kind is `loom:operator-decision`, the same comment MUST name
    the disagreement axis and state why it's a preference rather than a fact
    (#5826).** A bare "requires judgement" does not satisfy the rule — apply

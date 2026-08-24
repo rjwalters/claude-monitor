@@ -1022,6 +1022,80 @@ This criterion is deliberately kept **in addition to** the merge-risk judgment i
 
 **Verified against PR #6118 (#6147)**: PR #6118's `scripts/version.sh bump` commit touched `Cargo.lock`, `loom-api/Cargo.toml`, `loom-daemon/Cargo.toml`, `mcp-loom/package.json`, `mcp-loom/package-lock.json`, and `package.json` — every changed line in each of those 6 files' diffs was confirmed to match the version-line patterns above, so `version_only_diff` returns success for all 6 and the carve-out applies. The same PR's substantive change (a fix to `defaults/scripts/merge-pr.sh` and its tests) touches no critical-file pattern at all, so it was never subject to this criterion in the first place — it went through criterion #2's judgment as normal, unaffected by this carve-out.
 
+**Durable hold on FAIL, not a transient retry (#6879)**: unlike criteria #1/#4/#5/#6 (mechanical failures that clear on their own or on the next push), a critical-file FAIL is a **one-way terminal state** — nothing about a diff's critical-file-ness changes without a human decision or a later push that narrows the diff. Route it through its own durable-hold path, mirroring criterion #2's `loom:operator` hold pattern (see "Safety Criteria → 2. Merge-Risk Judgment → Hold behavior") instead of the shared "Transient failures" template in "PR Rejection Workflow" below. Unlike criterion #2's hold, this one does **not** need the sticky-hold precheck's judgment-call machinery (#4742): the check-loop above is a **deterministic** file-pattern match, not a judgment call, so the same diff always produces the same FAIL/PASS verdict — a hold can never "silently evaporate" on a mere re-read the way #4742 documented for criterion #2's axis scoring. The only thing that changes the verdict is the file list itself, which is exactly this hold's release condition.
+
+Run this immediately after the check-loop above, using its verdict (`CRITERION3_RESULT="FAIL"` if it printed `FAIL: Critical file modified: ...` and would have exited 1; `"PASS"` otherwise):
+
+```bash
+PR_NUMBER=<number>
+HOLD_MARKER="<!-- champion:critical-file-hold -->"
+CLEARED_MARKER="<!-- champion:critical-file-hold-cleared -->"
+
+# Which of the two markers is LATEST decides the current state — mirrors
+# criterion #2's "last comment matching the prefix" lookup (#5371's
+# startswith rationale applies here too: a later comment merely quoting a
+# marker in prose must never be mistaken for the state-owning comment).
+# Cached ("$GH_READ") — this only decides whether a PRIOR hold exists; the
+# FAIL/PASS verdict itself already came from an uncached read in the
+# check-loop above.
+LAST_STATE=$("$GH_READ" pr view "$PR_NUMBER" --json comments --jq \
+  --arg hold "$HOLD_MARKER" --arg cleared "$CLEARED_MARKER" \
+  '[.comments[] | select((.body | startswith($hold)) or (.body | startswith($cleared)))] | last | .body // ""')
+if [[ "$LAST_STATE" == "$HOLD_MARKER"* ]]; then
+  CURRENTLY_HELD=true
+else
+  CURRENTLY_HELD=false
+fi
+
+if [ "$CRITERION3_RESULT" = "FAIL" ]; then
+  if [ "$CURRENTLY_HELD" = true ]; then
+    echo "Critical-file hold already posted for #$PR_NUMBER — hold stands, no comment"
+  else
+    gh pr comment "$PR_NUMBER" --body "$HOLD_MARKER
+**Champion: Holding for Human Merge — Critical File**
+
+This PR modifies a critical file and cannot be automatically merged:
+
+- **Critical File Exclusion Check**: <FILE_PATH> matches critical-file pattern \`<PATTERN>\`
+
+**Next steps** — this hold stays in force until one of these happens:
+- A human merges it directly with \`./.loom/scripts/merge-pr.sh $PR_NUMBER\`
+- Or a later push narrows the diff so it no longer touches any critical-file pattern — Champion clears the hold and re-evaluates normally on the next tick
+
+Keeping \`loom:pr\`. This PR stays in the queue and is re-checked each tick against the release condition above.
+
+---
+*Automated by Champion role*"
+  fi
+  # loom:operator (#5502): same first-class "engine will not act further, a
+  # human is the only transition out" state criterion #2 uses — added
+  # alongside the marker (freshly posted this tick or already standing;
+  # --add-label is idempotent), never in place of loom:pr, never making
+  # sweep/shepherd skip the PR.
+  gh pr edit "$PR_NUMBER" --add-label "loom:operator" 2>/dev/null || true
+elif [ "$CURRENTLY_HELD" = true ]; then
+  # PASS this tick, but the latest marker is still the hold — a later push
+  # narrowed the diff so it no longer touches any critical-file pattern.
+  # Release: clear the label, post a one-time reversal notice (mirrors
+  # criterion #2's champion:merge-risk-hold-cleared block, but as its own
+  # standalone comment rather than folded into a pre-merge comment — this
+  # criterion gates the merge outright, so there is no merge comment to
+  # attach a reversal block to), and fall through to the rest of the
+  # criteria as an ordinary PASS.
+  gh pr edit "$PR_NUMBER" --remove-label "loom:operator" 2>/dev/null || true
+  gh pr comment "$PR_NUMBER" --body "$CLEARED_MARKER
+**Champion: Critical-File Hold Cleared**
+
+A later push narrowed this PR so it no longer touches any critical-file pattern. Re-evaluating normally on this and subsequent ticks.
+
+---
+*Automated by Champion role*"
+  echo "Critical-file hold cleared for #$PR_NUMBER — re-evaluating normally"
+fi
+```
+
+A FAIL here skips Steps 2-3 for this PR this pass, exactly as before this change — the only difference is which template records it: this durable-hold path, never the shared "Transient failures" template in "PR Rejection Workflow" (`critical-file` is no longer one of that section's `CRITERION_KEY` values, #6879). Once released, criterion #3 evaluates a subsequent FAIL as a **fresh** hold episode (a new `champion:critical-file-hold` comment) — the cleared marker only records that the *previous* episode ended, it is not a permanent exemption.
+
 ### 4. Merge Conflict Check
 - [ ] PR is mergeable (no conflicts with base branch)
 
@@ -1457,6 +1531,14 @@ only because an operator happened to inspect PR labels by hand. Run this once pe
 Champion pass — one `gh pr list` call, no per-PR reads — and put its output in the
 completion summary (see `champion-common.md` → "Completion Report").
 
+**Counts both hold kinds (#6879).** This query is keyed on `loom:operator`, not on
+the `champion:merge-risk-hold` marker specifically — so a critical-file hold
+(criterion #3, "Durable hold on FAIL" above) is counted here too, with no
+separate query needed. The "Merge-risk holds: N open PR(s)" label below predates
+the critical-file hold and is kept as-is for continuity with existing dashboards
+and transcripts; read it as "Champion-held PRs" (any `loom:operator` hold Champion
+itself applied), not literally "held on criterion #2 alone".
+
 ```bash
 # Cached ("$GH_READ") — an observation scan, never a merge gate.
 # `loom:operator` is Champion's hold label and, per the decision above, it is
@@ -1516,13 +1598,17 @@ comment or issue every tick.
 
 **Step 1 — per-PR hold reason.** `$HELD_JSON` already carries `mergeable` and
 whether the PR is `loom:changes-requested` (out at Doctor); it does not carry
-*why* the PR was held. Read that from the PR's own
-`<!-- champion:merge-risk-hold -->` comment — the same marker the sticky-hold
-precheck (criterion #2, above) reads — one cached read per held PR, never a
-second bulk `gh pr list`:
+*why* the PR was held. Read that from the PR's own hold comment — the same
+markers the sticky-hold precheck (criterion #2) and the durable critical-file
+hold (criterion #3, #6879) each read — one cached read per held PR, never a
+second bulk `gh pr list`. `loom:operator` is common to both hold kinds (this
+is why the aggregate `$HELD_JSON` query above already counts a critical-file
+hold for free), but each kind writes its reason under its own marker, so both
+are checked:
 
 ```bash
 HOLD_MARKER="<!-- champion:merge-risk-hold -->"
+CRITICAL_FILE_HOLD_MARKER="<!-- champion:critical-file-hold -->"
 DIGEST_ROWS=""
 for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r '.[].number'); do
   ROW=$(printf '%s\n' "$HELD_JSON" | jq -c --argjson n "$PR_NUM" '.[] | select(.number == $n)')
@@ -1530,15 +1616,22 @@ for PR_NUM in $(printf '%s\n' "$HELD_JSON" | jq -r '.[].number'); do
   AT_DOCTOR=$(jq -e '[.labels[].name] | index("loom:changes-requested")' <<<"$ROW" >/dev/null && echo true || echo false)
 
   # Cached ("$GH_READ") — an observation read, same rule as the aggregate
-  # query above: this digest never gates a merge decision.
+  # query above: this digest never gates a merge decision. Checks the
+  # merge-risk-hold marker first (the common case), then the critical-file
+  # hold marker — a PR only ever carries one of the two hold kinds at a time.
   HOLD_BODY=$("$GH_READ" pr view "$PR_NUM" --json comments \
     --jq "[.comments[] | select(.body | startswith(\"$HOLD_MARKER\"))] | last | .body // \"\"")
   if [ -z "$HOLD_BODY" ]; then
-    REASON="reason unrecorded (no $HOLD_MARKER comment found)"
+    HOLD_BODY=$("$GH_READ" pr view "$PR_NUM" --json comments \
+      --jq "[.comments[] | select(.body | startswith(\"$CRITICAL_FILE_HOLD_MARKER\"))] | last | .body // \"\"")
+  fi
+  if [ -z "$HOLD_BODY" ]; then
+    REASON="reason unrecorded (no hold-marker comment found)"
   else
-    # The hold template's one required line: "- **<AXIS>**: <CONCERN>".
+    # Both hold templates share this one required line shape: "- **<AXIS or
+    # CRITERION NAME>**: <CONCERN>".
     REASON=$(printf '%s\n' "$HOLD_BODY" | grep -m1 -E '^- \*\*.+\*\*:' | sed 's/^- //')
-    [ -z "$REASON" ] && REASON="hold marker present, axis bullet not parseable"
+    [ -z "$REASON" ] && REASON="hold marker present, reason bullet not parseable"
   fi
 
   STATUS="$PR_MERGEABLE"
@@ -2283,9 +2376,11 @@ fi
 
 ## PR Rejection Workflow
 
-If ANY safety criterion fails, do NOT merge. How the failure is handled depends on whether it is **transient** (clears on its own or on the next push — pending CI, conflicts being resolved, `UNKNOWN` mergeability), **terminal** (the PR has gone stale and cannot clear without a rebase), or a **merge-risk hold** (criterion #2 judged the PR to need a human merge).
+If ANY safety criterion fails, do NOT merge. How the failure is handled depends on whether it is **transient** (clears on its own or on the next push — pending CI, conflicts being resolved, `UNKNOWN` mergeability), **terminal** (the PR has gone stale and cannot clear without a rebase), a **merge-risk hold** (criterion #2 judged the PR to need a human merge), or a **critical-file hold** (criterion #3 matched a critical-file pattern).
 
 **Merge-risk holds** keep `loom:pr` like a transient failure, but comment **once** behind the `<!-- champion:merge-risk-hold -->` idempotency marker because the condition does not clear on its own, and additionally carry `loom:operator` (#5502) — the first-class "engine will not act further, a human is the only transition out" state, added alongside the marker and removed alongside its reversal, kept **filterable** without making sweep/shepherd skip the PR (see [`.loom/docs/label-state-machine.md`](../../../.loom/docs/label-state-machine.md)). Unlike a transient failure, the hold is **sticky**: later ticks re-check it against the release conditions (`loom:auto-merge-ok`, an explicit operator clearing comment, a new push, a new Judge review) rather than re-deriving it from a fresh axis read, and any merge that reverses one carries a mandatory reversal comment (#4742). The exact commands live with the criterion itself — see "Safety Criteria → 2. Merge-Risk Judgment → Sticky holds / Hold behavior"; do not duplicate them here.
+
+**Critical-file holds** work the same way, for the same reason (#6879): a critical-file FAIL cannot clear without either a human merge or a later push that narrows the diff, so it also keeps `loom:pr`, comments once behind its own idempotency marker (`<!-- champion:critical-file-hold -->`, distinct from `champion:merge-risk-hold`), and carries `loom:operator`. It does **not** need criterion #2's sticky-hold precheck machinery — the check-loop it is keyed on is a deterministic file-pattern match, not a judgment call, so there is no "same diff scores differently on a later read" failure mode to guard against, and its release condition is simpler: the diff no longer touches any critical-file pattern. `loom:auto-merge-ok` does **not** release it — that override is explicitly scoped to criterion #2 only (see "Safety Criteria → 2 → `loom:auto-merge-ok` override"). The exact commands live with the criterion itself — see "Safety Criteria → 3. Critical File Exclusion Check → Durable hold on FAIL"; do not duplicate them here.
 
 ### Transient failures — keep `loom:pr`, retry next tick
 
@@ -2320,16 +2415,16 @@ doesn't affect merge/safety decisions (#4835):
   names (`echo "$FAILING_CHECKS" | sort | paste -sd, -`) — not the prose sentence
   describing them.
 - **label-check**: the sorted, comma-joined list of missing/conflicting label names.
-- **critical-file**: the sorted, comma-joined list of touched critical file paths.
 - **size-check / merge-conflict**: nothing about these failures varies tick to tick
   (the whole PR is over the line, or has a conflict) — use `$CRITERION_KEY` itself as
   `$REASON_KEY`.
 
 ```bash
 PR_NUMBER=<number>
-# Slug for the criterion that failed: label-check | size-check | critical-file |
-# merge-conflict | ci-status. (Recency-check failures use the dedicated Stale PR
-# path below, not this one.)
+# Slug for the criterion that failed: label-check | size-check | merge-conflict
+# | ci-status. (Recency-check failures use the dedicated Stale PR path below,
+# and critical-file failures use their own durable-hold path in Safety
+# Criteria → 3 — see "Critical-file holds" above — neither uses this one.)
 CRITERION_KEY="<CRITERION_SLUG>"
 # Deterministic identity of THIS failure, built mechanically from the check/label/file
 # data above (see the per-criterion list) — never the freeform prose sentence. Must

@@ -321,11 +321,22 @@ gh issue list --state=open --limit 500 --json number,title,labels,createdAt \
   ) | "#\(.number) \(.title)"'
 ```
 
-Note: `loom:blocked` stays excluded here but is *not* dropped entirely from
-Curator's purview — the "Checking Dependencies" section below handles
-`loom:blocked` issues separately (dependency re-checks, unblock-on-resolve).
-`loom:operator-only` (host/cert/secret provisioning meant for a human, not a
-Builder) has no such re-check workflow, so it is excluded outright.
+Note: `loom:blocked` and `loom:operator-only` both stay excluded from this
+curation-candidate query, but neither is dropped entirely from Curator's
+purview. "Checking Dependencies" below re-checks `loom:blocked` issues
+(dependency re-checks, unblock-on-resolve), and "Checking Operator-Only
+Premises" (#6849) further below runs the *same class* of read-only re-check
+against `loom:operator-only` issues that name a specific blocker or parent
+epic. **The distinction the exclusion rests on is doing the work vs.
+re-checking the premise, not the label itself**: `loom:operator-only` is
+excluded here because host/cert/secret provisioning, and any preference or
+authority call, is work only a human may do — that stays true and out of
+scope. But determining whether the reference an operator-parked issue is
+waiting on has since closed is a forge read, the same computation the
+`loom:blocked` re-check already performs, with the same privileges as any
+other Curator pass. It never removes `loom:operator-only` or its sub-kind
+label, and it never auto-releases the issue — see "Checking Operator-Only
+Premises" for the read-only surfacing this enables.
 
 **Workflow**:
 1. Try Priority 1 search first
@@ -1372,6 +1383,101 @@ identity, not a bare "did we comment?" boolean. Do not add the escalation step
 speculatively — just do not build the suppression in a way that makes it
 unreachable.
 
+## Checking Operator-Only Premises (#6849)
+
+The `loom:blocked` dependency re-check above answers "has the thing this issue
+is waiting on resolved?" `loom:operator-only` issues wait on a human ruling,
+not a dependency — but a subset of them *also* name a specific blocker or
+parent epic (most commonly the `loom:operator-blocked` sub-kind's required
+`Blocked by #N` / `Depends on #N` / `Requires #N` line — see "Applying
+`loom:operator-only`" above — or an epic-phase issue's `**Epic**: #N` header)
+whose closure can make the parking premise stale without anyone noticing.
+
+This section runs the **same class of read-only re-check** against that
+reference. It never re-derives the operator's decision, never removes
+`loom:operator-only` or its sub-kind label, and never promotes or
+auto-releases the issue — see the note above the Priority 2 query in "Finding
+Work" for the "doing the work" vs. "re-checking the premise" distinction this
+rests on.
+
+### Finding candidates
+
+```bash
+gh issue list --label="loom:operator-only" --state=open --limit=500 \
+  --json number,updatedAt --jq 'sort_by(.updatedAt) | .[] | "#\(.number)"'
+```
+
+Run this as part of the same ongoing monitoring "Working Style" already
+applies to `loom:blocked` (see "Monitor workflow" below) — it is not gated on
+Priority 1/2 discovery and does not change what gets curated this pass.
+
+### Extracting the stated reference
+
+Reuse the exact machine-readable phrasings this file and
+`detect-dependency-cycle.sh` / `warn-operator-gated.sh` already parse, rather
+than inventing a new pattern — a bare prose mention (e.g. a backtick-quoted
+`` `owner/repo#123` ``) does not count:
+
+```bash
+ISSUE_NUMBER=<number>
+ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --json body,comments)
+# NOTE: printf '%s\n' "$VAR" | jq, never echo "$VAR" | jq (#5094).
+TEXT=$(printf '%s\n' "$ISSUE_JSON" | jq -r '[.body] + [.comments[].body] | join("\n")')
+
+REFS=$(printf '%s\n' "$TEXT" \
+  | grep -oE '(Blocked by|Depends on|Requires|\*\*Epic\*\*)[*_:[:space:]]*#[0-9]+' \
+  | grep -oE '#[0-9]+' | tr -d '#' | sort -un)
+```
+
+- **No reference found** → no-op. Most `loom:operator-mechanical` /
+  `loom:operator-decision` / `loom:operator-objective` issues have nothing
+  checkable — leave them exactly as found, silently.
+- **One or more references found** → for each, check its current state with
+  `gh issue view <ref> --json state,title` (fall back to `gh pr view <ref>
+  --json state,title` if the reference turns out to be a PR, not an issue).
+
+### Reporting a closed reference
+
+If **any** referenced number is closed, post a comment naming it — do not
+silently absorb the finding, and do not touch any label:
+
+```bash
+gh issue comment "$ISSUE_NUMBER" --body "**Operator-parked, premise possibly stale**: the reference this issue is parked on, #<ref>, is now **closed**. Worth an operator taking another look — not auto-releasing; \`loom:operator-only\` and its sub-kind label are left untouched. <!-- curator:operator-premise-recheck:$CONCLUSION_HASH -->"
+```
+
+The bolded **Operator-parked, premise possibly stale** phrasing is the
+distinct signal called for by this issue's acceptance criteria: grep issue
+comments for that literal phrase (or for the `curator:operator-premise-recheck:`
+marker) to rank operator-parked issues with a stale premise separately from
+ones still genuinely waiting — deliberately a report-line convention rather
+than a new label, consistent with this file's "Never invent new labels" rule
+under "Maintenance" above.
+
+**If every referenced number is still open** → no comment this pass. "Still
+parked, checked" is not newsworthy, exactly as an unchanged `blocked`
+conclusion is not newsworthy in the `loom:blocked` re-check above.
+
+### Idempotency
+
+Apply the same three-way decision and 24h staleness window as "Re-check
+Idempotency" above, with two differences: use the marker prefix
+`curator:operator-premise-recheck:` (never `curator:dep-recheck:` — the two
+markers must stay distinguishable so a later pass can tell which check
+produced which comment), and fold the closed-reference list into
+`CONCLUSION_HASH` the same way `BLOCKERS` does above — one `"<ref>:<state>"`
+line per referenced number, sorted, plus the verdict (`stale-premise` when
+any reference is closed; nothing is posted at all, and no hash is computed
+or compared, when every reference is still open).
+
+### What this section never does
+
+- Never removes or adds `loom:operator-only` or any sub-kind label.
+- Never marks the issue `loom:curated` or otherwise moves it toward the build
+  queue.
+- Never auto-releases the issue — a closed reference is grounds for an
+  operator to look again, not authorization to promote or unblock (explicit
+  non-goal of issue #6849).
+
 ## Issue Quality Checklist
 
 Before marking an issue as `loom:curated`, ensure it has:
@@ -1475,7 +1581,9 @@ gh issue edit 100 --remove-label "loom:curating" --remove-label "loom:triage" --
   gh issue edit <number> --remove-label "loom:curating" --remove-label "loom:triage" --add-label "loom:curated"
   ```
 - **NEVER add `loom:issue`**: promotion is never the Curator's call — see "Who promotes `loom:curated` → `loom:issue`" near the top of this file
-- **Monitor workflow**: Check for `loom:blocked` issues that need help
+- **Monitor workflow**: Check for `loom:blocked` issues that need help, and
+  `loom:operator-only` issues whose stated blocker/parent epic may have closed
+  (see "Checking Operator-Only Premises" above)
 - Be respectful: assume good intent, improve rather than criticize
 - Stay informed: read recent PRs and commits to understand context
 
