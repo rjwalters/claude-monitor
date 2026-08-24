@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # test-champion-held-pr-health-pass.sh - Regression tests for the merge-risk
-# hold "one-way door" defect (#6720).
+# hold "one-way door" defect (#6720), extended for the "rebase treadmill"
+# fix (#6852).
 #
 # Champion's 6 safety criteria (`champion-pr-merge.md`) are prose an LLM
 # instance reads and executes, not a standalone script (same situation as
@@ -19,10 +20,10 @@
 # `loom:operator`, 20 of the 21 were CONFLICTING (two untouched for 63h), and
 # Doctor's `loom:changes-requested` queue was empty.
 #
-# The fix decouples MERGE PERMISSION from HEALTH REPORTING:
+# The #6720 fix decouples MERGE PERMISSION from HEALTH REPORTING:
 #   1. A hold (sticky OR fresh) sets MERGE_BLOCKED_BY_HOLD=true and blocks the
 #      merge + criterion #3 + Steps 2-3 — but the PR is NOT dropped from the
-#      pass. Criteria #4/#5/#6 still run ("Held-PR Health Pass").
+#      pass. Criteria #4/#6/#5 still run ("Held-PR Health Pass").
 #   2. A held PR that turns CONFLICTING gets one idempotent
 #      `champion:held-pr-conflict-notice` comment.
 #   3. A held PR that goes stale is routed to Doctor exactly like an unheld one
@@ -35,20 +36,46 @@
 #      outstanding, and Doctor's `loom:changes-requested` queue filters
 #      `loom:blocked` / `loom:operator-only`, not `loom:operator`.
 #
+# Follow-up incident (#6848/#6852): the #6720 fix routes ANY held-and-stale PR
+# to Doctor, including one whose ONLY blocker is the standing hold itself (no
+# unresolved feedback, no failing CI). `main` moving repeatedly then produces
+# an unproductive "rebase treadmill" — conflict, route to Doctor, rebase,
+# still-held, `main` moves again — that cannot converge, since the real
+# blocker (a pending human merge decision) is untouched by any of it. #6852
+# narrows criterion #5's held route: it distinguishes a **hold-only** stale PR
+# (no other red criterion — left in place, one-time suspension notice, no
+# label change) from a **hold-plus-feedback** one (a failing required check —
+# routes to Doctor exactly as #6720 shipped). CI status is the only currently
+# available live signal cheap enough to compute every pass without inventing
+# new history-tracking machinery, so it is what `HELD_CI_FAILING` is keyed on;
+# criterion #6 is reordered to run BEFORE #5 so that signal is known before
+# #5's routing decision. Neither branch ever touches the hold marker or
+# `loom:operator` — #6720's core property (a held PR is never silently dropped
+# from reporting) holds on both.
+#
 # This file asserts:
-#   1. THE HEADLINE REGRESSION SHAPE: hold a PR, let `main` move until it
-#      conflicts, advance past 24h -> it reaches Doctor
+#   1. THE HEADLINE REGRESSION SHAPE (#6720), now the HOLD-PLUS-FEEDBACK
+#      variant: hold a PR that ALSO has a failing check, let `main` move until
+#      it conflicts, advance past 24h -> it still reaches Doctor
 #      (`loom:changes-requested`) instead of sitting silently.
-#   2. Criteria #4/#5/#6 are evaluated under a hold; #3 and the merge are not.
-#   3. The conflict notice and the stale notice are each posted exactly once
-#      across repeated ticks (10-minute cron anti-spam).
-#   4. The hold marker survives the route to Doctor on every held path.
-#   5. `loom:operator` is kept on the held route and still cleared on the
-#      unheld route (#5802 not regressed).
+#   1B. THE HOLD-ONLY VARIANT (#6852): the identical shape MINUS the failing
+#       check -> the automatic route is SUSPENDED, not fired; the PR stays on
+#       `loom:pr`, still reported, still carrying `loom:operator`.
+#   2. Criteria #4/#6/#5 are evaluated under a hold; #3 and the merge are not.
+#   3. The conflict notice, the stale notice, and the suspension notice are
+#      each posted exactly once across repeated ticks (10-minute cron
+#      anti-spam).
+#   4. The hold marker survives the route to Doctor on every held path, AND is
+#      untouched (trivially) on the suspended path.
+#   5. `loom:operator` is kept on the held route (routed or suspended) and
+#      still cleared on the unheld route (#5802 not regressed).
 #   6. A FRESH hold (red axis this tick) gets the same health pass as a sticky
-#      one — the defect is not sticky-specific.
+#      one, for both the hold-plus-feedback and hold-only variants — neither
+#      defect is sticky-specific.
 #   7. The never-held green path is byte-for-byte unchanged (still merges).
-#   8. The held-PR census jq pipeline computes count / conflicting / at-Doctor.
+#   8. The held-PR census jq pipeline computes count / conflicting / at-Doctor,
+#      and a hold-only-suspended PR (still `loom:pr` + `loom:operator`) is
+#      still counted exactly like one that routed.
 #   9. The stale-notice marker is keyed per-episode (head SHA), not
 #      posted-ever: a PR that cycled back to `loom:pr` with new commits and
 #      then went stale AGAIN gets a fresh notice, while a re-check within the
@@ -196,8 +223,10 @@ state_labels() {
 # champion-pr-merge.md's per-PR evaluation, mirrored from the shipped prose:
 #   - criterion #2's sticky-hold precheck (STICKY_HOLD / MERGE_BLOCKED_BY_HOLD)
 #   - criterion #2's "Hold behavior" fresh-hold branch
-#   - the "Held-PR Health Pass" (#6720): criteria #4/#5/#6 under a hold
-#   - "PR Rejection Workflow -> Stale PR", hold-aware
+#   - the "Held-PR Health Pass" (#6720, reordered by #6852): criteria
+#     #4/#6/#5 under a hold
+#   - "PR Rejection Workflow -> Stale PR, hold-plus-feedback or unheld"
+#     (#6720/#5802) and "-> Hold-only Stale PR" (#6852)
 #
 # Emits one ACTION line per observable effect so a test can assert on the
 # whole tick. Deliberately does NOT model criterion #1 or #3's internals —
@@ -205,6 +234,10 @@ state_labels() {
 #
 # Args: <state-file> <prior_hold> <release_reason> <axes_red> <mergeable>
 #       <hours_ago> <ci> [last_activity]
+#
+# `ci` ("pass" | "fail") plays two roles under a hold (#6852): the #6 report
+# below, AND (via HELD_CI_FAILING) the genuine-feedback signal #5 reads to
+# decide whether a stale held PR routes to Doctor or is left suspended.
 #
 # last_activity (#6860): the stale-notice marker's episode key, mirroring
 # champion-pr-merge.md's `<!-- champion:stale-pr-notice:$LAST_ACTIVITY -->` —
@@ -261,41 +294,63 @@ champion_pr_pass() {
         fi
     fi
 
-    # ---- criterion #5: ALWAYS evaluated; stale routes to Doctor ----------
+    # ---- criterion #6: ALWAYS evaluated; now runs BEFORE #5 (#6852) so its
+    # outcome (HELD_CI_FAILING) is known before #5's routing decision -------
+    echo "EVAL:criterion-6"
+    if [ "$ci" = "fail" ]; then
+        echo "REPORT:ci-status"
+    fi
+    # HELD_CI_FAILING mirrors the doc's own variable name. Only meaningful
+    # under a hold; unused (but harmless) on the unheld path.
+    local HELD_CI_FAILING=false
+    [ "$ci" = "fail" ] && HELD_CI_FAILING=true
+
+    # ---- criterion #5: ALWAYS evaluated; stale routes to Doctor -----------
+    # ONLY when hold-plus-feedback or unheld (#6720/#5802). A hold-only stale
+    # PR (MERGE_BLOCKED_BY_HOLD=true, HELD_CI_FAILING=false) is suspended
+    # instead — no label change, a separate one-time notice (#6852).
     echo "EVAL:criterion-5"
     local stale=false
     [ "$hours_ago" -gt 24 ] && stale=true
     if [ "$stale" = true ]; then
-        # #6860: keyed on last_activity, not on marker existence alone — a
-        # notice from a PAST episode (an older last_activity value, since
-        # superseded by real new activity that cycled the PR back to
-        # loom:pr) must NOT suppress a fresh notice for a NEW episode that
-        # has since gone stale again.
-        if state_has "marker:champion:stale-pr-notice:$last_activity" "$state"; then
-            echo "STALE_NOTICE:suppressed"
-        else
-            state_add "marker:champion:stale-pr-notice:$last_activity" "$state"
-            echo "COMMENT:champion:stale-pr-notice"
-            state_remove "label:loom:pr" "$state"
-            state_add "label:loom:changes-requested" "$state"
-            echo "LABEL_REMOVE:loom:pr"
-            echo "LABEL_ADD:loom:changes-requested"
-            # loom:operator: conditional on whether a hold is still in force
-            # (#6720 narrowing #5802).
-            if [ "$MERGE_BLOCKED_BY_HOLD" = true ]; then
-                echo "LABEL_KEEP:loom:operator"
+        if [ "$MERGE_BLOCKED_BY_HOLD" = true ] && [ "$HELD_CI_FAILING" != true ]; then
+            # ---- Hold-only Stale PR: suspend the route (#6852) ----------
+            if state_has "marker:champion:held-stale-suspended" "$state"; then
+                echo "SUSPEND_NOTICE:suppressed"
             else
-                state_remove "label:loom:operator" "$state"
-                echo "LABEL_REMOVE:loom:operator"
+                state_add "marker:champion:held-stale-suspended" "$state"
+                echo "COMMENT:champion:held-stale-suspended"
             fi
-            # The hold marker is NEVER touched on this path.
+            echo "SUSPENDED:hold-only"
+            # No label touched, no marker touched — the PR stays exactly
+            # where it was (loom:pr + loom:operator + the hold marker).
+        else
+            # ---- Stale PR: hold-plus-feedback, or unheld (#6720/#5802) --
+            # #6860: keyed on last_activity, not on marker existence alone — a
+            # notice from a PAST episode (an older last_activity value, since
+            # superseded by real new activity that cycled the PR back to
+            # loom:pr) must NOT suppress a fresh notice for a NEW episode that
+            # has since gone stale again.
+            if state_has "marker:champion:stale-pr-notice:$last_activity" "$state"; then
+                echo "STALE_NOTICE:suppressed"
+            else
+                state_add "marker:champion:stale-pr-notice:$last_activity" "$state"
+                echo "COMMENT:champion:stale-pr-notice"
+                state_remove "label:loom:pr" "$state"
+                state_add "label:loom:changes-requested" "$state"
+                echo "LABEL_REMOVE:loom:pr"
+                echo "LABEL_ADD:loom:changes-requested"
+                # loom:operator: conditional on whether a hold is still in
+                # force (#6720 narrowing #5802).
+                if [ "$MERGE_BLOCKED_BY_HOLD" = true ]; then
+                    echo "LABEL_KEEP:loom:operator"
+                else
+                    state_remove "label:loom:operator" "$state"
+                    echo "LABEL_REMOVE:loom:operator"
+                fi
+                # The hold marker is NEVER touched on this path.
+            fi
         fi
-    fi
-
-    # ---- criterion #6: ALWAYS evaluated ----------------------------------
-    echo "EVAL:criterion-6"
-    if [ "$ci" = "fail" ]; then
-        echo "REPORT:ci-status"
     fi
 
     # ---- merge decision --------------------------------------------------
@@ -360,21 +415,30 @@ echo "=== test-champion-held-pr-health-pass.sh ==="
 echo
 
 # ---------------------------------------------------------------------
-echo "Test 1: THE REGRESSION SHAPE — held + CONFLICTING + past 24h reaches Doctor"
-# This is the exact failure #6720 documents: a held PR that main has moved past
-# and that has aged out. Pre-fix, this tick produced nothing at all.
+echo "Test 1: THE REGRESSION SHAPE, hold-plus-feedback — held + CONFLICTING + failing CI + past 24h reaches Doctor"
+# This is the exact failure #6720 documents, now with a failing check added so
+# it exercises the hold-PLUS-FEEDBACK branch (#6852): a held PR that main has
+# moved past, that has aged out, AND that carries a real problem of its own
+# (unrelated to the hold). Pre-#6720, this tick produced nothing at all.
+# Pre-#6852 the routing below did not depend on `ci` at all — #6852 makes it
+# conditional, so this test's `ci=fail` is now load-bearing: it is what keeps
+# this a hold-plus-feedback case rather than sliding into the hold-only
+# suspension covered by Test 1B below.
 S=$(state_new)
 state_add "marker:champion:merge-risk-hold" "$S"
 state_add "label:loom:operator" "$S"
-OUT=$(champion_pr_pass "$S" true "" false CONFLICTING 63 pass)
+OUT=$(champion_pr_pass "$S" true "" false CONFLICTING 63 fail)
 
 assert_contains "$OUT" "HOLD:sticky" "the sticky hold is still recognized and still binds"
 assert_contains "$OUT" "NO_MERGE:hold" "the held PR is not merged"
 assert_contains "$OUT" "COMMENT:champion:held-pr-conflict-notice" \
     "the conflict is surfaced with an idempotent marker comment (AC #2)"
+assert_contains "$OUT" "REPORT:ci-status" "the failing check is reported (criterion #6)"
 assert_contains "$OUT" "LABEL_REMOVE:loom:pr" "loom:pr is removed by the stale route"
 assert_contains "$OUT" "LABEL_ADD:loom:changes-requested" \
-    "the held+stale PR REACHES DOCTOR via loom:changes-requested (AC #3)"
+    "the held+stale+hold-plus-feedback PR REACHES DOCTOR via loom:changes-requested (AC #3, unchanged by #6852)"
+assert_lacks "$OUT" "COMMENT:champion:held-stale-suspended" \
+    "a hold-plus-feedback PR is never suspended — only a hold-ONLY PR is (#6852)"
 assert_eq "loom:changes-requested,loom:operator" "$(state_labels "$S")" \
     "final labels: loom:changes-requested + loom:operator (loom:pr gone)"
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -385,6 +449,62 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: the hold marker was cleared — a rebase would launder this into an unheld PR"
 fi
+rm -f "$S"
+echo
+
+# ---------------------------------------------------------------------
+echo "Test 1B: THE HOLD-ONLY VARIANT (#6852) — held + CONFLICTING + past 24h, but NOTHING else red, is SUSPENDED not routed"
+# Identical shape to Test 1 MINUS the failing check: the PR's only blocker is
+# the standing hold itself. This is the treadmill case #6848/#6852 exist to
+# fix — main moving repeatedly must not force an endless rebase-to-Doctor
+# cycle when the actual blocker (a pending human merge decision) is untouched
+# by any of it.
+S=$(state_new)
+state_add "marker:champion:merge-risk-hold" "$S"
+state_add "label:loom:operator" "$S"
+OUT=$(champion_pr_pass "$S" true "" false CONFLICTING 63 pass)
+
+assert_contains "$OUT" "HOLD:sticky" "the sticky hold is still recognized and still binds"
+assert_contains "$OUT" "NO_MERGE:hold" "the held PR is not merged"
+assert_contains "$OUT" "COMMENT:champion:held-pr-conflict-notice" \
+    "the conflict is STILL surfaced — #6852 only changes the STALE route, not the conflict notice (AC #1 unaffected)"
+assert_lacks "$OUT" "REPORT:ci-status" "no failing check to report — CI is passing"
+assert_contains "$OUT" "SUSPENDED:hold-only" "the stale route is recognized as hold-only and suspended (AC #1/#2)"
+assert_contains "$OUT" "COMMENT:champion:held-stale-suspended" \
+    "a one-time suspension notice is posted explaining why no route happened (AC #2)"
+assert_lacks "$OUT" "COMMENT:champion:stale-pr-notice" \
+    "the ordinary stale-route notice is NOT posted for a hold-only PR"
+assert_lacks "$OUT" "LABEL_REMOVE:loom:pr" "loom:pr is NOT removed — the automatic rebase cycle is suspended (AC #2)"
+assert_lacks "$OUT" "LABEL_ADD:loom:changes-requested" \
+    "the hold-only PR does NOT reach Doctor — routing it would buy nothing (AC #2)"
+assert_eq "loom:operator,loom:pr" "$(state_labels "$S")" \
+    "final labels UNCHANGED: still loom:pr + loom:operator, still held-and-stale (AC #2, #3)"
+TESTS_RUN=$((TESTS_RUN + 1))
+if state_has "marker:champion:merge-risk-hold" "$S"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the champion:merge-risk-hold marker is untouched on the suspended path (trivially preserved, AC #3)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: the hold marker was cleared on the suspended path — must never happen"
+fi
+rm -f "$S"
+echo
+
+# ---------------------------------------------------------------------
+echo "Test 1C: hold-only suspension notice idempotency across repeated ticks (#6852)"
+S=$(state_new)
+state_add "marker:champion:merge-risk-hold" "$S"
+state_add "label:loom:operator" "$S"
+TICK1=$(champion_pr_pass "$S" true "" false CONFLICTING 63 pass)
+TICK2=$(champion_pr_pass "$S" true "" false CONFLICTING 64 pass)
+TICK3=$(champion_pr_pass "$S" true "" false CONFLICTING 65 pass)
+assert_contains "$TICK1" "COMMENT:champion:held-stale-suspended" "tick 1 posts the suspension notice"
+assert_contains "$TICK2" "SUSPEND_NOTICE:suppressed" "tick 2 suppresses the duplicate suspension notice"
+assert_contains "$TICK3" "SUSPEND_NOTICE:suppressed" "tick 3 suppresses the duplicate suspension notice"
+assert_lacks "$TICK2" "LABEL_REMOVE:loom:pr" "tick 2 still does not route — no label swap ever runs on this path"
+assert_lacks "$TICK3" "LABEL_ADD:loom:changes-requested" "tick 3 still does not route — no label swap ever runs on this path"
+assert_eq "loom:operator,loom:pr" "$(state_labels "$S")" \
+    "labels stay unchanged across every tick of a sustained hold-only suspension"
 rm -f "$S"
 echo
 
@@ -420,13 +540,15 @@ rm -f "$S"
 echo
 
 # ---------------------------------------------------------------------
-echo "Test 4: idempotency across repeated cron ticks — one comment per episode"
+echo "Test 4: idempotency across repeated cron ticks — one comment per episode (hold-plus-feedback)"
+# ci=fail keeps this a hold-plus-feedback episode (#6852) so the route still
+# fires, exactly as #6720 shipped; Test 1C above is the hold-only counterpart.
 S=$(state_new)
 state_add "marker:champion:merge-risk-hold" "$S"
 state_add "label:loom:operator" "$S"
-TICK1=$(champion_pr_pass "$S" true "" false CONFLICTING 63 pass)
-TICK2=$(champion_pr_pass "$S" true "" false CONFLICTING 64 pass)
-TICK3=$(champion_pr_pass "$S" true "" false CONFLICTING 65 pass)
+TICK1=$(champion_pr_pass "$S" true "" false CONFLICTING 63 fail)
+TICK2=$(champion_pr_pass "$S" true "" false CONFLICTING 64 fail)
+TICK3=$(champion_pr_pass "$S" true "" false CONFLICTING 65 fail)
 assert_contains "$TICK1" "COMMENT:champion:held-pr-conflict-notice" "tick 1 posts the conflict notice"
 assert_contains "$TICK2" "CONFLICT_NOTICE:suppressed" "tick 2 suppresses the duplicate conflict notice"
 assert_contains "$TICK3" "CONFLICT_NOTICE:suppressed" "tick 3 suppresses the duplicate conflict notice"
@@ -438,16 +560,20 @@ echo
 
 # ---------------------------------------------------------------------
 echo "Test 5: loom:operator — kept on the held route, still cleared on the unheld route (#5802)"
-# Held: the human merge decision is still outstanding, so the label stays.
+# Held, hold-plus-feedback: the human merge decision is still outstanding, so
+# the label stays. ci=fail keeps this the routed variant (#6852) — see Test 1B
+# for the hold-only variant, where loom:operator is also kept, but because the
+# label is simply never touched.
 S=$(state_new)
 state_add "marker:champion:merge-risk-hold" "$S"
 state_add "label:loom:operator" "$S"
-OUT=$(champion_pr_pass "$S" true "" false MERGEABLE 30 pass)
-assert_contains "$OUT" "LABEL_KEEP:loom:operator" "held+stale keeps loom:operator (AC #4)"
+OUT=$(champion_pr_pass "$S" true "" false MERGEABLE 30 fail)
+assert_contains "$OUT" "LABEL_KEEP:loom:operator" "held+stale+hold-plus-feedback keeps loom:operator (AC #4)"
 assert_contains "$(state_labels "$S")" "loom:operator" "loom:operator survives in the final label set"
 rm -f "$S"
 
-# Unheld: #5802's original behavior, unchanged.
+# Unheld: #5802's original behavior, unchanged. Unheld routing never depended
+# on CI status before #6852 and still does not — ci=pass here on purpose.
 S=$(state_new)
 OUT=$(champion_pr_pass "$S" false "" false MERGEABLE 30 pass)
 assert_contains "$OUT" "LABEL_REMOVE:loom:operator" "unheld+stale still clears loom:operator (#5802 not regressed)"
@@ -457,16 +583,18 @@ rm -f "$S"
 echo
 
 # ---------------------------------------------------------------------
-echo "Test 6: a FRESH hold (red axis this tick) gets the same health pass"
+echo "Test 6: a FRESH hold (red axis this tick) gets the same health pass — hold-plus-feedback"
 # The defect is not sticky-specific: a first-tick hold on an already-stale,
-# already-conflicting PR must not rot either.
+# already-conflicting, ALSO-CI-failing PR must not rot either. ci=fail keeps
+# this the routed variant (#6852) — Test 6B below is the fresh-hold hold-only
+# counterpart.
 S=$(state_new)
-OUT=$(champion_pr_pass "$S" false "" true CONFLICTING 63 pass)
+OUT=$(champion_pr_pass "$S" false "" true CONFLICTING 63 fail)
 assert_contains "$OUT" "COMMENT:champion:merge-risk-hold" "the fresh hold notice is posted"
 assert_contains "$OUT" "HOLD:fresh" "the fresh hold blocks the merge"
 assert_contains "$OUT" "EVAL:criterion-5" "criterion #5 still runs behind a fresh hold"
 assert_contains "$OUT" "COMMENT:champion:held-pr-conflict-notice" "a freshly-held conflicting PR is surfaced too"
-assert_contains "$OUT" "LABEL_ADD:loom:changes-requested" "a freshly-held stale PR reaches Doctor too"
+assert_contains "$OUT" "LABEL_ADD:loom:changes-requested" "a freshly-held, hold-plus-feedback stale PR reaches Doctor too"
 assert_contains "$OUT" "LABEL_KEEP:loom:operator" "the fresh hold's loom:operator is kept on the route"
 TESTS_RUN=$((TESTS_RUN + 1))
 if state_has "marker:champion:merge-risk-hold" "$S"; then
@@ -475,6 +603,31 @@ if state_has "marker:champion:merge-risk-hold" "$S"; then
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo -e "  ${RED}FAIL${NC}: the fresh hold's marker was cleared"
+fi
+rm -f "$S"
+echo
+
+# ---------------------------------------------------------------------
+echo "Test 6B: a FRESH hold that is hold-only (no other blocker) is suspended too (#6852)"
+# Same shape as Test 6, minus the failing check: neither the #6720 defect nor
+# its #6852 fix is sticky-specific.
+S=$(state_new)
+OUT=$(champion_pr_pass "$S" false "" true CONFLICTING 63 pass)
+assert_contains "$OUT" "COMMENT:champion:merge-risk-hold" "the fresh hold notice is posted"
+assert_contains "$OUT" "HOLD:fresh" "the fresh hold blocks the merge"
+assert_contains "$OUT" "COMMENT:champion:held-pr-conflict-notice" "a freshly-held conflicting PR is still surfaced"
+assert_contains "$OUT" "SUSPENDED:hold-only" "the freshly-held, hold-only stale PR is suspended, not routed"
+assert_contains "$OUT" "COMMENT:champion:held-stale-suspended" "the suspension notice is posted"
+assert_lacks "$OUT" "LABEL_ADD:loom:changes-requested" "a freshly-held, hold-only stale PR does NOT reach Doctor"
+assert_eq "loom:operator,loom:pr" "$(state_labels "$S")" \
+    "final labels: still loom:pr + loom:operator — the fresh hold's own label add survives, untouched by the suspension"
+TESTS_RUN=$((TESTS_RUN + 1))
+if state_has "marker:champion:merge-risk-hold" "$S"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: the fresh hold's marker is untouched on the suspended path"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: the fresh hold's marker was cleared on the suspended path"
 fi
 rm -f "$S"
 echo
@@ -511,6 +664,12 @@ echo
 
 # ---------------------------------------------------------------------
 echo "Test 8: held-PR census counts the set, the conflicts, and the ones out at Doctor"
+# #6445 below (loom:pr + loom:operator, CONFLICTING, no loom:changes-requested)
+# is exactly the shape a hold-only-suspended PR (#6852) leaves behind: it never
+# left loom:pr, so it is invisible to HELD_AT_DOCTOR but still counted in
+# HELD_COUNT/HELD_CONFLICTING via the loom:operator query alone — this doubles
+# as the #6852 "never silently dropped from reporting" check (#6720's core
+# property), independent of whether the PR routed or was suspended.
 CENSUS_FIXTURE='[
   {"number":6445,"createdAt":"2026-08-10T00:00:00Z","updatedAt":"2026-08-19T14:59:00Z","mergeable":"CONFLICTING","labels":[{"name":"loom:pr"},{"name":"loom:operator"}]},
   {"number":6484,"createdAt":"2026-08-12T00:00:00Z","updatedAt":"2026-08-19T14:59:00Z","mergeable":"CONFLICTING","labels":[{"name":"loom:changes-requested"},{"name":"loom:operator"}]},
@@ -518,6 +677,8 @@ CENSUS_FIXTURE='[
 ]'
 assert_eq "3 2 1" "$(printf '%s\n' "$CENSUS_FIXTURE" | held_census)" \
     "census: 3 held, 2 conflicting, 1 out at Doctor (AC #5)"
+assert_eq "3" "$(printf '%s\n' "$CENSUS_FIXTURE" | jq '[.[] | select([.labels[].name] | index("loom:pr") or index("loom:changes-requested"))] | length')" \
+    "census: every held PR is captured whether it is still on loom:pr (routed or hold-only-suspended, #6852) or already at Doctor"
 assert_eq "2026-08-10T00:00:00Z" \
     "$(printf '%s\n' "$CENSUS_FIXTURE" | jq -r 'min_by(.createdAt) | .createdAt')" \
     "census: the oldest held PR is identified for the age report"
@@ -757,6 +918,41 @@ assert_doc_contains "$CHAMPION_MD" \
 assert_doc_contains "$CHAMPION_MD" \
     'select((.body | test("champion:|Automated by Champion role")) | not) | .createdAt)' \
     "criterion #5's activity computation excludes Champion's own comments, mirroring the sticky-hold precheck's exclusion test (#6843)"
+
+# --- #6852: hold-only vs hold-plus-feedback stale routing ---
+assert_doc_contains "$CHAMPION_MD" \
+    "HELD_CI_FAILING" \
+    "the Held-PR Health Pass computes HELD_CI_FAILING to distinguish hold-only from hold-plus-feedback staleness (#6852)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    "### #5 under a hold — route to Doctor only when there is ALSO genuine feedback (#6852)" \
+    "the Held-PR Health Pass ships the #6852 hold-only-vs-hold-plus-feedback routing decision"
+
+assert_doc_contains "$CHAMPION_MD" \
+    "### Hold-only Stale PR — suspend the route, report once (#6852)" \
+    "champion-pr-merge.md ships the hold-only suspension block (#6852)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    '<!-- champion:held-stale-suspended -->' \
+    "the hold-only suspension notice has its own idempotency marker (#6852)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    'if [ "$HELD" = true ] && [ "$CI_FAILING" != true ]; then' \
+    "the hold-plus-feedback/unheld stale block fails closed rather than routing a hold-only PR if ever reached (#6852)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    "this block changes no label at all" \
+    "the hold-only suspension block documents that it never swaps loom:pr -> loom:changes-requested (#6852)"
+
+assert_doc_contains "$CHAMPION_MD" \
+    "Evaluate #4, then #6, then #5" \
+    "the Held-PR Health Pass documents the reordered evaluation sequence (#6852)"
+
+# --- absence pin: a hold-only PR must never be silently dropped from
+# reporting — #6720's core property, re-verified after #6852 ---
+assert_doc_lacks "$CHAMPION_MD" \
+    "### #5 under a hold — route to Doctor, keep the hold" \
+    "the pre-#6852 unconditional held-route heading is gone (superseded, not just supplemented)"
 
 echo
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed, $TESTS_FAILED failed"

@@ -116,6 +116,17 @@ axes are re-judged), but the *record* of the hold must survive — it is what ke
 `PRIOR_HOLD=true`, and therefore keeps Step 2's hold-reversal comment mandatory
 if the PR later merges. A rebase must not launder a held PR into an unheld one.
 
+**#6852 narrows the "Hold in force" row further.** Routing to Doctor on that row
+is now conditional on the PR carrying genuine unresolved feedback (a failing
+required check) *in addition to* the hold — a **hold-only** stale PR (the hold
+is the sole blocker; CI is passing or has no checks) is left on `loom:pr`
+instead of being routed, to stop an unproductive "rebase treadmill" where `main`
+moving repeatedly forces a rebase that cannot resolve the actual blocker (a
+pending human merge decision). `loom:operator` and the hold marker are
+unaffected either way — see `champion-pr-merge.md` → "Held-PR Health Pass" →
+"#5 under a hold" for the exact routing decision, and "Hold-only Stale PR —
+suspend the route" for the suspended path.
+
 ## Current implementation
 
 Only the Champion merge-risk-hold entry/exit pair is wired today:

@@ -1151,6 +1151,283 @@ mask_command_positional_args() {
 }
 
 # =============================================================================
+# FOR-LOOP ITEM-LIST MASKING (issue #6866, #6464 Instance 1)
+#
+# The three masking functions above all neutralize a literal that appears
+# DIRECTLY adjacent to its own safe usage -- a flag value, a positional
+# argument, a heredoc body captured by a text-data flag/field, or (via
+# mask_var_assigned_heredoc_bodies) a heredoc assigned to a variable and
+# dereferenced later. None of them recognize this shape, reported in #6464:
+#
+#   for q in "aws s3 rb" "some-search-term" "gh pr merge redirect"; do
+#     echo "=== $q ==="
+#     gh issue list --state open --search "$q" --limit 10 ...
+#   done
+#
+# Here the disallowed phrase is a literal ITEM in a `for VAR in "..." "...";
+# do` word list; it is only reachable later via `$VAR`/`${VAR}` inside the
+# loop body. No `gh`, `pr`, or `merge` subcommand is ever invoked. The literal
+# and its (safe) use live in two different places connected only by a shell
+# variable name -- structurally analogous to the heredoc-variable problem
+# above, but with a different capture syntax (a bare, quoted word list
+# instead of a heredoc body) and a different safe-usage shape (the reference
+# can be embedded inside a larger quoted string, e.g. `"=== $q ==="`, not
+# just as the entirety of a flag's value).
+#
+# mask_for_loop_list_items() masks a `for`-loop's item list at its point of
+# DEFINITION, but ONLY when every `$VAR`/`${VAR}` reference to that loop
+# variable anywhere else in the command is proven safe. Rather than
+# re-implementing the safe-context allowlist (flags, positional-arg commands,
+# the echo/printf nested-substitution and trailing-pipe restrictions, ...) a
+# third time, confinement is decided by literally asking the two
+# reference-site masking functions above: a scratch copy of the command (with
+# this candidate's own item-list span blanked out, so its own literal text
+# can never be mistaken for a live reference to its own variable name) is run
+# through `mask_command_positional_args` then `mask_data_flag_values` --
+# EXACTLY the two functions, in the same relative order, that the real
+# `GH_PR_MERGE_SCAN_TEXT` pipeline below applies to reference sites. Both
+# functions mask character-for-character (gsub(/./,"X",...) on each masked
+# span), which preserves the LENGTH and POSITION of every character, so
+# whether a given `$VAR` reference was masked can be read directly off the
+# masked output at the same character offset it had in the scratch input --
+# no separate anchor/flag/pipe regex needs to be duplicated here, and this
+# stays automatically in sync with any future extension to either function's
+# allowlist (e.g. adding `jq`, #6867).
+#
+# A reference is counted only via the exact "$VAR" / closed "${VAR}" (or any
+# longer parameter-expansion prefix "${VAR...") forms, mirroring
+# mask_var_assigned_heredoc_bodies's own reference scan -- including its
+# "$VARX"/"${VARX" false-extension guard. The item list is masked ONLY when
+# at least one reference was found AND every reference found was masked by
+# the two reference-site functions. Zero detected references is NOT proof of
+# safety (the variable may be reached through indirection this literal scan
+# cannot see -- `${!REF}`, `eval` of a computed name, a shadowed name in an
+# unrelated scope, ...), so a `for`-loop item list with no detected reference,
+# or with even ONE unconfined reference, is left COMPLETELY UNMASKED --
+# masking only ever narrows what this ONE check misses, it never widens it,
+# same invariant as every other masking function in this file. Because the
+# confinement scan runs over the WHOLE command buffer (not just the loop
+# body), it is deliberately over-inclusive rather than under-inclusive: a
+# same-named variable used unsafely anywhere else in the command (a shadowed
+# outer scope, a sibling loop reusing the name, ...) also blocks masking --
+# the fail-safe direction, never the reverse.
+#
+# Only two shapes are recognized, per the recommended approach in #6866:
+# `for VAR in "item1" "item2" ...; do` on one line, and the same list ending
+# the line (optionally with a trailing `;`) with `do` alone on the next line.
+# Anything else (a C-style `for ((...))`, an unquoted/glob word list, a `do`
+# on neither the same nor the very next line, an unterminated quote) is not
+# recognized as a candidate at all and is left fully visible -- fail-safe by
+# construction, not a masking decision.
+mask_for_loop_list_items() {
+    local input="$1"
+    local parsed
+    # Pass 1: locate every `for VAR in "..." "...";do` / newline-`do` shaped
+    # loop header in the buffer and emit one line per candidate:
+    # "VARNAME<TAB>qstart1:qend1,qstart2:qend2,..." where each qstart:qend is
+    # the absolute 1-indexed position of that item's OPENING and CLOSING
+    # quote character in the buffer (so downstream span-blanking/masking can
+    # operate on precise character offsets rather than re-parsing).
+    parsed=$(printf '%s' "$input" | awk '
+    BEGIN {
+        SQ = sprintf("%c", 39)
+        DQ = sprintf("%c", 34)
+    }
+    { buf = buf (NR > 1 ? "\n" : "") $0 }
+    END {
+        n = length(buf)
+        i = 1
+        while (i <= n) {
+            if (substr(buf, i, 3) == "for") {
+                pc = (i == 1) ? "" : substr(buf, i - 1, 1)
+                nc = substr(buf, i + 3, 1)
+                boundary_before = (pc == "" || pc == "\n" || pc == " " || pc == "\t" || pc == ";" || pc == "&" || pc == "|" || pc == "(")
+                boundary_after = (nc == " " || nc == "\t")
+                if (boundary_before && boundary_after) {
+                    j = i + 3
+                    while (substr(buf, j, 1) == " " || substr(buf, j, 1) == "\t") j++
+                    vstart = j
+                    if (substr(buf, j, 1) ~ /^[A-Za-z_]$/) {
+                        j++
+                        while (substr(buf, j, 1) ~ /^[A-Za-z0-9_]$/) j++
+                    }
+                    if (j > vstart) {
+                        vn = substr(buf, vstart, j - vstart)
+                        k = j
+                        while (substr(buf, k, 1) == " " || substr(buf, k, 1) == "\t") k++
+                        if (substr(buf, k, 2) == "in") {
+                            ic = substr(buf, k + 2, 1)
+                            if (ic == " " || ic == "\t") {
+                                k = k + 2
+                                while (substr(buf, k, 1) == " " || substr(buf, k, 1) == "\t") k++
+                                ntok = 0
+                                p = k
+                                bad = 0
+                                lastpos = 0
+                                toks = ""
+                                # Parse consecutive whitespace-separated
+                                # quoted words (no escape handling, matching
+                                # the rest of this files style); stops at
+                                # the first non-quote token or a quote left
+                                # unterminated on its own source line.
+                                while (1) {
+                                    while (substr(buf, p, 1) == " " || substr(buf, p, 1) == "\t") p++
+                                    qc = substr(buf, p, 1)
+                                    if (qc != SQ && qc != DQ) break
+                                    qstart = p
+                                    e = p + 1
+                                    found = 0
+                                    while (e <= n) {
+                                        cc = substr(buf, e, 1)
+                                        if (cc == "\n") break
+                                        if (cc == qc) { found = 1; break }
+                                        e++
+                                    }
+                                    if (!found) { bad = 1; break }
+                                    ntok++
+                                    toks = toks (toks == "" ? "" : ",") qstart ":" e
+                                    lastpos = e
+                                    p = e + 1
+                                }
+                                if (!bad && ntok > 0) {
+                                    r = lastpos + 1
+                                    while (substr(buf, r, 1) == " " || substr(buf, r, 1) == "\t") r++
+                                    if (substr(buf, r, 1) == ";") r++
+                                    while (substr(buf, r, 1) == " " || substr(buf, r, 1) == "\t") r++
+                                    valid = 0
+                                    if (substr(buf, r, 2) == "do") {
+                                        ac = substr(buf, r + 2, 1)
+                                        if (ac !~ /^[A-Za-z0-9_]$/) valid = 1
+                                    } else if (substr(buf, r, 1) == "\n") {
+                                        rr = r + 1
+                                        while (substr(buf, rr, 1) == " " || substr(buf, rr, 1) == "\t") rr++
+                                        if (substr(buf, rr, 2) == "do") {
+                                            ac = substr(buf, rr + 2, 1)
+                                            if (ac !~ /^[A-Za-z0-9_]$/) valid = 1
+                                        }
+                                    }
+                                    if (valid) {
+                                        print vn "\t" toks
+                                        # Resume scanning right after this
+                                        # loops own item list (not its body)
+                                        # so a later sibling/nested `for` is
+                                        # still found as its own candidate.
+                                        i = lastpos
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i++
+        }
+    }')
+
+    if [[ -z "$parsed" ]]; then
+        printf '%s' "$input"
+        return
+    fi
+
+    local out="$input"
+    local vn toks
+    while IFS=$'\t' read -r vn toks; do
+        [[ -z "$vn" ]] && continue
+
+        # Scratch buffer for THIS candidate's confinement scan: blank its own
+        # item-list span (quote characters included) with spaces so its own
+        # literal item text can never masquerade as a reference to its own
+        # variable name.
+        local scratch
+        scratch=$(BUF_ENV="$out" SPANS_ENV="$toks" FILL_ENV=" " awk '
+        BEGIN {
+            buf = ENVIRON["BUF_ENV"]
+            fill = ENVIRON["FILL_ENV"]
+            n = split(ENVIRON["SPANS_ENV"], parts, ",")
+            for (p = 1; p <= n; p++) {
+                split(parts[p], se, ":")
+                s = se[1]; e = se[2]
+                w = e - s + 1
+                rep = ""
+                for (c = 1; c <= w; c++) rep = rep fill
+                buf = substr(buf, 1, s - 1) rep substr(buf, e + 1)
+            }
+            printf "%s", buf
+        }')
+
+        # Ask the two reference-site masking functions -- in the same
+        # relative order the real pipeline below applies them -- whether
+        # every later reference to this variable falls in a context they
+        # already recognize as safe.
+        local masked
+        masked=$(mask_data_flag_values "$(mask_command_positional_args "$scratch")")
+
+        # Position-compare: both functions mask character-for-character, so
+        # a reference at buffer offset N is confined iff masked[N] == "X".
+        local result
+        result=$(SCAN_ENV="$scratch" MASK_ENV="$masked" VN_ENV="$vn" awk '
+        BEGIN {
+            buf = ENVIRON["SCAN_ENV"]
+            masked = ENVIRON["MASK_ENV"]
+            vn = ENVIRON["VN_ENV"]
+            vlen = length(vn)
+            buflen = length(buf)
+            nref = 0
+            confined = 1
+            pos = 1
+            while (pos <= buflen) {
+                rem = substr(buf, pos)
+                ib = index(rem, "${" vn)
+                is = index(rem, "$" vn)
+                if (ib == 0 && is == 0) break
+                useb = (ib > 0 && (is == 0 || ib <= is))
+                if (useb) {
+                    abspos = pos + ib - 1
+                    mlen = 2 + vlen
+                    aftch = substr(buf, abspos + mlen, 1)
+                    if (aftch ~ /^[A-Za-z0-9_]$/) { pos = abspos + 2; continue }
+                } else {
+                    abspos = pos + is - 1
+                    mlen = 1 + vlen
+                    aftch = substr(buf, abspos + mlen, 1)
+                    if (aftch ~ /^[A-Za-z0-9_]$/) { pos = abspos + 1; continue }
+                }
+                nref++
+                mch = substr(masked, abspos, 1)
+                if (mch != "X") confined = 0
+                pos = abspos + mlen
+            }
+            printf "%d", (confined == 1 && nref > 0) ? 1 : 0
+        }')
+
+        if [[ "$result" == "1" ]]; then
+            # Confirmed confined: mask the INNER content of each item
+            # (quote characters and inter-item whitespace left intact, same
+            # style as every other masking function here) to X's in the
+            # running output buffer. Character-preserving, so span offsets
+            # for any remaining/later candidates stay valid.
+            out=$(BUF_ENV="$out" SPANS_ENV="$toks" awk '
+            BEGIN {
+                buf = ENVIRON["BUF_ENV"]
+                n = split(ENVIRON["SPANS_ENV"], parts, ",")
+                for (p = 1; p <= n; p++) {
+                    split(parts[p], se, ":")
+                    s = se[1]; e = se[2]
+                    w = e - s - 1
+                    if (w <= 0) continue
+                    rep = ""
+                    for (c = 1; c <= w; c++) rep = rep "X"
+                    buf = substr(buf, 1, s) rep substr(buf, e)
+                }
+                printf "%s", buf
+            }')
+        fi
+    done <<<"$parsed"
+
+    printf '%s' "$out"
+}
+
+# =============================================================================
 # DECISION TELEMETRY (issue #3771 / #3898) — one JSONL record per deny decision,
 # identical schema + toggle semantics to guard-destructive.sh so both guards'
 # fires land in the SAME .loom/logs/guard-decisions.log for the standing
@@ -1332,14 +1609,24 @@ ask() {
 # =============================================================================
 
 # Match against a MASKED copy of $COMMAND (issue #5109, extended by #5155,
-# #5172, and #6464) so a mention of the phrase inside a cat-heredoc
+# #5172, #6464, and #6866) so a mention of the phrase inside a cat-heredoc
 # commit-message body, a --search/--body/-m/etc quoted value (including the
 # `gh api -f field=value` shape), a quoted POSITIONAL argument to a known
-# non-executing command (grep/rg/check-duplicate.sh/jq), or a heredoc
-# assigned to a shell variable and only referenced later via that variable,
-# doesn't false-positive as a real invocation. See the masking functions'
-# doc comments above for exactly what is (and is NOT) neutralized.
-GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_command_positional_args "$(mask_var_assigned_heredoc_bodies "$(mask_cat_heredoc_bodies "$COMMAND")")")")
+# non-executing command (grep/rg/check-duplicate.sh/jq), a heredoc assigned
+# to a shell variable and only referenced later via that variable, or a `for
+# VAR in "..." "...";  do` item list only referenced later via that loop
+# variable, doesn't false-positive as a real invocation. See the masking
+# functions' doc comments above for exactly what is (and is NOT) neutralized.
+#
+# mask_for_loop_list_items runs BEFORE mask_command_positional_args and
+# mask_data_flag_values here (mirroring mask_var_assigned_heredoc_bodies's
+# position) even though it internally calls those same two functions on a
+# scratch buffer to decide confinement -- that internal use is independent of
+# this outer composition order, and running it here (right after the other
+# DEFINITION-site masks, before the REFERENCE-site masks) keeps this pipeline
+# consistent: definition-site literals are neutralized first, so a later
+# reference-site pass can never be confused by a still-live definition.
+GH_PR_MERGE_SCAN_TEXT=$(mask_data_flag_values "$(mask_command_positional_args "$(mask_for_loop_list_items "$(mask_var_assigned_heredoc_bodies "$(mask_cat_heredoc_bodies "$COMMAND")")")")")
 if echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; then
     # Resolve the merge-pr.sh path for the current repo context. Prefer an
     # in-repo installed copy (./.loom/scripts/merge-pr.sh); fall back to the

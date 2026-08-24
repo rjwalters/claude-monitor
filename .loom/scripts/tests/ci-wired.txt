@@ -38,6 +38,7 @@ test-cargo-test-daemon-guard.sh
 test-champion-ci-checks-no-checks-signal.sh
 test-champion-critical-file-check.sh
 test-champion-held-pr-health-pass.sh
+test-champion-standing-authorization.sh
 test-check-ci-status.sh
 test-check-config-no-host-paths.sh
 test-check-duplicate.sh

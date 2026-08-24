@@ -1718,6 +1718,34 @@ function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
     }
     varmap[vname] = vval
 }
+# resolve_var_q() -- quote-aware wrapper around resolve_var(), used by the
+# five write-target print sites inside extract_write_targets() (#6444).
+# qsplit() deliberately preserves quote characters verbatim in each token
+# (see its own header comment above), so the extremely common, safe
+# double-quoted idiom (`"$VAR/path"`) reaches resolve_var() with a leading
+# `"` rather than `$`, and the `substr(tok, 1, 1) != "$"` guard at the top of
+# resolve_var() bails out immediately -- leaving a fully-known target
+# unresolved and producing a false `worktree-write-confinement-unresolved-
+# var` deny. Strip ONE matching leading+trailing DOUBLE-quote pair
+# (mirroring the DQ/SQ-aware, single-pair-only stripping rule record_assign()
+# already applies to assignment VALUES above, narrowed here to double-quote
+# only) before handing off to resolve_var(). SINGLE-quote is deliberately
+# never stripped here: a literal single-quoted reference like the two-
+# character sequence dollar-sign VAR wrapped in single quotes is a shell
+# literal (the shell never expands it) and must stay unresolved rather than
+# being silently substituted with varmap value -- the fail-closed guarantee
+# (#4921/#6172). A single-quoted or unquoted-but-non-dollar-leading token
+# falls through to resolve_var() exactly as it did before this wrapper
+# existed.
+function resolve_var_q(tok,   n, c1, c2) {
+    n = length(tok)
+    if (n >= 2) {
+        c1 = substr(tok, 1, 1)
+        c2 = substr(tok, n, 1)
+        if (c1 == DQ && c2 == DQ) tok = substr(tok, 2, n - 2)
+    }
+    return resolve_var(tok)
+}
 BEGIN {
     DQ = sprintf("%c", 34)
     SQ = sprintf("%c", 39)
@@ -5289,7 +5317,7 @@ extract_write_targets() {
                         if (toks[j] == "<<" || toks[j] == "<<-" || toks[j] == "<<<") j++
                         continue
                     }
-                    print curcwd SEP resolve_var(toks[j])
+                    print curcwd SEP resolve_var_q(toks[j])
                 }
             } else if (toks[1] == "sed") {
                 has_i = 0
@@ -5350,7 +5378,7 @@ extract_write_targets() {
                     bare_i_pending = 0
                 }
                 if (has_i && nf > sed_skip) {
-                    for (j = sed_skip + 1; j <= nf; j++) print curcwd SEP resolve_var(nfargs[j])
+                    for (j = sed_skip + 1; j <= nf; j++) print curcwd SEP resolve_var_q(nfargs[j])
                 }
             } else if (toks[1] == "cp" || toks[1] == "mv") {
                 nf = 0
@@ -5373,7 +5401,7 @@ extract_write_targets() {
                     nf++
                     nfargs[nf] = toks[j]
                 }
-                if (nf >= 2) print curcwd SEP resolve_var(nfargs[nf])
+                if (nf >= 2) print curcwd SEP resolve_var_q(nfargs[nf])
             }
 
             # >/>>  redirection — token-boundary detection only (never a
@@ -5391,7 +5419,7 @@ extract_write_targets() {
                     # Bare operator token. Dup-to-fd (`> &1`) is recognized by
                     # the NEXT token starting with `&` and excluded.
                     if (j + 1 <= m && toks[j+1] != "" && mtoks[j+1] !~ /^&/) {
-                        print curcwd SEP resolve_var(toks[j+1])
+                        print curcwd SEP resolve_var_q(toks[j+1])
                     }
                     continue
                 }
@@ -5399,7 +5427,7 @@ extract_write_targets() {
                     # Attached form (`>file`, `2>file`, `>>file`).
                     op = toks[j]
                     sub(/^[0-9]*>>?/, "", op)
-                    if (op != "") print curcwd SEP resolve_var(op)
+                    if (op != "") print curcwd SEP resolve_var_q(op)
                 }
             }
         }
