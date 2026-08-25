@@ -236,6 +236,16 @@ signature table plus ready-made wrappers
 `forge_gh_reopen_issue_rl_safe`, #4856) if you are scripting rather than
 running `gh` interactively.
 
+**`GraphQL: Body is too long` is a different, non-rate-limit rejection — do
+not apply this REST fallback to it (#6930).** A body edit (`gh issue
+edit`/`gh pr edit --body`/`--body-file`) that exceeds GitHub's ~256 KiB hard
+cap is not in the signature table above and is not a quota problem — REST's
+`PATCH .../issues/{n}` "succeeds" only because it skips the same size check,
+and a blind PATCH there can silently clobber a concurrent writer's edit with
+no error raised. If you hit this rejection, switch to posting the update as
+a comment instead of a body edit — full incident and rationale in
+`.loom/docs/graphql-body-size-cap.md`.
+
 ## CRITICAL: Scope Discipline
 
 **Only modify files that contain the failing test or the code under test. Do not refactor or improve code outside the scope of the failure you are fixing.**

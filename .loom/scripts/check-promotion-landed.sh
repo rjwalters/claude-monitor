@@ -53,8 +53,11 @@
 #   TIER=<tier:goal-advancing|tier:goal-supporting|tier:maintenance|"">
 #
 # Exit codes:
-#   0  = OK (no APPROVED verdict comment, or loom:issue already present —
-#        nothing to reconcile)
+#   0  = OK (no APPROVED verdict comment; loom:issue already present; or
+#        loom:issue is currently absent but the label timeline shows it WAS
+#        applied after the newest APPROVED comment and the issue has since
+#        legitimately progressed further, e.g. loom:issue -> loom:building or
+#        -> loom:blocked — nothing to reconcile in any of these cases, #6933)
 #   1  = usage or environment error (bad args, `gh`/`jq` missing, a required
 #        `gh` read failed)
 #   10 = NOT_OPEN (issue is closed — nothing left to reconcile)
@@ -148,6 +151,35 @@ fi
 
 if [[ "$HAS_ISSUE_LABEL" == "yes" ]]; then
   emit "OK" "APPROVED verdict comment present and loom:issue is present — promotion landed"
+  exit 0
+fi
+
+# --- Step 2: loom:issue is currently absent — but it may have landed and the
+# issue has SINCE legitimately progressed further (loom:issue -> loom:building,
+# or -> loom:blocked), which looks identical to a lost write from labels alone
+# when judged from the current label set only. Before concluding MISMATCH,
+# check the label timeline for a `labeled loom:issue` event that happened
+# AFTER the newest APPROVED comment: if one exists, the promotion landed and
+# this is not #6862's failure mode at all (#6933).
+APPROVED_AT="$(jq -r '.createdAt // empty' <<<"$APPROVED_COMMENT")"
+
+TIMELINE_JSON="$(gh api "repos/{owner}/{repo}/issues/$ISSUE/timeline" --paginate 2>"$GH_STDERR")" || {
+  echo "ERROR: 'gh api .../issues/$ISSUE/timeline' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
+  exit 1
+}
+
+# Newest `labeled loom:issue` event (by created_at) in the timeline — mirrors
+# check-evaluating-staleness.sh's own `sort_by`-free `last` selection pattern.
+# RFC3339 UTC timestamps compare correctly as plain strings, so no epoch
+# conversion is needed just to find the max.
+LATEST_LABELED_AT="$(jq -r '
+  [.[] | select(.event=="labeled" and .label.name=="loom:issue") | .created_at]
+  | sort
+  | last // empty
+' <<<"$TIMELINE_JSON" 2>/dev/null || true)"
+
+if [[ -n "$LATEST_LABELED_AT" && -n "$APPROVED_AT" && "$LATEST_LABELED_AT" > "$APPROVED_AT" ]]; then
+  emit "OK" "loom:issue was applied after the APPROVED comment and the issue has since progressed — nothing to reconcile"
   exit 0
 fi
 

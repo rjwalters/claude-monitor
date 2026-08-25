@@ -106,6 +106,15 @@ under "Creating Follow-up Issues" and "Raising Concerns") is a separate
 GraphQL mutation with its own REST fallback: `.loom/docs/gh-issue-create-rest-fallback.md`
 (or `forge_gh_create_issue_rl_safe` in the same `lib/forge-helpers.sh`, #5047).
 
+**`GraphQL: Body is too long` is a different, non-rate-limit rejection — do
+not apply this REST fallback to it (#6930).** A PR/issue body edit that
+exceeds GitHub's ~256 KiB hard cap is not in the signature table above and is
+not a quota problem — REST's `PATCH .../issues/{n}` "succeeds" only because
+it skips the same size check, and a blind PATCH there can silently clobber a
+concurrent writer's edit with no error raised. If you hit this rejection
+while writing a PR body, switch to posting the update as a comment instead —
+full incident and rationale in `.loom/docs/graphql-body-size-cap.md`.
+
 ## Your Role
 
 **Your primary task is to evaluate PRs labeled `loom:review-requested` (green badges).**

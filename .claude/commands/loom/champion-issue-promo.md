@@ -385,6 +385,7 @@ issue it does exactly one of:
 | `DECISION` | What happened |
 |---|---|
 | `OK` | No APPROVED comment (a search false-positive, or `loom:issue` already present — a concurrent pass may have just reconciled it) — nothing done |
+| `OK` (timeline-confirmed) | `loom:issue` is currently absent, but the label timeline shows it WAS applied after the newest APPROVED comment and the issue has since legitimately progressed further (e.g. `loom:issue` -> `loom:building`, or -> `loom:blocked`) — the promotion landed; this is not #6862's failure mode, and re-adding `loom:issue` here would corrupt the issue's current, further-along state (#6933) |
 | `NOT_OPEN` | Issue is closed — nothing left to reconcile |
 | `COMPLETED` | Recovered the tier from the verdict comment's "Goal Alignment" line, applied `loom:issue` + that tier, and **confirmed the addition via its own read-back** — the issue is now a normal, Builder-visible `loom:issue` |
 | `ESCALATED` | Could not safely complete (tier unrecoverable from the comment text, or the completing edit's own read-back still failed) — posted an explanatory comment and added `loom:operator-only,loom:operator-mechanical` rather than guess |

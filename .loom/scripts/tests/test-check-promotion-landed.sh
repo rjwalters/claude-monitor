@@ -107,6 +107,13 @@ trap 'rm -rf "$STUB_DIR" 2>/dev/null || true' EXIT
 #                                                       (fails if comment-fail-<N> exists)
 #   gh issue edit <N> ...                           -> append to $STUB_DIR/edit-writes.log
 #                                                       (fails if edit-fail-<N> exists)
+#   gh api repos/{owner}/{repo}/issues/<N>/timeline --paginate
+#                                                    -> cat $STUB_DIR/timeline-<N>.json (or
+#                                                       "[]" when no fixture staged, i.e. the
+#                                                       #6933 timeline check finds nothing and
+#                                                       the pre-existing MISMATCH/COMPLETED/
+#                                                       ESCALATED behavior is unchanged; fails
+#                                                       if timeline-fail-<N> exists)
 cat > "$STUB_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 STUB_DIR_FROM_ENV="${LOOM_TEST_STUB_DIR:?stub gh: LOOM_TEST_STUB_DIR not set}"
@@ -172,6 +179,22 @@ case "$1" in
     echo "stub gh: unhandled issue args: $*" >&2
     exit 3
     ;;
+  api)
+    path="$2"
+    if [[ "$path" == repos/*/issues/*/timeline ]]; then
+      num="${path#repos/*/issues/}"
+      num="${num%/timeline}"
+      if [[ -f "$STUB_DIR_FROM_ENV/timeline-fail-$num" ]]; then
+        echo "stub gh: timeline fetch failed" >&2
+        exit 1
+      fi
+      canned="$STUB_DIR_FROM_ENV/timeline-$num.json"
+      if [[ -f "$canned" ]]; then cat "$canned"; else echo "[]"; fi
+      exit 0
+    fi
+    echo "stub gh: unhandled api args: $*" >&2
+    exit 3
+    ;;
   *)
     echo "stub gh: unhandled args: $*" >&2
     exit 3
@@ -212,9 +235,19 @@ stage_verify() {
     printf '{"labels":%s}' "$2" > "$STUB_DIR/verify-$1.json"
 }
 
+# labeled_event <created_at> -- a `labeled loom:issue` timeline event.
+labeled_event() {
+    printf '{"event":"labeled","created_at":"%s","label":{"name":"loom:issue"}}' "$1"
+}
+
+# stage_timeline <N> <events-json-array> -- what `gh api .../timeline` returns.
+stage_timeline() {
+    printf '%s' "$2" > "$STUB_DIR/timeline-$1.json"
+}
+
 reset_state() {
-    rm -f "$STUB_DIR"/issue-*.json "$STUB_DIR"/verify-*.json
-    rm -f "$STUB_DIR"/issue-fail-* "$STUB_DIR"/verify-fail-*
+    rm -f "$STUB_DIR"/issue-*.json "$STUB_DIR"/verify-*.json "$STUB_DIR"/timeline-*.json
+    rm -f "$STUB_DIR"/issue-fail-* "$STUB_DIR"/verify-fail-* "$STUB_DIR"/timeline-fail-*
     rm -f "$STUB_DIR"/comment-fail-* "$STUB_DIR"/edit-fail-*
     rm -f "$STUB_DIR"/comment-writes.log "$STUB_DIR"/edit-writes.log
 }
@@ -353,6 +386,94 @@ assert_contains "$ERR" "required" "(k) stderr explains the usage error"
 reset_state
 run_sut --issue abc
 assert_eq "1" "$RC" "(l) non-numeric --issue -> exit 1"
+
+# --- #6933: loom:issue currently absent but the issue legitimately progressed
+# further (loom:issue -> loom:building/loom:blocked) AFTER promotion actually
+# landed. Judging purely from the current label set (no loom:issue present)
+# looks identical to #6862's lost-write MISMATCH; the timeline check must
+# distinguish the two so this case does NOT get loom:issue re-added on top of
+# the issue's current further-along label.
+
+# (m) APPROVED comment present, loom:issue currently absent, but the label
+#     timeline shows a `labeled loom:issue` event AFTER the comment -> the
+#     promotion landed and the issue has since moved on. DECISION=OK, exit 0,
+#     no writes at all (not even a report).
+reset_state
+issue_json "OPEN" "$(labels_json "loom:building")" \
+  "[$(approved_comment "2026-08-18T00:00:00Z" "**Goal Alignment**: Tier 3 (maintenance) - cleanup")]" \
+  > "$STUB_DIR/issue-400.json"
+stage_timeline 400 "[$(labeled_event "2026-08-18T00:05:00Z")]"
+run_sut --issue 400
+assert_eq "0" "$RC" "(m) loom:issue applied after APPROVED comment, issue since progressed -> exit 0"
+assert_eq "OK" "$(get_field "$OUT" DECISION)" "(m) DECISION=OK (timeline-confirmed)"
+assert_eq "" "$EDITS" "(m) no label edit issued -- must not re-add loom:issue on top of loom:building"
+assert_eq "" "$COMMENTS_POSTED" "(m) no comment posted"
+run_sut --issue 400 --apply
+assert_eq "0" "$RC" "(m) same result even with --apply (nothing to reconcile)"
+assert_eq "OK" "$(get_field "$OUT" DECISION)" "(m) DECISION=OK under --apply too"
+assert_eq "" "$EDITS" "(m) --apply still issues no label edit"
+
+# (n) Regression: APPROVED comment present, loom:issue currently absent, and a
+#     `labeled loom:issue` timeline event exists but it is BEFORE the comment
+#     (e.g. the label was applied, then somehow removed, predating this
+#     verdict) -- this is NOT the #6933 case, direction matters. Must still
+#     fall through to the existing #6862 MISMATCH behavior, unchanged.
+reset_state
+issue_json "OPEN" "$(labels_json "loom:auditor")" \
+  "[$(approved_comment "2026-08-18T00:00:00Z" "**Goal Alignment**: Tier 3 (maintenance) - cleanup")]" \
+  > "$STUB_DIR/issue-401.json"
+stage_timeline 401 "[$(labeled_event "2026-08-17T00:00:00Z")]"
+run_sut --issue 401
+assert_eq "11" "$RC" "(n) labeled-loom:issue event predates the APPROVED comment -> still exit 11"
+assert_eq "MISMATCH" "$(get_field "$OUT" DECISION)" "(n) DECISION=MISMATCH (direction-sensitive, not fooled by an earlier event)"
+
+# (o) Regression, explicit: no `labeled loom:issue` timeline event at all
+#     (empty timeline, the default when no fixture is staged) -- must still
+#     behave exactly like the pre-#6933 script: MISMATCH.
+reset_state
+issue_json "OPEN" "$(labels_json "loom:auditor")" \
+  "[$(approved_comment "2026-08-18T00:00:00Z" "**Goal Alignment**: Tier 3 (maintenance) - cleanup")]" \
+  > "$STUB_DIR/issue-402.json"
+run_sut --issue 402
+assert_eq "11" "$RC" "(o) no labeled loom:issue timeline event -> exit 11, MISMATCH unchanged"
+assert_eq "MISMATCH" "$(get_field "$OUT" DECISION)" "(o) DECISION=MISMATCH"
+
+# (p) Multiple APPROVED comments (re-evaluation): a `labeled loom:issue` event
+#     lands between the two APPROVED comments -- it postdates the OLDEST
+#     comment but predates the NEWEST one. The comparison must use the
+#     NEWEST comment (matching the existing `sort_by(.createdAt) | last`
+#     selection for APPROVED_COMMENT), so this must still be MISMATCH, not OK.
+reset_state
+issue_json "OPEN" "$(labels_json "loom:auditor")" \
+  "[$(approved_comment "2026-08-10T00:00:00Z" "**Goal Alignment**: Tier 2 - first pass"), $(approved_comment "2026-08-20T00:00:00Z" "**Goal Alignment**: Tier 3 (maintenance) - re-evaluated")]" \
+  > "$STUB_DIR/issue-403.json"
+stage_timeline 403 "[$(labeled_event "2026-08-11T00:00:00Z")]"
+run_sut --issue 403
+assert_eq "11" "$RC" "(p) labeled loom:issue event postdates oldest APPROVED comment but predates newest -> exit 11"
+assert_eq "MISMATCH" "$(get_field "$OUT" DECISION)" "(p) DECISION=MISMATCH -- compared against the NEWEST APPROVED comment, not the oldest"
+
+# (q) Same multi-comment shape, but the timeline event postdates BOTH APPROVED
+#     comments (i.e. after the re-evaluation too) -> OK, correctly compared
+#     against the newest comment.
+reset_state
+issue_json "OPEN" "$(labels_json "loom:building")" \
+  "[$(approved_comment "2026-08-10T00:00:00Z" "**Goal Alignment**: Tier 2 - first pass"), $(approved_comment "2026-08-20T00:00:00Z" "**Goal Alignment**: Tier 3 (maintenance) - re-evaluated")]" \
+  > "$STUB_DIR/issue-404.json"
+stage_timeline 404 "[$(labeled_event "2026-08-20T00:05:00Z")]"
+run_sut --issue 404
+assert_eq "0" "$RC" "(q) labeled loom:issue event postdates the newest APPROVED comment -> exit 0"
+assert_eq "OK" "$(get_field "$OUT" DECISION)" "(q) DECISION=OK"
+
+# (r) `gh api .../timeline` fetch itself fails -> exit 1, usage/environment
+#     error, same treatment as the initial `gh issue view` failure (j).
+reset_state
+issue_json "OPEN" "$(labels_json "loom:auditor")" \
+  "[$(approved_comment "2026-08-18T00:00:00Z" "**Goal Alignment**: Tier 3 (maintenance)")]" \
+  > "$STUB_DIR/issue-405.json"
+touch "$STUB_DIR/timeline-fail-405"
+run_sut --issue 405
+assert_eq "1" "$RC" "(r) gh api timeline failure -> exit 1"
+assert_contains "$ERR" "timeline" "(r) stderr names the failing gh api call"
 
 echo
 echo "--- Doc pins: champion-issue-promo.md ships the reordered write-then-verify Step 3b and the Pass 0c reconciliation loop (#6862) ---"
