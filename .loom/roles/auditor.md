@@ -167,7 +167,7 @@ repo) then:
 
 Some repos' only "build" is an **expensive** run — most notably SPICE/`ngspice`
 circuit simulations, which have caused sim storms on this fleet (#4903:
-`loom-worker-1` at loadavg 95 on 8 cores from 16 concurrent `ngspice` processes).
+an 8-core fleet worker at loadavg 95 from 16 concurrent `ngspice` processes).
 **A routine interval tick MUST NOT launch simulation or other heavy compute** just
 because it discovered a `Makefile` target that runs one. Only run expensive
 validation when the repo has **explicitly opted in**, signalled by *either*:
