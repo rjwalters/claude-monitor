@@ -30,7 +30,7 @@ each definition, for the terse version of this same table):
 | Label | Question it answers | Does sweep/shepherd skip it? |
 |---|---|---|
 | `loom:blocked` | Waiting on a dependency, but still automatable once that clears | No |
-| `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it |
+| `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it, except the narrow capability-matched `loom:operator-mechanical` case (#6893, see "Dispatch path" below) |
 | `loom:needs-capability` | Blocked on a missing tool/agent capability — not an operator-by-right decision, but automation genuinely cannot proceed without the capability existing first (#5817) | **Yes** — sweep/shepherd skip it, identically to `loom:operator-only` today |
 | `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **No** — stays in the normal re-evaluation queue |
 
@@ -238,12 +238,16 @@ sub-kind is additive metadata the skip logic does not currently branch on.
 `loom:operator-mechanical`'s "no judgement required" describes the *nature of
 the work* — a worker with the right host/credential/admin access could do it
 without a ruling — not a claim that it is dispatched differently than
-`loom:operator-decision` today; the base label wins for all four sub-kinds.
-Making the skip capability-aware for the mechanical sub-kind specifically —
-so a worker that holds the declared capability may attempt it instead of
-parking unconditionally — is tracked separately (#6885); until that lands,
-treat "no judgement required" as a routing hint for a future capability-aware
-pass, not as a description of today's dispatch behavior.
+`loom:operator-decision`; the base label wins for all four sub-kinds **unless
+the capability lane below applies**.
+
+**Updated by #6893.** The skip is now capability-aware for the mechanical
+sub-kind specifically — see "Dispatch path" under the convention below. The
+paragraph above still describes the default: a `loom:operator-mechanical` item
+with no capability declaration, or one this worker cannot satisfy, is skipped
+identically to the other three sub-kinds. What changed is that "no judgement
+required" is no longer *only* a routing hint — for a declaring item on a
+declaring host it is now a real, narrow, propose-only dispatch path.
 
 ### Capability-declaration convention (`<!-- loom:capability=<name> -->`, #6885/#6892)
 
@@ -306,7 +310,12 @@ marker's plain `[a-z]*` to accommodate the colon-parameterized
 `cloud-profile:<name>` family. Unlike the complexity marker (`tail -1`, last
 match wins because only one tier is ever valid), a capability-bearing item
 collects **every** matching marker, deduplicated — the whole declared set
-matters, not just the last one written.
+matters, not just the last one written. The whitespace immediately before
+the closing `-->` is optional — `<!--loom:capability=host-sudo-->` and
+`<!-- loom:capability=host-sudo -->` parse identically — but both reference
+parsers anchor extraction on the closing delimiter itself (#6914), so a
+value never picks up the delimiter's own leading dashes when there is no
+space to stop it first.
 
 A reference implementation of this exact contract lives at
 `defaults/scripts/extract-capability-markers.sh` (tests:
@@ -317,9 +326,59 @@ capability-aware dispatch check should parse a body identically to that
 reference rather than deriving their own regex, so the two surfaces cannot
 silently diverge on what counts as a valid marker.
 
-This issue's own convention work makes **no dispatch-logic change** — no
-skip-decision anywhere currently reads this marker. It exists purely so
-#6893's dispatch path has a stable, tested format to consume.
+The convention work itself (#6892) made **no dispatch-logic change**. #6893
+added the consumer described next.
+
+### Dispatch path (#6893) — propose-only, opt-in per host, fail-closed
+
+Two surfaces read the marker and may route a `loom:operator-mechanical` item
+somewhere other than the `loom:operator-only` park:
+
+| Surface | Where |
+|---|---|
+| Daemon (Tier 2 dispatch) | `loom-daemon/src/capability.rs` + `WorkItem::is_skipped_with_capabilities` / the `SweepRegistry` step-2.7 park guard |
+| Sweep (`all` sentinel + Mode C C0) | `defaults/.claude/commands/loom/sweep.md` → "Capability-aware `loom:operator-mechanical` lane" |
+
+Both apply the **same four gates**, in order, and any failure means "skipped
+exactly as before":
+
+1. **The host declares capabilities.** `LOOM_WORKER_CAPABILITIES` (a comma- or
+   whitespace-separated list of closed-vocabulary values) is set in the
+   *environment*. Unset — the default everywhere — makes the whole path inert.
+   It is deliberately **not** readable from `.loom/config.json`: a capability is
+   a property of the machine and its credentials, and a file committed to git
+   must not be able to assert that the host running it has root. A worker's own
+   declared values are validated against the same closed vocabulary, so a typo'd
+   hold grants nothing.
+2. **Labels are exactly the mechanical shape** — `loom:operator-only` **and**
+   `loom:operator-mechanical`, and **none** of `loom:operator-decision`,
+   `loom:operator-blocked`, `loom:operator-objective`, `loom:needs-capability`,
+   `loom:blocked`, `loom:operator`. A contradictory pairing resolves in favour
+   of the judgement sub-kind.
+3. **The body declares ≥1 marker and every declared value is recognized** (the
+   fail-closed rule above; an unknown value is exactly as undispatchable as no
+   value).
+4. **The host holds every declared capability** (markers are ANDed).
+
+**What the lane may then do is produce a proposal — never a live credentialed
+action.** The worker emits the exact commands (or a PR) for an operator to
+approve and stops; the item keeps both labels and is not closed. A
+live-execution mode is a separate, explicit opt-in that this work deliberately
+did not build.
+
+**When a declared capability is not held**, the item still parks — but the
+worker leaves a comment naming the missing capability, turning a silent stall
+into a capability request.
+
+**When anything encountered turns out to require a judgement call** rather than
+mechanical execution, the worker hard-stops and relabels
+`loom:operator-mechanical` → `loom:operator-decision` (or
+`loom:operator-objective`), which makes the stop durable: gate 2 refuses the
+item on every later pass.
+
+`loom:needs-capability` is **unaffected** — different label, different problem
+(see "Bidirectional routing" below): it asserts the capability does not exist
+yet, which no worker can hold.
 
 ### The classifying question, before choosing `loom:operator-decision` (#5826)
 

@@ -79,7 +79,17 @@ is_known() {
 declare -A seen_valid=()
 unknown=()
 for m in "${raw_matches[@]}"; do
-  value="$(sed -E 's/.*capability=([a-z0-9][a-z0-9:_-]*).*/\1/' <<<"$m")"
+  # Anchored on the same `[[:space:]]*-->` terminator the recognition regex
+  # above matched (#6914) -- `-` is both a legal value character and the head
+  # of the closing delimiter, so an unanchored greedy capture (the pre-#6914
+  # form: `s/.*capability=([a-z0-9][a-z0-9:_-]*).*/\1/`) could cross into the
+  # delimiter's own dashes on a no-space marker like
+  # `<!--loom:capability=tailnet-access-->`, yielding `tailnet-access--`
+  # instead of `tailnet-access`. Anchoring the capture on `-->` (optionally
+  # preceded by whitespace) forces the regex engine to backtrack the capture
+  # to stop exactly where recognition already decided the value ends, so the
+  # two steps agree.
+  value="$(sed -E 's/.*capability=([a-z0-9][a-z0-9:_-]*)[[:space:]]*-->.*/\1/' <<<"$m")"
   if is_known "$value"; then
     seen_valid["$value"]=1
   else

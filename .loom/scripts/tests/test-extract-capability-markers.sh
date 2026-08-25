@@ -166,6 +166,23 @@ out="$(run_parser "This doc describes \`<!-- loom:capability=<name> -->\` as the
 assert_eq "1" "$rc" "prose-only mention (no live marker) exits 1, not a false positive"
 assert_eq "" "$out" "prose-only mention prints nothing"
 
+# -------- Test 11: no-space marker form -- extraction must not swallow the
+# closing delimiter's dashes (#6914) --------
+echo "Test 11: no-space marker form -- value must not pick up the closing delimiter's dashes"
+out="$(run_parser '<!--loom:capability=tailnet-access-->' 2>/dev/null)"; rc=$?
+assert_eq "0" "$rc" "no-space marker exits 0"
+assert_eq "tailnet-access" "$out" "no-space marker's value excludes the closing delimiter's dashes"
+
+# -------- Test 12: genuinely dash-suffixed value, no-space form -- must still
+# fail closed as unknown (distinct from Test 11 -- the trailing dash here is
+# part of the declared value itself, not the closing delimiter) --------
+echo "Test 12: dash-suffixed value with no space before the delimiter still fails closed"
+capture_parser '<!--loom:capability=host-sudo--->'
+assert_eq "2" "$CAP_RC" "no-space dash-suffixed value exits 2"
+assert_eq "" "$CAP_OUT" "no-space dash-suffixed value prints nothing to stdout"
+assert_contains "host-sudo-" "$CAP_ERR" "stderr names the value with exactly one trailing dash, not extra"
+assert_not_contains "host-sudo--" "$CAP_ERR" "stderr does not name the value with the delimiter's dashes appended"
+
 # -------- Summary --------
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
