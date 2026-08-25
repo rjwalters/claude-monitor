@@ -1237,29 +1237,57 @@ gh issue edit <number> --add-label "loom:blocked"
 
 GitHub automatically checks boxes when issues close. **Before acting on all-boxes-checked, first check for a superseding block reason (#4634)** —
 `loom:blocked` can get re-applied later for a reason that has nothing to do
-with the body's original Dependencies section (e.g. this issue's own
-implementation PR later hit the Doctor-cycle cap and needs human review). A
-body dependency closing does NOT mean the label's *current* justification has
-cleared, and blindly trusting it caused a live flip-flop loop on #4492: three
-separate Curator passes each stripped `loom:blocked` citing "dependency
-resolved" while the real, current block (an open PR with
-`loom:changes-requested`) was still active, forcing Champion to keep manually
-re-blocking with the real reason each time.
+with the body's original Dependencies section. A body dependency closing does
+NOT mean the label's *current* justification has cleared, and blindly
+trusting it caused a live flip-flop loop on #4492: three separate Curator
+passes each stripped `loom:blocked` citing "dependency resolved" while the
+real, current block (an open PR with `loom:changes-requested`) was still
+active, forcing Champion to keep manually re-blocking with the real reason
+each time.
 
 **Primary check (preferred, mechanical/testable) — run this first:**
 ```bash
-# Any PR that would close this issue, still OPEN and carrying
-# loom:changes-requested or loom:blocked, is a superseding CURRENT block
-# reason — regardless of what the body's Dependencies section says.
+# Any PR that would close this issue, still OPEN, is checked below for two
+# independent superseding-block signals — label state and merge state.
 gh issue view <number> --json closedByPullRequestsReferences \
   --jq '.closedByPullRequestsReferences[].number'
 # For each PR number returned:
-gh pr view <pr_number> --json state,labels
-# state == "OPEN" AND labels include loom:changes-requested or loom:blocked
-#   → a superseding block is active. Leave loom:blocked in place, do NOT mark
-#     loom:curated, and do NOT post an "unblocked"/"dependencies resolved"
-#     comment — even though the body's checklist is fully checked.
+gh pr view <pr_number> --json state,labels,mergeable,mergeStateStatus
 ```
+
+`closedByPullRequestsReferences` returns **this issue's own
+implementing/closing PR(s)** — the PR(s) GitHub will merge to close *this*
+issue. It is unrelated to a prerequisite PR belonging to a *different* issue
+named in this issue's own Dependencies checklist — that is a separate case,
+outside the scope of this primary check, and is unaffected by anything below.
+Evaluate each returned still-OPEN PR against both sub-checks, in order —
+**this is unambiguous and covers every case, including this issue's own
+implementing PR**:
+
+- **Label check (primary signal).** `state == "OPEN"` AND `labels` includes
+  `loom:changes-requested` or `loom:blocked` → a superseding block is active.
+  Leave `loom:blocked` in place, do NOT mark `loom:curated`, and do NOT post
+  an "unblocked"/"dependencies resolved" comment — even though the body's
+  checklist is fully checked. (This is the #4492 case above, restated as its
+  own explicit rule: it also covers the case where this issue's own
+  implementing PR hits the Doctor-cycle cap and needs human review, which
+  surfaces as `loom:changes-requested` on that same PR.)
+- **An open implementing PR carrying neither `loom:changes-requested` nor
+  `loom:blocked` is NOT, by itself, a superseding block.** This includes an
+  open implementing PR carrying only `loom:pr`/`loom:operator`
+  (Judge-approved, held on a Champion merge-risk hold — the #6317 case) — that
+  label combination does **not** trigger this check on label grounds alone.
+  Continue to the merge-state check below before concluding "no block."
+- **Merge-state check (secondary signal, independent of labels).**
+  Regardless of what labels are present, `mergeable == "CONFLICTING"` or
+  `mergeStateStatus` in (`"DIRTY"`, `"CONFLICTING"`) on that same open PR is,
+  on its own, independently sufficient evidence of a superseding block — a PR
+  in that state cannot currently land no matter what its labels say. Treat it
+  exactly like the label check above: leave `loom:blocked` in place and do
+  not mark `loom:curated`.
+- Only when every open implementing PR clears **both** checks (no blocking
+  label, and `mergeable`/`mergeStateStatus` is not `CONFLICTING`/`DIRTY`) —
+  or there is no open implementing PR at all — does this primary check clear.
 
 **Secondary heuristic (fragile, optional defense-in-depth, does NOT override
 the primary check above):** if there is no linked PR at all, scan recent

@@ -1718,6 +1718,70 @@ function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
     }
     varmap[vname] = vval
 }
+# strip_subst_close_parens() -- drop the closing paren(s) of an ENCLOSING
+# `$(...)` command substitution that whitespace tokenization left glued onto a
+# write-target token (#6940).
+#
+# extract_write_targets() is a whitespace/quote-aware TOKENIZER, not a shell
+# parser: it has no notion of command-substitution nesting, so in the extremely
+# common capture-stderr idiom
+#
+#     ERR_FILE=/tmp/champion_ci_err_6212.txt
+#     out=$(gh pr checks "$PR" --json bucket 2>"$ERR_FILE")
+#
+# the `2>` redirect target arrives at resolve_var_q() as the literal token
+#     "$ERR_FILE")
+# -- the `)` that actually terminates the SURROUNDING `$(`...`)` is still
+# attached, because nothing separated it from the target by whitespace.
+# the double-quote-pair test in resolve_var_q() (and the leading-`$` test
+# inside resolve_var()) then both miss, so a target whose value the resolver had
+# ALREADY recorded from a literal same-command assignment moments earlier fell
+# through unresolved and denied with `worktree-write-confinement-unresolved-
+# var`. The identical command WITHOUT the `$(...)` wrapper resolved fine, so
+# this was a tokenization gap, not an intentional "a substitution is a fresh
+# unresolvable scope" rule (#6940; same defect class as the #6444 quote gap
+# directly below).
+#
+# NARROWNESS -- only an UNBALANCED trailing `)` is stripped: the token`s own
+# parens are counted, and at most (closes - opens) trailing `)` characters are
+# removed. A paren that belongs to the TOKEN ITSELF is therefore never touched,
+# which is what keeps the fail-closed contract intact for the cases that matter:
+#   - `$(mktemp -d)` / `"$(mktemp)"` as the target is BALANCED -> untouched ->
+#     still not a bare variable reference -> still unresolvable -> still denies.
+#   - `$(mktemp))` (a dynamic target inside an enclosing substitution) loses
+#     exactly ONE paren, leaving `$(mktemp)` -- still unresolvable, still denies.
+#   - a process substitution argument (`>(cmd)`) is balanced -> untouched.
+# Parens inside a quoted span are counted like any other, so quoted paren DATA
+# can only ever SUPPRESS a strip (leaving the pre-#6940 unresolved/deny
+# behavior), never manufacture one.
+#
+# Stripping cannot widen an allow on its own either: the returned token is
+# still handed to resolve_var() (unchanged fail-closed semantics -- an
+# unresolvable name comes back untouched) and the resolved path is still run
+# through the SAME containment check, so this can never grant more than writing
+# that literal path outright would already grant (the #6172 argument). Removing
+# a trailing `)` only ever SHORTENS a path within the same parent directory, so
+# a target that was inside the main checkout stays inside it.
+function strip_subst_close_parens(tok,   i, n, c, opens, closes, excess) {
+    n = length(tok)
+    if (n == 0) return tok
+    if (substr(tok, n, 1) != ")") return tok
+    opens = 0
+    closes = 0
+    for (i = 1; i <= n; i++) {
+        c = substr(tok, i, 1)
+        if (c == "(") { opens++ } else if (c == ")") { closes++ }
+    }
+    excess = closes - opens
+    if (excess <= 0) return tok
+    while (excess > 0) {
+        n = length(tok)
+        if (n == 0 || substr(tok, n, 1) != ")") break
+        tok = substr(tok, 1, n - 1)
+        excess--
+    }
+    return tok
+}
 # resolve_var_q() -- quote-aware wrapper around resolve_var(), used by the
 # five write-target print sites inside extract_write_targets() (#6444).
 # qsplit() deliberately preserves quote characters verbatim in each token
@@ -1738,6 +1802,10 @@ function record_assign(word,   eqpos, vname, vval, vlen, c1, c2) {
 # falls through to resolve_var() exactly as it did before this wrapper
 # existed.
 function resolve_var_q(tok,   n, c1, c2) {
+    # #6940: peel an enclosing `$(...)`s trailing paren FIRST, so the quote
+    # test below (and resolve_var()s leading-$ test after it) sees the real
+    # target token rather than one with a stray `)` glued on.
+    tok = strip_subst_close_parens(tok)
     n = length(tok)
     if (n >= 2) {
         c1 = substr(tok, 1, 1)
