@@ -19,6 +19,26 @@
 # argument (`loom-daemon noop-cooldown record <ISSUE> --reason ...`), NOT a
 # `--issue` flag.
 #
+# `--workspace-root` (Issue #6957): the caller (sweep.md) has never passed
+# this explicitly, which is fine on a single-workspace daemon (the default
+# registry IS that one repo's registry) but silently mis-routes on a
+# multi-workspace daemon (the epic supervisor's fan-out, #3928) — the daemon
+# side (`resolve_registry` in `loom-daemon/src/ipc.rs`) falls back to its
+# cwd-seeded "default" registry whenever `workspace_root` is absent, which is
+# very unlikely to be the calling repo's OWN per-repo registry (the one the
+# epic supervisor's dispatch guard actually reads, via
+# `WorkspacePool::get_or_provision`). A no-op recorded against the wrong
+# registry is invisible to the repo that needs the cooldown, producing an
+# unbounded re-dispatch loop on a candidate whose conclusion never changes
+# (observed on a `loom:epic-phase` tracking issue blocked on a
+# `loom:operator-only` sub-issue). To fix this without requiring every caller
+# to remember the flag, default `--workspace-root` to `$_repo_root` (already
+# computed just below, for daemon-binary resolution) whenever the caller
+# doesn't supply one explicitly — this is exactly the repo the sweep
+# orchestrator is running against, and is a no-op on a single-workspace
+# daemon (that repo's root IS the seeded default workspace, so
+# `resolve_registry` resolves back to the same shared registry either way).
+#
 # Usage:
 #   record-noop-release.sh <ISSUE> [--reason TEXT] [--workspace-root PATH]
 #
@@ -81,6 +101,14 @@ _daemon_bin="$(loom_locate_daemon_bin "$_repo_root" 2>/dev/null || true)"
 if [[ -z "$_daemon_bin" || ! -x "$_daemon_bin" ]]; then
   echo "[record-noop-release] note: no loom-daemon binary resolved — skipping noop-cooldown record for issue #${ISSUE} (best-effort, #6670)" >&2
   exit 0
+fi
+
+# #6957: default to this repo's own root when the caller didn't supply
+# --workspace-root explicitly, so a multi-workspace daemon arms the cooldown
+# on the registry the epic supervisor / work finder actually reads for this
+# repo, not its cwd-seeded "default" registry (see the header comment above).
+if [[ -z "$WORKSPACE_ROOT" ]]; then
+  WORKSPACE_ROOT="$_repo_root"
 fi
 
 _args=(noop-cooldown record "$ISSUE")

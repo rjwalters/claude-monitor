@@ -4194,6 +4194,24 @@ no PR was opened — the exact "checkpoint written, claim released cleanly,
 zero forge/issue mutation" shape this section describes. Hermetic call-shape
 test: `defaults/scripts/tests/test-record-noop-release.sh`.
 
+**Multi-workspace routing (#6957).** `record-noop-release.sh` never used to
+pass `--workspace-root` on the caller's behalf, which is harmless on a
+single-workspace daemon but silently misroutes on a multi-workspace one (the
+epic supervisor's multi-repo fan-out, #3928): the IPC `RecordNoopRelease`
+handler resolves its target registry via `resolve_registry`, which falls
+back to the daemon's single cwd-seeded "default" registry whenever
+`workspace_root` is absent — very unlikely to be the calling repo's own
+per-repo registry (`WorkspacePool::get_or_provision`, the same call the epic
+supervisor's dispatch guard uses to read cooldown state). A no-op recorded
+against the wrong registry is invisible to the repo that needs it, producing
+an unbounded re-dispatch loop on a candidate whose conclusion never changes
+— observed live on a `loom:epic-phase` tracking issue blocked on a
+`loom:operator-only` sub-issue (~25 identical no-op cycles over 5 hours).
+The script now defaults `--workspace-root` to its own `$_repo_root`
+(resolved via `git rev-parse --show-toplevel`) whenever the caller doesn't
+supply one explicitly, so the cooldown always arms the correct registry
+regardless of how many repos the daemon manages.
+
 **Verified-open-PR memo (#6788).** The three brakes above bound how often an
 issue is *re-dispatched*. A fourth, narrower problem sits one layer down, in the
 #4123 open-PR guard's own probe: an issue whose closing PR is parked awaiting a

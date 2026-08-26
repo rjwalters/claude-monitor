@@ -153,7 +153,75 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Section 3: a genuine usage error is NOT swallowed (distinct from the
+# Section 3: --workspace-root auto-derivation (#6957)
+#
+# The script's caller (`/loom:sweep`'s Builder phase, see sweep.md) has never
+# passed --workspace-root explicitly. On a single-workspace daemon that is
+# harmless (the daemon's cwd-seeded default registry IS the one repo's
+# registry), but on a multi-workspace daemon (the epic supervisor's
+# multi-repo fan-out, #3928) the omission silently arms the cooldown on the
+# WRONG registry — the daemon's `resolve_registry` falls back to its
+# cwd-seeded "default" registry whenever `workspace_root` is absent, which is
+# unlikely to be the calling repo's own per-repo registry. Fix: the script
+# now defaults --workspace-root to this repo's own root ($_repo_root,
+# resolved via `git rev-parse --show-toplevel`) whenever the caller doesn't
+# supply one, so the daemon always arms the cooldown on the correct registry
+# regardless of caller diligence.
+# ---------------------------------------------------------------------------
+
+EXPECTED_ROOT="$(cd "$REPO_ROOT" && git rev-parse --show-toplevel 2>/dev/null)"
+
+if [[ -z "$EXPECTED_ROOT" ]]; then
+    echo "ERROR: could not resolve REPO_ROOT's git toplevel — is $REPO_ROOT inside a git checkout?" >&2
+    exit 1
+fi
+
+: > "$CALL_LOG"
+autoroot_output="$(cd "$REPO_ROOT" && LOOM_DAEMON_BIN="$STUB_DIR/loom-daemon" \
+    bash "$RECORD_NOOP" 6957 --reason "no explicit workspace-root supplied" 2>&1)"
+autoroot_rc=$?
+
+if [[ "$autoroot_rc" -eq 0 ]]; then
+    pass "recording a no-op release with no --workspace-root still exits 0"
+else
+    fail "expected exit 0, got $autoroot_rc: $autoroot_output"
+fi
+
+if grep -Fq -- "--workspace-root $EXPECTED_ROOT" "$CALL_LOG" 2>/dev/null; then
+    pass "with no explicit --workspace-root, the call auto-derives it from the repo root (#6957)"
+else
+    fail "expected '--workspace-root $EXPECTED_ROOT' to be auto-derived, log was: $(cat "$CALL_LOG" 2>/dev/null)"
+fi
+
+# An explicit --workspace-root must still win over the auto-derived default
+# (e.g. a future caller that DOES know the right root explicitly).
+: > "$CALL_LOG"
+EXPLICIT_ROOT="$STUB_DIR/some-other-repo"
+mkdir -p "$EXPLICIT_ROOT"
+explicit_output="$(cd "$REPO_ROOT" && LOOM_DAEMON_BIN="$STUB_DIR/loom-daemon" \
+    bash "$RECORD_NOOP" 6958 --reason "x" --workspace-root "$EXPLICIT_ROOT" 2>&1)"
+explicit_rc=$?
+
+if [[ "$explicit_rc" -eq 0 ]]; then
+    pass "recording a no-op release with an explicit --workspace-root still exits 0"
+else
+    fail "expected exit 0, got $explicit_rc: $explicit_output"
+fi
+
+if grep -Fq -- "--workspace-root $EXPLICIT_ROOT" "$CALL_LOG" 2>/dev/null; then
+    pass "an explicit --workspace-root overrides the auto-derived repo root"
+else
+    fail "expected '--workspace-root $EXPLICIT_ROOT' to be forwarded verbatim, log was: $(cat "$CALL_LOG" 2>/dev/null)"
+fi
+
+if grep -Fq -- "$EXPECTED_ROOT" "$CALL_LOG" 2>/dev/null; then
+    fail "explicit --workspace-root call unexpectedly also mentions the auto-derived repo root: $(cat "$CALL_LOG" 2>/dev/null)"
+else
+    pass "explicit --workspace-root call does not also carry the auto-derived repo root"
+fi
+
+# ---------------------------------------------------------------------------
+# Section 4: a genuine usage error is NOT swallowed (distinct from the
 # daemon-availability cases above)
 # ---------------------------------------------------------------------------
 
