@@ -93,6 +93,7 @@ test-guide-docs-pr-exclude-refresh.sh
 test-guide-docs-pr-race.sh
 test-guide-docs-telemetry.sh
 test-guide-operator-attention-fold.sh
+test-guide-operator-only-exclude.sh
 test-guide-pool-pressure-defer.sh
 test-guide-work-log-debounce.sh
 test-guide-work-log-issue-out-of-order.sh

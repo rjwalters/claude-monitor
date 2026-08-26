@@ -142,11 +142,14 @@ Writes stay literal `gh` (so the guard hooks still see them). Full policy:
 ## Finding Work
 
 ```bash
-# Find all human-approved issues ready for work (exclude building issues)
+# Find all human-approved issues ready for work (exclude building issues and
+# loom:operator-only issues — #6941: labels.yml documents loom:operator-only
+# as "sweep skips", so Builder can never act on one, exactly like
+# loom:blocked; it must never surface as ready/urgent-eligible work).
 # NOTE: gh ANDs --label values, so `--label "!loom:building"` matches a literal
 # label no issue carries and silently returns an empty set. Exclude building
-# issues with a raw search term instead (`-label:loom:building`).
-"$GH_READ" issue list --label "loom:issue" --search "-label:loom:building" --state open --json number,title,labels,body
+# and operator-only issues with raw search terms instead.
+"$GH_READ" issue list --label "loom:issue" --search "-label:loom:building -label:loom:operator-only" --state open --json number,title,labels,body
 
 # Find currently urgent issues (exclude building issues)
 "$GH_READ" issue list --label "loom:urgent" --search "-label:loom:building" --state open
@@ -204,6 +207,38 @@ if [ "$(has_open_pr_labeled_loom_pr <number>)" = "true" ]; then
   echo "Skipping #<number> - already has an open loom:pr PR awaiting merge, not ready work"
 fi
 ```
+
+### Skip Candidates Carrying `loom:operator-only` (#6941)
+
+`labels.yml` documents `loom:operator-only` as "sweep skips" — Builder can
+never act on an issue carrying it, for exactly the same practical reason as
+`loom:blocked` (a human must act or rule outside automation), just via a
+different mechanism. #6245 was mispromoted to `loom:urgent` twice in under
+24h because none of the eligibility filters below excluded it. One
+label-membership check, same shape as `has_open_pr_labeled_loom_pr()` above:
+
+```bash
+has_operator_only() {
+  local number="$1"
+  local labels
+  labels=$(gh issue view "$number" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null)
+  case ",$labels," in
+    *,loom:operator-only,*) echo "true"; return ;;
+  esac
+  echo "false"
+}
+
+# Before promoting a candidate (Fill free slots) or keeping an incumbent
+# (Evict ineligible holders), skip it if this returns "true":
+if [ "$(has_operator_only <number>)" = "true" ]; then
+  echo "Skipping #<number> - loom:operator-only, Builder can never act on this (same as loom:blocked)"
+fi
+```
+
+Applies unconditionally regardless of which `loom:operator-*` sub-kind label
+(`loom:operator-blocked`, `-mechanical`, `-decision`, `-objective`)
+accompanies it — those always ship alongside the base `loom:operator-only`
+label (never instead of it), so checking the base label alone is sufficient.
 
 A PR still under review (`loom:review-requested` / `loom:changes-requested`,
 no `loom:pr` yet) does **not** trigger this skip — that PR hasn't cleared
@@ -999,18 +1034,22 @@ Each tick performs the smallest possible edit to it, in this order:
    ```
 
 2. **Evict ineligible holders.** A holder is ineligible when it is closed, has
-   lost `loom:issue`, has gained `loom:building` / `loom:blocked`, or now has
-   an open linked PR carrying `loom:pr` (see "Skip Candidates With an Open
-   Linked PR" above — its Builder work is done and it is only waiting on a
-   human merge decision). This is a *state change*, never a judgment call, so
-   it is the one demotion you may make without a challenger.
+   lost `loom:issue`, has gained `loom:building` / `loom:blocked` /
+   `loom:operator-only` (`has_operator_only()` returns `true` — Builder can
+   never act on it, exactly like `loom:blocked`, #6941), or now has an open linked
+   PR carrying `loom:pr` (see "Skip Candidates With an Open Linked PR" above —
+   its Builder work is done and it is only waiting on a human merge decision).
+   This is a *state change*, never a judgment call, so it is the one demotion
+   you may make without a challenger.
 
 3. **Fill free slots.** If fewer than 3 eligible holders remain, promote the
    highest-ranked eligible `loom:issue` candidates until the set is back to 3
    — "eligible" excludes any candidate with an open `loom:pr`-labeled linked
-   PR per "Skip Candidates With an Open Linked PR" above (#5911). Filling a
-   free slot displaces nobody, so no comparison against an incumbent is
-   required.
+   PR per "Skip Candidates With an Open Linked PR" above (#5911), and any
+   candidate `has_operator_only()` returns `true` for (#6941) — such a
+   candidate can never be genuinely "ready work" regardless of rank, since
+   Builder/sweep hard-skips it. Filling a free slot displaces nobody, so no
+   comparison against an incumbent is required.
 
 4. **With 3 eligible holders, a candidate may displace the weakest holder ONLY
    IF it *strictly outranks* it** (`urgency_rank` below). **A tie leaves the
@@ -1109,7 +1148,7 @@ looks the way it does instead of re-litigating it from scratch.
 
 ## Safety Check: Never Mark Building Issues Urgent
 
-**Before applying `loom:urgent`, verify the issue doesn't already have `loom:building`, and isn't already satisfied by an open `loom:pr` PR:**
+**Before applying `loom:urgent`, verify the issue doesn't already have `loom:building`, isn't already satisfied by an open `loom:pr` PR, and doesn't carry `loom:operator-only`:**
 
 ```bash
 # Check labels before marking urgent
@@ -1117,6 +1156,15 @@ LABELS=$(gh issue view <number> --json labels --jq '[.labels[].name] | join(",")
 
 if echo "$LABELS" | grep -q "loom:building"; then
   echo "Skipping #<number> - already being built"
+  exit 0
+fi
+
+# #6941: last-line-of-defense re-check for loom:operator-only, even if this
+# candidate already passed the "Fill free slots" / incumbency filters above —
+# Builder can never act on it (sweep hard-skips it, per labels.yml), so it
+# must never read as a top Builder priority.
+if [ "$(has_operator_only <number>)" = "true" ]; then
+  echo "Skipping #<number> - loom:operator-only, Builder can never act on this"
   exit 0
 fi
 
@@ -1139,6 +1187,7 @@ fi
 - The sweep orchestrator may be confused by conflicting labels on its assigned issues
 - The daemon may misinterpret building issues as ready work
 - An issue whose PR already carries `loom:pr` needs a human merge decision, not urgency signaling toward a Builder (#5911)
+- An issue carrying `loom:operator-only` can never be acted on by Builder — sweep hard-skips it outright, so `loom:urgent` on it is a false top-priority signal (#6941; #6245 was mispromoted twice in <24h this way)
 
 **If an urgent issue is already building:**
 - Leave it alone - work is already happening
