@@ -404,4 +404,109 @@ assert_grep 'NEVER have more than 3 issues marked' "$GUIDE_MD" \
 assert_grep 'Max 3 urgent.*non-negotiable' "$GUIDE_MD" \
     "the Working Style cap bullet is intact"
 
+# --- Test 12: open-loom:pr-linked-PR eligibility check (#6975/#5911) --------
+# guide.md's inline has_open_pr_labeled_loom_pr() pre-filter was skipped by
+# three separate Guide ticks (#6975), so the guard itself -- the one place
+# every loom:urgent add write already has to pass through -- is now the
+# authoritative, mechanically-enforced copy of the same check.
+echo ""
+echo "Test 12: an issue with an open loom:pr-labeled linked PR is not promotable (#6975)"
+
+NO_EVENTS="$SANDBOX/no-events.json"
+printf '[]\n' > "$NO_EVENTS"
+
+# guard_check()/guard_rc() above hardcode LOOM_URGENT_GUARD_EVENTS_FILE, so
+# drive the PR-linkage seams directly here instead of reusing them.
+pr_guard_check() { # <prs-file-or-empty> <details-file-or-empty> <issue> <dir>
+    local prs="$1" details="$2" issue="$3" dir="$4"
+    local -a envs=(LOOM_URGENT_GUARD_EVENTS_FILE="$NO_EVENTS" LOOM_URGENT_GUARD_NOW="$NOW")
+    [[ -n "$prs" ]] && envs+=(LOOM_URGENT_GUARD_ISSUE_PRS_FILE="$prs")
+    [[ -n "$details" ]] && envs+=(LOOM_URGENT_GUARD_PR_DETAILS_FILE="$details")
+    env "${envs[@]}" "$GUARD_SH" check "$issue" "$dir" 2>/dev/null
+}
+pr_guard_rc() { # same args as pr_guard_check; echo the exit code
+    local out rc=0
+    out="$(pr_guard_check "$@")" || rc=$?
+    echo "$rc"
+}
+
+# Case 1: no linked PR at all -> passes.
+NO_PRS="$SANDBOX/no-prs.json"
+printf '[]\n' > "$NO_PRS"
+out="$(pr_guard_check "$NO_PRS" "" 6975 add)"
+rc="$(pr_guard_rc "$NO_PRS" "" 6975 add)"
+if [[ "$rc" == "0" ]] && [[ "$out" == *"reason=no-history"* ]]; then
+    pass "issue with no linked PR -> add is allowed"
+else
+    fail "issue with no linked PR should be allowed (rc=$rc out='$out')"
+fi
+
+# Case 2: a linked OPEN PR that does NOT carry loom:pr -> passes (still
+# legitimately mid-review per guide.md's own carve-out).
+ONE_PR="$SANDBOX/one-pr.json"
+printf '[456]\n' > "$ONE_PR"
+NON_LOOM_PR_DETAILS="$SANDBOX/pr-456-open-other.json"
+printf '{"456": {"state": "OPEN", "labels": [{"name": "other-label"}]}}\n' > "$NON_LOOM_PR_DETAILS"
+rc="$(pr_guard_rc "$ONE_PR" "$NON_LOOM_PR_DETAILS" 6975 add)"
+if [[ "$rc" == "0" ]]; then
+    pass "linked OPEN PR without loom:pr -> add is still allowed (mid-review, not yet Judge-approved)"
+else
+    fail "a linked PR lacking loom:pr must not block promotion, got rc=$rc"
+fi
+
+# Case 3: a linked OPEN loom:pr PR -> suppressed, naming the PR.
+LOOM_PR_DETAILS="$SANDBOX/pr-456-open-loompr.json"
+printf '{"456": {"state": "OPEN", "labels": [{"name": "loom:pr"}]}}\n' > "$LOOM_PR_DETAILS"
+out="$(pr_guard_check "$ONE_PR" "$LOOM_PR_DETAILS" 6975 add)"
+rc="$(pr_guard_rc "$ONE_PR" "$LOOM_PR_DETAILS" 6975 add)"
+if [[ "$rc" == "1" ]] && [[ "$out" == *"reason=open-loom-pr"* ]] && [[ "$out" == *"linked_pr=456"* ]]; then
+    pass "linked OPEN loom:pr PR -> add is suppressed and names the PR (#456)"
+else
+    fail "expected suppression naming PR #456 (rc=$rc out='$out')"
+fi
+
+# `remove` must never be blocked by this new condition, even with the exact
+# same open loom:pr-labeled linked PR in place.
+rc="$(pr_guard_rc "$ONE_PR" "$LOOM_PR_DETAILS" 6975 remove)"
+if [[ "$rc" == "0" ]]; then
+    pass "check <N> remove is unaffected by an open loom:pr-labeled linked PR"
+else
+    fail "remove must never be blocked by the open-PR check, got rc=$rc"
+fi
+
+# Case 4: a linked but MERGED loom:pr PR -> passes (historical, not current).
+MERGED_PR_DETAILS="$SANDBOX/pr-456-merged-loompr.json"
+printf '{"456": {"state": "MERGED", "labels": [{"name": "loom:pr"}]}}\n' > "$MERGED_PR_DETAILS"
+rc="$(pr_guard_rc "$ONE_PR" "$MERGED_PR_DETAILS" 6975 add)"
+if [[ "$rc" == "0" ]]; then
+    pass "linked MERGED loom:pr PR -> add is allowed (historical, not a current block)"
+else
+    fail "a merged/closed PR must not block promotion, got rc=$rc"
+fi
+
+CLOSED_PR_DETAILS="$SANDBOX/pr-456-closed-loompr.json"
+printf '{"456": {"state": "CLOSED", "labels": [{"name": "loom:pr"}]}}\n' > "$CLOSED_PR_DETAILS"
+rc="$(pr_guard_rc "$ONE_PR" "$CLOSED_PR_DETAILS" 6975 add)"
+if [[ "$rc" == "0" ]]; then
+    pass "linked CLOSED loom:pr PR -> add is allowed (historical, not a current block)"
+else
+    fail "a closed PR must not block promotion, got rc=$rc"
+fi
+
+# Fail-open: the issue-PRs lookup itself is unreadable -> must NOT suppress.
+rc="$(pr_guard_rc "$SANDBOX/does-not-exist-prs.json" "" 6975 add)"
+if [[ "$rc" == "0" ]]; then
+    pass "an unreadable issue->PR linkage lookup fails OPEN (never blocks a promotion)"
+else
+    fail "the PR-linkage lookup must fail open, got rc=$rc"
+fi
+
+# Fail-open: the per-PR details lookup itself is unreadable -> must NOT suppress.
+rc="$(pr_guard_rc "$ONE_PR" "$SANDBOX/does-not-exist-details.json" 6975 add)"
+if [[ "$rc" == "0" ]]; then
+    pass "an unreadable per-PR details lookup fails OPEN (never blocks a promotion)"
+else
+    fail "the per-PR details lookup must fail open, got rc=$rc"
+fi
+
 summarize_and_exit

@@ -171,6 +171,17 @@ own per-issue pre-flight existing-PR probe (`sweep.md` → "Existing-PR probe",
 burns a full claim-flip + worktree/session spin-up cycle discovering what
 Guide could have skipped for free.
 
+**This is now guard-enforced, not just role-prompt-instructed (#6975).** This
+prose-only check was skipped three separate times by three separate Guide
+ticks before it became mechanical — the same failure mode #5643's cooldown/
+flap rules below already had, and the same fix: `urgent-flip-guard.sh`'s
+`check <number> add` path (see "Every `loom:urgent` write goes through
+`urgent-flip-guard.sh`" below) independently re-derives this exact
+`closedByPullRequestsReferences` lookup and refuses the write regardless of
+whether a tick remembered to call `has_open_pr_labeled_loom_pr()` below. That
+guard call is the authority; `has_open_pr_labeled_loom_pr()` stays only as a
+cheap early-out so a doomed promotion is never ranked in the first place.
+
 ```bash
 # GitHub's own closes-graph, not a body-grep — `closedByPullRequestsReferences`
 # returns every PR that closes this issue (via `Closes/Fixes/Resolves #N`), but
@@ -1111,6 +1122,13 @@ re-promote an issue already flapping (`LOOM_URGENT_FLAP_THRESHOLD` events inside
 `LOOM_URGENT_FLAP_WINDOW_SECS`). It **fails closed**: an unreadable history
 suppresses the write, the same stance the #5511 open-linked-PR gate takes above.
 
+It also independently refuses an `add` when the issue already has an open,
+`loom:pr`-labeled linked PR (#6975/#5911, "Skip Candidates With an Open Linked
+PR" above) — mechanically, not just when a tick remembers to check first. That
+one lookup is the deliberate exception to fail-closed: if it cannot complete,
+the guard does **not** suppress on its account, so a forge hiccup on this
+specific probe never blocks an otherwise-legitimate promotion.
+
 A suppressed write is not an error and is not something to work around — do not
 retry it, do not reach for `gh api` to bypass it, and do not "just this once"
 edit the label by hand. Move on; the next tick re-evaluates. The cooldown gates
@@ -1168,14 +1186,17 @@ if [ "$(has_operator_only <number>)" = "true" ]; then
   exit 0
 fi
 
-# #5911: last-line-of-defense re-check, even if this candidate already passed
+# #5911: cheap early-out re-check, even if this candidate already passed
 # "Skip Candidates With an Open Linked PR" above — the same one-field probe.
+# Not the authority: skipped here is fine to skip, but the guard call below
+# re-derives and enforces this same check mechanically either way (#6975).
 if [ "$(has_open_pr_labeled_loom_pr <number>)" = "true" ]; then
   echo "Skipping #<number> - already has an open loom:pr PR awaiting merge, not ready work"
   exit 0
 fi
 
-# Still not safe to write yet: the flip guard has the final say (#5643).
+# Still not safe to write yet: the flip guard has the final say, for both the
+# cooldown/flap rules (#5643) and the open-loom:pr-PR check above (#6975).
 if ./.loom/scripts/urgent-flip-guard.sh check <number> add; then
   gh issue edit <number> --add-label "loom:urgent"
 fi

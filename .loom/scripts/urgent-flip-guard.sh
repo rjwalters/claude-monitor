@@ -43,8 +43,33 @@
 #    enough that it was almost certainly another tick's, not a real priority
 #    change?"
 #
-# Two suppression rules
-# ----------------------
+# Three suppression rules
+# ------------------------
+#   0. ALREADY-SATISFIED-BY-AN-OPEN-PR (`add` only, issue #6975/#5911). If the
+#      issue's own `closedByPullRequestsReferences` links an OPEN pull request
+#      that already carries `loom:pr`, the issue is fully implemented and
+#      Judge-approved -- it is waiting on a human merge decision, not on more
+#      urgency. guide.md documents this same lookup as
+#      `has_open_pr_labeled_loom_pr()` and used to rely on every Guide tick
+#      remembering to call it inline before promoting; that prose-only
+#      invariant was skipped three separate times by three separate ticks
+#      (#6975), so this script -- the one place every `loom:urgent add` write
+#      is already required to pass through -- is now the authoritative,
+#      mechanically-enforced copy of the check. guide.md's inline call stays
+#      only as a cheap pre-filter for ranking, exactly as
+#      `urgent-flip-guard.sh` already became the authority for cooldown/flap
+#      over the two rules below (#5643).
+#
+#      Deliberately `add`-only, same shape as the flap-freeze below: an issue
+#      already `loom:urgent` may still be legitimately demoted (e.g. by the
+#      incumbency rule) once its PR lands, and demotion must never be blocked.
+#
+#      This rule's own PR-linkage lookup is FAIL-OPEN, not fail-closed like
+#      the history read below -- a rate limit or forge hiccup on this one
+#      probe must never block an otherwise-legitimate promotion, the same
+#      posture guide.md's `has_open_pr_labeled_loom_pr()` /
+#      `has_operator_only()` already document.
+#
 #   1. REVERSAL-WITHIN-COOLDOWN (both directions). If the most recent
 #      `loom:urgent` labeled/unlabeled event on the issue is younger than
 #      LOOM_URGENT_FLIP_COOLDOWN_SECS and the requested write reverses it,
@@ -75,13 +100,17 @@
 #      blocking the removal that restores the "max 3" cap. That invariant is
 #      unchanged by this guard.
 #
-# Fail-closed
-# ------------
-# If the label history cannot be read at all (forge outage, wedged `gh`, auth
-# failure), the answer is SUPPRESS, not ALLOW — the same "a probe that could
-# not answer at all blocks the write" stance guide.md's #5511 open-linked-PR
-# gate already takes. Skipping one tick's urgency update is cheap; resuming an
-# unbounded flap is not.
+# Fail-closed (history), fail-open (PR linkage)
+# -----------------------------------------------
+# If the loom:urgent label history cannot be read at all (forge outage, wedged
+# `gh`, auth failure), the answer is SUPPRESS, not ALLOW — the same "a probe
+# that could not answer at all blocks the write" stance guide.md's #5511
+# open-linked-PR gate already takes for label writes. Skipping one tick's
+# urgency update is cheap; resuming an unbounded flap is not.
+#
+# Rule 0's separate PR-linkage lookup is the one deliberate exception: if IT
+# cannot be completed, this script does NOT suppress on its account — see
+# "0. ALREADY-SATISFIED-BY-AN-OPEN-PR" above for why.
 #
 # Exit codes:
 #   0  ALLOW    - proceed with the label write
@@ -134,10 +163,19 @@ Tunables (env vars):
   LOOM_URGENT_FLAP_WINDOW_SECS    Flap-detection window (default 86400 = 24h).
 
 Test seams (unset in normal operation):
-  LOOM_URGENT_GUARD_EVENTS_FILE   Read the event list from this JSON file
-                                  (same shape as the GitHub issue-events API)
-                                  instead of calling `gh api`.
-  LOOM_URGENT_GUARD_NOW           Treat this epoch-seconds value as "now".
+  LOOM_URGENT_GUARD_EVENTS_FILE     Read the event list from this JSON file
+                                    (same shape as the GitHub issue-events API)
+                                    instead of calling `gh api`.
+  LOOM_URGENT_GUARD_NOW             Treat this epoch-seconds value as "now".
+  LOOM_URGENT_GUARD_ISSUE_PRS_FILE  Read the issue's linked PR numbers from
+                                    this JSON file (a bare array, e.g. `[456]`)
+                                    instead of `gh issue view
+                                    --json closedByPullRequestsReferences`.
+  LOOM_URGENT_GUARD_PR_DETAILS_FILE Read linked-PR state/labels from this JSON
+                                    file (an object keyed by PR number, e.g.
+                                    `{"456": {"state": "OPEN", "labels":
+                                    [{"name": "loom:pr"}]}}`) instead of `gh pr
+                                    view --json state,labels`.
 
 Exit codes: 0 = allow, 1 = suppress, 2 = usage/configuration error.
 EOF
@@ -286,6 +324,79 @@ if [[ "$CMD" == "status" ]]; then
           flap_window_secs: $flap_window_secs,
           flapping: ($events_in_flap_window >= $flap_threshold)}'
     exit 0
+fi
+
+# --- Rule 0: already satisfied by an open loom:pr-labeled linked PR (add only)
+# See "0. ALREADY-SATISFIED-BY-AN-OPEN-PR" in the header. Two lookups, mirroring
+# guide.md's `has_open_pr_labeled_loom_pr()`: the issue's own closes-graph, then
+# each linked PR's state/labels. FAIL-OPEN on either lookup -- a probe that
+# could not answer must never block an otherwise-legitimate promotion.
+
+# Issue -> newline-separated linked PR numbers. Empty output (rc 0) on a clean
+# "no linked PRs"; non-zero rc means the lookup itself failed.
+_read_issue_linked_prs() { # <issue-number>
+    local number="$1" raw rc=0
+    if [[ -n "${LOOM_URGENT_GUARD_ISSUE_PRS_FILE:-}" ]]; then
+        [[ -f "$LOOM_URGENT_GUARD_ISSUE_PRS_FILE" ]] || return 1
+        raw="$(jq -r '.[]' "$LOOM_URGENT_GUARD_ISSUE_PRS_FILE" 2>/dev/null)" || rc=$?
+    else
+        raw="$(gh issue view "$number" --json closedByPullRequestsReferences \
+            --jq '.closedByPullRequestsReferences[].number' 2>/dev/null)" || rc=$?
+    fi
+    [[ "$rc" -eq 0 ]] || return 1
+    printf '%s\n' "$raw"
+    return 0
+}
+
+# PR number -> "true"/"false" (open AND labeled loom:pr). Non-zero rc means
+# this one PR's lookup failed (skip it, don't treat as a match or a block).
+_pr_is_open_loom_pr() { # <pr-number>
+    local pr="$1" pr_json rc=0
+    if [[ -n "${LOOM_URGENT_GUARD_PR_DETAILS_FILE:-}" ]]; then
+        [[ -f "$LOOM_URGENT_GUARD_PR_DETAILS_FILE" ]] || return 1
+        pr_json="$(jq -c --arg pr "$pr" '.[$pr] // empty' "$LOOM_URGENT_GUARD_PR_DETAILS_FILE" 2>/dev/null)" || rc=$?
+        [[ "$rc" -eq 0 ]] && [[ -n "$pr_json" ]] || return 1
+    else
+        pr_json="$(gh pr view "$pr" --json state,labels 2>/dev/null)" || return 1
+    fi
+    # NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" | jq` -- zsh's
+    # `echo` builtin reinterprets `\n`/`\t` escapes by default, which would
+    # corrupt captured JSON before jq ever parses it (#5094).
+    local pr_state pr_has_loom_pr
+    pr_state="$(printf '%s\n' "$pr_json" | jq -r '.state' 2>/dev/null)" || return 1
+    pr_has_loom_pr="$(printf '%s\n' "$pr_json" | jq -r '[.labels[].name] | any(. == "loom:pr")' 2>/dev/null)" || return 1
+    if [[ "$pr_state" == "OPEN" ]] && [[ "$pr_has_loom_pr" == "true" ]]; then
+        echo "true"
+    else
+        echo "false"
+    fi
+    return 0
+}
+
+# Issue -> the PR number of its first open loom:pr-labeled linked PR, or empty
+# if none exists OR either lookup failed (fail open in both cases).
+_find_open_loom_pr_link() { # <issue-number>
+    local number="$1" prs pr verdict
+    prs="$(_read_issue_linked_prs "$number")" || return 0
+    for pr in $prs; do
+        [[ -n "$pr" ]] || continue
+        verdict="$(_pr_is_open_loom_pr "$pr")" || continue
+        if [[ "$verdict" == "true" ]]; then
+            echo "$pr"
+            return 0
+        fi
+    done
+    return 0
+}
+
+if [[ "$DIRECTION" == "add" ]]; then
+    OPEN_LOOM_PR="$(_find_open_loom_pr_link "$ISSUE")"
+    if [[ -n "$OPEN_LOOM_PR" ]]; then
+        echo "SUPPRESS reason=open-loom-pr issue=${ISSUE} direction=add linked_pr=${OPEN_LOOM_PR}"
+        print_warn "#${ISSUE} already has an open PR #${OPEN_LOOM_PR} labeled loom:pr — it is implemented and awaiting a human merge decision, not ready work (#5911/#6975)."
+        print_info "Leaving the label alone. Reviewing/merging #${OPEN_LOOM_PR} is the next step here, not more urgency."
+        exit 1
+    fi
 fi
 
 # --- Rule 2: flap-freeze (promotions only) -----------------------------------
