@@ -370,6 +370,41 @@ assert_eq "0" "$RC" "(j2) stderr on BOTH calls, cap not reached -> exit 0"
 assert_eq "EVALUATE" "$(get_field "$OUT" DECISION)" "(j2) DECISION=EVALUATE with stderr on both calls"
 assert_eq "1" "$(get_field "$OUT" MARKER_COUNT)" "(j2) MARKER_COUNT=1 counted correctly despite dual stderr"
 
+# (k) Loom's own App dispatch identity (app/loom-fleet-dispatch) is reported
+#     by GitHub as is_bot:true, same as Dependabot -- but MUST NOT be skipped
+#     via the bot-author path (#6982): it is Loom's own PR creation identity,
+#     not an external bot outside the Loom label workflow. No prior markers
+#     -> proceeds all the way to EVALUATE, exit 0, proving it reaches cap/dedup
+#     logic rather than exiting 10.
+reset_state
+cat > "$STUB_DIR/pr-112.json" <<'EOF'
+{"author":{"is_bot":true,"login":"app/loom-fleet-dispatch"},"headRefOid":"c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"}
+EOF
+run_guard 112
+assert_eq "0" "$RC" "(k) app/loom-fleet-dispatch is_bot:true -> NOT skipped, exit 0"
+assert_eq "EVALUATE" "$(get_field "$OUT" DECISION)" "(k) DECISION=EVALUATE for app/loom-fleet-dispatch despite is_bot:true"
+
+# (k2) Same allowlisted identity, but with enough prior markers to reach the
+#      lifetime cap -> proves it reaches Step 2 (cap logic), not that it is
+#      unconditionally waved through -- SKIP now comes from the cap, not the
+#      bot-author path (exit 11, not exit 10).
+reset_state
+cat > "$STUB_DIR/pr-113.json" <<EOF
+{"author":{"is_bot":true,"login":"app/loom-fleet-dispatch"},"headRefOid":"d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d"}
+EOF
+{
+  echo "["
+  marker_comment "$(hours_ago 40)" "1111111111111111111111111111111111111a"
+  echo ","
+  marker_comment "$(hours_ago 30)" "2222222222222222222222222222222222222b"
+  echo ","
+  marker_comment "$(hours_ago 20)" "3333333333333333333333333333333333333c"
+  echo "]"
+} > "$STUB_DIR/comments-113.json"
+run_guard 113 --cap 3
+assert_eq "11" "$RC" "(k2) app/loom-fleet-dispatch past bot-check, cap reached -> exit 11 (not 10)"
+assert_eq "SKIP" "$(get_field "$OUT" DECISION)" "(k2) DECISION=SKIP via lifetime cap, not bot-author path"
+
 # --- Summary -------------------------------------------------------------
 echo ""
 echo "Results: $TESTS_PASSED/$TESTS_RUN passed"
