@@ -37,6 +37,7 @@ test-build-slot.sh
 test-cargo-test-daemon-guard.sh
 test-champion-ci-checks-no-checks-signal.sh
 test-champion-critical-file-check.sh
+test-champion-epic-phase-marker-normalization.sh
 test-champion-held-pr-health-pass.sh
 test-champion-standing-authorization.sh
 test-check-ci-status.sh

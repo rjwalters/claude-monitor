@@ -341,10 +341,39 @@ missing-idempotency-check bug, not a concurrency race — the two creations were
 ~2 hours apart, not simultaneous — so the fix is a query, not a lock (see
 "Why this alone is sufficient — no mutex change" below).
 
+**Phase-form normalization (#6967)**: the marker's phase token is not always a
+plain integer — a historical/foreign epic convention (or a phase marker
+written by a different tool) can leave a letter-form marker (`phase:B`) on an
+existing issue. A later pass that re-derives a numeric `$PHASE` for that same
+logical phase (`PHASE=2`) must still recognize it as "already exists", or it
+creates a duplicate — an exact literal-string `--search` match alone cannot do
+that (GitHub's search treats `phase:B` and `phase:2` as unrelated strings).
+`canonicalize_phase()` below maps both forms (`A`/`B`/`C`/… and `1`/`2`/`3`/…,
+case-insensitively) to the same canonical integer so the comparison is
+form-agnostic; an unrecognized token (neither a bare integer nor a single
+letter) is left as-is so it can never *falsely* collapse into a match — see
+"two genuinely different phases must never collapse" in the regression test
+below.
+
 ```bash
 EPIC_NUMBER=<number>
 PHASE=<N>   # 1 at Step 3; N+1 at "Creating Next Phase Issues"
 PHASE_MARKER="<!-- loom:epic:$EPIC_NUMBER:phase:$PHASE -->"
+
+# A=1, B=2, C=3, ... ; a bare integer canonicalizes to itself; anything else
+# (multi-char/non-alpha token) is returned unchanged — never guessed at.
+canonicalize_phase() {
+  local token
+  token=$(printf '%s' "$1" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+  if [[ "$token" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$token"
+  elif [[ "$token" =~ ^[A-Z]$ ]]; then
+    printf '%s' "$(( $(printf '%d' "'$token") - 64 ))"
+  else
+    printf '%s' "$token"
+  fi
+}
+CANONICAL_PHASE=$(canonicalize_phase "$PHASE")
 
 # Any state — a materialized-and-CLOSED phase must dedupe exactly like an
 # open one (that's precisely the incident this fixes: the canonical set was
@@ -352,13 +381,33 @@ PHASE_MARKER="<!-- loom:epic:$EPIC_NUMBER:phase:$PHASE -->"
 # same query "Detecting Phase Completion" already uses below, so the two
 # call sites can never disagree about what "already exists" means. Cached
 # (${GH_READ:-gh}) — this is a content check, not claim arbitration.
-EXISTING_PHASE_ISSUES=$(${GH_READ:-gh} issue list \
+#
+# Search on the epic-number prefix only (`loom:epic:$EPIC_NUMBER:phase`), NOT
+# the exact `:$PHASE` suffix — narrowing to one literal phase string is
+# exactly what missed a differently-formed existing marker for the same
+# phase (#6967). The broader hit set is then narrowed precisely by
+# canonicalized comparison below, so this is strictly more inclusive, never
+# less precise.
+CANDIDATE_PHASE_ISSUES=$(${GH_READ:-gh} issue list \
   --label="loom:epic-phase" \
   --state=all \
   --limit=500 \
-  --search="loom:epic:$EPIC_NUMBER:phase:$PHASE in:body" \
-  --json number,title,state \
+  --search="loom:epic:$EPIC_NUMBER:phase in:body" \
+  --json number,title,state,body \
   --jq '.')
+
+# Extract each candidate's own marker phase token and keep only the ones that
+# canonicalize to THIS phase — this is what makes `phase:B` match `PHASE=2`
+# (both canonicalize to 2) while `phase:1` never matches `PHASE=2` (#6967).
+EXISTING_PHASE_ISSUES=$(printf '%s\n' "$CANDIDATE_PHASE_ISSUES" | jq -c '.[]' | while IFS= read -r issue; do
+  MARKER_PHASE=$(printf '%s' "$issue" | jq -r '.body' | \
+    grep -oE "loom:epic:$EPIC_NUMBER:phase:[A-Za-z0-9]+" | head -1 | \
+    sed -E "s/^loom:epic:$EPIC_NUMBER:phase://")
+  [ -z "$MARKER_PHASE" ] && continue
+  if [ "$(canonicalize_phase "$MARKER_PHASE")" = "$CANONICAL_PHASE" ]; then
+    printf '%s\n' "$issue" | jq 'del(.body)'
+  fi
+done | jq -s '.')
 EXISTING_COUNT=$(printf '%s\n' "$EXISTING_PHASE_ISSUES" | jq 'length')
 
 if [ "$EXISTING_COUNT" -gt 0 ]; then
@@ -376,7 +425,7 @@ if [ "$EXISTING_COUNT" -gt 0 ]; then
     gh issue comment "$EPIC_NUMBER" --body "$STANDDOWN_MARKER
 **Champion: Phase $PHASE Issues Already Exist — Skipping Creation**
 
-Found $EXISTING_COUNT existing issue(s) already carrying \`$PHASE_MARKER\`:
+Found $EXISTING_COUNT existing issue(s) already covering phase $PHASE (matched by canonical phase form, e.g. \`$PHASE_MARKER\` or an equivalent letter-form marker — #6967):
 
 $ISSUE_LIST
 
@@ -607,19 +656,51 @@ section, not this one, when evaluating a blocker reference (#5211).
 EPIC_NUMBER=123
 PHASE=1
 
-# Get all issues with loom:epic-phase that reference this epic and phase.
-# Search for the machine-generated marker emitted into each phase-issue body
-# (see Step 3): `<!-- loom:epic:<epic>:phase:<n> -->`. This is an exact,
-# drift-free token — unlike the old natural-language "Epic: #N Phase: N"
-# phrase, which never matched the "**Epic**: #N" / "**Phase**: 1 of N" prose
-# the body template actually emits.
-PHASE_ISSUES=$(gh issue list \
+# A=1, B=2, C=3, ... ; a bare integer canonicalizes to itself; anything else
+# (multi-char/non-alpha token) is returned unchanged — never guessed at. Same
+# helper as Step 2.75 above — kept in sync so the two call sites can never
+# disagree about which existing issues belong to this phase (#6967).
+canonicalize_phase() {
+  local token
+  token=$(printf '%s' "$1" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+  if [[ "$token" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$token"
+  elif [[ "$token" =~ ^[A-Z]$ ]]; then
+    printf '%s' "$(( $(printf '%d' "'$token") - 64 ))"
+  else
+    printf '%s' "$token"
+  fi
+}
+CANONICAL_PHASE=$(canonicalize_phase "$PHASE")
+
+# Get all issues with loom:epic-phase that reference this epic, on the
+# epic-number prefix only (NOT the exact `:$PHASE` suffix — narrowing to one
+# literal phase string misses an existing marker in a different form for the
+# same logical phase, #6967). Search for the machine-generated marker emitted
+# into each phase-issue body (see Step 3): `<!-- loom:epic:<epic>:phase:<n> -->`.
+# This is an exact, drift-free token — unlike the old natural-language
+# "Epic: #N Phase: N" phrase, which never matched the "**Epic**: #N" /
+# "**Phase**: 1 of N" prose the body template actually emits.
+CANDIDATE_PHASE_ISSUES=$(gh issue list \
   --label="loom:epic-phase" \
   --state=all \
   --limit=500 \
-  --search="loom:epic:$EPIC_NUMBER:phase:$PHASE in:body" \
-  --json number,state \
+  --search="loom:epic:$EPIC_NUMBER:phase in:body" \
+  --json number,state,body \
   --jq '.')
+
+# Keep only the candidates whose own marker phase token canonicalizes to THIS
+# phase — this is what makes `phase:B` count toward `PHASE=2` (both
+# canonicalize to 2) while `phase:1` never counts toward `PHASE=2` (#6967).
+PHASE_ISSUES=$(printf '%s\n' "$CANDIDATE_PHASE_ISSUES" | jq -c '.[]' | while IFS= read -r issue; do
+  MARKER_PHASE=$(printf '%s' "$issue" | jq -r '.body' | \
+    grep -oE "loom:epic:$EPIC_NUMBER:phase:[A-Za-z0-9]+" | head -1 | \
+    sed -E "s/^loom:epic:$EPIC_NUMBER:phase://")
+  [ -z "$MARKER_PHASE" ] && continue
+  if [ "$(canonicalize_phase "$MARKER_PHASE")" = "$CANONICAL_PHASE" ]; then
+    printf '%s\n' "$issue" | jq 'del(.body)'
+  fi
+done | jq -s '.')
 
 # Count open vs closed. NOTE: `printf '%s\n' "$VAR" | jq`, never `echo "$VAR" |
 # jq` — zsh's `echo` builtin reinterprets `\n`/`\t` escapes by default, which
