@@ -355,6 +355,20 @@ assert_contains "$EDITS" "loom:operator-only" "(h) escalates to loom:operator-on
 assert_contains "$EDITS" "loom:operator-mechanical" "(h) escalates with loom:operator-mechanical sub-kind"
 assert_contains "$COMMENTS_POSTED" "302" "(h) an escalation comment is posted on the issue"
 
+# (h2) #6942: re-invoking --apply against the SAME issue after case (h) already
+#     escalated it (loom:operator-only is now present) must NOT post a second
+#     escalation comment or re-run the label edit -- DECISION=ALREADY_ESCALATED,
+#     exit 0, distinguishable from a fresh ESCALATED (exit 13).
+reset_state
+issue_json "OPEN" "$(labels_json "loom:curated" "loom:operator-only" "loom:operator-mechanical")" \
+  "[$(approved_comment "2026-08-18T00:00:00Z" "no tier info here")]" \
+  > "$STUB_DIR/issue-302.json"
+run_sut --issue 302 --apply
+assert_eq "0" "$RC" "(h2) already loom:operator-only -> exit 0, not 13"
+assert_eq "ALREADY_ESCALATED" "$(get_field "$OUT" DECISION)" "(h2) DECISION=ALREADY_ESCALATED, distinguishable from fresh ESCALATED"
+assert_eq "" "$EDITS" "(h2) no duplicate label edit is issued"
+assert_eq "" "$COMMENTS_POSTED" "(h2) no duplicate escalation comment is posted"
+
 # (i) --apply, tier recoverable, but the completing edit's OWN read-back still
 #     shows loom:issue missing (the exact #6464 failure mode recurring on the
 #     reconciliation attempt itself) -> ESCALATED, exit 13, never silently

@@ -389,6 +389,7 @@ issue it does exactly one of:
 | `NOT_OPEN` | Issue is closed — nothing left to reconcile |
 | `COMPLETED` | Recovered the tier from the verdict comment's "Goal Alignment" line, applied `loom:issue` + that tier, and **confirmed the addition via its own read-back** — the issue is now a normal, Builder-visible `loom:issue` |
 | `ESCALATED` | Could not safely complete (tier unrecoverable from the comment text, or the completing edit's own read-back still failed) — posted an explanatory comment and added `loom:operator-only,loom:operator-mechanical` rather than guess |
+| `ALREADY_ESCALATED` | Tier unrecoverable, but the issue already carries `loom:operator-only` from a prior run — a human already owns it, so no duplicate comment is posted and no redundant label edit is issued (#6942) |
 
 Nothing here re-runs the 8 evaluation criteria or re-derives a tier from
 scratch — the original verdict already did that work; this pass only

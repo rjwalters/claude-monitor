@@ -45,10 +45,13 @@
 #   3. If no tier could be recovered, or the completing edit's own read-back
 #      still fails: posts an explanatory comment and adds
 #      `loom:operator-only,loom:operator-mechanical` so a human finishes it —
-#      never guesses. DECISION=ESCALATED.
+#      never guesses. DECISION=ESCALATED. If the issue ALREADY carries
+#      `loom:operator-only` (a prior run already escalated it and nothing
+#      changed since), this is skipped entirely — no duplicate comment, no
+#      redundant label edit. DECISION=ALREADY_ESCALATED instead (#6942).
 #
 # Output (stdout — one KEY=VALUE per line, machine-parseable):
-#   DECISION=OK|NOT_OPEN|MISMATCH|COMPLETED|ESCALATED
+#   DECISION=OK|NOT_OPEN|MISMATCH|COMPLETED|ESCALATED|ALREADY_ESCALATED
 #   REASON=<short human-readable reason>
 #   TIER=<tier:goal-advancing|tier:goal-supporting|tier:maintenance|"">
 #
@@ -57,7 +60,10 @@
 #        loom:issue is currently absent but the label timeline shows it WAS
 #        applied after the newest APPROVED comment and the issue has since
 #        legitimately progressed further, e.g. loom:issue -> loom:building or
-#        -> loom:blocked — nothing to reconcile in any of these cases, #6933)
+#        -> loom:blocked — nothing to reconcile in any of these cases, #6933).
+#        ALSO used for DECISION=ALREADY_ESCALATED (tier unrecoverable, but the
+#        issue already carries loom:operator-only from a prior run — a human
+#        already owns it, nothing further to do, #6942).
 #   1  = usage or environment error (bad args, `gh`/`jq` missing, a required
 #        `gh` read failed)
 #   10 = NOT_OPEN (issue is closed — nothing left to reconcile)
@@ -70,10 +76,11 @@
 #        its own read-back still shows loom:issue missing — routed to
 #        loom:operator-only,loom:operator-mechanical instead of guessing)
 #
-# CALLERS MUST NOT SWALLOW THE EXIT CODE. OK (0) and NOT_OPEN (10) both mean
-# "nothing to do here"; MISMATCH/COMPLETED/ESCALATED (11/12/13) are each
-# distinct outcomes a caller should account for separately, same as every
-# other classify-then-caller-acts script in this directory.
+# CALLERS MUST NOT SWALLOW THE EXIT CODE. OK (0), NOT_OPEN (10), and
+# ALREADY_ESCALATED (0) all mean "nothing to do here";
+# MISMATCH/COMPLETED/ESCALATED (11/12/13) are each distinct outcomes a caller
+# should account for separately, same as every other classify-then-caller-acts
+# script in this directory.
 
 set -uo pipefail
 
@@ -208,6 +215,19 @@ elif printf '%s' "$TIER_LINE" | grep -qi 'Tier 3'; then
 fi
 
 if [[ -z "$TIER" ]]; then
+  # Idempotency guard (#6942): if a PRIOR run of this exact branch already
+  # routed the issue to loom:operator-only, nothing about the issue's state
+  # has changed since (the label edit is the only durable side effect this
+  # branch has, and it's already present) — re-posting the escalation
+  # comment on every subsequent --apply invocation just spams the issue
+  # (#6076 accumulated 18 near-identical comments this way). Mirrors the
+  # ALREADY_ROUTED short-circuit in champion-issue-promo.md's Idempotency
+  # check and classify-dependency-block.sh's own-marker check.
+  if jq -e '.labels[] | select(.name=="loom:operator-only")' <<<"$ISSUE_JSON" >/dev/null 2>&1; then
+    emit "ALREADY_ESCALATED" "$REASON; already routed to loom:operator-only by a prior run — nothing further to do"
+    exit 0
+  fi
+
   gh issue comment "$ISSUE" --body "<!-- champion:promotion-landed-mismatch -->
 **Champion: Promotion write did not land — escalating**
 
