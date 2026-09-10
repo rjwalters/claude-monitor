@@ -13,7 +13,7 @@ import Darwin
 /// or refreshes an OpenAI credential**.
 ///
 /// ```
-/// codex -s read-only -a untrusted app-server
+/// codex -s read-only -a never app-server
 /// initialize → initialized (notification) → account/read → account/rateLimits/read
 /// ```
 ///
@@ -272,6 +272,33 @@ final class CodexBinaryVersionLog: @unchecked Sendable {
         guard lastLoggedKey != key else { return false }
         lastLoggedKey = key
         return true
+    }
+}
+
+/// Captures the child's stderr so a launch failure (e.g. a bad CLI argument)
+/// can be reported instead of the opaque "exited before answering". Same
+/// `@unchecked Sendable`-over-`NSLock` shape as `CodexLineStream`, since the
+/// producer is the readability callback and the consumer is the request loop.
+private final class CodexStderrCapture: @unchecked Sendable {
+    static let maxBufferedBytes = 4 * 1024
+    private let lock = NSLock()
+    private var buffer = Data()
+
+    func ingest(_ chunk: Data) {
+        guard !chunk.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        buffer.append(chunk)
+        if buffer.count > Self.maxBufferedBytes {
+            buffer = buffer.suffix(Self.maxBufferedBytes)
+        }
+    }
+
+    var snapshot: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return String(data: buffer, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 }
 
@@ -757,7 +784,7 @@ final class CodexAppServerClient: Sendable {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
         // `-s` / `-a` are top-level flags and must precede the subcommand.
-        process.arguments = ["-s", "read-only", "-a", "untrusted", "app-server"]
+        process.arguments = ["-s", "read-only", "-a", "never", "app-server"]
 
         var childEnv = environment
         if let codexHome = codexHome, !codexHome.isEmpty {
@@ -767,11 +794,10 @@ final class CodexAppServerClient: Sendable {
 
         let stdinPipe = Pipe()
         let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
-        // Never a pipe: an undrained stderr fills its ~64 KB buffer and blocks
-        // the child forever. (Observed: app-server writes nothing there anyway.)
-        process.standardError = FileHandle.nullDevice
+        process.standardError = stderrPipe
 
         let stream = CodexLineStream()
         let readHandle = stdoutPipe.fileHandleForReading
@@ -781,10 +807,19 @@ final class CodexAppServerClient: Sendable {
             stream.ingest(handle.availableData)
         }
 
+        let stderrCapture = CodexStderrCapture()
+        let stderrHandle = stderrPipe.fileHandleForReading
+        // Drained the same way as stdout, and capped, so a chatty or hostile
+        // child can't fill the pipe buffer and block, nor grow this unbounded.
+        stderrHandle.readabilityHandler = { handle in
+            stderrCapture.ingest(handle.availableData)
+        }
+
         do {
             try process.run()
         } catch {
             readHandle.readabilityHandler = nil
+            stderrHandle.readabilityHandler = nil
             throw CodexAppServerError.launchFailed(error.localizedDescription)
         }
 
@@ -811,7 +846,7 @@ final class CodexAppServerClient: Sendable {
                 "params": ["clientInfo": ["name": "claude-monitor", "version": AppVersion.current]],
             ])
             let initializeResult = try await self.awaitReply(
-                id: 1, method: "initialize", stream: stream, process: process,
+                id: 1, method: "initialize", stream: stream, process: process, stderr: stderrCapture,
                 deadline: Self.earliest(Date().addingTimeInterval(timeouts.initialize), overallDeadline)
             )
             Self.logResolvedBinaryVersionOnce(binaryPath: binary, initializeResult: initializeResult)
@@ -826,7 +861,7 @@ final class CodexAppServerClient: Sendable {
             try Self.send(writer, ["jsonrpc": "2.0", "id": 2, "method": "account/read", "params": [:]])
             do {
                 accountResult = try await self.awaitReply(
-                    id: 2, method: "account/read", stream: stream, process: process,
+                    id: 2, method: "account/read", stream: stream, process: process, stderr: stderrCapture,
                     deadline: Self.earliest(Date().addingTimeInterval(timeouts.method), overallDeadline)
                 )
                 let decoded = accountResult.flatMap { try? CodexWire.decode(CodexWire.AccountRead.self, from: $0) }
@@ -857,7 +892,7 @@ final class CodexAppServerClient: Sendable {
             guard includeRateLimits else { return (accountResult, nil) }
             try Self.send(writer, ["jsonrpc": "2.0", "id": 3, "method": "account/rateLimits/read", "params": [:]])
             let rateLimits = try await self.awaitReply(
-                id: 3, method: "account/rateLimits/read", stream: stream, process: process,
+                id: 3, method: "account/rateLimits/read", stream: stream, process: process, stderr: stderrCapture,
                 deadline: Self.earliest(Date().addingTimeInterval(timeouts.method), overallDeadline)
             )
 
@@ -866,10 +901,10 @@ final class CodexAppServerClient: Sendable {
 
         do {
             let result = try await exchange()
-            await Self.reap(process, stdin: stdin, stdout: readHandle, timeouts: timeouts)
+            await Self.reap(process, stdin: stdin, stdout: readHandle, stderr: stderrHandle, timeouts: timeouts)
             return result
         } catch {
-            await Self.reap(process, stdin: stdin, stdout: readHandle, timeouts: timeouts)
+            await Self.reap(process, stdin: stdin, stdout: readHandle, stderr: stderrHandle, timeouts: timeouts)
             throw error
         }
     }
@@ -907,6 +942,7 @@ final class CodexAppServerClient: Sendable {
         method: String,
         stream: CodexLineStream,
         process: Process,
+        stderr: CodexStderrCapture,
         deadline: Date
     ) async throws -> Data {
         // This reply may already have been read while a previous call was
@@ -932,7 +968,9 @@ final class CodexAppServerClient: Sendable {
 
             if Date() >= deadline { throw CodexAppServerError.timedOut(method) }
             if stream.isDrained, !process.isRunning {
-                throw CodexAppServerError.protocolFailure("app-server exited before answering \(method)")
+                let detail = stderr.snapshot
+                let suffix = detail.isEmpty ? "" : ": \(detail)"
+                throw CodexAppServerError.protocolFailure("app-server exited before answering \(method)\(suffix)")
             }
             try await Task.sleep(nanoseconds: 15_000_000)
         }
@@ -967,8 +1005,9 @@ final class CodexAppServerClient: Sendable {
     /// gone by the first `waitForExit`. Only a wedged child reaches the
     /// escalation, and even then this is bounded by
     /// `gracefulExit + terminateGrace + 2`.
-    private static func reap(_ process: Process, stdin: FileHandle, stdout: FileHandle, timeouts: Timeouts) async {
+    private static func reap(_ process: Process, stdin: FileHandle, stdout: FileHandle, stderr: FileHandle, timeouts: Timeouts) async {
         stdout.readabilityHandler = nil
+        stderr.readabilityHandler = nil
         try? stdin.close()
 
         if await !waitForExit(process, within: timeouts.gracefulExit) {
@@ -981,6 +1020,7 @@ final class CodexAppServerClient: Sendable {
             }
         }
         try? stdout.close()
+        try? stderr.close()
     }
 
     /// Poll `isRunning` until the child is gone; true if it exited in time.
