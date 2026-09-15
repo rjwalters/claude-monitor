@@ -1211,6 +1211,43 @@ _in_any_managed_worktree() {
     return 1
 }
 
+# Reads the `# Branch: <name>` line worktree.sh's write_loom_sentinel() (in
+# defaults/scripts/worktree.sh) records into every managed worktree's
+# `.loom-managed` sentinel at creation time (#7530). Authoritative: recorded
+# once when the worktree is created, so it survives the worktree later going
+# detached/unresolved — unlike reconstructing "current branch" from live git
+# state, which is exactly the ambiguous case this helper exists to resolve.
+# Walks up from $1 the same way _in_any_managed_worktree() does (same 64-hop
+# cap); echoes the recorded branch name (e.g. "feature/issue-7530") if a
+# sentinel is found and it has a `# Branch:` line, else echoes nothing —
+# callers must check the echoed value is non-empty (not every sentinel writer
+# includes a `# Branch:` line, e.g. some docs-worktree flows). Best-effort,
+# ALWAYS returns 0 (mirrors resolve_default_branch()'s contract just above)
+# — this hook's global ERR trap fail-opens (treats any unprotected non-zero
+# exit as an internal error and ALLOWS the command outright), so a helper
+# called outside an `if`/`||` guard must never itself be the source of a
+# non-zero exit for the ordinary "nothing found" case.
+_managed_worktree_branch() {
+    local dir="$1"
+    [[ -n "$dir" ]] || return 0
+    if [[ ! -d "$dir" ]]; then
+        dir="${dir%/*}"
+        [[ -z "$dir" ]] && dir="/"
+    fi
+    local i=0
+    while [[ $i -lt 64 ]]; do
+        if [[ -f "$dir/.loom-managed" ]]; then
+            grep -m1 '^# Branch: ' "$dir/.loom-managed" 2>/dev/null | sed -E 's/^# Branch: //' || true
+            return 0
+        fi
+        [[ "$dir" == "/" ]] && break
+        dir="${dir%/*}"
+        [[ -z "$dir" ]] && dir="/"
+        i=$((i + 1))
+    done
+    return 0
+}
+
 # True if at least one managed worktree currently exists under $1
 # (<base>/<name>/.loom-managed, depth 2 — matches worktree.sh's layout).
 # Mirrors any_managed_worktree_exists() in guard-worktree-paths.sh.
@@ -3992,11 +4029,25 @@ mask_ask_positional_args() {
 # through to the raw substring scan below and hard-denied on read-only
 # forensic log inspection even though the phrase was only ever quoted DATA
 # inside the filter, never a live invocation.
+#
+# #7515: the double-quoted-argument boundary scan below is escape-aware
+# (mirrors mask_stash_scan_positional_args()'s #7363 fix) — a same-character
+# scan that closes on the FIRST raw `"` regardless of a preceding backslash
+# mis-parses a check-duplicate.sh TITLE/DESCRIPTION that quotes an EXAMPLE
+# command string containing its own escaped inner double quotes (e.g. a
+# dedup-check description text ABOUT a for-loop repro, `"for p in \"...
+# catastrophic:aws s3 rb...\"; do ...\"; done ..."`), truncating the
+# "argument" at the first escaped quote and leaving the true remainder of
+# the real argument -- including a catastrophic-tier phrase quoted only as
+# descriptive text -- unmasked and still visible to the raw scan below.
+# Single-quoted spans are untouched (still a plain same-character scan):
+# real bash gives backslash no special meaning inside single quotes.
 mask_catastrophic_positional_args() {
     printf '%s' "$1" | awk '
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
+        BS = sprintf("%c", 92)
         # Command-name allowlist: known non-executing search commands whose
         # positional pattern arguments are inert search text, never live
         # shell syntax. Unlike mask_ask_positional_args() above, grep/egrep/
@@ -4056,8 +4107,31 @@ mask_catastrophic_positional_args() {
                 qc = substr(rest, 1, 1)
                 if (qc != DQ && qc != SQ) break
                 endpos = 0
-                for (i = 2; i <= length(rest); i++) {
-                    if (substr(rest, i, 1) == qc) { endpos = i; break }
+                if (qc == DQ) {
+                    # Escape-aware (#7515, mirrors mask_stash_scan_positional_args()'\''s
+                    # #7363 fix): a backslash swallows the NEXT character as one
+                    # atomic unit, so an escaped `\"` -- e.g. a check-duplicate.sh
+                    # dedup TITLE/DESCRIPTION that quotes an EXAMPLE command
+                    # string with its own inner double quotes -- can never be
+                    # misread as this argument'\''s closing quote, leaving the
+                    # remainder of the real argument (which may itself contain
+                    # the catastrophic-tier phrase) unmasked and still visible to
+                    # the raw scan below.
+                    i = 2
+                    rlen = length(rest)
+                    while (i <= rlen) {
+                        c = substr(rest, i, 1)
+                        if (c == BS) { i += 2; continue }
+                        if (c == DQ) { endpos = i; break }
+                        i++
+                    }
+                } else {
+                    # Single-quoted: bash gives backslash no special meaning
+                    # inside real single quotes, so the plain same-character
+                    # scan is correct here (unchanged from before #7515).
+                    for (i = 2; i <= length(rest); i++) {
+                        if (substr(rest, i, 1) == qc) { endpos = i; break }
+                    }
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
@@ -4136,11 +4210,10 @@ mask_catastrophic_positional_args() {
 # / stash-scope:main-checkout (confirmed in `.loom/logs/guard-decisions.log`,
 # #7363).
 #
-# ESCAPE-AWARE double-quote scanning (unlike mask_catastrophic_positional_args()
-# above, which — as of this writing, with PR #7519/#7515 still unmerged —
-# still closes a double-quoted span on the FIRST raw `"` regardless of a
-# preceding backslash; mask_ask_positional_args() above already carries this
-# same escape-aware fix, ported via #7516): the real false-positive
+# ESCAPE-AWARE double-quote scanning (as of #7515 also in
+# mask_catastrophic_positional_args() above, which ported this same treatment,
+# and in mask_ask_positional_args() above via #7516): the real
+# false-positive
 # repro from #7363 is `grep -n "^assert_ask \"stash-scope: git stash pop in
 # main checkout asks" file` — a single double-quoted argument containing a
 # backslash-escaped `\"`. A naive same-character scan stops at that escaped
@@ -4402,7 +4475,24 @@ mask_catastrophic_var_assignment() {
 #      sees the argument immediately following the command name, so that
 #      shape stays fail-closed like any other unrecognized consumer;
 #      `printf "text $var text"` (var interpolated directly in the one
-#      format-string argument) IS covered.
+#      format-string argument) IS covered. #7515 adds one more still-open-
+#      quote shape, this time for `jq` specifically: `jq -r --arg p "XX"
+#      'select(.pattern == $p) | .ts'` — the loop variable's TEXT (`$p`)
+#      appears inside jq's own single-quoted FILTER-SCRIPT argument, where
+#      it is a jq-language variable reference (bound by `--arg p "XX"` to
+#      the literal string `"XX"`, never the outer loop variable's value) —
+#      not a bash variable expansion at all, since it sits inside a
+#      single-quoted bash argument bash never expands. The existing
+#      grep/jq case above only recognizes `$var` immediately following
+#      jq/grep/etc. (optionally after short flags) as the ENTIRE quoted
+#      positional argument; it does not tolerate `--arg NAME "VALUE"` pairs
+#      between the command and the final quoted script the way this new
+#      check does, nor does it tolerate `$var` appearing mid-argument
+#      (only at the very start). This new check is scoped narrowly to
+#      `jq` followed by short flags and/or `--arg`/`--argjson NAME "VALUE"`
+#      pairs, then a still-open quoted argument — mirroring the echo/printf
+#      still-open-quote rationale, not a blanket loosening of the jq/grep
+#      trusted-consumer set.
 #
 # Only when every check passes are the word-list literals masked, using the
 # same inertness floor as every other pass in this file: a span containing
@@ -4520,7 +4610,8 @@ mask_catastrophic_forloop_wordlist() {
                     vpre = substr(btmp, 1, RSTART - 1)
                     if (vpre !~ /(--search|--arg[ \t]+[A-Za-z_][A-Za-z0-9_]*|--argjson[ \t]+[A-Za-z_][A-Za-z0-9_]*)[ \t]*=?[ \t]*("(\\")?)?$/ \
                         && vpre !~ /(grep|egrep|fgrep|rg|jq|\.\/\.loom\/scripts\/check-duplicate\.sh)([ \t]+-[A-Za-z0-9_-]+)*[ \t]+"?$/ \
-                        && vpre !~ /(^|[ \t\n;&|`(])(echo|printf)([ \t]+-[A-Za-z0-9_-]+)*[ \t]+["'"'"'][^"'"'"']*$/) {
+                        && vpre !~ /(^|[ \t\n;&|`(])(echo|printf)([ \t]+-[A-Za-z0-9_-]+)*[ \t]+["'"'"'][^"'"'"']*$/ \
+                        && vpre !~ /(^|[ \t\n;&|`(])jq([ \t]+-[A-Za-z0-9_-]+)*([ \t]+--arg(json)?[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+"[^"]*")*[ \t]+["'"'"'][^"'"'"']*$/) {
                         safe = 0
                     }
                     btmp = substr(btmp, RSTART + RLENGTH)
@@ -7791,17 +7882,26 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                         # empty here means this was actually a PUSH line, not
                         # a reset, and stays fully ambiguous) resolves to
                         # origin/main, origin/master, origin/<repo-default>,
-                        # or plain HEAD (a bare `git reset --hard` — a no-op
-                        # ref move, only discards uncommitted changes) — none
-                        # of those name a protected branch or another agent's
-                        # WIP — AND the cwd resolves inside a Loom-managed
-                        # worktree (the disposable, session-owned checkout
-                        # this recovery pattern is scoped to, never the main
+                        # plain HEAD (a bare `git reset --hard` — a no-op ref
+                        # move, only discards uncommitted changes), or the
+                        # worktree's OWN tracked branch (#7530: e.g. a
+                        # builder/doctor resyncing its own worktree to its own
+                        # `origin/feature/issue-N` after an upstream
+                        # force-push/rebase — a strict subset of the
+                        # force-push power that same agent already holds over
+                        # that same branch via its own PR) — none of those
+                        # name a protected branch or another agent's WIP —
+                        # AND the cwd resolves inside a Loom-managed worktree
+                        # (the disposable, session-owned checkout this
+                        # recovery pattern is scoped to, never the main
                         # checkout, never an unmanaged directory). Any other
-                        # shape — an unrecognized reset target, a non-reset
-                        # (push) line, or a cwd outside a managed worktree —
-                        # still asks exactly as before.
+                        # shape — an unrecognized reset target (including
+                        # ANOTHER issue's `origin/feature/issue-M` branch), a
+                        # non-reset (push) line, or a cwd outside a managed
+                        # worktree — still asks exactly as before.
                         _fdetached_safe=false
+                        _fcwdabs=""
+                        [[ "$_fcwd" == /* ]] && _fcwdabs=$(normalize_abs_path "$_fcwd")
                         if [[ -n "$_fresettarget" ]]; then
                             if [[ "$_fresettarget" == "HEAD" || \
                                   "$_fresettarget" == "origin/main" || \
@@ -7811,12 +7911,15 @@ if [[ "$COMMAND_ASK_SCAN" == *git* ]] && \
                                 _fdetdefault=$(resolve_default_branch "$_fcwd")
                                 if [[ -n "$_fdetdefault" && "$_fresettarget" == "origin/$_fdetdefault" ]]; then
                                     _fdetached_safe=true
+                                else
+                                    _fownbranch=$(_managed_worktree_branch "$_fcwdabs")
+                                    if [[ -n "$_fownbranch" && "$_fresettarget" == "origin/$_fownbranch" ]]; then
+                                        _fdetached_safe=true
+                                    fi
                                 fi
                             fi
                         fi
                         if [[ "$_fdetached_safe" == true ]]; then
-                            _fcwdabs=""
-                            [[ "$_fcwd" == /* ]] && _fcwdabs=$(normalize_abs_path "$_fcwd")
                             _in_any_managed_worktree "$_fcwdabs" || _fdetached_safe=false
                         fi
                         if [[ "$_fdetached_safe" != true ]]; then

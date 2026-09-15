@@ -3919,6 +3919,11 @@ knobs not yet audited here.
 | *(host-local tiers only — see below)* | `LOOM_ROLE_RUNNER_SHARD_INDEX` | *(unset)* | **This host's** 0-based role-runner shard index (#6374). Must **differ** per host, so it belongs in the service unit next to `LOOM_ROLE_RUNNER`, never in the tracked `.loom/config.json` — a committed `autonomous.roleRunner.shardIndex` gives every host the same index and leaves every other slice with zero owners fleet-wide, so the daemon **refuses** it (logs `error!`, falls back to unsharded). Requires `shardCount`; out-of-range/malformed → unsharded. See [Role-runner host sharding](#role-runner-host-sharding-6374) |
 | `autonomous.roleRunner.shardCount` | `LOOM_ROLE_RUNNER_SHARD_COUNT` | *(unset)* | Fleet-wide number of role-runner shards (#6374) — must be **identical** on every host, which is why the tracked config is a fine home for it. `0`/`1`/malformed → unsharded (every host rotates every workspace, the pre-#6374 behavior). Requires `shardIndex` |
 | `autonomous.roleRunner.shardKey` | *(config only)* | `owner/repo` from `origin`, else the root's basename | Explicit cross-host-stable key hashed to pick a workspace's owning shard (#6374). Must be identical fleet-wide. Set it when the derived key would diverge between hosts — the basename fallback does exactly that if two hosts cloned the same repo into differently-named directories. `status` reports the resolved key and its tier so two hosts can be diffed |
+| `autonomous.roleRunner.roster.enabled` | `LOOM_ROLE_RUNNER_ROSTER` | `false` | Opt-in publish of this host's roster comment (Issue #7690, Phase A of #6704). Off ⇒ zero extra forge calls, `status` byte-identical to pre-#7690. **Observational only** — does not affect `role_shard::decide()`'s verdict; see [Role-runner host roster](#role-runner-host-roster-7690-phase-a-of-6704) |
+| `autonomous.roleRunner.roster.issue` | `LOOM_ROLE_RUNNER_ROSTER_ISSUE` | *(unset)* | `owner/repo#N` of the designated roster issue. Fleet-wide, so the tracked config is a fine home (same argument as `shardCount`). `enabled: true` with this unset/invalid ⇒ one `error!` and no roster (never a panic) |
+| `autonomous.roleRunner.roster.heartbeatSecs` | `LOOM_ROLE_RUNNER_ROSTER_HEARTBEAT_SECS` | `300` | This host's roster-comment refresh cadence |
+| `autonomous.roleRunner.roster.ttlSecs` | `LOOM_ROLE_RUNNER_ROSTER_TTL_SECS` | `900` | Liveness TTL — floored at 3x `heartbeatSecs` regardless of a smaller configured value, so a single missed round-trip can never look like a death |
+| `autonomous.roleRunner.roster.settleSecs` | `LOOM_ROLE_RUNNER_ROSTER_SETTLE_SECS` | `900` | Quiet period a new ring must survive before anyone acts under it. Unused in Phase A (no ring consumes the roster yet); reserved for Phase B's fencing rule |
 | `autonomous.idleExit.enabled` | `LOOM_AUTONOMOUS_IDLE_EXIT_ENABLED` | `false` | End the daemon cleanly after the idle window so a host guard can take over. Independent of Work Finder; never invokes a power command |
 | `autonomous.idleExit.idleMinutes` | `LOOM_AUTONOMOUS_IDLE_EXIT_MINUTES` | `60` | Continuous idle/starvation window. Zero/invalid → default |
 | `autonomous.idleExit.onTokenStarvation` | `LOOM_AUTONOMOUS_IDLE_EXIT_ON_TOKEN_STARVATION` | `true` | Also exit after zero healthy accounts for the full window with no sweep in flight, even if roles keep cycling |
@@ -5012,25 +5017,68 @@ line naming the owning shard, the key, and the key's tier. Unconfigured
 single-host installs print neither. `--json` carries the same under
 `role_runner_shard` (report-level) and `per_repo[].role_runner_shard`.
 
-**Static, not roster-driven (deferred).** The assignment comes from
-`(shardIndex, shardCount)`, not from a live host roster. Killing a host does
-**not** automatically reassign its slice — those workspaces stop rotating until
-an operator lowers `shardCount` or points a survivor at the vacated index.
-Automatic reassignment needs a liveness protocol whose failure modes are exactly
-the zero-or-two-owner races this static scheme rules out arithmetically, so it is
-deliberately a follow-up (#6704) rather than part of the same change.
+**Still static in this phase.** The assignment consumed by `decide()` /
+`owns()` above still comes from `(shardIndex, shardCount)`, never from the
+roster below — see the next section for what has actually shipped.
 
-The design for that follow-up is now recorded in
-[`role-runner-roster.md`](role-runner-roster.md) — a **forge-backed roster**
-(one marker comment per host on a designated roster issue, liveness from the
-comment's forge-assigned `updated_at`, as with lease records) plus a
-**generation-fenced ring** (a host acts only under the newest membership
-generation it has observed, and only after that generation has been settled for
-a full role-tick interval, so a membership disagreement yields rather than
-duplicating). Nothing in it is live yet: the doc is the reviewed decision, and
-the behavior lands in two phases (roster publication + `status` rendering
-first, then rank-from-roster + bounded reassignment). Until Phase B ships, this
-section describes the whole of what the daemon does.
+### Role-runner host roster (#7690, Phase A of #6704)
+
+The design record — [`role-runner-roster.md`](role-runner-roster.md) — picked
+a **forge-backed roster** (one marker comment per host on a designated roster
+issue, liveness from the comment's forge-assigned `updated_at`, as with lease
+records) plus a **generation-fenced ring** for a *future* phase to consume.
+Phase A, described here, ships only the write side and `status` rendering:
+**it does not change `decide()`'s verdict at all.** Killing a host still does
+**not** reassign its slice automatically — that is Phase B, gated entirely
+behind `roster.enabled` staying off by default (see the config table above,
+`autonomous.roleRunner.roster.*`).
+
+**What Phase A does.** With `roster.enabled: true` and a valid `roster.issue`
+(`owner/repo#N`), each daemon runs ONE per-daemon (not per-workspace)
+heartbeat loop that:
+
+1. Reads back every roster comment on the issue (REST — `gh api
+   repos/{owner}/{repo}/issues/{n}/comments`, never GraphQL, #5047).
+2. Locates this host's own comment (by its opaque id — the same
+   `opaque_host_id(host_identity())` lease records publish, #6322) — or, on a
+   fleet host's very first cycle, has none to find.
+3. `PATCH`es it (or `POST`s a new one) with a fresh body advertising the
+   `fnv1a64` digest of every currently-registered, role-runner-enabled
+   workspace's shard key, sorted ascending. The body is regenerated wholesale
+   every cycle (there is no user prose to preserve), so its own trailing
+   timestamp guarantees the "PATCH must change something" contract
+   (`lease-renewal.md`) on every call, `serves` change or not.
+
+At the default 300s cadence that is ~24 REST calls/hour/host, budgeted in the
+design record. With `roster.enabled: false` (the default) the loop never
+spawns and the daemon makes zero extra forge calls.
+
+**Membership and generation are pure functions of `(comment set, instant)`** —
+`role_shard::roster::members`/`ring`/`generation` — exactly as the design
+record specifies, and are the basis for Phase B's fencing rule. Nothing in the
+daemon calls them for ownership yet; `status` is their only consumer so far
+(next paragraph).
+
+**Visibility.** `loom-daemon status` extends the `Role runner (sharding): …`
+header (when the roster has completed at least one heartbeat cycle) with a
+roster block naming the issue, live/seen member counts, the current
+generation and how long it has been settled, and one line per member:
+
+```
+Role runner (sharding): shard 1 of 3 (index from env, count from config)
+  Roster: issue owner/repo#1234 · 3 live / 4 seen · gen 2026-09-15T09:41:07Z (settled 22m)
+    host-a3f9c1d2   fresh   (last beat 41s ago)   serves 27
+    host-d9142cf3   fresh   (last beat 2m ago)    serves 27   ← this host
+    host-e1d4c843   EXPIRED (last beat 31m ago)   serves 27
+```
+
+An EXPIRED member is always rendered, never dropped — silence about a dead
+host is exactly how the pre-#6374 `LOOM_ROLE_RUNNER=0` mitigation became
+invisible. `status` never triggers its own forge read for this: it renders
+only whatever the heartbeat task's own last successful read cached, so a
+roster that has never completed a cycle (including the always-off default)
+renders nothing. `--json` carries the identical section under
+`role_runner_shard.roster`.
 
 ### Completion narration → public fleet feed (#4426)
 

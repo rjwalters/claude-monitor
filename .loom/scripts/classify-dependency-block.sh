@@ -781,7 +781,16 @@ _apply_fact_unescalation() {
 
     if ! printf '%s' "$body" | grep -qF "$revision_marker"; then
         local new_body
-        new_body="$(cat <<EOF
+        # Assigned via `read`, NOT `"$(cat <<EOF ...)"`: bash 3.2 -- the stock
+        # macOS /bin/bash, which `#!/usr/bin/env bash` resolves to -- does not
+        # skip heredoc bodies when scanning a command substitution for its
+        # closing paren. An apostrophe in the prose below ("Champion's") then
+        # opens a quote that never closes, and the whole file fails `bash -n`
+        # ~150 lines downstream, taking `check-shell-syntax.sh` and every
+        # `resync-installed.sh` run on macOS with it (#7721). `read` returns
+        # non-zero at EOF, hence `|| true`; the trailing-newline strip keeps
+        # this byte-identical to the command substitution it replaces.
+        IFS= read -r -d '' new_body <<EOF || true
 $body
 
 ## Revision ($today)
@@ -793,7 +802,7 @@ $summary
 
 $revision_marker
 EOF
-)"
+        new_body="${new_body%$'\n'}"
         if ! gh issue edit "$ISSUE" --repo "$REPO_NWO" --body "$new_body" >/dev/null 2>&1; then
             warn "could not append the ## Revision section to $REPO_NWO#$ISSUE (no label change, no comment; a later pass will retry)"
             return 1
@@ -809,7 +818,16 @@ EOF
     gh issue edit "$ISSUE" --repo "$REPO_NWO" --remove-label "$OPERATOR_DECISION_LABEL" >/dev/null 2>&1 || true
 
     local comment_body
-    comment_body="$(cat <<EOF
+    # Assigned via `read`, NOT `"$(cat <<EOF ...)"`: bash 3.2 -- the stock
+    # macOS /bin/bash, which `#!/usr/bin/env bash` resolves to -- does not
+    # skip heredoc bodies when scanning a command substitution for its
+    # closing paren. An apostrophe in the prose below ("Champion's") then
+    # opens a quote that never closes, and the whole file fails `bash -n`
+    # ~150 lines downstream, taking `check-shell-syntax.sh` and every
+    # `resync-installed.sh` run on macOS with it (#7721). `read` returns
+    # non-zero at EOF, hence `|| true`; the trailing-newline strip keeps
+    # this byte-identical to the command substitution it replaces.
+    IFS= read -r -d '' comment_body <<EOF || true
 **Curator: De-escalating — every cited objection has resolved on \`main\`**
 
 Champion escalated this proposal for repeated rejection without revision.
@@ -830,7 +848,7 @@ for the same finding set.
 *Automated by Curator role (classify-dependency-block.sh --check-fact-unescalate, #7650)*
 $marker
 EOF
-)"
+    comment_body="${comment_body%$'\n'}"
     if ! gh issue comment "$ISSUE" --repo "$REPO_NWO" --body "$comment_body" >/dev/null 2>&1; then
         warn "de-escalated $REPO_NWO#$ISSUE but could not post the confirming comment (audit trail missing)"
     fi
