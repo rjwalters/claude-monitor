@@ -954,7 +954,7 @@ and the cooldown remaining — plus the **identity of the binary that decided**
 error: All 3 tokens in ~/.loom/tokens are marked bad, empty, or .ranking-excluded.
   - agent-1: bad-marked [exhaustion, TTL] at 2026-07-30T16:58:32Z — "exhausted: hit your weekly limit"; clears in 5h48m
   - agent-2: bad-marked [auth, permanent] at 2026-07-29T21:33:41Z — "401 unauthorized"; needs `loom-daemon tokens unblock agent-2`
-  - agent-3: hard-excluded by .ranking status (exhausted) — never readmitted by the fail-safe; re-probe with `loom-daemon tokens check --ranking`
+  - agent-3: hard-excluded by .ranking status (exhausted) — never readmitted by the fail-safe; re-probe with `loom-daemon tokens check --ranking` (this re-probes an account whose reset time has already passed, #7420; use `--source probe` to force a probe of every account)
   deciding binary: loom-daemon 0.16.0 (commit 105f9c12, built 2026-07-30T05:23:19Z)
   exhaustion cooldown: 21600s (override LOOM_TOKEN_EXHAUSTION_COOLDOWN_SECS); auth entries never expire …
 ```
@@ -962,6 +962,51 @@ error: All 3 tokens in ~/.loom/tokens are marked bad, empty, or .ranking-exclude
 The `hard-excluded by .ranking status` line is the #5629 exclusion set above:
 that account is not in `.bad_tokens` at all, so `tokens unblock` will not help —
 the `.ranking` file is what rules it out, and re-probing is the recovery.
+
+### Overdue resets: a revoked account is not an exhausted one (#7420)
+
+`exhausted`/`blocked` are the #5629 hard exclusions — never readmitted without a
+successful re-probe. Under the default `--source auto`, though, Loom derives the
+ranking from claude-monitor's `~/.claude-monitor/ranking.json` whenever that file
+is fresh, and **returns before the probe loop**. So when a credential is *revoked*
+upstream, claude-monitor's own `usage.db` stops refreshing that account, its
+`ranking.json` row freezes, and Loom copied `exhausted` plus a reset instant days
+in the past forward forever — the account looked like it was resting until a date
+that had already gone by, while other hosts had it recorded as
+`auth-dead: 401/invalid credential`.
+
+The combination "hard-excluded status **and** its binding reset is already in the
+past" is now a first-class signal:
+
+- **`tokens check` (source `auto`, which is what `--ranking` and the daemon's
+  10-minute `token_ranking_refresh` use) re-probes exactly those rows** — and only
+  those; every other row still comes from the file with no network call. A `401`
+  records the account in `.bad_tokens` as
+  `auth-dead: 401 on overdue-reset re-probe` (the permanent `auth` class, cleared
+  with `loom-daemon tokens unblock <name>` after re-authenticating). A `200`
+  clears the exclusion outright — the account really was just resting behind a
+  stale monitor db. An *inconclusive* probe (timeout, connection failure, no
+  `.token` file) leaves the row exactly as it was, so a network blip can never
+  soften a hard exclusion into an advisory one.
+- **Only an authoritative run persists the block.** The `.bad_tokens` write is
+  gated on the same flag that writes `.ranking`, so `--ranking` and the daemon
+  refresh record it while read-only diagnostics (`loom-daemon status`'s token
+  snapshot, a bare `tokens check`) re-probe and report the 401 without mutating
+  pool state behind the operator's back.
+- **`--source monitor` keeps its "no probe, ever" contract.** The frozen row is
+  still reported, just flagged.
+- **The table never prints a past reset as current state.** The `Resets at` cell
+  reads `overdue since 2026-09-01T00:00:00Z (7d)`, and a footer names the
+  recovery commands.
+- **`--json` carries `reset_overdue` per account plus a pool-level
+  `overdue_reset_accounts` count**, so fleet tooling can count revoked accounts
+  separately from genuinely quota-exhausted ones without re-deriving the rule.
+
+`rate_limited` is deliberately **not** in scope: its 5h window rolls over
+routinely, it is only an advisory exclusion (the fail-safe readmits it), and a
+monitor file a few minutes behind would flag every such row. An account with no
+reset instant at all is likewise never flagged — missing stays "unknown", never
+coerced into a claim about the past.
 
 **Shadowed shared pool (#6614).** The all-excluded message also says whether a
 *different*, healthy pool exists that was never consulted. `resolve_tokens_dir`
