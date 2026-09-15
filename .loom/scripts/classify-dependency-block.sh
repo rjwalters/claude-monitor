@@ -329,7 +329,9 @@ _extract_refs() {
 #
 #   1. a dependency word ("blocked by", "blocker", "depends on", "dependent
 #      on", "dependency on"/"dependencies on"/"dependency of"/"dependencies
-#      of", "requires", "prerequisite", "waiting on"), and
+#      of", "requires", "prerequisite", "waiting on", "waits on", "cannot
+#      start/proceed/begin ... until", "not startable/beginable until",
+#      "must wait for/until"), and
 #   2. an actual issue/PR reference.
 #
 # (2) is what keeps ordinary English out of the timing bucket: "Requires a
@@ -345,9 +347,14 @@ _extract_refs() {
 # at all -- that false positive incorrectly un-escalated #4196 (#6112).
 # "dependent on" already covers the adjectival phrasing, so nothing is lost by
 # requiring the noun form to be followed by its preposition.
+#
+# "cannot start until #N" / "cannot proceed until #N" and their kin (#7652)
+# describe the exact same timing relationship as "blocked by #N" in different
+# words -- a sequential-ordering finding, not a merits finding -- so they are
+# included as their own phrase family rather than folded into "blocked".
 is_dependency_finding() {
     local bullet="$1"
-    printf '%s' "$bullet" | grep -qiE '(blocked by|blocker|blocking|blocks|depends on|dependent on|dependenc(y|ies) (on|of)|requires|prerequisite|waiting on|waits on)' || return 1
+    printf '%s' "$bullet" | grep -qiE '(blocked by|blocker|blocking|blocks|depends on|dependent on|dependenc(y|ies) (on|of)|requires|prerequisite|waiting on|waits on|cannot (start|proceed|begin)( work)? until|not (start|begin)able until|must wait (for|until))' || return 1
     printf '%s' "$bullet" | grep -qE '([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)?#[0-9]+|https?://[^[:space:]),]+/(issues|pull)/[0-9]+' || return 1
     return 0
 }

@@ -222,6 +222,29 @@ assert_true is_dependency_finding '- Technical Feasibility: hard dependency on p
 assert_true is_dependency_finding '- Technical Feasibility: this has a dependency of the RTL work on #3' \
     "'dependency of' + #N still classifies as a dependency finding"
 
+# #7652: "cannot start until #N" describes the same sequential-ordering
+# relationship as "blocked by #N" but used none of the previously recognized
+# keywords, so it misclassified as a merits finding and defeated the #5664
+# self-clearing-timing-block protection. Verbatim wording from the real #7431
+# escalation comment that exposed the gap.
+assert_true is_dependency_finding '- Scope: this issue is explicitly sequential (3 of 3, final) and cannot start until #7430 closes.' \
+    "'cannot start until' + #N is a dependency finding (#7652, verbatim #7431 wording)"
+assert_true is_dependency_finding '- Scope: this work cannot proceed until private/repo#88 lands' \
+    "'cannot proceed until' + #N is a dependency finding (#7652)"
+assert_true is_dependency_finding '- Scope: implementation cannot begin work until #12 merges' \
+    "'cannot begin work until' + #N is a dependency finding (#7652)"
+assert_true is_dependency_finding '- Scope: this is not startable until #9 is resolved' \
+    "'not startable until' + #N is a dependency finding (#7652)"
+assert_true is_dependency_finding '- Scope: we must wait until #14 before touching this' \
+    "'must wait until' + #N is a dependency finding (#7652)"
+assert_true is_dependency_finding '- Scope: we must wait for #14 before touching this' \
+    "'must wait for' + #N is a dependency finding (#7652)"
+if is_dependency_finding '- Scope: this work cannot start soon given the current backlog'; then
+    fail "'cannot start' with no 'until' and no reference is a merits finding (#7652)"
+else
+    pass "'cannot start' with no 'until' and no reference is a merits finding (#7652)"
+fi
+
 echo
 echo "--- findings_are_dependency_only: one merits finding disqualifies the set ---"
 
