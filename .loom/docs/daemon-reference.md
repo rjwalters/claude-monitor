@@ -475,6 +475,55 @@ never held one). #4980 closes that by persisting the group:
 pre-#4980 daemon still deserializes — failing to parse it would be read
 everywhere as "no owner" and would drop a *live* sweep's lock.
 
+#### Lease renewal is started at dispatch, but never owned by the daemon (#7672)
+
+A dispatch that successfully flips `loom:issue → loom:building` also writes a
+**lease record** on the issue (`<!-- loom:lease host=… sweep=… -->`, #6179) —
+the liveness evidence a peer host's reclamation gate (#6286), the dispatch-time
+ordering check (#6287) and the sweep-side pre-push fence (#6309) all read. A
+lease only means anything while something keeps re-touching it.
+
+Since #7672 the daemon starts that renewal loop itself, in
+`finish_issue_dispatch`, immediately after the child is spawned and past the
+#4689 preflight-death check:
+
+```
+.loom/scripts/sweep-lease-renew.sh start <N> \
+  --watch-pid <child pid> --host <published host> --sweep-id <sweep id>
+```
+
+It supersedes a prose instruction in `sweep.md`'s Step 1a that asked the spawned
+session to run the command itself — one session skipping it cost ~2.5 h of
+fleet-wide claim/yield thrash and a near-miss double-claim on a shared worktree.
+Every `Issue` dispatch also exports `LOOM_SWEEP_LEASE_RENEW_DISPATCHED=<N>` so
+Step 1a can tell whether *this* daemon does the hand-off, and still start the
+loop itself against a pre-#7672 binary — the prompt and the binary roll on
+different cadences (`git pull` vs. `loom update`).
+
+**This is a one-shot invocation, not ownership.** `start` forks a loop,
+`disown`s it and returns; the daemon retains no handle, no tick, and no
+restart-time re-arm. The loop watches the **sweep child's** pid
+(`--watch-pid`), runs in its own process group, and self-terminates when the
+sweep exits or its own lease yields — so a daemon restart one second later
+leaves it running. Daemon-*owned* renewal is explicitly forbidden: role agents
+outlive the daemon that spawned them (#6129), so a restart would expire a live
+sweep's lease and invite exactly the reclamation this mechanism exists to
+prevent. It is also best-effort — no helper script, a non-zero `start`, or a
+spawn failure only logs, and the lease then ages out as it did before.
+
+The `start` handshake itself (the subprocess spawn plus its bounded wait for
+the loop pid) runs on a **detached thread**, never inline:
+`finish_issue_dispatch` holds the global registry mutex — on a tokio worker
+thread for both the IPC and work-finder dispatch paths — and a pathological
+helper must not be able to pin it for up to 10 s per `Issue` dispatch and
+starve `list_sweeps` / `cancel` / concurrent dispatches. Same hazard, and same
+shape of fix, as the #6592/#7307 split that moved the account-selection poll
+out from under the lock.
+
+Manual / `--no-daemon` / GH Actions sweeps have no dispatch code to do this, so
+they still publish and start their own loop at Step 1b (#6320). Full mechanism:
+[`lease-renewal.md`](lease-renewal.md) · [`lease-record.md`](lease-record.md).
+
 ### `list_sweeps` (Phase A)
 
 Return all tracked sweeps, optionally filtered by lifecycle state.
@@ -4970,6 +5019,18 @@ an operator lowers `shardCount` or points a survivor at the vacated index.
 Automatic reassignment needs a liveness protocol whose failure modes are exactly
 the zero-or-two-owner races this static scheme rules out arithmetically, so it is
 deliberately a follow-up (#6704) rather than part of the same change.
+
+The design for that follow-up is now recorded in
+[`role-runner-roster.md`](role-runner-roster.md) — a **forge-backed roster**
+(one marker comment per host on a designated roster issue, liveness from the
+comment's forge-assigned `updated_at`, as with lease records) plus a
+**generation-fenced ring** (a host acts only under the newest membership
+generation it has observed, and only after that generation has been settled for
+a full role-tick interval, so a membership disagreement yields rather than
+duplicating). Nothing in it is live yet: the doc is the reviewed decision, and
+the behavior lands in two phases (roster publication + `status` rendering
+first, then rank-from-roster + bounded reassignment). Until Phase B ships, this
+section describes the whole of what the daemon does.
 
 ### Completion narration → public fleet feed (#4426)
 
