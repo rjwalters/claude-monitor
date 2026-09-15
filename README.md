@@ -151,7 +151,7 @@ stores no OpenAI credential of its own (#104) — both tiers read through
 whatever the Codex CLI already owns:
 
 1. **`codex app-server`** (preferred). The app runs
-   `codex -s read-only -a untrusted app-server`, speaks JSON-RPC over its stdio,
+   `codex -s read-only -a never app-server`, speaks JSON-RPC over its stdio,
    and reads `account/rateLimits/read`. **Codex owns the credential end to end
    — this app never reads, stores, or refreshes an OpenAI token on this path.**
    Requires `codex` **0.147.0 or newer**: the method does not exist in 0.46.0
