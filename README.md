@@ -803,6 +803,12 @@ claude-monitor accounts import accounts.json
   same file, and safe to import an older export after newer local polls.
   `--dry-run` previews the account count without writing anything, and `-` as
   the path reads the export from stdin.
+- **A fresh host needs no prior store:** `import` creates
+  `~/.claude-monitor/usage.db` (directory, file, and schema) when the
+  destination has never launched the app or the daemon, so a new worker can be
+  converged before it has polled once. `export` still refuses a host with no
+  store — there is nothing there to export, and an empty bundle would look
+  like a successful one.
 - **Credentials are secrets:** the export is plaintext JSON containing live
   OAuth tokens. `--output <path>` (`-o`) writes it with `0600` permissions and the
   command prints a warning either way (`--compact` drops the pretty-printing); without `--output` (stdout, e.g. for
