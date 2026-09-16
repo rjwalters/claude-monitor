@@ -600,6 +600,12 @@ run.
 
 ### Build (Linux)
 
+The quickest path needs no Swift toolchain at all: every
+[GitHub Release](https://github.com/rjwalters/claude-monitor/releases) carries
+a statically-linked `claude-monitor-linux-x64` asset (no dynamic Swift/
+Foundation dependency — verified in CI via `ldd`), so `curl`-ing it down and
+`chmod +x` is enough to run it on a bare host. To build from source instead:
+
 Requires a Swift toolchain ([swift.org](https://www.swift.org/install/) or the
 `swift:6.1` Docker image) and the SQLite dev headers:
 
