@@ -598,6 +598,41 @@ The same package builds on Linux as a headless daemon — no UI, same poll loop
 same `~/.claude-monitor/usage.db` and `ranking.json`. This is what Loom hosts
 run.
 
+### Quick install (recommended)
+
+`scripts/install-linux.sh` automates the whole standing-up sequence — acquire
+a binary, refuse one that's dynamically linked, install it, wire up the
+systemd user unit, seed accounts — in one idempotent, re-runnable command:
+
+```bash
+# Fastest path: download the latest static-stdlib release asset, no Swift
+# toolchain needed. Installs to ~/.local/bin (no sudo) and starts the unit.
+./scripts/install-linux.sh --from-release
+
+# No GitHub release available yet: build in the swift:6.1 container instead
+# (requires docker, no local Swift toolchain).
+./scripts/install-linux.sh --from-source
+
+# Already have a binary (built by hand, copied from another host, ...):
+./scripts/install-linux.sh --binary /path/to/ClaudeMonitor
+
+# System-wide install instead of the per-user default (sudo used only here):
+./scripts/install-linux.sh --from-release --prefix /usr/local
+
+# Seed accounts.env at install time (see "Multiple Accounts" below):
+./scripts/install-linux.sh --from-release --accounts-env /path/to/accounts.env
+```
+
+Re-running the script upgrades an already-installed daemon in place and
+restarts the unit when a newer binary is available, and reports a no-op when
+the version is unchanged. It refuses to install a dynamically-linked binary
+(printing the `ldd` evidence) before touching the filesystem — the failure
+mode that leaves a host with a unit that can't start. Run
+`./scripts/install-linux.sh --help` for the full flag list.
+
+The rest of this section explains what the script automates, for manual
+installs, upgrades, or troubleshooting.
+
 ### Build (Linux)
 
 The quickest path needs no Swift toolchain at all: every
