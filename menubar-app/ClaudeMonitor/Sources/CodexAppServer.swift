@@ -90,6 +90,22 @@ func redactHomePath(_ path: String) -> String {
     return path
 }
 
+/// `redactHomePath` for free-form text — a child process's stderr, say — where
+/// a home-directory path can appear anywhere in the string rather than *being*
+/// the string. Collapses this process's own home and any `/Users/<name>` or
+/// `/home/<name>` prefix to `~`, so text that is about to be logged or persisted
+/// to `oauth_credentials.last_error` never carries a username.
+func redactHomePaths(inText text: String) -> String {
+    var out = text
+    let home = NSHomeDirectory()
+    if !home.isEmpty { out = out.replacingOccurrences(of: home, with: "~") }
+    if let regex = try? NSRegularExpression(pattern: #"(?:/Users|/home)/[^/\s'"`]+"#) {
+        let range = NSRange(out.startIndex..., in: out)
+        out = regex.stringByReplacingMatches(in: out, range: range, withTemplate: "~")
+    }
+    return out
+}
+
 // MARK: - Version diagnostics
 
 /// The `result` payload of an `initialize` reply — the only field the
@@ -968,7 +984,11 @@ final class CodexAppServerClient: Sendable {
 
             if Date() >= deadline { throw CodexAppServerError.timedOut(method) }
             if stream.isDrained, !process.isRunning {
-                let detail = stderr.snapshot
+                // Redacted before it can reach `debug.log` or
+                // `oauth_credentials.last_error`: the child runs with
+                // `CODEX_HOME` set to a real home, and a CLI that echoes a path
+                // in its diagnostic would otherwise persist a username.
+                let detail = redactHomePaths(inText: stderr.snapshot)
                 let suffix = detail.isEmpty ? "" : ": \(detail)"
                 throw CodexAppServerError.protocolFailure("app-server exited before answering \(method)\(suffix)")
             }

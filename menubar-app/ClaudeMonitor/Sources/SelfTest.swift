@@ -2309,6 +2309,50 @@ enum SelfTest {
                     // test's concern; the timeout/elapsed-time assertions above
                     // already cover the escalation ladder's correctness.
                 }
+
+                // #184: a child that exits before answering `initialize` (the
+                // shape of a CLI-argument break, e.g. codex >= 0.149 rejecting
+                // `-a untrusted`) must surface its stderr in the error instead
+                // of a bare "exited before answering" — and that stderr must be
+                // scrubbed of home paths first, because the string is logged and
+                // persisted to `oauth_credentials.last_error`.
+                let home = NSHomeDirectory()
+                let argFailStub = try writeStub(in: dir, name: "codex-argfail", body: """
+                #!/bin/sh
+                trap 'echo reaped > "$MARKER"' EXIT
+                echo "error: invalid value 'untrusted' for '--ask-for-approval' (config: \(home)/.codex-fixture/config.toml)" >&2
+                exit 2
+                """)
+                let argFailClient = CodexAppServerClient(
+                    codexHome: dir.path,
+                    timeouts: timeouts,
+                    environment: [
+                        CodexBinary.overrideEnvKey: argFailStub,
+                        "PATH": "/usr/bin:/bin",
+                        "MARKER": dir.appendingPathComponent("argfail-reaped").path,
+                    ]
+                )
+                switch runBlocking({ try await argFailClient.fetchUsage() }) {
+                case .success:
+                    checks += 1
+                    failures.append("a child that exits on an argument error must not appear to succeed")
+                case .failure(let error):
+                    guard let codexError = error as? CodexAppServerError, case .protocolFailure(let detail) = codexError else {
+                        checks += 1
+                        failures.append("an early exit must fail with .protocolFailure, got \(error)")
+                        break
+                    }
+                    expect(detail.contains("invalid value 'untrusted'"),
+                           "the child's stderr is surfaced in the early-exit error: \(detail)")
+                    expect(!detail.contains(home) && detail.contains("~/.codex-fixture/config.toml"),
+                           "a home path in the child's stderr is collapsed to ~ before it can be persisted: \(detail)")
+                }
+
+                expectEqual(redactHomePaths(inText: "open /home/bob/.codex/auth.json: EACCES (see /Users/alice/x.log)"),
+                            "open ~/.codex/auth.json: EACCES (see ~/x.log)",
+                            "redactHomePaths(inText:) collapses every /Users/<name> and /home/<name> prefix in free text")
+                expectEqual(redactHomePaths(inText: "no paths here"), "no paths here",
+                            "redactHomePaths(inText:) leaves text without a home path untouched")
             } catch {
                 checks += 1
                 failures.append("codex app-server stub test threw: \(error)")
