@@ -121,6 +121,15 @@ enum SelfTest {
         testHeadlessEnvFileCanDeclareIdentities()
         testAbsentVocabularyIsDistinct()
         testAccountSyncExcludesOpenAIAccounts()
+        testAccountSyncExportHasUniqueEmailsAndNoOpenAI()
+        testAccountImportCreatesMissingDatabase()
+        testAccountSyncRemoteArgsAndCommands()
+        testAccountSyncPushStreamsBundleWithoutWritingAFile()
+        testAccountSyncPushDryRunSendsNoBundle()
+        testAccountSyncPushReportsPerHostFailure()
+        testAccountSyncPushSurvivesSSHThatNeverReadsStdin()
+        testAccountSyncPullImportsPeerBundle()
+        testAccountSyncPullRejectsUndecodableBodyWithoutEchoingIt()
         testMergeDuplicateAccountsSharingEmail()
         testAccountDeletionRemovesCredentials()
         testPurgeOrphanedCredentialsMigration()
@@ -3824,6 +3833,616 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("account sync host-local exclusion test threw: \(error)")
+            }
+        }
+    }
+
+    // MARK: - AccountSync export invariants + ssh fan-out (#188)
+
+    /// The bundle `import` upserts **by email**, so two records sharing an
+    /// email inside one bundle would silently collide — the second landing on
+    /// the row the first just created. A build from 2026-08-03 still emitted
+    /// the host-local Codex rows, and a Codex account routinely shares its
+    /// operator's Anthropic email, so that build produced exactly such a
+    /// bundle. This pins the invariant so the regression cannot return: the
+    /// fixture below *is* the colliding pair, and the export must still come
+    /// out with unique emails and no `openai` record.
+    private static func testAccountSyncExportHasUniqueEmailsAndNoOpenAI() {
+        withSelfTestTempDir { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+
+                // The same human, on both providers, with one address.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('anthropic-row', 'agent-17', 'agent-17@example.com', 'Max',
+                            '2026-09-16T00:00:00Z', 'anthropic')
+                """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('openai-row', 'agent-17', 'agent-17@example.com', 'pro',
+                            '2026-09-16T00:00:00Z', 'openai')
+                """)
+                // A second Codex identity sharing another Anthropic row's
+                // email — and that Anthropic row written the pre-migration way
+                // (no provider column named at all), so it exercises the
+                // DEFAULT 'anthropic' path rather than an explicit value.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated)
+                    VALUES ('legacy-row', 'agent-18', 'agent-18@example.com', 'Max',
+                            '2026-09-16T00:00:00Z')
+                """)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('openai-row-2', 'agent-18', 'agent-18@example.com', 'pro',
+                            '2026-09-16T00:00:00Z', 'openai')
+                """)
+
+                let bundle = try AccountSync.exportBundle(dbPath: dbPath)
+                expect(bundle.accounts.allSatisfy { $0.provider != "openai" },
+                       "export emits zero provider == openai records")
+                expectEqual(bundle.accounts.count, 2, "only the two Anthropic-side rows are exported")
+
+                let emails = bundle.accounts.compactMap { $0.email?.lowercased() }
+                expectEqual(emails.count, Set(emails).count,
+                            "no two exported records share an email — import upserts by email, so a duplicate would collide")
+                expectEqual(bundle.accounts.first(where: { $0.id == "legacy-row" })?.provider, "anthropic",
+                            "a row written without an explicit provider exports as anthropic rather than being dropped")
+            } catch {
+                checks += 1
+                failures.append("account export invariant test threw: \(error)")
+            }
+        }
+    }
+
+    /// A fresh worker has no `usage.db` at all — which is precisely the host an
+    /// import is most needed on. Before #188 `importBundle` refused it
+    /// (`No database found at …`) *after* `--dry-run` had reported success, so
+    /// a bootstrap script could not even detect the problem in advance. Import
+    /// must create the store, its parent directory, and its schema.
+    private static func testAccountImportCreatesMissingDatabase() {
+        withSelfTestTempDir { dir in
+            do {
+                // Deliberately two levels down: neither the directory nor the
+                // file exists, exactly like a never-launched `~/.claude-monitor`.
+                let dbPath = dir.appendingPathComponent("fresh-host/.claude-monitor/usage.db").path
+                expect(!FileManager.default.fileExists(atPath: dbPath),
+                       "fixture precondition: the database does not exist yet")
+
+                let bundle = AccountSync.ExportBundle(
+                    formatVersion: AccountSync.formatVersion,
+                    exportedAt: "2026-09-16T00:00:00Z",
+                    sourceHost: "selftest",
+                    accounts: [AccountSync.ExportedAccount(
+                        id: "claude-org-uuid",
+                        provider: "anthropic",
+                        accountName: "agent-17",
+                        email: "agent-17@example.com",
+                        plan: "Max",
+                        lastUpdated: "2026-09-16T00:00:00Z",
+                        sortOrder: 0,
+                        credentials: [AccountSync.ExportedCredential(
+                            label: "agent-17@example.com", source: "token", provider: "anthropic",
+                            accessToken: "sk-ant-fresh-host", refreshToken: nil,
+                            expiresAt: nil, tokenExpiresAt: nil,
+                            scopes: nil, subscriptionType: nil, rateLimitTier: nil,
+                            isActive: true, createdAt: nil, updatedAt: nil, tokenRolledAt: nil
+                        )]
+                    )]
+                )
+
+                let summary = try AccountSync.importBundle(bundle, dbPath: dbPath)
+                expectEqual(summary.created, 1, "the account is created on a host that had no store")
+                expect(FileManager.default.fileExists(atPath: dbPath),
+                       "import created the database file itself")
+
+                // The store is a real one, not just a file: schema applied, row
+                // readable through the same loader the app uses.
+                let store = UsageStore(dbPath: dbPath)
+                store.loadFromDatabase()
+                expectEqual(store.accounts.count, 1, "the created store loads the imported account back")
+                expectEqual(store.accounts.first?.email, "agent-17@example.com", "imported account identity survives")
+
+                // Re-running against the now-existing store is still a no-op
+                // upsert, not a duplicate.
+                let second = try AccountSync.importBundle(bundle, dbPath: dbPath)
+                expectEqual(second.created, 0, "a second import creates nothing new")
+                store.loadFromDatabase()
+                expectEqual(store.accounts.count, 1, "…and leaves exactly one row")
+            } catch {
+                checks += 1
+                failures.append("fresh-host import test threw: \(error)")
+            }
+        }
+    }
+
+    /// Argument parsing and remote-command construction for `accounts
+    /// push`/`pull` — the strings that get handed to a *remote shell*, which is
+    /// the one place a quoting mistake would be both invisible locally and
+    /// destructive remotely.
+    private static func testAccountSyncRemoteArgsAndCommands() {
+        do {
+            let push = try AccountSyncRemote.parseArgs(
+                ["worker1", "worker2", "--then-loom", "--ssh-option", "-p", "--ssh-option", "2222",
+                 "--remote-bin", "/opt/bin/claude-monitor", "--db", "/tmp/alt.db"],
+                verb: .push
+            )
+            expectEqual(push.hosts, ["worker1", "worker2"], "every non-option argument is a host")
+            expect(push.thenLoom, "--then-loom parsed")
+            expect(!push.dryRun, "--dry-run defaults off")
+            expectEqual(push.sshOptions, ["-p", "2222"], "--ssh-option is repeatable and order-preserving")
+            expectEqual(push.remoteBinary, "/opt/bin/claude-monitor", "--remote-bin overrides the far-side binary")
+            expectEqual(push.dbPath, "/tmp/alt.db", "--db still routes through CLIArgs.matchCommon")
+        } catch {
+            checks += 1
+            failures.append("push arg parsing threw: \(error)")
+        }
+
+        // A pull converges this host from one peer; two peers would mean two
+        // conflicting sources of truth in a single command.
+        do {
+            _ = try AccountSyncRemote.parseArgs(["a", "b"], verb: .pull)
+            checks += 1
+            failures.append("pull with two hosts should have been rejected")
+        } catch let error as AccountSyncRemote.ArgError {
+            if case .tooManyHosts = error {
+                expect(true, "pull rejects more than one host")
+            } else {
+                expect(false, "pull with two hosts reported the wrong error: \(error.message)")
+            }
+        } catch {
+            checks += 1
+            failures.append("pull arg parsing threw unexpectedly: \(error)")
+        }
+
+        do {
+            _ = try AccountSyncRemote.parseArgs([], verb: .push)
+            checks += 1
+            failures.append("push with no host should have been rejected")
+        } catch let error as AccountSyncRemote.ArgError {
+            if case .noHost = error {
+                expect(true, "push requires at least one host")
+            } else {
+                expect(false, "push with no host reported the wrong error: \(error.message)")
+            }
+        } catch {
+            checks += 1
+            failures.append("push arg parsing threw unexpectedly: \(error)")
+        }
+
+        do {
+            _ = try AccountSyncRemote.parseArgs(["worker1", "--nope"], verb: .push)
+            checks += 1
+            failures.append("an unknown option should have been rejected")
+        } catch let error as AccountSyncRemote.ArgError {
+            if case .unknownOption = error {
+                expect(true, "an unknown option is rejected rather than treated as a host")
+            } else {
+                expect(false, "unknown option reported the wrong error: \(error.message)")
+            }
+        } catch {
+            checks += 1
+            failures.append("push arg parsing threw unexpectedly: \(error)")
+        }
+
+        expectEqual(AccountSyncRemote.shellQuote("/opt/my bin/claude-monitor"),
+                    "'/opt/my bin/claude-monitor'",
+                    "a path with a space arrives at the remote shell quoted")
+        expectEqual(AccountSyncRemote.shellQuote("it's"), "'it'\\''s'",
+                    "an embedded single quote is escaped the POSIX way")
+
+        expectEqual(AccountSyncRemote.remoteImportCommand(remoteBinary: "claude-monitor", thenLoom: false),
+                    "'claude-monitor' accounts import -",
+                    "push feeds the destination through stdin — never a path on disk")
+        expectEqual(AccountSyncRemote.remoteImportCommand(remoteBinary: "claude-monitor", thenLoom: true),
+                    "'claude-monitor' accounts import - && \(AccountSyncRemote.loomImportCommand)",
+                    "--then-loom chains with && so a failed import never re-publishes stale tokens")
+        expectEqual(AccountSyncRemote.remoteExportCommand(remoteBinary: "claude-monitor"),
+                    "'claude-monitor' accounts export --compact",
+                    "pull reads the peer's stdout")
+
+        let args = AccountSyncRemote.sshArguments(
+            host: "worker1", sshOptions: ["-p", "2222"], remoteCommand: "echo hi")
+        expectEqual(args, ["-o", "BatchMode=yes", "-p", "2222", "worker1", "echo hi"],
+                    "ssh options precede the host, and the remote command is a single trailing argument")
+
+        expect(AccountSyncRemote.exitDescription(255).contains("ssh itself failed"),
+               "255 is reported as an ssh-level failure, not a remote-command one")
+        expect(AccountSyncRemote.exitDescription(127).contains("--remote-bin"),
+               "127 points at the PATH fix that actually resolves it")
+
+        // The override is the seam the fan-out tests below use; a broken one
+        // must fail rather than silently fall back to PATH.
+        expectEqual(AccountSyncRemote.resolveSSHBinary(
+            environment: [AccountSyncRemote.sshOverrideEnvKey: "/nonexistent/ssh", "PATH": "/usr/bin"]),
+                    nil, "a non-executable ssh override resolves to nil instead of falling back to PATH")
+    }
+
+    /// End-to-end `accounts push` against a stub `ssh`, asserting the property
+    /// the whole feature exists for: **the bundle never becomes a file**. The
+    /// stub stands in for the network and then runs the real destination
+    /// command (`accounts import -` against a scratch database) with the piped
+    /// stdin it was handed, so this also covers the fresh-host import path from
+    /// the outside.
+    private static func testAccountSyncPushStreamsBundleWithoutWritingAFile() {
+        guard let selfBinary = Bundle.main.executablePath,
+              FileManager.default.isExecutableFile(atPath: selfBinary) else {
+            // Nothing to spawn (e.g. an embedded host) — skip rather than fail.
+            return
+        }
+        withSelfTestTempDir("push") { dir in
+            do {
+                let sourceDB = dir.appendingPathComponent("source.db").path
+                let destDB = dir.appendingPathComponent("dest/usage.db").path
+                let argvFile = dir.appendingPathComponent("ssh-argv").path
+                let token = "sk-ant-push-channel-token"
+
+                let store = UsageStore(dbPath: sourceDB)
+                store.ensureDatabase()
+                let db = try openDatabase(sourceDB)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('claude-org-uuid', 'agent-17', 'agent-17@example.com', 'Max',
+                            '2026-09-16T00:00:00Z', 'anthropic')
+                """)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                    VALUES ('claude-org-uuid', 'agent-17@example.com', 'token', 'anthropic',
+                            '\(token)', 1, '2026-09-16T00:00:00Z', '2026-09-16T00:00:00Z')
+                """)
+
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    # Stub ssh: record the argv it was invoked with, then run the
+                    # destination command locally against a scratch database with
+                    # the piped bundle still on stdin.
+                    printf '%s\\n' "$*" > \(argvFile)
+                    exec "\(selfBinary)" accounts import - --db "\(destDB)"
+                    """)
+
+                var info: [String] = []
+                var errors: [String] = []
+                let options = try AccountSyncRemote.parseArgs(["worker1", "--db", sourceDB], verb: .push)
+                let status = AccountSyncRemote.runPush(
+                    options,
+                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
+                )
+
+                expectEqual(status, 0, "push against a reachable host exits 0 (stderr: \(errors.joined(separator: " | ")))")
+                expect(info.contains { $0.contains("push: 1/1 host(s) succeeded") },
+                       "push reports per-host success; saw: \(info.joined(separator: " | "))")
+                expect(info.contains { $0.contains("agent-17@example.com: created") },
+                       "the destination's own import outcome is relayed back; saw: \(info.joined(separator: " | "))")
+
+                let argv = (try? String(contentsOfFile: argvFile, encoding: .utf8)) ?? ""
+                expect(argv.contains("BatchMode=yes"), "ssh runs in batch mode; argv was: \(argv)")
+                expect(argv.contains("worker1"), "the host is passed to ssh; argv was: \(argv)")
+                expect(argv.contains("'claude-monitor' accounts import -"),
+                       "the remote command reads the bundle from stdin; argv was: \(argv)")
+
+                // The destination store was created by the import itself.
+                expect(FileManager.default.fileExists(atPath: destDB),
+                       "the destination database was created by `import -` on a host that had none")
+                let destStore = UsageStore(dbPath: destDB)
+                destStore.loadFromDatabase()
+                expectEqual(destStore.accounts.count, 1, "the account crossed the channel")
+                expectEqual(destStore.accounts.first?.email, "agent-17@example.com", "…with its identity intact")
+                let destDB2 = try openDatabase(destDB)
+                expectEqual(try destDB2.scalar(
+                    "SELECT access_token FROM oauth_credentials WHERE account_id = 'claude-org-uuid'") as? String,
+                            token, "…and its credential")
+
+                // The point of the exercise: no file outside the two SQLite
+                // stores ever held the token. Anything else on disk carrying it
+                // would be the plaintext bundle this feature exists to avoid.
+                let stores = [sourceDB, destDB]
+                var leaked: [String] = []
+                let all = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: nil)?
+                    .compactMap { ($0 as? URL)?.path } ?? []
+                for path in all where !stores.contains(where: { path.hasPrefix($0) }) {
+                    guard let contents = FileManager.default.contents(atPath: path),
+                          let text = String(data: contents, encoding: .utf8) else { continue }
+                    if text.contains(token) { leaked.append(path) }
+                }
+                expect(leaked.isEmpty, "no file outside the SQLite stores contains the token: \(leaked)")
+            } catch {
+                checks += 1
+                failures.append("push fan-out test threw: \(error)")
+            }
+        }
+    }
+
+    /// `--dry-run` must not put a credential on the wire for a mere preview: it
+    /// probes reachability (and that `claude-monitor` resolves on the far
+    /// side's non-interactive PATH) and sends nothing.
+    private static func testAccountSyncPushDryRunSendsNoBundle() {
+        withSelfTestTempDir("push-dry") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('claude-org-uuid', 'agent-17', 'agent-17@example.com', 'Max',
+                            '2026-09-16T00:00:00Z', 'anthropic')
+                """)
+
+                let stdinBytes = dir.appendingPathComponent("stdin-bytes").path
+                let argvFile = dir.appendingPathComponent("ssh-argv").path
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    printf '%s\\n' "$*" > \(argvFile)
+                    wc -c > \(stdinBytes)
+                    echo "ClaudeMonitor 9.9.9"
+                    """)
+
+                var info: [String] = []
+                var errors: [String] = []
+                let options = try AccountSyncRemote.parseArgs(
+                    ["worker1", "worker2", "--dry-run", "--db", dbPath], verb: .push)
+                let status = AccountSyncRemote.runPush(
+                    options,
+                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
+                )
+
+                expectEqual(status, 0, "a reachable dry run exits 0 (stderr: \(errors.joined(separator: " | ")))")
+                let argv = (try? String(contentsOfFile: argvFile, encoding: .utf8)) ?? ""
+                expect(argv.contains("'claude-monitor' --version"),
+                       "a dry run asks the far side to identify itself, nothing more; argv was: \(argv)")
+                let bytes = ((try? String(contentsOfFile: stdinBytes, encoding: .utf8)) ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                expectEqual(bytes, "0", "a dry run sends zero bytes of bundle on stdin")
+                expect(info.contains { $0.contains("9.9.9") },
+                       "the far side's reported version is surfaced; saw: \(info.joined(separator: " | "))")
+                expect(info.contains { $0.contains("nothing was written") },
+                       "the dry run says plainly that nothing was written; saw: \(info.joined(separator: " | "))")
+            } catch {
+                checks += 1
+                failures.append("push dry-run test threw: \(error)")
+            }
+        }
+    }
+
+    /// One unreachable worker must not strand the rest of the fleet: every host
+    /// is still attempted, the failure is named, and the exit status is
+    /// non-zero so a bootstrap script notices.
+    private static func testAccountSyncPushReportsPerHostFailure() {
+        withSelfTestTempDir("push-fail") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                    VALUES ('claude-org-uuid', 'agent-17', 'agent-17@example.com', 'Max',
+                            '2026-09-16T00:00:00Z', 'anthropic')
+                """)
+
+                let attempts = dir.appendingPathComponent("attempts").path
+                // Fails only for `unreachable`, exactly as ssh does (255), and
+                // consumes stdin either way so the writer never wedges.
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    cat > /dev/null
+                    for arg in "$@"; do
+                      case "$arg" in
+                        unreachable|worker*) printf '%s\\n' "$arg" >> \(attempts) ;;
+                      esac
+                    done
+                    case "$*" in
+                      *unreachable*) echo "ssh: connect to host unreachable port 22: No route to host" >&2; exit 255 ;;
+                    esac
+                    echo "Done: 1 created, 0 updated, 0 skipped, 0 excluded."
+                    """)
+
+                var info: [String] = []
+                var errors: [String] = []
+                let options = try AccountSyncRemote.parseArgs(
+                    ["unreachable", "worker2", "--db", dbPath], verb: .push)
+                let status = AccountSyncRemote.runPush(
+                    options,
+                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
+                )
+
+                expectEqual(status, 1, "a failed host makes the whole push exit non-zero")
+                let attempted = ((try? String(contentsOfFile: attempts, encoding: .utf8)) ?? "")
+                expect(attempted.contains("worker2"),
+                       "the host after the failure is still attempted; attempts were: \(attempted)")
+                expect(errors.contains { $0.contains("failed: unreachable") },
+                       "the summary names which host failed; saw: \(errors.joined(separator: " | "))")
+                expect(errors.contains { $0.contains("No route to host") },
+                       "ssh's own diagnostic is relayed rather than swallowed; saw: \(errors.joined(separator: " | "))")
+            } catch {
+                checks += 1
+                failures.append("push failure-reporting test threw: \(error)")
+            }
+        }
+    }
+
+    /// Real ssh does **not** read its stdin when it fails fast: a refused
+    /// connection, a rejected host key or a bad option makes it exit 255 before
+    /// the bundle is ever consumed. With SIGPIPE at its default disposition that
+    /// killed the whole `claude-monitor` process (exit 141, no diagnostic at
+    /// all) for any bundle larger than the pipe buffer — so the *first*
+    /// unreachable host stranded the entire fleet, the exact opposite of what
+    /// the per-host loop promises, and the `exit 127 → try --remote-bin` hint
+    /// became unreachable at fleet scale.
+    ///
+    /// The stub therefore deliberately omits the `cat` its sibling above uses —
+    /// consuming stdin is the one behaviour real ssh does not exhibit on a
+    /// connection failure — and the fixture is sized past the pipe buffer, which
+    /// is what makes the write block long enough to take EPIPE.
+    private static func testAccountSyncPushSurvivesSSHThatNeverReadsStdin() {
+        withSelfTestTempDir("push-sigpipe") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+                // A fleet-sized bundle: ~30 accounts with realistic (long)
+                // credentials comfortably exceeds the 64 KiB pipe buffer, which
+                // is the threshold the failure needs. A single-account bundle
+                // fits in the buffer and lands before the child is gone, which
+                // is precisely why the small fixtures above never caught this.
+                let filler = String(repeating: "x", count: 3072)
+                for index in 0..<30 {
+                    try db.run("""
+                        INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                        VALUES ('claude-org-\(index)', 'agent-\(index)', 'agent-\(index)@example.com', 'Max',
+                                '2026-09-16T00:00:00Z', 'anthropic')
+                    """)
+                    try db.run("""
+                        INSERT INTO oauth_credentials
+                            (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                        VALUES ('claude-org-\(index)', 'agent-\(index)@example.com', 'token', 'anthropic',
+                                'sk-ant-\(index)-\(filler)', 1, '2026-09-16T00:00:00Z', '2026-09-16T00:00:00Z')
+                    """)
+                }
+
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let bundleBytes = try encoder.encode(AccountSync.exportBundle(dbPath: dbPath)).count
+                expect(bundleBytes > 64 * 1024,
+                       "the fixture bundle must exceed the pipe buffer or this check cannot reproduce "
+                           + "the failure it exists for (was \(bundleBytes) byte(s))")
+
+                let attempts = dir.appendingPathComponent("attempts").path
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    # No `cat`: this stands in for ssh failing before it ever
+                    # reads the bundle, which is what a refused port looks like.
+                    for arg in "$@"; do
+                      case "$arg" in
+                        worker*) printf '%s\\n' "$arg" >> \(attempts) ;;
+                      esac
+                    done
+                    echo "ssh: connect to host $* port 22: Connection refused" >&2
+                    exit 255
+                    """)
+
+                var info: [String] = []
+                var errors: [String] = []
+                let options = try AccountSyncRemote.parseArgs(
+                    ["worker1", "worker2", "--db", dbPath], verb: .push)
+                let status = AccountSyncRemote.runPush(
+                    options,
+                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
+                )
+
+                // Reaching this line at all is most of the point: before the
+                // fix the process died of SIGPIPE inside `runPush` and no
+                // assertion below ever ran.
+                expectEqual(status, 1, "a host that never reads the bundle is a reported failure, not a crash")
+                let attempted = ((try? String(contentsOfFile: attempts, encoding: .utf8)) ?? "")
+                expect(attempted.contains("worker2"),
+                       "the host after the broken pipe is still attempted; attempts were: \(attempted)")
+                expect(errors.contains { $0.contains("ssh itself failed") },
+                       "the failure reads as ssh's own exit 255, not as a launch error; "
+                           + "saw: \(errors.joined(separator: " | "))")
+                expect(errors.contains { $0.contains("Connection refused") },
+                       "ssh's own diagnostic still reaches the operator; saw: \(errors.joined(separator: " | "))")
+                expect(errors.contains { $0.contains("failed: worker1, worker2") },
+                       "both hosts are named in the summary; saw: \(errors.joined(separator: " | "))")
+            } catch {
+                checks += 1
+                failures.append("push broken-pipe test threw: \(error)")
+            }
+        }
+    }
+
+    /// `accounts pull` is the bootstrap direction: a fresh host with no store
+    /// converges from a peer over the same channel, again without either side
+    /// writing the bundle to disk.
+    private static func testAccountSyncPullImportsPeerBundle() {
+        withSelfTestTempDir("pull") { dir in
+            do {
+                // The "peer" is a stub ssh that prints a bundle on stdout —
+                // plus a warning on stderr, exactly as the real `accounts
+                // export` does, which must not end up inside the JSON.
+                let bundleJSON = """
+                    {"accounts":[{"credentials":[{"accessToken":"sk-ant-pulled","isActive":true,\
+                    "label":"agent-17@example.com","provider":"anthropic","source":"token"}],\
+                    "email":"agent-17@example.com","id":"claude-org-uuid","provider":"anthropic",\
+                    "sortOrder":0}],"exportedAt":"2026-09-16T00:00:00Z","formatVersion":1,\
+                    "sourceHost":"robb-studio"}
+                    """
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    echo "WARNING: this export contains OAuth access/refresh tokens in plaintext." >&2
+                    cat <<'BUNDLE'
+                    \(bundleJSON)
+                    BUNDLE
+                    """)
+
+                let dbPath = dir.appendingPathComponent("fresh/usage.db").path
+                var info: [String] = []
+                var errors: [String] = []
+                let options = try AccountSyncRemote.parseArgs(["robb-studio", "--db", dbPath], verb: .pull)
+                let status = AccountSyncRemote.runPull(
+                    options,
+                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
+                )
+
+                expectEqual(status, 0, "pull from a reachable peer exits 0 (stderr: \(errors.joined(separator: " | ")))")
+                expect(info.contains { $0.contains("1 created") },
+                       "pull reports the same created/updated/skipped summary import does; saw: \(info.joined(separator: " | "))")
+                let pulledStore = UsageStore(dbPath: dbPath)
+                pulledStore.loadFromDatabase()
+                expectEqual(pulledStore.accounts.count, 1, "the peer's account landed in this host's freshly created store")
+                expectEqual(pulledStore.accounts.first?.email, "agent-17@example.com", "…with its identity intact")
+            } catch {
+                checks += 1
+                failures.append("pull test threw: \(error)")
+            }
+        }
+    }
+
+    /// A pull whose peer answers with something that is not a bundle must fail
+    /// loudly — and must not echo the body, which is a credential. (A shell
+    /// profile that prints a banner on every non-interactive login is the
+    /// realistic way this happens.)
+    private static func testAccountSyncPullRejectsUndecodableBodyWithoutEchoingIt() {
+        withSelfTestTempDir("pull-bad") { dir in
+            do {
+                let secret = "sk-ant-should-never-be-printed"
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    echo "=== Welcome to worker1 ==="
+                    echo '{"accounts":[{"accessToken":"\(secret)"}]'
+                    """)
+
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                var info: [String] = []
+                var errors: [String] = []
+                let options = try AccountSyncRemote.parseArgs(["worker1", "--db", dbPath], verb: .pull)
+                let status = AccountSyncRemote.runPull(
+                    options,
+                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
+                )
+
+                expectEqual(status, 1, "an undecodable remote bundle fails the pull")
+                let everything = (info + errors).joined(separator: " | ")
+                expect(!everything.contains(secret),
+                       "the unparseable body is never echoed — it is a credential")
+                expect(errors.contains { $0.contains("could not parse the remote bundle") },
+                       "the failure is actionable; saw: \(everything)")
+                expect(!FileManager.default.fileExists(atPath: dbPath),
+                       "a failed pull writes no store")
+            } catch {
+                checks += 1
+                failures.append("pull decode-failure test threw: \(error)")
             }
         }
     }

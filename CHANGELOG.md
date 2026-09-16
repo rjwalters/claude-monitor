@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`claude-monitor accounts push HOST...` / `accounts pull HOST`** — converge a
+  fleet's account records and OAuth credentials over ssh without ever writing a
+  plaintext-token file. The bundle is serialized in memory and streamed into
+  `accounts import -` on the destination (or read from a peer's `accounts
+  export` for `pull`), replacing the `export` → `scp` → `import` → `rm` dance.
+  Every host is attempted even after one fails and the exit status is non-zero
+  if any did; `--dry-run` probes reachability while sending zero bytes of
+  bundle; `--then-loom` chains `loom-daemon tokens import-from-monitor
+  --shared` on the receiving host with `&&`. `--remote-bin` and a repeatable
+  `--ssh-option` cover a far side that isn't on the non-interactive `PATH`.
+  (#188)
+
 ### Changed
 
 - **Chart-history cutoff and decimation logic deduplicated in `UsageStore`**
@@ -30,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Docs drift:** build-script version detection, the `codex` binary search
   path, `selftest --codex`, `accounts` flags, and the headless `--help` text
   for `codex` now describe what the code does.
+- **`accounts import` refused a host with no `usage.db`** (`No database found
+  at …`) — the state of every fresh worker, and the one host an import is most
+  needed on. Worse, `--dry-run` reported success on the same host, so a
+  bootstrap script could not detect the problem in advance. `import` now
+  creates the store, its parent directory, and its schema. `export` keeps its
+  own guard. (#188)
 
 ## [1.20.0] - 2026-08-17
 
