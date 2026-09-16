@@ -1,4 +1,12 @@
 import Foundation
+// `signal` / `SIGPIPE` / `SIG_IGN` are POSIX, not Foundation: Linux's
+// swift-corelibs-foundation does not re-export them, so the platform module has
+// to be imported explicitly for the headless build.
+#if canImport(Glibc)
+import Glibc
+#elseif canImport(Darwin)
+import Darwin
+#endif
 
 /// `claude-monitor accounts push|pull` — ssh fan-out built on the existing
 /// `AccountSync` export/import plumbing (#188).
@@ -51,8 +59,12 @@ enum AccountSyncRemote {
         var wantsHelp = false
         var dbPath = AccountSync.defaultDBPath
         var remoteBinary = defaultRemoteBinary
-        /// Extra arguments spliced in ahead of the host (e.g. `-p 2222`,
-        /// `-i ~/.ssh/fleet`). Repeatable `--ssh-option`.
+        /// Extra arguments spliced in ahead of the host. `--ssh-option` carries
+        /// exactly **one argv element per flag**, so an option that takes a
+        /// value needs the flag twice: `--ssh-option -p --ssh-option 2222`,
+        /// `--ssh-option -i --ssh-option ~/.ssh/fleet`. (Passing `-p 2222` as a
+        /// single value would hand ssh one argument containing a space, which it
+        /// rejects.)
         var sshOptions: [String] = []
     }
 
@@ -214,7 +226,32 @@ enum AccountSyncRemote {
         let status: Int32
         let stdout: Data
         let stderr: Data
+        /// True when `input` could not be handed to the child in full — i.e. the
+        /// child stopped reading (EPIPE) before the whole bundle was written.
+        /// Kept separate from `status` because the two answer different
+        /// questions: a fast-failing ssh reports *why* it failed in its own exit
+        /// code, and the broken pipe is merely the downstream symptom.
+        var inputWriteFailed: Bool = false
     }
+
+    /// SIGPIPE's default disposition kills the **whole process**, which on a
+    /// fan-out means the first fast-failing host takes every remaining host with
+    /// it — silently, with exit 141 and no diagnostic at all. That is exactly
+    /// what happens with real ssh against a refused port: it exits before
+    /// reading its stdin, so any bundle larger than the pipe buffer (~64 KiB,
+    /// i.e. roughly a fleet's worth of accounts) blocks mid-write and then takes
+    /// EPIPE. Ignoring the signal turns that into an ordinary error return the
+    /// per-host loop can report and recover from.
+    ///
+    /// Installed lazily at the first subprocess launch (a `static let`
+    /// initializer is run-once and thread-safe) rather than at the CLI entry
+    /// point, so it covers every caller of `runProcess` — including `selftest`,
+    /// which drives `runPush` in-process and would otherwise be unable to test
+    /// this path at all.
+    private static let sigpipeIgnored: Bool = {
+        signal(SIGPIPE, SIG_IGN)
+        return true
+    }()
 
     /// Accumulates one child stream on Foundation's reader queue.
     ///
@@ -264,9 +301,14 @@ enum AccountSyncRemote {
     ///
     /// `input` is written after the drains are armed, so a bundle larger than a
     /// pipe buffer cannot wedge against output the child has already produced.
+    /// A child that exits *without* reading its stdin (ssh failing fast on a
+    /// refused connection, a missing remote binary) is likewise survivable: the
+    /// EPIPE is reported in `RemoteResult.inputWriteFailed` instead of killing
+    /// this process, and the child's own status and stderr are still collected.
     static func runProcess(
         executable: String, arguments: [String], input: Data? = nil
     ) throws -> RemoteResult {
+        _ = sigpipeIgnored
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -284,17 +326,33 @@ enum AccountSyncRemote {
 
         try process.run()
 
+        var inputWriteFailed = false
         if let input = input {
             // The one and only place the bundle leaves this process: a pipe to
             // the ssh child. It is never handed to `Data.write(to:)`.
-            inPipe.fileHandleForWriting.write(input)
+            //
+            // The *throwing* `write(contentsOf:)`, not the non-throwing
+            // `write(_:)`: with SIGPIPE ignored above, a child that has already
+            // gone away makes this return EPIPE, and only the throwing spelling
+            // surfaces that as a catchable Swift error. Swallowing it here (and
+            // falling through to the wait below) is deliberate — the child's own
+            // exit status and stderr are the actionable diagnostic, and they are
+            // still on their way.
+            do {
+                try inPipe.fileHandleForWriting.write(contentsOf: input)
+            } catch {
+                inputWriteFailed = true
+            }
             try? inPipe.fileHandleForWriting.close()
         }
 
         let out = outDrain.waitForEOF()
         let err = errDrain.waitForEOF()
         process.waitUntilExit()
-        return RemoteResult(status: process.terminationStatus, stdout: out, stderr: err)
+        return RemoteResult(
+            status: process.terminationStatus, stdout: out, stderr: err,
+            inputWriteFailed: inputWriteFailed
+        )
     }
 
     // MARK: - push
@@ -350,9 +408,9 @@ enum AccountSyncRemote {
                 // stderr stays on stderr whether or not the host succeeded.
                 output.relay(result.stdout, host: host)
                 output.relay(result.stderr, host: host, asError: true)
-                if result.status != 0 {
+                if let reason = failureDescription(result) {
                     failed.append(host)
-                    output.error("\(host): FAILED (\(exitDescription(result.status)))")
+                    output.error("\(host): FAILED (\(reason))")
                 }
             } catch {
                 failed.append(host)
@@ -506,6 +564,25 @@ enum AccountSyncRemote {
         }
         output.error("\(verb.rawValue): \(ok)/\(hosts.count) host(s) succeeded; failed: \(failed.joined(separator: ", "))")
         return 1
+    }
+
+    /// Why one host failed, or `nil` if it did not — both halves of the
+    /// evidence in one place: what the child exited with, and whether the bundle
+    /// actually reached it.
+    ///
+    /// A non-zero status wins even when the write also broke, because the
+    /// broken pipe is the *symptom*: ssh died first (255 for a refused
+    /// connection, 127 for a missing remote binary) and the blocked write took
+    /// EPIPE afterwards. Reporting the pipe would hide the one line the operator
+    /// can act on. A clean exit with a truncated bundle is the remaining case —
+    /// the remote command stopped reading early, so nothing can be assumed to
+    /// have landed.
+    static func failureDescription(_ result: RemoteResult) -> String? {
+        if result.status != 0 { return exitDescription(result.status) }
+        if result.inputWriteFailed {
+            return "the remote command stopped reading before the whole bundle was sent"
+        }
+        return nil
     }
 
     /// ssh's own conventions, spelled out — `255` is ssh itself failing (auth,

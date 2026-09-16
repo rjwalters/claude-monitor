@@ -127,6 +127,7 @@ enum SelfTest {
         testAccountSyncPushStreamsBundleWithoutWritingAFile()
         testAccountSyncPushDryRunSendsNoBundle()
         testAccountSyncPushReportsPerHostFailure()
+        testAccountSyncPushSurvivesSSHThatNeverReadsStdin()
         testAccountSyncPullImportsPeerBundle()
         testAccountSyncPullRejectsUndecodableBodyWithoutEchoingIt()
         testMergeDuplicateAccountsSharingEmail()
@@ -4219,6 +4220,98 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("push failure-reporting test threw: \(error)")
+            }
+        }
+    }
+
+    /// Real ssh does **not** read its stdin when it fails fast: a refused
+    /// connection, a rejected host key or a bad option makes it exit 255 before
+    /// the bundle is ever consumed. With SIGPIPE at its default disposition that
+    /// killed the whole `claude-monitor` process (exit 141, no diagnostic at
+    /// all) for any bundle larger than the pipe buffer — so the *first*
+    /// unreachable host stranded the entire fleet, the exact opposite of what
+    /// the per-host loop promises, and the `exit 127 → try --remote-bin` hint
+    /// became unreachable at fleet scale.
+    ///
+    /// The stub therefore deliberately omits the `cat` its sibling above uses —
+    /// consuming stdin is the one behaviour real ssh does not exhibit on a
+    /// connection failure — and the fixture is sized past the pipe buffer, which
+    /// is what makes the write block long enough to take EPIPE.
+    private static func testAccountSyncPushSurvivesSSHThatNeverReadsStdin() {
+        withSelfTestTempDir("push-sigpipe") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let store = UsageStore(dbPath: dbPath)
+                store.ensureDatabase()
+                let db = try openDatabase(dbPath)
+                // A fleet-sized bundle: ~30 accounts with realistic (long)
+                // credentials comfortably exceeds the 64 KiB pipe buffer, which
+                // is the threshold the failure needs. A single-account bundle
+                // fits in the buffer and lands before the child is gone, which
+                // is precisely why the small fixtures above never caught this.
+                let filler = String(repeating: "x", count: 3072)
+                for index in 0..<30 {
+                    try db.run("""
+                        INSERT INTO accounts (id, account_name, email, plan, last_updated, provider)
+                        VALUES ('claude-org-\(index)', 'agent-\(index)', 'agent-\(index)@example.com', 'Max',
+                                '2026-09-16T00:00:00Z', 'anthropic')
+                    """)
+                    try db.run("""
+                        INSERT INTO oauth_credentials
+                            (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                        VALUES ('claude-org-\(index)', 'agent-\(index)@example.com', 'token', 'anthropic',
+                                'sk-ant-\(index)-\(filler)', 1, '2026-09-16T00:00:00Z', '2026-09-16T00:00:00Z')
+                    """)
+                }
+
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let bundleBytes = try encoder.encode(AccountSync.exportBundle(dbPath: dbPath)).count
+                expect(bundleBytes > 64 * 1024,
+                       "the fixture bundle must exceed the pipe buffer or this check cannot reproduce "
+                           + "the failure it exists for (was \(bundleBytes) byte(s))")
+
+                let attempts = dir.appendingPathComponent("attempts").path
+                let ssh = try writeStub(in: dir, name: "ssh", body: """
+                    #!/bin/sh
+                    # No `cat`: this stands in for ssh failing before it ever
+                    # reads the bundle, which is what a refused port looks like.
+                    for arg in "$@"; do
+                      case "$arg" in
+                        worker*) printf '%s\\n' "$arg" >> \(attempts) ;;
+                      esac
+                    done
+                    echo "ssh: connect to host $* port 22: Connection refused" >&2
+                    exit 255
+                    """)
+
+                var info: [String] = []
+                var errors: [String] = []
+                let options = try AccountSyncRemote.parseArgs(
+                    ["worker1", "worker2", "--db", dbPath], verb: .push)
+                let status = AccountSyncRemote.runPush(
+                    options,
+                    environment: [AccountSyncRemote.sshOverrideEnvKey: ssh],
+                    output: AccountSyncRemote.Output(info: { info.append($0) }, error: { errors.append($0) })
+                )
+
+                // Reaching this line at all is most of the point: before the
+                // fix the process died of SIGPIPE inside `runPush` and no
+                // assertion below ever ran.
+                expectEqual(status, 1, "a host that never reads the bundle is a reported failure, not a crash")
+                let attempted = ((try? String(contentsOfFile: attempts, encoding: .utf8)) ?? "")
+                expect(attempted.contains("worker2"),
+                       "the host after the broken pipe is still attempted; attempts were: \(attempted)")
+                expect(errors.contains { $0.contains("ssh itself failed") },
+                       "the failure reads as ssh's own exit 255, not as a launch error; "
+                           + "saw: \(errors.joined(separator: " | "))")
+                expect(errors.contains { $0.contains("Connection refused") },
+                       "ssh's own diagnostic still reaches the operator; saw: \(errors.joined(separator: " | "))")
+                expect(errors.contains { $0.contains("failed: worker1, worker2") },
+                       "both hosts are named in the summary; saw: \(errors.joined(separator: " | "))")
+            } catch {
+                checks += 1
+                failures.append("push broken-pipe test threw: \(error)")
             }
         }
     }
