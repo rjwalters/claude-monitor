@@ -606,8 +606,41 @@ Requires a Swift toolchain ([swift.org](https://www.swift.org/install/) or the
 ```bash
 sudo apt-get install libsqlite3-dev   # (yum: sqlite-devel)
 cd claude-monitor/menubar-app/ClaudeMonitor
-swift build -c release
+swift build -c release --static-swift-stdlib
 sudo cp .build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+```
+
+**Use `--static-swift-stdlib` for any binary you intend to deploy.** A plain
+`swift build` links against the Swift runtime in `/usr/lib/swift/linux`
+(`libswiftCore`, `libFoundation*`, `libdispatch`, …), so the binary dies with
+`libswiftSwiftOnoneSupport.so: cannot open shared object file` the moment it is
+copied to a host without the toolchain — or the toolchain is removed from the
+build host afterwards. Statically linking the stdlib makes the binary
+self-contained apart from `libsqlite3-0` (see below).
+
+#### No toolchain on the host? Build in a container
+
+Build the deployable binary inside the `swift:6.1` image and copy the result
+out — no Swift install on either the build host or the target (verified
+2026-09-16, ~47 s):
+
+```bash
+docker run --rm -v "$PWD/menubar-app/ClaudeMonitor:/src" -w /src swift:6.1 bash -c \
+  'apt-get update -qq && apt-get install -y -qq libsqlite3-dev && swift build -c release --static-swift-stdlib'
+sudo cp menubar-app/ClaudeMonitor/.build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+```
+
+Run it from the repository root (the bind mount is relative to `$PWD`).
+
+#### Runtime requirement
+
+A statically-linked build still needs **`libsqlite3-0`** at runtime — the
+package uses the system SQLite, not a vendored copy. It is already present on
+Ubuntu 24.04; on a minimal image install it with `apt-get install libsqlite3-0`.
+Confirm the binary has no other unmet dependencies:
+
+```bash
+ldd /usr/local/bin/claude-monitor | grep 'not found'   # should print nothing
 ```
 
 ### Run
@@ -825,6 +858,37 @@ badge says "Still valid!", re-run the revoke console script from step 2 (it
 automatically retries tokens that survive a round) and click **Verify old
 token revoked** again. "Couldn't check" means the ping itself failed
 (network/5xx) — try again later.
+
+### Linux: `cannot open shared object file` on startup
+
+```
+./claude-monitor: error while loading shared libraries:
+libswiftSwiftOnoneSupport.so: cannot open shared object file: No such file or directory
+```
+
+The binary was built **without** `--static-swift-stdlib`, so it still needs the
+Swift runtime (~12 shared objects under `/usr/lib/swift/linux`). That runtime
+comes from the Swift toolchain — copying the binary to a host that has no
+toolchain, or uninstalling the toolchain after building, produces exactly this
+loader error. Diagnose it with:
+
+```bash
+ldd /usr/local/bin/claude-monitor | grep 'not found'
+```
+
+Any unresolved `libswift*` / `libFoundation*` / `libdispatch*` entry confirms
+it. The cure is to rebuild statically and re-copy — see
+[Build (Linux)](#build-linux):
+
+```bash
+swift build -c release --static-swift-stdlib
+sudo cp .build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+```
+
+If the deploy host has no Swift toolchain at all, use the
+[container recipe](#no-toolchain-on-the-host-build-in-a-container) and copy the
+resulting binary over. `libsqlite3-0` is the one shared library that remains
+required even for a static build (already present on Ubuntu 24.04).
 
 ### Logs
 
