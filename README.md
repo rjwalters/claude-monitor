@@ -56,7 +56,7 @@ OAuth tokens you provide, and renders the data locally on your Mac.
 
 ### 1. Prerequisites
 
-- macOS 13+ (Ventura or later)
+- macOS 14+ (Sonoma or later)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed (you
   use it to generate the OAuth tokens via `claude setup-token`)
 
@@ -178,8 +178,9 @@ whatever the Codex CLI already owns:
    `brew upgrade --cask codex` periodically is on you.
 2. **`auth.json` at request time.** `GET https://chatgpt.com/backend-api/wham/usage`
    — the same endpoint Codex CLI's own `/usage` command calls — with the bearer
-   read fresh out of `$CODEX_HOME/auth.json` for that one request. Never written
-   back, never refreshed.
+   read fresh out of that account's own Codex home's `auth.json` (its registered
+   `codex_home`, or `$CODEX_HOME`/`~/.codex` for the ambient account) for that one
+   request. Never written back, never refreshed.
 
 A tier that is merely *unavailable* — no `codex` on the host, a `codex` too old,
 no readable `auth.json` — falls through silently to the next one. Only a genuine
@@ -190,7 +191,7 @@ red Token dot rather than quietly polling a stale copy of the credential.
 
 `codex` is located by absolute path, first hit wins: `$CLAUDE_MONITOR_CODEX_BIN`,
 then each `PATH` entry, then `/opt/homebrew/bin`, `/usr/local/bin`,
-`~/.local/bin`, `~/.npm-global/bin`. (A macOS app launched from Finder inherits
+`~/.local/bin`, `~/.npm-global/bin`, `~/.nvm/versions/node/current/bin`. (A macOS app launched from Finder inherits
 launchd's minimal `PATH`, which contains neither Homebrew's nor npm's bin
 directory — hence the explicit list.) Set `CLAUDE_MONITOR_CODEX_BIN` to point at
 a specific install.
@@ -541,8 +542,8 @@ against `/v1/messages`.
 
 ### Requirements
 
-- macOS 13+
-- Xcode Command Line Tools (`xcode-select --install`)
+- macOS 14+ (Sonoma or later)
+- Xcode 16+ (Swift 6.0+ toolchain — the package builds in Swift 6 language mode) with the Command Line Tools installed (`xcode-select --install`)
 - Claude Code (to generate tokens)
 
 ### Build & Run
@@ -583,7 +584,8 @@ incident.
 ./scripts/build-macos-app.sh
 ```
 
-The script auto-detects the installed `claude-code` npm version and patches
+The script auto-detects the installed `claude-code` version (from
+`claude --version`, falling back to the npm global listing) and patches
 the User-Agent string in `AnthropicAPI.swift` before compiling. Output:
 `build/ClaudeMonitor.app` and `build/ClaudeMonitor.zip`.
 
@@ -702,6 +704,8 @@ claude-monitor selftest         # self-check (no network/credentials); non-zero 
 database — it writes, so never point it at the live `usage.db`) and
 `--wire <path>` (decode a captured `/wham/usage` body offline to re-check the
 OpenAI wire contract; prints only derived numbers, never identity fields).
+`--codex` additionally runs one real `codex app-server` handshake against the
+installed binary (opt-in: it needs a logged-in Codex home).
 Run `claude-monitor selftest --help` for details.
 
 Edits to `accounts.env` / `accounts.local.env` are picked up automatically
@@ -753,10 +757,11 @@ claude-monitor accounts import accounts.json
   local record**: if the local `last_updated` is at least as recent as the
   imported one, that account is left untouched. Safe to re-run against the
   same file, and safe to import an older export after newer local polls.
-  `--dry-run` previews the account count without writing anything.
+  `--dry-run` previews the account count without writing anything, and `-` as
+  the path reads the export from stdin.
 - **Credentials are secrets:** the export is plaintext JSON containing live
-  OAuth tokens. `--output <path>` writes it with `0600` permissions and the
-  command prints a warning either way; without `--output` (stdout, e.g. for
+  OAuth tokens. `--output <path>` (`-o`) writes it with `0600` permissions and the
+  command prints a warning either way (`--compact` drops the pretty-printing); without `--output` (stdout, e.g. for
   `> accounts.json`) permissions aren't set for you — `chmod 600` the result,
   transfer it over a trusted channel, and delete it once every destination
   host has imported. Full at-rest/in-transit encryption (age, openssl) is a
@@ -1024,6 +1029,7 @@ claude-monitor/
 │   └── claude-monitor.service      # Sample systemd user unit for Linux headless mode
 ├── docs/spikes/                 # Investigation write-ups (e.g. the OpenAI usage-endpoint probe)
 ├── .github/workflows/build.yml  # CI: build + selftest on macOS and Linux
+├── .github/dependabot.yml       # Weekly grouped GitHub Actions bumps (the only third-party surface)
 ├── build/                       # Build output (gitignored): ClaudeMonitor.app + .zip
 ├── CHANGELOG.md                 # Release history
 ├── CLAUDE.md                    # Development notes (build/install sequence, invariants)

@@ -29,7 +29,7 @@ enum SelfTest {
 
         if arguments.contains("--help") || arguments.contains("-h") {
             print("""
-                Usage: ClaudeMonitor selftest [--db <path>] [--wire <path>]
+                Usage: ClaudeMonitor selftest [--db <path>] [--wire <path>] [--codex]
 
                 Runs assertions over the portable core (rate-limit window model,
                 schema migration). No network access and no credentials needed.
