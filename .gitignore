@@ -9,6 +9,7 @@ dist/
 *.xcodeproj/
 .claude/*
 !.claude/commands/
+!.claude/skills/
 *.zip
 # >>> loom-managed (do not edit) >>>
 # Loom runtime state (don't commit these)
@@ -64,3 +65,6 @@ dist/
 .loom/logs/
 .loom/.resync-in-progress
 # <<< loom-managed <<<
+
+# Repo Skills machine-local install metadata (absolute source path + timestamp)
+.claude/skills/repo/.install-local.json
