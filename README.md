@@ -724,9 +724,53 @@ stderr and exit non-zero rather than launching a duplicate GUI instance, e.g.
 
 When multiple hosts each run their own `claude-monitor` (e.g. two Macs + a
 fleet of headless Linux workers), account records and OAuth credentials added
-on one host don't automatically appear on the others. `claude-monitor
-accounts export` / `import` is the blessed, headless-safe way to converge
-them — no GUI required, works identically on macOS and Linux:
+on one host don't automatically appear on the others. `claude-monitor accounts
+push` / `pull` converges them over ssh — no GUI required, works identically on
+macOS and Linux:
+
+```bash
+# From the host that has the account: fan it out to the whole fleet.
+claude-monitor accounts push robb-pro loom-worker-1 loom-worker-2
+
+# Check reachability first, without sending anything:
+claude-monitor accounts push robb-pro loom-worker-1 --dry-run
+
+# On a Loom host, chain the step that always follows an import:
+claude-monitor accounts push loom-worker-1 --then-loom
+
+# Bootstrapping a fresh host instead? Pull from a peer that already has them.
+claude-monitor accounts pull robb-studio
+```
+
+- **Nothing is written to disk on either side.** `push` serializes the bundle
+  in memory and streams it into `accounts import -` on the destination over
+  the ssh channel; `pull` is the same channel in reverse. There is no
+  plaintext-token file to `scp`, to `chmod`, or to remember to delete — the
+  failure mode that made the manual `export` → `scp` → `import` → `rm` dance
+  worth replacing.
+- **One unreachable host doesn't strand the fleet.** Every host is attempted;
+  each reports its own `created / updated / skipped` exactly as `import` does,
+  prefixed with the host name. The exit status is non-zero if **any** host
+  failed, so a bootstrap script can gate on it.
+- **`--dry-run` sends nothing.** It checks that each host is reachable and that
+  `claude-monitor` resolves there (reporting its version) — the failure that
+  actually bites a fan-out — without putting a credential on the wire for a
+  preview.
+- **`--then-loom`** runs `loom-daemon tokens import-from-monitor --shared` on
+  whichever host received the bundle (the remote one for `push`, this one for
+  `pull`), and only after a successful import — chained with `&&`, so a failed
+  import never re-publishes the old tokens as if it had worked.
+- **ssh specifics:** `HOST` is anything ssh accepts (`user@host`, an
+  `~/.ssh/config` alias). ssh runs with `BatchMode=yes`, so key/agent auth is
+  required and an unknown host key fails fast instead of hanging on a prompt
+  nobody can answer — run `ssh HOST true` once first. Pass extra ssh arguments
+  with a repeatable `--ssh-option` (e.g. `--ssh-option -p --ssh-option 2222`).
+  On `exit 127` (command not found), reach for `--remote-bin <absolute path>`:
+  a non-interactive `ssh HOST <command>` shell doesn't source the profile that
+  puts `~/.local/bin` on `PATH`.
+
+`export` / `import` remain the building blocks `push`/`pull` are made of, and
+are still the right tool when there is no ssh path between two hosts:
 
 ```bash
 # On the source host: dump account records + credentials to a file (0600).
