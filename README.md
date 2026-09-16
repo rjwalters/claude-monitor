@@ -56,7 +56,7 @@ OAuth tokens you provide, and renders the data locally on your Mac.
 
 ### 1. Prerequisites
 
-- macOS 13+ (Ventura or later)
+- macOS 14+ (Sonoma or later)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed (you
   use it to generate the OAuth tokens via `claude setup-token`)
 
@@ -178,8 +178,9 @@ whatever the Codex CLI already owns:
    `brew upgrade --cask codex` periodically is on you.
 2. **`auth.json` at request time.** `GET https://chatgpt.com/backend-api/wham/usage`
    — the same endpoint Codex CLI's own `/usage` command calls — with the bearer
-   read fresh out of `$CODEX_HOME/auth.json` for that one request. Never written
-   back, never refreshed.
+   read fresh out of that account's own Codex home's `auth.json` (its registered
+   `codex_home`, or `$CODEX_HOME`/`~/.codex` for the ambient account) for that one
+   request. Never written back, never refreshed.
 
 A tier that is merely *unavailable* — no `codex` on the host, a `codex` too old,
 no readable `auth.json` — falls through silently to the next one. Only a genuine
@@ -190,7 +191,7 @@ red Token dot rather than quietly polling a stale copy of the credential.
 
 `codex` is located by absolute path, first hit wins: `$CLAUDE_MONITOR_CODEX_BIN`,
 then each `PATH` entry, then `/opt/homebrew/bin`, `/usr/local/bin`,
-`~/.local/bin`, `~/.npm-global/bin`. (A macOS app launched from Finder inherits
+`~/.local/bin`, `~/.npm-global/bin`, `~/.nvm/versions/node/current/bin`. (A macOS app launched from Finder inherits
 launchd's minimal `PATH`, which contains neither Homebrew's nor npm's bin
 directory — hence the explicit list.) Set `CLAUDE_MONITOR_CODEX_BIN` to point at
 a specific install.
@@ -541,8 +542,8 @@ against `/v1/messages`.
 
 ### Requirements
 
-- macOS 13+
-- Xcode Command Line Tools (`xcode-select --install`)
+- macOS 14+ (Sonoma or later)
+- Xcode 16+ (Swift 6.0+ toolchain — the package builds in Swift 6 language mode) with the Command Line Tools installed (`xcode-select --install`)
 - Claude Code (to generate tokens)
 
 ### Build & Run
@@ -583,7 +584,8 @@ incident.
 ./scripts/build-macos-app.sh
 ```
 
-The script auto-detects the installed `claude-code` npm version and patches
+The script auto-detects the installed `claude-code` version (from
+`claude --version`, falling back to the npm global listing) and patches
 the User-Agent string in `AnthropicAPI.swift` before compiling. Output:
 `build/ClaudeMonitor.app` and `build/ClaudeMonitor.zip`.
 
@@ -598,7 +600,48 @@ The same package builds on Linux as a headless daemon — no UI, same poll loop
 same `~/.claude-monitor/usage.db` and `ranking.json`. This is what Loom hosts
 run.
 
+### Quick install (recommended)
+
+`scripts/install-linux.sh` automates the whole standing-up sequence — acquire
+a binary, refuse one that's dynamically linked, install it, wire up the
+systemd user unit, seed accounts — in one idempotent, re-runnable command:
+
+```bash
+# Fastest path: download the latest static-stdlib release asset, no Swift
+# toolchain needed. Installs to ~/.local/bin (no sudo) and starts the unit.
+./scripts/install-linux.sh --from-release
+
+# No GitHub release available yet: build in the swift:6.1 container instead
+# (requires docker, no local Swift toolchain).
+./scripts/install-linux.sh --from-source
+
+# Already have a binary (built by hand, copied from another host, ...):
+./scripts/install-linux.sh --binary /path/to/ClaudeMonitor
+
+# System-wide install instead of the per-user default (sudo used only here):
+./scripts/install-linux.sh --from-release --prefix /usr/local
+
+# Seed accounts.env at install time (see "Multiple Accounts" below):
+./scripts/install-linux.sh --from-release --accounts-env /path/to/accounts.env
+```
+
+Re-running the script upgrades an already-installed daemon in place and
+restarts the unit when a newer binary is available, and reports a no-op when
+the version is unchanged. It refuses to install a dynamically-linked binary
+(printing the `ldd` evidence) before touching the filesystem — the failure
+mode that leaves a host with a unit that can't start. Run
+`./scripts/install-linux.sh --help` for the full flag list.
+
+The rest of this section explains what the script automates, for manual
+installs, upgrades, or troubleshooting.
+
 ### Build (Linux)
+
+The quickest path needs no Swift toolchain at all: every
+[GitHub Release](https://github.com/rjwalters/claude-monitor/releases) carries
+a statically-linked `claude-monitor-linux-x64` asset (no dynamic Swift/
+Foundation dependency — verified in CI via `ldd`), so `curl`-ing it down and
+`chmod +x` is enough to run it on a bare host. To build from source instead:
 
 Requires a Swift toolchain ([swift.org](https://www.swift.org/install/) or the
 `swift:6.1` Docker image) and the SQLite dev headers:
@@ -606,8 +649,41 @@ Requires a Swift toolchain ([swift.org](https://www.swift.org/install/) or the
 ```bash
 sudo apt-get install libsqlite3-dev   # (yum: sqlite-devel)
 cd claude-monitor/menubar-app/ClaudeMonitor
-swift build -c release
+swift build -c release --static-swift-stdlib
 sudo cp .build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+```
+
+**Use `--static-swift-stdlib` for any binary you intend to deploy.** A plain
+`swift build` links against the Swift runtime in `/usr/lib/swift/linux`
+(`libswiftCore`, `libFoundation*`, `libdispatch`, …), so the binary dies with
+`libswiftSwiftOnoneSupport.so: cannot open shared object file` the moment it is
+copied to a host without the toolchain — or the toolchain is removed from the
+build host afterwards. Statically linking the stdlib makes the binary
+self-contained apart from `libsqlite3-0` (see below).
+
+#### No toolchain on the host? Build in a container
+
+Build the deployable binary inside the `swift:6.1` image and copy the result
+out — no Swift install on either the build host or the target (verified
+2026-09-16, ~47 s):
+
+```bash
+docker run --rm -v "$PWD/menubar-app/ClaudeMonitor:/src" -w /src swift:6.1 bash -c \
+  'apt-get update -qq && apt-get install -y -qq libsqlite3-dev && swift build -c release --static-swift-stdlib'
+sudo cp menubar-app/ClaudeMonitor/.build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+```
+
+Run it from the repository root (the bind mount is relative to `$PWD`).
+
+#### Runtime requirement
+
+A statically-linked build still needs **`libsqlite3-0`** at runtime — the
+package uses the system SQLite, not a vendored copy. It is already present on
+Ubuntu 24.04; on a minimal image install it with `apt-get install libsqlite3-0`.
+Confirm the binary has no other unmet dependencies:
+
+```bash
+ldd /usr/local/bin/claude-monitor | grep 'not found'   # should print nothing
 ```
 
 ### Run
@@ -628,6 +704,8 @@ claude-monitor selftest         # self-check (no network/credentials); non-zero 
 database — it writes, so never point it at the live `usage.db`) and
 `--wire <path>` (decode a captured `/wham/usage` body offline to re-check the
 OpenAI wire contract; prints only derived numbers, never identity fields).
+`--codex` additionally runs one real `codex app-server` handshake against the
+installed binary (opt-in: it needs a logged-in Codex home).
 Run `claude-monitor selftest --help` for details.
 
 Edits to `accounts.env` / `accounts.local.env` are picked up automatically
@@ -679,10 +757,11 @@ claude-monitor accounts import accounts.json
   local record**: if the local `last_updated` is at least as recent as the
   imported one, that account is left untouched. Safe to re-run against the
   same file, and safe to import an older export after newer local polls.
-  `--dry-run` previews the account count without writing anything.
+  `--dry-run` previews the account count without writing anything, and `-` as
+  the path reads the export from stdin.
 - **Credentials are secrets:** the export is plaintext JSON containing live
-  OAuth tokens. `--output <path>` writes it with `0600` permissions and the
-  command prints a warning either way; without `--output` (stdout, e.g. for
+  OAuth tokens. `--output <path>` (`-o`) writes it with `0600` permissions and the
+  command prints a warning either way (`--compact` drops the pretty-printing); without `--output` (stdout, e.g. for
   `> accounts.json`) permissions aren't set for you — `chmod 600` the result,
   transfer it over a trusted channel, and delete it once every destination
   host has imported. Full at-rest/in-transit encryption (age, openssl) is a
@@ -826,6 +905,37 @@ automatically retries tokens that survive a round) and click **Verify old
 token revoked** again. "Couldn't check" means the ping itself failed
 (network/5xx) — try again later.
 
+### Linux: `cannot open shared object file` on startup
+
+```
+./claude-monitor: error while loading shared libraries:
+libswiftSwiftOnoneSupport.so: cannot open shared object file: No such file or directory
+```
+
+The binary was built **without** `--static-swift-stdlib`, so it still needs the
+Swift runtime (~12 shared objects under `/usr/lib/swift/linux`). That runtime
+comes from the Swift toolchain — copying the binary to a host that has no
+toolchain, or uninstalling the toolchain after building, produces exactly this
+loader error. Diagnose it with:
+
+```bash
+ldd /usr/local/bin/claude-monitor | grep 'not found'
+```
+
+Any unresolved `libswift*` / `libFoundation*` / `libdispatch*` entry confirms
+it. The cure is to rebuild statically and re-copy — see
+[Build (Linux)](#build-linux):
+
+```bash
+swift build -c release --static-swift-stdlib
+sudo cp .build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+```
+
+If the deploy host has no Swift toolchain at all, use the
+[container recipe](#no-toolchain-on-the-host-build-in-a-container) and copy the
+resulting binary over. `libsqlite3-0` is the one shared library that remains
+required even for a static build (already present on Ubuntu 24.04).
+
 ### Logs
 
 ```
@@ -919,6 +1029,7 @@ claude-monitor/
 │   └── claude-monitor.service      # Sample systemd user unit for Linux headless mode
 ├── docs/spikes/                 # Investigation write-ups (e.g. the OpenAI usage-endpoint probe)
 ├── .github/workflows/build.yml  # CI: build + selftest on macOS and Linux
+├── .github/dependabot.yml       # Weekly grouped GitHub Actions bumps (the only third-party surface)
 ├── build/                       # Build output (gitignored): ClaudeMonitor.app + .zip
 ├── CHANGELOG.md                 # Release history
 ├── CLAUDE.md                    # Development notes (build/install sequence, invariants)

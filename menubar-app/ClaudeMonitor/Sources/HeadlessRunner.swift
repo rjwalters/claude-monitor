@@ -156,8 +156,9 @@ enum HeadlessRunner {
 
         Subcommands:
           accounts            Export/import accounts + credentials
-          codex               Import an OpenAI/Codex credential from
-                              ~/.codex/auth.json (honors $CODEX_HOME)
+          codex               Manage OpenAI/Codex accounts by their CODEX_HOME
+                              (provision|add|list|import; no credential is
+                              stored — codex itself is asked for usage)
           selftest            Run portable-core assertions (no network, no
                               credentials; exits non-zero on failure)
         """

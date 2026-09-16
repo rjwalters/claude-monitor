@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Chart-history cutoff and decimation logic deduplicated in `UsageStore`**
+  (internal refactor, no behaviour change) (#182)
+
+### Fixed
+
+- **App bundle advertised macOS 13 while the binary targets macOS 14.** The
+  `LSMinimumSystemVersion` stamped by `build-macos-app.sh` now matches the
+  package's `.macOS(.v14)` deployment target, so Finder refuses the app on
+  Ventura instead of letting it crash at launch. README requirements updated to
+  match (macOS 14+, Xcode 16+ / Swift 6 toolchain).
+- **Docs drift:** build-script version detection, the `codex` binary search
+  path, `selftest --codex`, `accounts` flags, and the headless `--help` text
+  for `codex` now describe what the code does.
+
 ## [1.20.0] - 2026-08-17
 
 ### Summary

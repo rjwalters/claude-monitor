@@ -37,17 +37,34 @@
 
 # Determine log directory relative to this script's location
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
-HOOK_ERROR_LOG="${SCRIPT_DIR}/../logs/hook-errors.log"
+
+# Runtime log directory (#7882) — identical resolution to
+# guard-destructive-generic.sh, deliberately kept in lockstep so both guards
+# always write to the same place. At runtime SCRIPT_DIR is the INSTALLED hook's
+# own dir (.loom/hooks/) and ../logs is .loom/logs; when the guard is invoked
+# directly from its SOURCE location (defaults/hooks/) the same expression would
+# resolve to defaults/logs, depositing runtime telemetry inside the VENDORED
+# tree that ships to every consumer repo and that
+# scripts/check-vendored-private-refs.sh scans. Redirect that case to the repo's
+# own .loom/logs. Pure parameter expansion (no subshells) — this runs on every
+# hook invocation.
+_LOOM_HOOK_PARENT="${SCRIPT_DIR%/*}"
+if [[ "${_LOOM_HOOK_PARENT##*/}" == "defaults" ]]; then
+    HOOK_LOG_DIR="${_LOOM_HOOK_PARENT%/*}/.loom/logs"
+else
+    HOOK_LOG_DIR="${SCRIPT_DIR}/../logs"
+fi
+
+HOOK_ERROR_LOG="${HOOK_LOG_DIR}/hook-errors.log"
 
 # Decision telemetry log (issue #3771 / #3898) — a SEPARATE JSONL file from
 # HOOK_ERROR_LOG, sharing the SAME schema + stable rule tags as
 # guard-destructive.sh so a single reader (#3772 / the standing per-trigger
-# review policy) aggregates BOTH guards' fires. At runtime SCRIPT_DIR is the
-# installed hook's own dir (.loom/hooks/), so this resolves to
+# review policy) aggregates BOTH guards' fires. Resolves to
 # .loom/logs/guard-decisions.log. LOOM_GUARD_DECISION_LOG_FILE overrides the
 # path (test seam / operator override). Off by default — see
 # decision_log_enabled() below.
-DECISION_LOG="${LOOM_GUARD_DECISION_LOG_FILE:-${SCRIPT_DIR}/../logs/guard-decisions.log}"
+DECISION_LOG="${LOOM_GUARD_DECISION_LOG_FILE:-${HOOK_LOG_DIR}/guard-decisions.log}"
 
 # Shared config-tier resolver (#4063). Source defaults/scripts/lib/config-resolver.sh
 # so decision_log_enabled() below reads the full config tier chain through the
@@ -76,6 +93,27 @@ log_hook_error() {
 # first (#3898). Best-effort: any failure falls back to the raw command.
 strip_literal_text() {
     printf '%s' "$1" | awk '
+    # Same live-vs-escaped substitution scan as mask_data_flag_values() below
+    # (issue #7495) -- an escaped backtick or `\$(` is a literal character, not
+    # a command substitution, so a `\`code span\`` in a --body value must not
+    # veto redaction and leave a raw secret in the decision log. Duplicated
+    # rather than shared because each function is its own awk program.
+    function has_live_subst(str,    i, c, bs) {
+        bs = 0
+        for (i = 1; i <= length(str); i++) {
+            c = substr(str, i, 1)
+            if (c == "\\") {
+                bs++
+                continue
+            }
+            if (bs % 2 == 0) {
+                if (c == "`") return 1
+                if (c == "$" && substr(str, i + 1, 1) == "(") return 1
+            }
+            bs = 0
+        }
+        return 0
+    }
     BEGIN {
         SQ = sprintf("%c", 39)   # single quote
         DQ = sprintf("%c", 34)   # double quote
@@ -99,7 +137,7 @@ strip_literal_text() {
             head  = substr(matched, 1, qpos)
             qchar = substr(matched, qpos, 1)
             inner = substr(matched, qpos + 1, length(matched) - qpos - 1)
-            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+            if (!has_live_subst(inner)) {
                 gsub(/./, "X", inner)
             }
             out = out pre head inner qchar
@@ -630,10 +668,10 @@ mask_var_assigned_heredoc_bodies() {
 # --search. A near-duplicate of strip_literal_text() above (which is used
 # only for decision-log redaction) with --search added, kept as a SEPARATE
 # function so this decision-time masking can never change what
-# strip_literal_text() logs. Same conservative floor as strip_literal_text():
-# a span that still contains an unmasked `$(`/backtick (e.g. real command
-# substitution, not yet neutralized by the heredoc pass above) is left
-# completely untouched.
+# strip_literal_text() logs. Same conservative floor as strip_literal_text()
+# (both share an identical copy of has_live_subst(), #7495): a span that still
+# contains a LIVE, unescaped `$(`/backtick (e.g. real command substitution,
+# not yet neutralized by the heredoc pass above) is left completely untouched.
 #
 # Also recognizes `gh api ... -f <field>=<value>` for known text-bearing
 # fields (issue #5172): `gh api`'s field syntax is `-f key=value`, a
@@ -641,6 +679,30 @@ mask_var_assigned_heredoc_bodies() {
 # so it needs its own alternative in the same regex.
 mask_data_flag_values() {
     printf '%s' "$1" | awk '
+    # Return 1 iff `inner` contains a LIVE (unescaped) backtick or `$(`
+    # command-substitution opener. A backtick or `$(` immediately preceded
+    # by an ODD number of backslashes is escaped -- a literal character with
+    # zero execution risk inside a double-quoted string (e.g. the `\`foo()\``
+    # markdown code-span idiom every automated PR/issue comment uses) -- and
+    # must NOT trip this check (issue #7495, third recurrence of the
+    # #5109/#6464/#6866 false-positive class). An EVEN number of preceding
+    # backslashes (including zero) leaves the character live.
+    function has_live_subst(str,    i, c, bs) {
+        bs = 0
+        for (i = 1; i <= length(str); i++) {
+            c = substr(str, i, 1)
+            if (c == "\\") {
+                bs++
+                continue
+            }
+            if (bs % 2 == 0) {
+                if (c == "`") return 1
+                if (c == "$" && substr(str, i + 1, 1) == "(") return 1
+            }
+            bs = 0
+        }
+        return 0
+    }
     BEGIN {
         SQ = sprintf("%c", 39)
         DQ = sprintf("%c", 34)
@@ -664,7 +726,7 @@ mask_data_flag_values() {
             head  = substr(matched, 1, qpos)
             qchar = substr(matched, qpos, 1)
             inner = substr(matched, qpos + 1, length(matched) - qpos - 1)
-            if (index(inner, "$(") == 0 && index(inner, "`") == 0) {
+            if (!has_live_subst(inner)) {
                 gsub(/./, "X", inner)
             }
             out = out pre head inner qchar
@@ -727,6 +789,33 @@ mask_data_flag_values() {
 # onto the same line -- fully visible.
 mask_command_positional_args() {
     printf '%s' "$1" | awk '
+    # Return 1 iff str contains a LIVE (unescaped) dollar-paren
+    # command-substitution opener or backtick. Either one, immediately
+    # preceded by an ODD number of backslashes, is escaped -- a literal,
+    # inert character inside a double-quoted positional argument (e.g. a
+    # backslash-escaped dollar-paren ahead of an inert, quoted mention of the
+    # disallowed CLI phrase later in the same argument) with zero execution
+    # risk -- and must NOT block masking of the rest of the argument (issue
+    # #7558, mirroring the #7495 fix to mask_data_flag_values() below). An
+    # EVEN number of preceding backslashes (including zero) leaves the
+    # character genuinely live, which must still block masking so a real
+    # substitution stays visible to the phrase check.
+    function has_live_subst(str,    i, c, bs) {
+        bs = 0
+        for (i = 1; i <= length(str); i++) {
+            c = substr(str, i, 1)
+            if (c == "\\") {
+                bs++
+                continue
+            }
+            if (bs % 2 == 0) {
+                if (c == "`") return 1
+                if (c == "$" && substr(str, i + 1, 1) == "(") return 1
+            }
+            bs = 0
+        }
+        return 0
+    }
     # Per-position command-substitution nesting depth, computed with an
     # explicit OPENER-TYPE-AWARE STACK rather than a scalar counter: `$(`
     # pushes a SUB level, a bare `(` pushes a GROUP level, and a `)` pops
@@ -1133,7 +1222,7 @@ mask_command_positional_args() {
                 }
                 if (endpos == 0) break
                 inner = substr(rest, 2, endpos - 2)
-                if (!block_mask && index(inner, "$(") == 0 && index(inner, "`") == 0) {
+                if (!block_mask && !has_live_subst(inner)) {
                     gsub(/./, "X", inner)
                 }
                 out = out qc inner qc
@@ -1640,7 +1729,25 @@ if echo "$GH_PR_MERGE_SCAN_TEXT" | grep -qE 'gh\s+pr\s+merge'; then
             MERGE_SCRIPT="$REPO_ROOT/defaults/scripts/merge-pr.sh"
         fi
     fi
-    deny "Use $MERGE_SCRIPT <PR_NUMBER> instead of 'gh pr merge'. The script merges via the GitHub API without local checkout, which avoids worktree errors." "loom:gh-pr-merge-redirect"
+
+    # Issue #7773: mask_cat_heredoc_bodies() only neutralizes a cat-heredoc
+    # CAPTURED by a text-data-consuming command (the `-m "$(cat <<EOF ...)"`
+    # idiom) -- a heredoc redirected straight to a FILE (`cat > FILE
+    # <<'DELIM'`) is deliberately left unmasked, because #5122 showed a later
+    # command on the same line can execute that file. That is still the right
+    # call ("masking only ever narrows what this ONE check can see; it never
+    # widens what it misses" -- see the block comment above
+    # mask_cat_heredoc_bodies()), but it means writing prose that merely
+    # quotes the phrase to a file this way denies with no hint that the
+    # trigger was inert documentation, not a live invocation. When that shape
+    # is present, name it explicitly so the false-positive case (an agent
+    # documenting this very rule) isn't left guessing why an apparently-inert
+    # command was denied.
+    HEREDOC_TO_FILE_NOTE=""
+    if echo "$COMMAND" | grep -qE 'cat[[:space:]]*>>?[[:space:]]*[^<[:space:]]+[[:space:]]*<<'; then
+        HEREDOC_TO_FILE_NOTE=" If this matched inside a heredoc body being written to a file rather than executed (e.g. documenting this rule), write the file with a non-Bash tool (Write/Edit) instead -- a file-bound heredoc is deliberately left visible to this check (#7773)."
+    fi
+    deny "Use $MERGE_SCRIPT <PR_NUMBER> instead of 'gh pr merge'. The script merges via the GitHub API without local checkout, which avoids worktree errors.${HEREDOC_TO_FILE_NOTE}" "loom:gh-pr-merge-redirect"
 fi
 
 # =============================================================================

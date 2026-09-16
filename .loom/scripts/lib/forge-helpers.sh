@@ -304,10 +304,23 @@ forge_split_nwo() {
 
 # --- Forge-Dispatched Operations ---
 
+# forge_detect_merge_method() (#7754) lives in the sibling module below --
+# forge-helpers.sh is already over the file-size ratchet's threshold and
+# frozen at its current size (scripts/file-size-baseline.txt), so new
+# functionality is split out rather than added here.
+# shellcheck source=./forge-merge-method.sh
+source "$_LOOM_FORGE_HELPERS_LIB_DIR/forge-merge-method.sh"
+
 # Merge a PR via the forge API.
-# Usage: forge_merge_pr NWO PR_NUMBER [EXPECTED_HEAD_SHA]
-# GitHub: PUT /repos/{nwo}/pulls/{n}/merge with merge_method=squash
-# Gitea: POST /repos/{owner}/{repo}/pulls/{n}/merge with Do=squash
+# Usage: forge_merge_pr NWO PR_NUMBER [EXPECTED_HEAD_SHA] [MERGE_METHOD]
+# GitHub: PUT /repos/{nwo}/pulls/{n}/merge with merge_method=<MERGE_METHOD>
+# Gitea: POST /repos/{owner}/{repo}/pulls/{n}/merge with Do=<MERGE_METHOD>
+#
+# MERGE_METHOD (optional, #7754): one of "squash"/"merge"/"rebase". Defaults
+# to "squash" when omitted -- preserves this function's pre-#7754 behavior
+# for any caller that has not been updated to pass a detected method (e.g.
+# via forge_detect_merge_method). Callers that need to respect a target
+# repo's actual allowed strategies MUST pass this explicitly.
 #
 # EXPECTED_HEAD_SHA (optional, #5579): an optimistic-concurrency precondition —
 # the SHA the PR's head branch must currently match for the merge to proceed.
@@ -332,19 +345,18 @@ forge_split_nwo() {
 # ErrSHADoesNotMatch, which routers/api/v1/repo/pull.go maps to HTTP 409 with
 # message "head out of date".
 forge_merge_pr() {
-  local nwo="$1"
-  local pr_number="$2"
-  local expected_head_sha="${3:-}"
+  local nwo="$1" pr_number="$2"
+  local expected_head_sha="${3:-}" merge_method="${4:-squash}"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     forge_split_nwo "$nwo"
     if [[ -n "$expected_head_sha" ]]; then
       gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
-        -d "$(jq -nc --arg sha "$expected_head_sha" \
-          '{"Do":"squash","delete_branch_after_merge":false,"head_commit_id":$sha}')"
+        -d "$(jq -nc --arg method "$merge_method" --arg sha "$expected_head_sha" \
+          '{"Do":$method,"delete_branch_after_merge":false,"head_commit_id":$sha}')"
     else
       gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
-        -d '{"Do":"squash","delete_branch_after_merge":false}'
+        -d "$(jq -nc --arg method "$merge_method" '{"Do":$method,"delete_branch_after_merge":false}')"
     fi
   else
     # Routed through the #6074 permission ladder (#6752): a stale/scope-limited
@@ -357,12 +369,12 @@ forge_merge_pr() {
     if [[ -n "$expected_head_sha" ]]; then
       forge_gh_perm_safe api "repos/$nwo/pulls/$pr_number/merge" \
         -X PUT \
-        -f merge_method=squash \
+        -f merge_method="$merge_method" \
         -f sha="$expected_head_sha" 2>&1
     else
       forge_gh_perm_safe api "repos/$nwo/pulls/$pr_number/merge" \
         -X PUT \
-        -f merge_method=squash 2>&1
+        -f merge_method="$merge_method" 2>&1
     fi
   fi
 }
@@ -533,11 +545,18 @@ forge_delete_branch() {
 }
 
 # Enable auto-merge on a PR.
-# Usage: forge_auto_merge NWO PR_NUMBER [EXPECTED_HEAD_SHA]
+# Usage: forge_auto_merge NWO PR_NUMBER [EXPECTED_HEAD_SHA] [MERGE_METHOD]
 # GitHub: GraphQL enablePullRequestAutoMerge mutation (pure API, no
 #         working-tree dependency — `gh pr merge --auto` does a local
 #         checkout that collides with worktrees owning the head branch).
 # Gitea: POST /repos/{owner}/{repo}/pulls/{n}/merge with merge_when_checks_succeed
+#
+# MERGE_METHOD (optional, #7754): one of "squash"/"merge"/"rebase" (GitHub is
+# uppercased to the GraphQL enum's SQUASH/MERGE/REBASE). Defaults to "squash"
+# when omitted -- preserves this function's pre-#7754 behavior for any caller
+# that has not been updated to pass a detected method (e.g. via
+# forge_detect_merge_method). Callers that need to respect a target repo's
+# actual allowed strategies MUST pass this explicitly.
 #
 # EXPECTED_HEAD_SHA (optional, #5579): same optimistic-concurrency precondition
 # as forge_merge_pr's — see that function's comment for the general rationale
@@ -555,17 +574,17 @@ forge_delete_branch() {
 forge_auto_merge() {
   local nwo="$1"
   local pr_number="$2"
-  local expected_head_sha="${3:-}"
+  local expected_head_sha="${3:-}" merge_method="${4:-squash}"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     forge_split_nwo "$nwo"
     if [[ -n "$expected_head_sha" ]]; then
       gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
-        -d "$(jq -nc --arg sha "$expected_head_sha" \
-          '{"Do":"squash","merge_when_checks_succeed":true,"delete_branch_after_merge":true,"head_commit_id":$sha}')"
+        -d "$(jq -nc --arg method "$merge_method" --arg sha "$expected_head_sha" \
+          '{"Do":$method,"merge_when_checks_succeed":true,"delete_branch_after_merge":true,"head_commit_id":$sha}')"
     else
       gitea_api POST "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/merge" \
-        -d '{"Do":"squash","merge_when_checks_succeed":true,"delete_branch_after_merge":true}'
+        -d "$(jq -nc --arg method "$merge_method" '{"Do":$method,"merge_when_checks_succeed":true,"delete_branch_after_merge":true}')"
     fi
   else
     # Resolve PR node_id (required by GraphQL mutation).
@@ -576,13 +595,15 @@ forge_auto_merge() {
     # The mutation (a WRITE) goes through the #6074 permission ladder (#6752),
     # like the native `loom-daemon forge auto-merge` this shell path stands in
     # for; the node_id lookup above is a read and needs no escalation.
+    # GraphQL's PullRequestMergeMethod enum is uppercase (MERGE/SQUASH/REBASE,
+    # #7754) -- uppercased inline below rather than via a separate variable.
     if [[ -n "$expected_head_sha" ]]; then
       local mutation_with_oid='mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!, $expectedHeadOid: GitObjectID) { enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod, expectedHeadOid: $expectedHeadOid}) { pullRequest { number autoMergeRequest { enabledAt } } } }'
 
       forge_gh_perm_safe api graphql \
         -f "query=$mutation_with_oid" \
         -F "pullRequestId=$node_id" \
-        -F "mergeMethod=SQUASH" \
+        -F "mergeMethod=$(printf '%s' "$merge_method" | tr '[:lower:]' '[:upper:]')" \
         -F "expectedHeadOid=$expected_head_sha" 2>/dev/null
     else
       local mutation='mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) { enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}) { pullRequest { number autoMergeRequest { enabledAt } } } }'
@@ -590,7 +611,7 @@ forge_auto_merge() {
       forge_gh_perm_safe api graphql \
         -f "query=$mutation" \
         -F "pullRequestId=$node_id" \
-        -F "mergeMethod=SQUASH" 2>/dev/null
+        -F "mergeMethod=$(printf '%s' "$merge_method" | tr '[:lower:]' '[:upper:]')" 2>/dev/null
     fi
   fi
 }
@@ -1636,20 +1657,227 @@ forge_get_pr_comments() {
   fi
 }
 
-# Get PR reviews.
-# Usage: forge_get_pr_reviews NWO PR_NUMBER
+# --- Formal review / inline review-comment ingestion (#7647) ----------------
+#
+# The three helpers below are the ONLY supported way to read a PR's formal
+# review state. They exist because the pre-#7647 `forge_get_pr_reviews` made a
+# single unpaginated request, emitted `.[].body` only, and swallowed every
+# error as empty output — three separate ways to conclude "no blockers" from a
+# read that never established it. That shape is what let a Judge approve
+# kicad-tools#5369 over an unresolved same-head CHANGES_REQUESTED review it had
+# never read.
+#
+# Contract for all three:
+#   - FULL pagination. A truncated read is a failure, never a short result.
+#   - COMPLETE records (NDJSON, one compact JSON object per line) — never bare
+#     bodies: review id, state, commit/head association and timestamps are what
+#     make a finding auditable against the current tree.
+#   - FAIL CLOSED. Any read error returns non-zero with NO output. Callers must
+#     branch on the exit code; empty stdout on its own never means "clean".
+#
+# Old bodies-only behaviour is one jq away for any caller that genuinely wants
+# it: `forge_get_pr_reviews "$nwo" "$n" | jq -r 'select(.body != "") | .body'`.
+
+# jq filter shared by both forges' review reads. Emits one compact JSON record
+# per review. Gitea spells two states differently (REQUEST_CHANGES / COMMENT);
+# they are normalized to GitHub's vocabulary so callers reconcile against one
+# enum. Any other/unrecognized state is passed through verbatim so a caller can
+# fail closed on it rather than silently treating it as benign.
+_FORGE_REVIEW_RECORD_JQ='.[] | {
+  id: (.id // 0),
+  state: ((.state // "UNKNOWN") | ascii_upcase
+          | if . == "REQUEST_CHANGES" then "CHANGES_REQUESTED"
+            elif . == "COMMENT" then "COMMENTED"
+            else . end),
+  commit_id: (.commit_id // ""),
+  submitted_at: (.submitted_at // ""),
+  author: (.user.login // ""),
+  body: (.body // "")
+} | tojson'
+
+# jq filter for inline (diff-anchored) review comments. `position == null` is
+# GitHub for "this comment is anchored to a line that no longer exists in the
+# current diff" — i.e. an OUTDATED finding, which needs explicit disposition,
+# not automatic dismissal.
+_FORGE_REVIEW_COMMENT_RECORD_JQ='.[] | {
+  id: (.id // 0),
+  review_id: (.pull_request_review_id // 0),
+  in_reply_to_id: (.in_reply_to_id // 0),
+  commit_id: (.commit_id // ""),
+  original_commit_id: (.original_commit_id // ""),
+  path: (.path // ""),
+  outdated: (.position == null),
+  author: (.user.login // ""),
+  body: (.body // "")
+} | tojson'
+
+# Get a PR's formal reviews as complete, fully-paginated NDJSON records.
+#
+# Usage: forge_get_pr_reviews NWO PR_NUMBER [GH_CMD]
+# Output: one JSON object per line —
+#   {"id":…,"state":"APPROVED|CHANGES_REQUESTED|COMMENTED|DISMISSED|PENDING|…",
+#    "commit_id":"…","submitted_at":"…","author":"…","body":"…"}
+# Exit: 0 on a complete read (including a genuinely empty review list),
+#       non-zero on ANY read/pagination failure (fail closed).
+#
 # Both forges: GET /repos/{nwo}/pulls/{n}/reviews
+# Always plain `gh` (never a cache wrapper): this read gates a verdict, and the
+# review that landed 20 seconds ago is exactly the one a cache would hide.
 forge_get_pr_reviews() {
   local nwo="$1"
   local pr_number="$2"
+  local gh_cmd="${3:-gh}"
 
   if [[ "$FORGE_TYPE" == "gitea" ]]; then
     forge_split_nwo "$nwo"
-    gitea_api GET "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/reviews" 2>/dev/null | \
-      jq -r '.[].body // empty'
-  else
-    gh api "repos/$nwo/pulls/$pr_number/reviews" --jq '.[].body // empty' 2>/dev/null || echo ""
+    _forge_gitea_paginate "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/reviews" \
+      "$_FORGE_REVIEW_RECORD_JQ"
+    return $?
   fi
+
+  "$gh_cmd" api "repos/$nwo/pulls/$pr_number/reviews?per_page=100" --paginate \
+    --jq "$_FORGE_REVIEW_RECORD_JQ"
+}
+
+# Get a PR's INLINE review comments (diff-anchored), fully paginated.
+#
+# Usage: forge_get_pr_review_comments NWO PR_NUMBER [GH_CMD]
+# Output: one JSON object per line (see _FORGE_REVIEW_COMMENT_RECORD_JQ).
+# Exit: 0 on a complete read, non-zero on ANY failure (fail closed).
+#
+# GitHub: GET /repos/{nwo}/pulls/{n}/comments — a DIFFERENT endpoint from
+#   /issues/{n}/comments (general PR conversation). Both exist; reading only the
+#   issue-comments one is precisely the #7647 blind spot.
+# Gitea: has no flat per-PR inline-comment endpoint, so the comments are
+#   collected per review (GET /pulls/{n}/reviews/{id}/comments).
+forge_get_pr_review_comments() {
+  local nwo="$1"
+  local pr_number="$2"
+  local gh_cmd="${3:-gh}"
+
+  if [[ "$FORGE_TYPE" == "gitea" ]]; then
+    forge_split_nwo "$nwo"
+    local review_ids review_id
+    review_ids=$(forge_get_pr_reviews "$nwo" "$pr_number" | jq -r '.id') || return 1
+    local id
+    for id in $review_ids; do
+      [[ "$id" =~ ^[0-9]+$ ]] || return 1
+      review_id="$id"
+      _forge_gitea_paginate \
+        "repos/$FORGE_OWNER/$FORGE_REPO/pulls/$pr_number/reviews/$review_id/comments" \
+        "$_FORGE_REVIEW_COMMENT_RECORD_JQ" || return 1
+    done
+    return 0
+  fi
+
+  "$gh_cmd" api "repos/$nwo/pulls/$pr_number/comments?per_page=100" --paginate \
+    --jq "$_FORGE_REVIEW_COMMENT_RECORD_JQ"
+}
+
+# Get a PR's review THREADS with their actual resolution state.
+#
+# Usage: forge_get_pr_review_threads NWO PR_NUMBER [GH_CMD]
+# Output: one JSON object per line —
+#   {"id":"…","is_resolved":true|false,"is_outdated":true|false,
+#    "path":"…","author":"…","body":"…"}
+# Exit: 0 on a complete read, 2 when the forge has no supported
+#       thread-resolution interface (caller must fall back and fail closed on
+#       the unknown resolution state — NOT treat it as resolved), 1 on failure.
+#
+# Resolution state is GraphQL-only on GitHub (REST exposes no `isResolved`), so
+# this is the one read here that cannot use the REST pool. `gh api graphql` dies
+# under GraphQL exhaustion — hence exit 1/2 being explicitly distinguishable so
+# the caller degrades to "resolution unknown" rather than "nothing unresolved".
+forge_get_pr_review_threads() {
+  local nwo="$1"
+  local pr_number="$2"
+  local gh_cmd="${3:-gh}"
+
+  if [[ "$FORGE_TYPE" != "github" ]]; then
+    return 2
+  fi
+
+  forge_split_nwo "$nwo"
+
+  local query='query($owner:String!,$repo:String!,$pr:Int!,$cursor:String){
+    repository(owner:$owner,name:$repo){
+      pullRequest(number:$pr){
+        reviewThreads(first:100,after:$cursor){
+          pageInfo{hasNextPage endCursor}
+          nodes{
+            id isResolved isOutdated
+            comments(first:1){nodes{path author{login} body}}
+          }
+        }
+      }
+    }
+  }'
+
+  local cursor="" page=0 response threads has_next
+  while :; do
+    page=$((page + 1))
+    if [[ $page -gt 50 ]]; then
+      echo "forge_get_pr_review_threads: exceeded 50 pages — refusing to report a truncated thread list" >&2
+      return 1
+    fi
+
+    if [[ -z "$cursor" ]]; then
+      response=$("$gh_cmd" api graphql -f query="$query" \
+        -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number") || return 1
+    else
+      response=$("$gh_cmd" api graphql -f query="$query" \
+        -F owner="$FORGE_OWNER" -F repo="$FORGE_REPO" -F pr="$pr_number" \
+        -F cursor="$cursor") || return 1
+    fi
+
+    threads=$(printf '%s' "$response" \
+      | jq -c '.data.repository.pullRequest.reviewThreads.nodes[] | {
+          id: .id,
+          is_resolved: (.isResolved // false),
+          is_outdated: (.isOutdated // false),
+          path: (.comments.nodes[0].path // ""),
+          author: (.comments.nodes[0].author.login // ""),
+          body: (.comments.nodes[0].body // "")
+        }') || return 1
+    [[ -n "$threads" ]] && printf '%s\n' "$threads"
+
+    has_next=$(printf '%s' "$response" \
+      | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage') || return 1
+    [[ "$has_next" != "true" ]] && break
+    cursor=$(printf '%s' "$response" \
+      | jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor') || return 1
+    [[ -z "$cursor" || "$cursor" == "null" ]] && return 1
+  done
+
+  return 0
+}
+
+# Page a Gitea list endpoint to exhaustion, applying JQ_FILTER to each page.
+# Usage: _forge_gitea_paginate PATH JQ_FILTER
+# Exit: 0 on a complete read, non-zero on any page failure or page-cap trip.
+_forge_gitea_paginate() {
+  local path="$1"
+  local jq_filter="$2"
+  local limit=50 page=0 batch count sep
+
+  while :; do
+    page=$((page + 1))
+    if [[ $page -gt 50 ]]; then
+      echo "_forge_gitea_paginate: exceeded 50 pages for $path — refusing to report a truncated list" >&2
+      return 1
+    fi
+    sep="?"
+    [[ "$path" == *"?"* ]] && sep="&"
+    batch=$(gitea_api GET "${path}${sep}limit=${limit}&page=${page}") || return 1
+    count=$(printf '%s' "$batch" | jq 'length') || return 1
+    [[ "$count" =~ ^[0-9]+$ ]] || return 1
+    if [[ "$count" -gt 0 ]]; then
+      printf '%s' "$batch" | jq -r "$jq_filter" || return 1
+    fi
+    [[ "$count" -lt "$limit" ]] && break
+  done
+
+  return 0
 }
 
 # Get branch-protection required status check contexts for a branch.

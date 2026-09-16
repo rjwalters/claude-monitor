@@ -28,6 +28,15 @@
 #                          parent branch (feature/issue-N) still has open
 #                          stacked child PRs targeting it (operator asserts the
 #                          children are already reconciled). See #3747 item 2.
+#   --allow-unapproved     Bypass the pre-merge loom:pr review-signal guard,
+#                          which otherwise hard-blocks merging a PR whose
+#                          current head carries no loom:pr label (no
+#                          forge-visible signal Judge reviewed it — e.g. a
+#                          Doctor rebase cleared it via the staleness guard).
+#                          The bypass is recorded as a warning and, on a real
+#                          (non-dry-run) merge, best-effort as a PR comment
+#                          audit trail. Operator asserts responsibility,
+#                          mirroring --allow-stacked-children. See #7419.
 #   --no-cleanup-primary   Skip the automatic primary-checkout branch cleanup
 #                          (#5015): when the merged branch is checked out in
 #                          the PRIMARY repo checkout (not a worktree) and it
@@ -177,6 +186,17 @@ Options:
                          Pass this flag only after you have manually reconciled
                          (or verified) the children — the operator asserts
                          responsibility, mirroring --worktree-path.
+  --allow-unapproved     Bypass the pre-merge loom:pr review-signal guard.
+                         By default the script refuses to merge (exit 1) a
+                         PR whose current head does not carry the loom:pr
+                         label — the only forge-visible signal Judge
+                         reviewed that head (it may have been cleared by a
+                         staleness guard, e.g. after a Doctor rebase). This
+                         flag bypasses that block; the operator asserts
+                         responsibility, mirroring --allow-stacked-children.
+                         The bypass is always logged as a warning and, on a
+                         real (non-dry-run) merge, best-effort recorded as a
+                         PR comment audit trail too.
   --no-cleanup-primary   Skip automatic primary-checkout branch cleanup (#5015).
                          When the merged branch is checked out in the PRIMARY
                          repo checkout (not a worktree), the script normally
@@ -261,6 +281,11 @@ Examples:
   ./.loom/scripts/merge-pr.sh 123 --no-cleanup-primary
     Merges PR but always prints manual instructions instead of
     auto-cleaning a branch checked out in the primary repo checkout.
+
+  ./.loom/scripts/merge-pr.sh 123 --allow-unapproved
+    Merges PR #123 even though it does not carry loom:pr (no forge-visible
+    Judge review signal for the current head). Logs a warning and posts a
+    PR comment recording the override.
 EOF
 }
 
@@ -329,6 +354,13 @@ else
   loom_resolve_worktree_target_dir() { printf '%s\n' "$1/target"; }
   loom_reclaim_worktree_target_dir() { printf 'inside\t%s\tcargo-target-dir.sh lib unavailable\n' "$3"; }
 fi
+# Shared "has this branch landed?" primitive (#7812) — the one implementation
+# of the question the branch-delete and worktree-preserve guards below ask.
+# Required, like forge-helpers.sh above: every branch-delete decision in this
+# script depends on it, and a missing lib must fail loudly at startup rather
+# than silently degrade a destructive decision to a guess.
+# shellcheck source=lib/branch-landed.sh
+source "$SCRIPT_DIR/lib/branch-landed.sh"
 # Default-branch resolver (#4100) — the local-branch delete guard must never
 # target the repo's default branch. Sourced defensively: a repo where this
 # fails to resolve (e.g. no network + no origin/HEAD symref) still falls back
@@ -351,8 +383,13 @@ else
     GH="gh"
 fi
 
-REPO_NWO="$(forge_get_repo_nwo "$GH")" || \
-  error "Could not determine repository. Is 'gh' authenticated?"
+REPO_NWO="$(forge_get_repo_nwo "$GH")" || error "Could not determine repository. Is 'gh' authenticated?"
+# Detect which merge strategy the target repo actually allows (#7754) --
+# previously every call site below hardcoded "squash", which fails outright
+# ("Squash merges are not allowed on this repository") on any repo that has
+# squash-merge disabled. Read once per invocation; fails open to "squash"
+# (this script's pre-#7754 behavior) on any probe failure.
+REPO_MERGE_METHOD="$(forge_detect_merge_method "$REPO_NWO" "$GH" 2>/dev/null || echo squash)"
 
 # Parse arguments
 PR_NUMBER=""
@@ -365,6 +402,10 @@ DRY_RUN=false
 AUTO_MERGE=false
 WORKTREE_PATH_OVERRIDE=""
 ALLOW_STACKED_CHILDREN=false
+# ALLOW_UNAPPROVED (#7419): bypasses the loom:pr review-signal guard
+# (_check_loom_pr_label below). Off by default — a missing loom:pr label
+# hard-blocks the merge unless the operator explicitly opts in here.
+ALLOW_UNAPPROVED=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -385,6 +426,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; shift ;;
     --auto) AUTO_MERGE=true; shift ;;
     --allow-stacked-children) ALLOW_STACKED_CHILDREN=true; shift ;;
+    --allow-unapproved) ALLOW_UNAPPROVED=true; shift ;;
     -*)  error "Unknown option: $1" ;;
     *)
       if [[ -z "$PR_NUMBER" ]]; then
@@ -397,7 +439,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--no-cleanup-primary] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children]"
+[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--no-cleanup-primary] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children] [--allow-unapproved]"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || error "PR number must be numeric: $PR_NUMBER"
 
 # Validate --worktree-path early (before any network calls) so bad input
@@ -444,6 +486,10 @@ PR_MERGEABLE=$(echo "$PR_JSON" | jq -r '.mergeable')
 # PR, so it is safe to force-delete even though it will never satisfy
 # `git branch --merged` after a squash merge.
 PR_HEAD_SHA=$(echo "$PR_JSON" | jq -r '.head.sha // empty')
+# Labels (#7419): the loom:pr review-signal guard's only input. Both forges'
+# forge_get_pr responses already carry a `labels` array in this shape, so no
+# extra API call is needed beyond the fetch above.
+PR_LABELS=$(echo "$PR_JSON" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)
 
 # Check if already merged
 if [[ "$PR_MERGED" == "true" ]]; then
@@ -540,37 +586,14 @@ Or, if you have already verified/reconciled them, re-run with --allow-stacked-ch
 _check_no_open_stacked_children
 
 # ---------------------------------------------------------------------------
-# Pre-merge defaults/ VERSION-bump collision guard (#7302).
-#
-# check-defaults-version-bump.sh's CI job (.github/workflows/ci.yml) gates a
-# PR's own HEAD VERSION against its PR's `base.sha` — fixed at PR-open (or
-# last-rebase) time and never re-diffed against the CURRENT default branch.
-# When two PRs are open concurrently and both bump VERSION from the same
-# stale base to the same target (e.g. both from 0.18.197 to 0.18.198), the
-# first to merge advances the default branch to that target; the CI gate on
-# the SECOND PR already passed against ITS OWN stale base and has no
-# visibility into that concurrent merge, so it can land on top with a
-# NET-ZERO version increment despite genuinely changing `defaults/` —
-# silently defeating the currency signal check-defaults-version-bump.sh
-# exists to guarantee (#5874). This happened for real: PR #7300 vs.
-# concurrently-merged #7298.
-#
-# Fix shape: re-run the SAME check script — UNCHANGED, per #7302's own
-# acceptance criteria; its job (diff two given refs) already works correctly,
-# the gap is entirely in which refs the CI caller gives it — here, at the
-# merge choke point, against the default branch's CURRENT tip instead of the
-# PR's stale base.sha. That is the freshest reference available short of an
-# atomic merge, and mirrors the pattern _check_no_open_stacked_children above
-# already uses (a live re-check immediately before the actual merge call).
-#
-# Best-effort at every NON-decision step — an unresolvable default branch, a
-# failed fetch, or a PR head not reachable locally all fall through to "skip
-# the check" rather than blocking a merge this guard cannot evaluate safely.
-# Only a CONFIRMED collision (the check script's own exit 1 against the
-# CURRENT default branch tip) hard-blocks, matching the
-# hard-block-on-confirmed-collision shape of the guard above. --dry-run still
-# runs the guard and reports the would-be block, mirroring that guard's
-# dry-run contract.
+# Pre-merge version policy guard (#7827, replacing #7302's collision policy).
+# Feature PRs must not hand-edit versions: the merge workflow owns bumps.
+# Reuse the canonical checker in the same --forbid-bump mode as CI. It
+# compares against the merge base, so concurrent changes on main cannot be
+# mistaken for edits authored by this PR. Keep legacy checker mode intact
+# for downstream consumers that still require explicit surface bumps.
+# Guard faults retain the existing best-effort behavior; only a confirmed
+# forbidden version edit blocks. Dry-run reports without attempting a merge.
 _check_defaults_version_bump_collision() {
   local check_script="$REPO_ROOT/defaults/scripts/check-defaults-version-bump.sh"
   [[ -x "$check_script" ]] || return 0
@@ -594,43 +617,43 @@ _check_defaults_version_bump_collision() {
   # already-deleted-branch edge case where it might not resolve.
   git -C "$REPO_ROOT" rev-parse --verify --quiet "${PR_HEAD_SHA}^{commit}" >/dev/null 2>&1 || return 0
 
-  local pr_body check_output check_rc
-  pr_body="$(echo "$PR_JSON" | jq -r '.body // ""')"
+  # The checker's shallow-history fallback compares raw tips. That cannot
+  # establish who changed a version; refuse to label it a confirmed edit.
+  if ! git -C "$REPO_ROOT" merge-base "$current_main_sha" "$PR_HEAD_SHA" >/dev/null 2>&1; then
+    warning "Version policy guard: PR ancestry unavailable; skipping unverified comparison."
+    return 0
+  fi
+
+  local check_output check_rc
   check_rc=0
-  check_output=$(cd "$REPO_ROOT" && PR_BODY="$pr_body" "$check_script" --base "$current_main_sha" --head "$PR_HEAD_SHA" 2>&1) || check_rc=$?
+  check_output=$(cd "$REPO_ROOT" && "$check_script" --forbid-bump --base "$current_main_sha" --head "$PR_HEAD_SHA" 2>&1) || check_rc=$?
 
   if [[ "$check_rc" -eq 0 ]]; then
     return 0
   fi
 
   # A non-zero, non-1 exit (bad usage, unresolved ref) is a guard-internal
-  # problem, not a confirmed collision — report and skip rather than block a
+  # problem, not a confirmed version edit — report and skip rather than block a
   # merge on a guard fault.
   if [[ "$check_rc" -ne 1 ]]; then
-    warning "defaults/ VERSION-bump collision guard: check-defaults-version-bump.sh exited $check_rc against current '$DEFAULT_BRANCH_NAME' ($current_main_sha) — skipping (not a confirmed collision):"
+    warning "Version policy guard: check-defaults-version-bump.sh exited $check_rc against current '$DEFAULT_BRANCH_NAME' ($current_main_sha) — skipping (not a confirmed version edit):"
     warning "$check_output"
     return 0
   fi
 
   local msg
-  msg="Merge blocked: PR #$PR_NUMBER's \`defaults/\` change would leave '$DEFAULT_BRANCH_NAME' at an unchanged (or non-increasing) VERSION relative to its CURRENT tip ($current_main_sha) — a concurrently-merged PR likely already advanced '$DEFAULT_BRANCH_NAME' to this PR's target VERSION (#7302).
+  msg="Merge blocked: PR #$PR_NUMBER hand-edits a version-bearing value (#7827).
 
 $check_output
 
-Rebase onto the current '$DEFAULT_BRANCH_NAME' and bump VERSION again, then re-run this merge:
-  git fetch origin $DEFAULT_BRANCH_NAME
-  git rebase origin/$DEFAULT_BRANCH_NAME
-  ./scripts/version.sh bump patch
-  git push --force-with-lease
-
-If this change genuinely does not alter installed behavior, add the
-<!-- loom:no-surface-change --> marker to the PR body or a commit message
-instead of bumping VERSION, then re-run this merge."
+Revert the version-value changes authored by this PR, preserving its other
+changes, then rerun CI and review. Version bumps are applied automatically
+by the merge workflow (#7743); a no-surface-change marker cannot waive this policy."
 
   # --dry-run still runs the guard and REPORTS the would-be block, but honors
   # the dry-run contract (never exits 1) — same shape as the guard above.
   if [[ "$DRY_RUN" == "true" ]]; then
-    warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: defaults/ VERSION-bump collision against current '$DEFAULT_BRANCH_NAME' ($current_main_sha)."
+    warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: forbidden version edit relative to '$DEFAULT_BRANCH_NAME' ($current_main_sha)."
     return 0
   fi
 
@@ -640,6 +663,123 @@ instead of bumping VERSION, then re-run this merge."
 # Invoke this guard too, before either merge path attempts the actual merge
 # API call — same reasoning as _check_no_open_stacked_children above.
 _check_defaults_version_bump_collision
+
+# ---------------------------------------------------------------------------
+# Pre-merge loom:pr review-signal guard (#7419).
+#
+# `loom:pr` is the only forge-visible statement that the CURRENT head passed
+# Judge review. Champion's auto-merge path (champion-pr-merge.md) already
+# refuses to merge without it, but this shared script — driven directly by
+# humans and in-session agents, not just Champion — previously merged
+# whatever PR it was pointed at regardless of label state. That gap let a
+# real incident through: a Doctor rebase cleared `loom:pr` via the staleness
+# guard, and a human running this script directly moments later squash-merged
+# a head no Judge had reviewed, with zero friction at the one point it was
+# cheap (#7419).
+#
+# Default is a hard block (error, exit 1) — the same shape as
+# _check_no_open_stacked_children / _check_defaults_version_bump_collision
+# above — printing the CURRENT label set and head SHA so the operator can see
+# exactly what they are about to merge. --allow-unapproved bypasses the
+# block (operator asserts responsibility, mirroring --allow-stacked-children
+# and --worktree-path); the bypass is always recorded as a loud warning
+# (mirrors --allow-stacked-children's own override warning) and, on a REAL
+# run only (never --dry-run — a preview must have zero forge side effects),
+# best-effort recorded as a PR comment audit trail too, mirroring the
+# _post_premature_close_comment / partial-increment comment pattern already
+# used elsewhere in this file. --dry-run reports the would-be block without
+# exiting 1 or merging, same dry-run contract as both guards above.
+#
+# A present `loom:pr` is the overwhelmingly common case and must add zero
+# overhead on that path: labels were already extracted from the initial
+# $PR_JSON fetch into $PR_LABELS above, so this needs no extra API call to
+# pass through.
+#
+# AC #3: when `loom:pr` IS present, also WARN (never hard-block — presence of
+# loom:pr already means Judge approved SOME head, just possibly not the
+# current one, which is a softer signal than the missing-label case above) if
+# a Champion `<!-- champion:hold-state head=<sha> -->` marker (see
+# champion-pr-merge.md's own hold-state tracking) names a SHA that differs
+# from the current head. forge_get_pr's response has no `.comments` (unlike
+# champion-pr-merge.md's own `gh pr view --json comments,...` fetch), so this
+# needs the dedicated forge_get_pr_comments() helper (lib/forge-helpers.sh).
+_check_champion_hold_state_staleness() {
+  local comments hold_head
+  comments="$(forge_get_pr_comments "$REPO_NWO" "$PR_NUMBER" 2>/dev/null || true)"
+  [[ -n "$comments" ]] || return 0
+
+  # Mirrors champion-pr-merge.md's own extraction (same marker, same capture
+  # group); "last" match wins in case of multiple hold episodes on one PR.
+  hold_head="$(printf '%s\n' "$comments" \
+    | grep -o 'champion:hold-state head=[0-9a-f]*' \
+    | tail -1 \
+    | sed -n 's/.*head=\([0-9a-f]*\)/\1/p')" || true
+  [[ -n "$hold_head" ]] || return 0
+
+  if [[ "$hold_head" != "$PR_HEAD_SHA" ]]; then
+    warning "champion:hold-state marker recorded head=$hold_head, but PR #$PR_NUMBER's current head is $PR_HEAD_SHA — the hold/approval state may have been recorded against a different tree than the one about to merge. loom:pr's presence means Judge approved SOME head; verify it still covers this one before proceeding."
+  fi
+}
+
+_check_loom_pr_label() {
+  local has_loom_pr=false
+
+  if printf '%s\n' "$PR_LABELS" | grep -qx 'loom:pr'; then
+    has_loom_pr=true
+  fi
+
+  if [[ "$has_loom_pr" == "true" ]]; then
+    _check_champion_hold_state_staleness
+    return 0
+  fi
+
+  # loom:pr absent.
+  if [[ "$ALLOW_UNAPPROVED" == "true" ]]; then
+    warning "loom:pr guard: --allow-unapproved set; proceeding without loom:pr (labels: ${PR_LABELS:-<none>}; head: $PR_HEAD_SHA) — operator asserts responsibility for merging an unreviewed head"
+
+    if [[ "$DRY_RUN" != "true" ]]; then
+      local override_comment
+      override_comment="## Merge Proceeded Without \`loom:pr\` (Override)
+
+PR #$PR_NUMBER was merged via \`merge-pr.sh --allow-unapproved\` while the \`loom:pr\` label was absent — no forge-visible Judge review signal existed for the head being merged.
+
+- **Head SHA**: \`$PR_HEAD_SHA\`
+- **Labels at merge time**: ${PR_LABELS:-<none>}
+
+The operator running this merge explicitly asserted responsibility for this override (#7419).
+
+---
+*Recorded by merge-pr.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ)*"
+      forge_gh_comment_rl_safe "$REPO_NWO" "$PR_NUMBER" "$override_comment" 2>/dev/null || \
+        warning "Could not post loom:pr override audit comment on PR #$PR_NUMBER (merge proceeds anyway; the warning above is still the log record)"
+    fi
+
+    return 0
+  fi
+
+  local msg
+  msg="Merge blocked: PR #$PR_NUMBER does not carry the \`loom:pr\` label — no forge-visible signal exists that Judge reviewed the CURRENT head.
+
+Current labels: ${PR_LABELS:-<none>}
+Current head SHA: $PR_HEAD_SHA
+
+loom:pr may have been cleared by a staleness guard (e.g. after a Doctor rebase moved the head) or never applied. Get the PR (re-)reviewed by Judge and re-labeled loom:pr, then re-run this merge.
+
+If you are deliberately merging without that review signal and take responsibility for it, re-run with --allow-unapproved to bypass this guard."
+
+  # --dry-run still runs the guard and REPORTS the would-be block, but honors
+  # the dry-run contract (never exits 1) — same shape as the guards above.
+  if [[ "$DRY_RUN" == "true" ]]; then
+    warning "[dry-run] Would BLOCK merge of PR #$PR_NUMBER: loom:pr label absent (labels: ${PR_LABELS:-<none>}; head: $PR_HEAD_SHA). Re-run with --allow-unapproved to override."
+    return 0
+  fi
+
+  error "$msg"
+}
+
+# Invoke the guard before either merge path attempts the actual merge API
+# call — same reasoning as the two guards above.
+_check_loom_pr_label
 
 # ---------------------------------------------------------------------------
 # Partial-increment closing-keyword conflict detection (#4569, extended by
@@ -1675,7 +1815,7 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
       # and captures the native exit code (0=merged, 3=Gitea decline,
       # 4=head-SHA mismatch, else fail).
       _AM_RC=0
-      AUTO_MERGE_OUTPUT=$(forge_cmd_perm_safe loom-daemon forge auto-merge "$PR_NUMBER" --method squash --expected-head-sha "$MERGE_PRECONDITION_SHA" 2>&1) || _AM_RC=$?
+      AUTO_MERGE_OUTPUT=$(forge_cmd_perm_safe loom-daemon forge auto-merge "$PR_NUMBER" --method "$REPO_MERGE_METHOD" --expected-head-sha "$MERGE_PRECONDITION_SHA" 2>&1) || _AM_RC=$?
       if [[ $_AM_RC -eq 0 ]]; then
         AUTO_MERGE_OK=true
         break
@@ -1699,7 +1839,7 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
     if [[ "$_AM_DECLINED" == true ]]; then
       # loom-daemon absent, or it declined (e.g. Gitea) — shell-based
       # forge_auto_merge carries the poll-and-merge for both forges.
-      if AUTO_MERGE_OUTPUT=$(forge_auto_merge "$REPO_NWO" "$PR_NUMBER" "$MERGE_PRECONDITION_SHA" 2>&1); then
+      if AUTO_MERGE_OUTPUT=$(forge_auto_merge "$REPO_NWO" "$PR_NUMBER" "$MERGE_PRECONDITION_SHA" "$REPO_MERGE_METHOD" 2>&1); then
         AUTO_MERGE_OK=true
         break
       fi
@@ -2175,7 +2315,7 @@ if [[ "$PR_MERGEABLE" == "false" ]]; then
 fi
 
 if [[ "$DRY_RUN" == "true" ]]; then
-  info "[dry-run] Would merge PR #$PR_NUMBER (squash) and delete remote branch '$PR_BRANCH'"
+  info "[dry-run] Would merge PR #$PR_NUMBER ($REPO_MERGE_METHOD) and delete remote branch '$PR_BRANCH'"
   if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     info "[dry-run] Would clean up local worktree"
     if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$PR_BRANCH"; then
@@ -2187,12 +2327,13 @@ if [[ "$DRY_RUN" == "true" ]]; then
   exit 0
 fi
 
-# Merge via API (squash) with retry for stale branch
+# Merge via API (using the repo's detected/allowed merge method, #7754) with
+# retry for stale branch
 MAX_MERGE_RETRIES=3
 MERGE_RETRY_DELAY=5
 
 for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
-  MERGE_RESPONSE=$(forge_merge_pr "$REPO_NWO" "$PR_NUMBER" "$MERGE_PRECONDITION_SHA" 2>&1) && break  # Success, exit loop
+  MERGE_RESPONSE=$(forge_merge_pr "$REPO_NWO" "$PR_NUMBER" "$MERGE_PRECONDITION_SHA" "$REPO_MERGE_METHOD" 2>&1) && break  # Success, exit loop
 
   # Check if it merged despite error (race condition)
   RECHECK_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
@@ -2433,44 +2574,39 @@ _find_worktree_by_branch() {
     '
 }
 
-# _worktree_branch_fully_captured <branch> <expected_head_sha>
-#
-# True (rc 0) when the LOCAL branch's tip commit equals expected_head_sha —
-# every commit on the branch was part of the just-merged PR, so nothing on
-# disk under that branch is unmerged. This is the exact criterion
-# `_maybe_delete_local_branch` below already uses to safely upgrade `git
-# branch -d` to `-D` after a squash merge (where `git branch --merged` never
-# returns true, #4100); it is factored out here (#6694) so the
-# worktree-preserve decision can reuse it too, not just the branch-delete
-# safety check. `git merge-base --is-ancestor branch default` is NOT an
-# equivalent substitute — it is false for a squash-merged branch even though
-# every one of its commits made it into the merge — so this stays keyed on
-# the merged PR's head SHA rather than default-branch ancestry.
-_worktree_branch_fully_captured() {
-  local branch="$1" expected_head_sha="${2:-}"
-  [[ -z "$branch" || -z "$expected_head_sha" ]] && return 1
-  local local_tip
-  local_tip="$(git -C "$REPO_ROOT" rev-parse --verify -q "refs/heads/$branch" 2>/dev/null || echo "")"
-  [[ -n "$local_tip" ]] && [[ "$local_tip" == "$expected_head_sha" ]]
-}
+# The worktree-preserve decisions below (#6694) and the branch-delete safety
+# check in _maybe_delete_local_branch both ask "does the default branch
+# already contain everything this branch has?" via `branch_has_landed`
+# (lib/branch-landed.sh, #7812), replacing the private
+# `_worktree_branch_fully_captured` tip-vs-merged-head comparison. Tip
+# equality was only ever a *sufficient* proof of "fully captured", never a
+# necessary one: it is false under a rebase merge (which rewrites every SHA)
+# exactly as `git merge-base --is-ancestor` is false under a squash merge.
+# `branch_landed`'s fail-closed `unknown` is false there, so both callers keep
+# their conservative behaviour when nothing could prove the branch landed.
 
 # Delete the matching local branch (#4100).
 #
 # _maybe_delete_local_branch <branch> [expected_head_sha]
 #
+# The `-d` → `-D` upgrade is gated on the shared `branch_landed` primitive
+# (#7812): `git branch -D` (force) is safe exactly when the default branch
+# already contains everything this branch has, which stays true under a
+# squash merge (where `git branch --merged` is always false) and under a
+# rebase merge (where the tip SHA match this used to rely on is always false).
+#
 # `expected_head_sha` is optional — the merged PR's `head.sha` (already parsed
-# into $PR_HEAD_SHA at the top of this script). When it is supplied AND the
-# local branch tip equals it, every commit on the branch was part of the
-# merged PR, so `git branch -D` (force) is safe even though the branch will
-# never satisfy `git branch --merged` after a squash merge. When it is absent
-# (the pre-#4100 :1455-equivalent caller below) or the tip does not match
-# (unpushed local work), this falls back to the original `git branch -d`
-# behaviour: Git's own "not fully merged" safety net, which keeps the branch
-# and reports it rather than force-deleting.
+# into $PR_HEAD_SHA at the top of this script). It is passed through purely as
+# a hint: a tip that matches it is landed with no forge round-trip at all.
+# When it is absent, or does not match, `branch_landed` falls through to the
+# forge probe and the offline tree-equality check. Anything short of a
+# `landed` verdict — including the fail-closed `unknown` — keeps the original
+# `git branch -d` behaviour: Git's own "not fully merged" safety net, which
+# keeps the branch and reports it rather than force-deleting.
 #
 # Primary-checkout auto-cleanup (#5015): when the branch turns out to be
 # checked out in the repo's PRIMARY working copy rather than a removable
-# worktree, and the tip-matches-head safety check above already held, and
+# worktree, and the landed safety check above already held, and
 # the primary checkout's working tree is clean with no stash entries (see
 # the auto-cleanup block below for the exact gate), this checks out the
 # default branch there and force-deletes the now-unreferenced branch
@@ -2498,11 +2634,20 @@ _maybe_delete_local_branch() {
     return 0
   fi
 
-  local delete_flag="-d"
-  local safety_note=""
-  if _worktree_branch_fully_captured "$branch" "$expected_head_sha"; then
+  # #7812: ask the shared primitive, as a plain statement so the
+  # BRANCH_LANDED_* globals survive (a `$(...)` subshell would discard them).
+  # Fail closed: only a `landed` verdict force-deletes. `not-landed` and
+  # `unknown` both keep `git branch -d`, which still deletes a branch git
+  # itself can prove merged and refuses (loudly) otherwise.
+  branch_landed "$branch" "${DEFAULT_BRANCH_NAME:-}" "$expected_head_sha" >/dev/null
+  local delete_flag="-d" safety_note=""
+  if [[ "$BRANCH_LANDED_VERDICT" == "landed" ]]; then
     delete_flag="-D"
-    safety_note=" (tip matches merged PR head SHA — safe force-delete)"
+    safety_note=" (branch has landed: $BRANCH_LANDED_EVIDENCE — safe force-delete)"
+  elif [[ "$BRANCH_LANDED_FORGE_STATUS" == "unavailable" ]]; then
+    info "Could not query the forge for a merged PR on '$branch' — fell back to the offline tree-equality check (verdict: $BRANCH_LANDED_VERDICT) and kept the conservative 'git branch -d'"
+  elif [[ "$BRANCH_LANDED_VERDICT" == "unknown" ]]; then
+    info "Could not determine whether '$branch' has landed — keeping the conservative 'git branch -d'"
   fi
 
   local delete_output
@@ -2533,9 +2678,9 @@ _maybe_delete_local_branch() {
       # hold — do it instead of just printing instructions:
       #   1. Not opted out via --no-cleanup-primary / CLEANUP_PRIMARY_CHECKOUT.
       #   2. The default branch actually resolved (never silently guess one).
-      #   3. delete_flag == "-D" — the tip-matches-merged-head-SHA safety
-      #      check above already passed, so every commit on $branch is part
-      #      of the merged PR; nothing is lost by deleting it.
+      #   3. delete_flag == "-D" — the `branch_landed` safety check above
+      #      already returned `landed`, so the default branch already has
+      #      every change on $branch; nothing is lost by deleting it.
       #   4. The primary checkout's working tree is clean (no uncommitted
       #      changes, no staged changes) AND has no stash entries — checked
       #      HERE, immediately before the mutating `checkout`, not cached
@@ -2878,18 +3023,19 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
       if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
         # #6694: the issue-close gate above says "preserve", but that is only
         # correct while the worktree/branch might still be needed. When the
-        # branch's tip is already the merged PR's head SHA, every commit on
-        # it made it into the merge — the worktree holds nothing unmerged
-        # regardless of whether the ISSUE itself ever closes. Without this
+        # branch has already LANDED (#7812 — forge PR state, tree equality,
+        # or ancestry), every change on it made it into the default branch —
+        # the worktree holds nothing unmerged regardless of whether the ISSUE
+        # itself ever closes. Without this
         # check, a programme issue intentionally designed to accumulate
         # `Part of #N` increments forever (every merge non-closing by
         # design) would preserve this worktree/branch indefinitely, since
         # _issue_is_closed_for_cleanup never flips true for it.
-        if _worktree_branch_fully_captured "$PR_BRANCH" "$PR_HEAD_SHA"; then
-          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' tip matches PR #$PR_NUMBER's merged head — its content is already on the default branch, so the worktree holds nothing unmerged; removing it (#6694)"
+        if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
+          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the worktree holds nothing unmerged; removing it (#6694)"
           _remove_loom_worktree "$DEFAULT_WT_PATH"
         else
-          warning "Preserving worktree at $DEFAULT_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' carries local commits beyond merged PR #$PR_NUMBER's head"
+          warning "Preserving worktree at $DEFAULT_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
           info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DEFAULT_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
         fi
       else
@@ -2918,14 +3064,14 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
           # gate (#4186) says preserve.
           if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
             # #6694: see the matching comment at the default-path call site
-            # above — reuse the tip-matches-merged-head check so a
-            # never-closing programme issue does not preserve this
-            # non-standard-path worktree forever either.
-            if _worktree_branch_fully_captured "$PR_BRANCH" "$PR_HEAD_SHA"; then
-              info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' tip matches PR #$PR_NUMBER's merged head — its content is already on the default branch, so the discovered worktree holds nothing unmerged; removing it (#6694)"
+            # above — reuse the landed check so a never-closing programme
+            # issue does not preserve this non-standard-path worktree forever
+            # either.
+            if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
+              info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the discovered worktree holds nothing unmerged; removing it (#6694)"
               _remove_loom_worktree "$DISCOVERED_WT"
             else
-              warning "Preserving discovered worktree at $DISCOVERED_WT — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' carries local commits beyond merged PR #$PR_NUMBER's head"
+              warning "Preserving discovered worktree at $DISCOVERED_WT — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
               info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$DISCOVERED_WT\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
             fi
           else
@@ -2962,14 +3108,14 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     if [[ -n "$JUDGE_PR_WT_PATH" ]] && [[ -d "$JUDGE_PR_WT_PATH" ]]; then
       if [[ -n "${ISSUE_NUM:-}" ]] && ! _issue_is_closed_for_cleanup "$ISSUE_NUM"; then
         # #6694: see the matching comment at the default-path call site
-        # above — reuse the tip-matches-merged-head check so a never-closing
-        # programme issue does not preserve this Judge/Doctor review
-        # worktree forever either.
-        if _worktree_branch_fully_captured "$PR_BRANCH" "$PR_HEAD_SHA"; then
-          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' tip matches PR #$PR_NUMBER's merged head — its content is already on the default branch, so the Judge/Doctor review worktree holds nothing unmerged; removing it (#6694)"
+        # above — reuse the landed check so a never-closing programme issue
+        # does not preserve this Judge/Doctor review worktree forever
+        # either.
+        if branch_has_landed "$PR_BRANCH" "$DEFAULT_BRANCH_NAME" "$PR_HEAD_SHA"; then
+          info "Issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER (partial-increment case, #3667), but branch '$PR_BRANCH' has already landed (${BRANCH_LANDED_EVIDENCE}) — its content is already on the default branch, so the Judge/Doctor review worktree holds nothing unmerged; removing it (#6694)"
           _remove_loom_worktree "$JUDGE_PR_WT_PATH"
         else
-          warning "Preserving Judge/Doctor review worktree at $JUDGE_PR_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' carries local commits beyond merged PR #$PR_NUMBER's head"
+          warning "Preserving Judge/Doctor review worktree at $JUDGE_PR_WT_PATH — issue #$ISSUE_NUM is not a close target of PR #$PR_NUMBER, its live state is not CLOSED, and branch '$PR_BRANCH' has not landed (${BRANCH_LANDED_VERDICT}/${BRANCH_LANDED_EVIDENCE}) — it carries content the default branch does not have"
           info "This may be the partial-increment case (#3667) awaiting a future closing merge, or an issue-state lookup failure — cleanup retries automatically on a merge that closes #$ISSUE_NUM. If #$ISSUE_NUM is a programme issue designed never to close (#6694), that retry never fires: remove manually with 'git -C \"$REPO_ROOT\" worktree remove \"$JUDGE_PR_WT_PATH\" --force && git -C \"$REPO_ROOT\" branch -D $PR_BRANCH'"
         fi
       else
@@ -2981,10 +3127,11 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
     # discovered-Loom-managed-non-standard-path, and the no-worktree-at-all
     # case (rows 2-4 of the issue's path table) all funnel through here —
     # none of them call _maybe_delete_local_branch internally the way the
-    # --worktree-path override does above. Passing $PR_HEAD_SHA lets the
-    # helper safely `-D` a branch whose tip matches the merged PR (the only
-    # criterion that is correct after a squash merge — `git branch --merged`
-    # is not). If the discovered worktree above was user-owned and left in
+    # --worktree-path override does above. Passing $PR_HEAD_SHA is a hint that
+    # lets the helper answer "has it landed?" without a forge round-trip when
+    # the tip matches the merged PR; `branch_landed` covers the squash and
+    # rebase cases where neither `git branch --merged` nor a tip match is
+    # correct (#7812). If the discovered worktree above was user-owned and left in
     # place, its branch is still checked out there, so this call is a
     # harmless no-op that reports the specific "checked out" refusal instead
     # of attempting a real delete.
