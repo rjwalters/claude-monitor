@@ -1,96 +1,3 @@
-# Loom Workflow Labels
-# These labels coordinate the Loom AI agent workflow
-# Sync with: .loom/scripts/sync-labels.sh (from the installed repo root)
-# Or manually: gh label create/edit commands
-
-# Core Workflow States
-- name: loom:triage
-  description: New issue awaiting Curator enhancement
-  color: "9CA3AF"  # gray-400 - neutral initial state
-
-- name: loom:issue
-  description: Approved for work by human (ready for Builder to claim)
-  color: "3B82F6"  # blue-500
-
-# DEPRECATED: loom:in-progress removed (use role-specific labels)
-# - loom:building (Builder implementing issue)
-# - loom:curating (Curator enhancing issue)
-# - loom:reviewing (Judge reviewing PR)
-# - loom:treating (Doctor fixing bug/PR feedback)
-
-# Role-Specific Workflow Labels
-- name: loom:building
-  description: Builder is implementing this issue
-  color: "F59E0B"  # amber-500 - matches other in-progress states
-
-- name: loom:curating
-  description: Curator is enhancing this issue
-  color: "F59E0B"  # amber-500 - matches other in-progress states
-
-- name: loom:treating
-  description: Doctor is fixing this bug or addressing PR feedback
-  color: "F59E0B"  # amber-500 - matches other in-progress states
-
-- name: loom:reviewing
-  description: Judge is actively reviewing this PR
-  color: "F59E0B"  # amber-500 - matches other in-progress states
-
-- name: loom:review-requested
-  description: PR ready for Judge to review
-  color: "10B981"  # emerald-500
-
-- name: loom:changes-requested
-  description: "PR requires changes before re-review (Judge requested modifications)"
-  color: "F59E0B"  # amber-500 - matches other "action required" labels
-
-- name: loom:pr
-  description: PR approved by Judge, ready for human to merge
-  color: "3B82F6"  # blue-500
-
-# Agent Proposal Labels
-- name: loom:architect
-  description: Architect proposal awaiting user approval
-  color: "9333EA"  # purple (violet-600)
-
-- name: loom:hermit
-  description: Hermit removal/simplification proposal awaiting user approval
-  color: "9333EA"  # purple (violet-600)
-
-- name: loom:curated
-  description: "Curator-enriched. Additive marker; coexists with loom:issue (highest-quality state for Builders)"
-  color: "10B981"  # emerald-500
-
-# Status Labels
-- name: loom:blocked
-  description: Implementation blocked, needs help or clarification
-  color: "EF4444"  # red-500
-
-- name: loom:urgent
-  description: Critical/blocking issue requiring immediate attention
-  color: "DC2626"  # red-600
-
-# Epic Labels
-- name: loom:epic
-  description: Multi-phase epic proposal (decomposes into implementation issues)
-  color: "7C3AED"  # violet-600 - distinguishes from regular proposals
-
-- name: loom:epic-phase
-  description: Issue is part of an epic phase (references parent epic)
-  color: "8B5CF6"  # violet-500 - lighter variant for child issues
-
-# Tier Labels (Goal Alignment)
-- name: tier:goal-advancing
-  description: Directly implements a milestone deliverable or unblocks goal work
-  color: "0E8A16"  # green - highest priority
-
-- name: tier:goal-supporting
-  description: Infrastructure, testing, or docs for milestone features
-  color: "FBCA04"  # yellow - medium priority
-
-- name: tier:maintenance
-  description: Cleanup, refactoring, or improvements not tied to current goals
-  color: "D4C5F9"  # purple - lower priority
-
 # BEGIN LOOM LABELS
 # ============================================================================
 # LOOM-MANAGED BLOCK — everything between the BEGIN/END LOOM LABELS markers is
@@ -129,9 +36,46 @@
 # - loom:reviewing (Judge reviewing PR)
 # - loom:treating (Doctor fixing bug/PR feedback)
 
+# PR verdict-label mutual exclusion (#4570): {loom:review-requested,
+# loom:reviewing, loom:changes-requested, loom:pr} form a mutually-exclusive
+# verdict class on a PR — at most ONE of these four should be present at a
+# time, with one legal transient exception: `loom:review-requested` and
+# `loom:reviewing` may coexist while a Judge's claim is active (the review is
+# in progress but has not yet produced a verdict). `loom:changes-requested`
+# and `loom:pr` are terminal verdicts and must never coexist with each other,
+# nor with a live `loom:reviewing` claim from a DIFFERENT actor's concurrent
+# review. A PR observed carrying `loom:pr` + `loom:changes-requested` (or,
+# equally invalid, `loom:pr` + `loom:review-requested` — twelve open PRs were
+# found in this state on 2026-08-28, #7018) simultaneously is in an off-graph,
+# contradictory state (see the PR #4560 incident, 2026-07-30) that must never
+# be auto-merged — Champion's Verdict-State Janitor
+# (defaults/.claude/commands/loom/champion-pr-merge.md) resolves it fail-safe
+# (`loom:pr` always loses; whichever OTHER label is present wins), and
+# Judge/Doctor's Verdict-Time CAS Recheck (judge.md / doctor.md) is the
+# write-time guard that prevents it from being produced in the first place.
+# `verdict-staleness-guard.sh` and `loom-daemon`'s `reconcile_pr_verdicts`
+# both strip EVERY terminal verdict label on a stale-verdict clear, not just
+# the one they detected as stale, so a stray copy of the other cannot survive
+# that transition either (#7018).
+
+# PR verdict labels are SHA-scoped (#5686): `loom:changes-requested` and
+# `loom:pr` are statements about the specific tree they were rendered against,
+# not about the PR as an object. Judge stamps every verdict comment with
+# `<!-- loom:verdict-sha sha=<head-sha> verdict=approved|changes-requested -->`,
+# and once the PR's head SHA moves (rebase, force-push, or new commits) that
+# verdict is STALE: it is cleared and the PR returns to `loom:review-requested`
+# for a fresh evaluation. Enforced by defaults/scripts/verdict-staleness-guard.sh
+# (called from judge.md's Stale-Verdict Sweep, doctor.md's Stale-Verdict Check,
+# and champion-pr-merge.md's Verdict-State Janitor Part 2) with an always-on
+# daemon backstop in loom-daemon's claim_reconciliation `reconcile_pr_verdicts`
+# pass. A stale APPROVAL is the dangerous direction — before #5686 it let
+# Champion auto-merge a tree no Judge had reviewed. A verdict carrying no marker
+# at all (written before this convention) fails safe: it is kept, never
+# force-cleared.
+
 # Role-Specific Workflow Labels
 - name: loom:building
-  description: "Builder is implementing this issue. Applied by: Builder/Shepherd only (claim label)."
+  description: "Builder is implementing this issue. Applied by: Builder only (claim label)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:curating
@@ -139,11 +83,15 @@
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:treating
-  description: "Doctor is fixing this bug or addressing PR feedback. Applied by: Doctor only (claim label)."
+  description: "Doctor is fixing this bug or PR. Applied by: Doctor. Stale after LOOM_STALE_TREATING_MINUTES (60m)."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:reviewing
   description: "Judge is reviewing this PR. Applied by: Judge only. Stale after LOOM_STALE_REVIEWING_MINUTES (30m)."
+  color: "F59E0B"  # amber-500 - matches other in-progress states
+
+- name: loom:evaluating
+  description: "Champion is evaluating this proposal (claim label, stale after 15m). Applied by: Champion only."
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:review-requested
@@ -159,7 +107,7 @@
   color: "DC2626"  # red-600 - indicates broken state
 
 - name: loom:auto-merge-ok
-  description: Override size limit for auto-merge (applied by Judge or human)
+  description: Override a Champion merge-risk hold (applied by Judge or human)
   color: "10B981"  # emerald-500 - signals safe to proceed
 
 - name: loom:ci-failure
@@ -201,17 +149,86 @@
   color: "DC2626"  # red-600
 
 - name: loom:abort
-  description: Signal to abort shepherd for this issue (returns to loom:issue)
+  description: Signal to abort the sweep for this issue (returns to loom:issue)
   color: "F97316"  # orange-500 - warning/signal color
 
-# loom:operator-only vs loom:blocked: operator-only = a human must act OUTSIDE
-# automation (credentials, infra, hardware) and sweep/shepherd skip it entirely;
+# loom:operator-only vs loom:blocked: operator-only = a human must act or rule
+# OUTSIDE automation (credentials, infra, hardware, or an owner-gated decision
+# on owner-tracked code) and sweep skips it entirely;
 # blocked = waiting on a dependency but otherwise automatable. Keep the
 # description at/under GitHub's 100-char label-description limit so sync-labels.sh
 # can create it (a longer description fails with HTTP 422 and the label never syncs).
 - name: loom:operator-only
-  description: "Requires human action outside automation (credentials, infra, hardware); sweep/shepherd skip"
+  description: "Requires human action or ruling outside automation (creds, infra, hardware); sweep skips"
   color: "F97316"  # orange-500 - operator-action signal (matches loom:abort)
+
+# loom:needs-capability (#5817): a narrower claim than loom:operator-only —
+# blocked on a missing tool/agent capability, not an operator-by-right
+# decision. Skips sweep identically to loom:operator-only today (same
+# hard-skip rows in sweep.md and the same warn-operator-gated.sh
+# dependency-declared check); the routing convention for when to apply this
+# vs. loom:operator-only is out of scope here (see #5818). Keep the
+# description at/under GitHub's 100-char label-description limit — see the
+# comment above loom:operator-only.
+- name: loom:needs-capability
+  description: "Blocked on a missing tool/agent capability, not operator-by-right; link the capability-request issue"
+  color: "FDE68A"  # amber-200 - distinct from the operator-only orange family
+
+# loom:operator-only sub-kind labels (#5671). A single `loom:operator-only` was
+# carrying at least four meanings with no mechanical way to tell them apart —
+# these four ALWAYS accompany `loom:operator-only` (never replace it; every
+# existing filter/skip that keys off the base label is unaffected) and record
+# WHICH kind at the point of application. Exactly one of the four is applied
+# per issue/PR. See .loom/docs/label-state-machine.md "operator-only sub-kinds"
+# for the full decision table and the machine-readable-blocker convention.
+# NOTE (#5826): loom:operator-decision is no longer the safe unsure-default —
+# being unsure is a sign the analysis is incomplete, not a reason to apply the
+# label. Only apply loom:operator-only once a specific sub-kind fits.
+# NOTE (#6881, updated #6893): loom:operator-mechanical's "no judgement
+# required" describes the WORK. The base loom:operator-only label's hard skip
+# still wins for every sub-kind by default -- with ONE narrow, fail-closed
+# exception since #6893: a mechanical item whose body declares
+# `<!-- loom:capability=<name> -->` marker(s) (#6892) that the executing HOST
+# holds (LOOM_WORKER_CAPABILITIES, env-only) is routed to a PROPOSE-ONLY lane
+# instead of parked -- it emits the commands / a PR for an operator to
+# approve, never a live credentialed action. The other three sub-kinds are
+# unchanged and hard-skip unconditionally, marker or no marker.
+- name: loom:operator-blocked
+  description: "operator-only sub-kind: self-clearing, waiting on a named issue/infra to land"
+  color: "FDBA74"  # orange-300 - lightest: transient, expected to clear on its own
+
+# A loom:operator-mechanical item may additionally declare the capability(ies)
+# it needs via `<!-- loom:capability=<name> -->` marker(s) in its body (#6892)
+# -- meaningful only alongside THIS sub-kind, ignored by the other three. See
+# .loom/docs/label-state-machine.md "Capability-declaration convention" for
+# the closed vocabulary and parser contract, and its "Dispatch path (#6893)"
+# subsection for the four gates that consume it.
+- name: loom:operator-mechanical
+  description: "operator-only sub-kind: no judgement needed; parks unless a declared capability is held (#6893)"
+  color: "FB923C"  # orange-400
+
+- name: loom:operator-decision
+  description: "operator-only sub-kind: preference/authority axis named; not a safe default (#5826)"
+  color: "C2410C"  # orange-700 - darkest
+
+- name: loom:operator-objective
+  description: "operator-only sub-kind: determined once operator states objective; lists candidates"
+  color: "FED7AA"  # orange-200 - lightest of all: clears on a single stated preference
+
+# loom:operator is the first-class "a human is needed" pipeline state (#5502):
+# the engine (any role, plus sweep/shepherd dispatch) will not act on this
+# item further until a human does. It differs from BOTH neighbors above:
+# vs. loom:operator-only — operator-only tells sweep/shepherd to SKIP the item
+# entirely; loom:operator does not — the item stays in the normal
+# re-evaluation queue so a role's own exit rule (e.g. Champion's head-SHA
+# precheck, an explicit human comment, or a new artifact) can still clear it
+# automatically. vs. loom:blocked — blocked means "waiting on a dependency,
+# still automatable"; loom:operator means "the engine has stopped and only a
+# human moves it forward." See .loom/docs/label-state-machine.md for the full
+# entry/exit model.
+- name: loom:operator
+  description: "Engine stops work on this item; human is the only transition out. Sweep/shepherd do not skip it."
+  color: "EA580C"  # orange-600 - operator-action signal, one shade darker than operator-only
 
 # Epic Labels
 - name: loom:epic
@@ -236,9 +253,15 @@
   color: "D4C5F9"  # purple - lower priority
 
 # External Contribution Gate
-# Not part of the loom: workflow. Builders MUST skip issues carrying this label
-# (see builder.md "Ignore External Issues") — a non-collaborator submission needs
-# maintainer approval before Curator/Builder process it.
+# Not part of the loom: workflow. A non-collaborator submission needs maintainer
+# approval before Curator/Builder process it.
+#
+# This is a HARD EXCLUSION (#7528): no Loom role may curate, build, or promote
+# it, AND loom-daemon's work finder will not dispatch a sweep for it. The
+# authoritative list lives in ONE place — `defaults/scripts/hard-exclusion-labels.sh`
+# (mirrored by `loom_daemon::hard_exclusion::HARD_EXCLUSION_LABELS`, kept in
+# lockstep by a unit test). Adding a hard exclusion means editing that list, not
+# just adding a label here.
 - name: external
   description: "Non-collaborator submission; needs maintainer approval before curation. Applied by: humans only."
   color: "E5E7EB"  # gray-200 - external/hold marker
