@@ -57,12 +57,18 @@ enum AccountSync {
         /// Carries the path that was actually looked at — with `--db <path>` the
         /// default location is not the one that mattered (issue #105).
         case databaseMissing(String)
+        /// `import` creates the store when it is absent (#188); this is the
+        /// narrower failure of not being *able* to — an unwritable or
+        /// non-existent parent directory it could not create.
+        case storeUnwritable(String, Error)
         case sqlite(Error)
 
         var errorDescription: String? {
             switch self {
             case .databaseMissing(let path):
                 return "No database found at \(path)"
+            case .storeUnwritable(let path, let error):
+                return "Could not create a database at \(path): \(error.localizedDescription)"
             case .sqlite(let error):
                 return "Database error: \(error.localizedDescription)"
             }
@@ -201,9 +207,36 @@ enum AccountSync {
     /// on match so `usage_history` / `probe_snapshots` rows stay attached.
     @discardableResult
     static func importBundle(_ bundle: ExportBundle, dbPath: String = defaultDBPath) throws -> ImportSummary {
-        guard FileManager.default.fileExists(atPath: dbPath) else { throw SyncError.databaseMissing(dbPath) }
+        // A fresh worker has no store yet — that is the *normal* state of the
+        // host an import is most needed on (#188). Creating it here is not a
+        // new capability: `openDatabase` already opens read-write with
+        // `SQLITE_OPEN_CREATE`, and `applySchema` below already exists to bring
+        // a pre-migration database up to date. Only the parent directory has to
+        // be materialized first, exactly as `UsageStore.ensureDatabase` does,
+        // or SQLite answers `SQLITE_CANTOPEN` for a missing `~/.claude-monitor`.
+        // Note `exportBundle` keeps its own `databaseMissing` guard: exporting
+        // from a host that has never run the app has nothing to read, and
+        // conjuring an empty database there would emit an empty bundle that
+        // looks like a successful export.
+        let isNewDatabase = !FileManager.default.fileExists(atPath: dbPath)
+        if isNewDatabase {
+            let directory = (dbPath as NSString).deletingLastPathComponent
+            if !directory.isEmpty, !FileManager.default.fileExists(atPath: directory) {
+                do {
+                    try FileManager.default.createDirectory(
+                        atPath: directory, withIntermediateDirectories: true
+                    )
+                } catch {
+                    throw SyncError.storeUnwritable(dbPath, error)
+                }
+            }
+        }
         do {
             let db = try openDatabase(dbPath)
+            // Match what the app itself creates, so the store this import just
+            // materialized behaves identically to one the daemon made: WAL, so
+            // a concurrent poll loop reads without blocking the writer.
+            if isNewDatabase { try? db.execute("PRAGMA journal_mode=WAL") }
             // Bring the target database up to the current schema first — a host
             // that has never launched the app still has a pre-migration
             // database, and the upserts below write the provider columns.
