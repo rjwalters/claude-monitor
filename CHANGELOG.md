@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Codex app-server spawn failed outright on codex >= 0.149.** The client
+  passed `-a untrusted`, an approval policy newer CLIs reject at argument
+  parsing, so every poll died before `initialize` with an opaque "exited before
+  answering". Now spawns with `-a never` (valid on every supported version and
+  correct for a read-only client). The child's stderr is captured (capped at
+  4 KB, drained so it can never block) and folded into the early-exit error —
+  after home-path redaction, so a diagnostic that echoes `CODEX_HOME` cannot
+  persist a username to `debug.log` or `oauth_credentials.last_error` (#184,
+  thanks @theossalmeida)
 - **App bundle advertised macOS 13 while the binary targets macOS 14.** The
   `LSMinimumSystemVersion` stamped by `build-macos-app.sh` now matches the
   package's `.macOS(.v14)` deployment target, so Finder refuses the app on
