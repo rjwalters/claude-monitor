@@ -117,6 +117,8 @@ enum SelfTest {
         testProvisioningAbsentIdentityConvertsInPlace()
         testAbsentIdentityDoesNotMakeAmbientHomeAmbiguous()
         testOpenAIAccountCountIncludesLegacyRowWithUsageHistory()
+        testStrandedCodexIdentityIsReported()
+        testExhaustedTiersMessageNeverClaimsAMissingToken()
         testDeclaredIdentityRePropagates()
         testHeadlessEnvFileCanDeclareIdentities()
         testAbsentVocabularyIsDistinct()
@@ -3630,6 +3632,231 @@ enum SelfTest {
                 checks += 1
                 failures.append("openAIAccountCount legacy-usage-history test threw: \(error)")
             }
+        }
+    }
+
+    /// #194: the silent dead end, pinned end to end.
+    ///
+    /// The shape reproduced here is the one that actually occurs — verified
+    /// against a live `usage.db` on 2026-09-17, where **both** OpenAI accounts
+    /// sat in it and the poll loop enumerated zero OpenAI credentials. An
+    /// account added by token paste before #104 carries `source = 'codex'`, a
+    /// stored token, and no `codex_home`; #123's healing migration then nulls
+    /// the token. Both halves of `loadActiveCredentials`'s admission test now
+    /// fail, so the row leaves the poll set — `pollOpenAI` is never reached, no
+    /// status is written, and `isAbsentCodexIdentity` correctly declines to
+    /// claim it because it has readings. The row simply froze, with nothing
+    /// anywhere saying why.
+    ///
+    /// Note what this test does **not** assert: it never expects the stranded
+    /// row back in `loadActiveCredentials`. Reviving it would mean polling from
+    /// a stored credential, which is exactly the rotation race #104 removed.
+    /// The fix is a voice, not a fallback.
+    private static func testStrandedCodexIdentityIsReported() {
+        withSelfTestTempDir("stranded-codex") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                let poller = OAuthPoller(dbPath: dbPath)
+                let db = try openDatabase(dbPath)
+                let now = "2026-01-01T00:00:00Z"
+
+                // 1. The stranded row: token-imported, token since nulled, no
+                //    home, but this host has polled it before.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-stranded', 'stranded@example.com', 'stranded@example.com', 'pro', ?, 0, 'openai')
+                """, now)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                    VALUES ('user-stranded', 'stranded@example.com', 'codex', 'openai', NULL, 1, ?, ?)
+                """, now, now)
+                try db.run("""
+                    INSERT INTO usage_history (account_id, timestamp, primary_percent)
+                    VALUES ('user-stranded', ?, 42.0)
+                """, now)
+
+                // 2. A declared-but-unprovisioned identity (#135): same first
+                //    three conditions, no reading. It has its own badge and its
+                //    own remediation, so the stranded pass must not claim it.
+                poller.declareCodexIdentity(email: "absent@example.com", homeLabel: "absent")
+
+                // 3. A home-registered, token-free account: the path this issue
+                //    must not disturb.
+                let home = "/tmp/selftest-stranded-home-\(UUID().uuidString)"
+                poller.saveCodexHomeAccount(
+                    accountId: "user-home", email: "home@example.com", plan: "pro", codexHome: home
+                )
+
+                // 4. An ordinary Anthropic account with a stored token.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('org-anthropic', 'a@example.com', 'a@example.com', 'Max', ?, 3, 'anthropic')
+                """, now)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                    VALUES ('org-anthropic', 'a@example.com', 'token', 'anthropic', 'sk-ant-oat01-selftest', 1, ?, ?)
+                """, now, now)
+
+                // The shared rule agrees on which of the four this is.
+                expect(isStrandedCodexIdentity(provider: .openai, hasStoredToken: false,
+                                               hasCodexHome: false, hasLocalReading: true),
+                       "a tokenless, homeless OpenAI row WITH a reading is stranded")
+                expect(!isStrandedCodexIdentity(provider: .openai, hasStoredToken: false,
+                                                hasCodexHome: false, hasLocalReading: false),
+                       "…and without a reading it is absent (#135), not stranded")
+                expect(!isStrandedCodexIdentity(provider: .openai, hasStoredToken: false,
+                                                hasCodexHome: true, hasLocalReading: true),
+                       "a registered home is a credential path — never stranded")
+                expect(!isStrandedCodexIdentity(provider: .anthropic, hasStoredToken: false,
+                                                hasCodexHome: false, hasLocalReading: true),
+                       "stranding is an OpenAI/Codex condition only")
+                // Absent and stranded partition the no-credential-path set: for
+                // any given row exactly one of them can be true.
+                for reading in [true, false] {
+                    expect(isAbsentCodexIdentity(provider: .openai, hasStoredToken: false,
+                                                 hasCodexHome: false, hasLocalReading: reading)
+                           != isStrandedCodexIdentity(provider: .openai, hasStoredToken: false,
+                                                      hasCodexHome: false, hasLocalReading: reading),
+                           "absent and stranded are mutually exclusive and jointly exhaustive (reading=\(reading))")
+                }
+
+                // The poll set is unchanged: the stranded row stays out, and the
+                // home-registered one stays in.
+                let polled = Set(poller.loadActiveCredentials().compactMap { $0.accountId })
+                expect(!polled.contains("user-stranded"),
+                       "the stranded row is still NOT polled — #104's boundary is intact, this is diagnostics only")
+                expect(polled.contains("user-home"),
+                       "the token-free codex-home registration path is unaffected")
+                expect(polled.contains("org-anthropic"),
+                       "a stored-token Anthropic account is unaffected")
+                expect(!polled.contains("user-absent") && polled.count == 2,
+                       "nothing else slipped into the poll set")
+
+                // …and exactly the stranded row gets a voice.
+                let stranded = poller.strandedCodexCredentials()
+                expectEqual(stranded.count, 1, "exactly one row is reported as stranded")
+                expectEqual(stranded.first?.accountId, "user-stranded",
+                            "the absent placeholder and the home-registered row are not claimed")
+
+                // `codex list` reads the same rule rather than a second
+                // look-alike, so the CLI and the popover cannot disagree about
+                // which row is in which state. Before #194 the stranded row took
+                // an ambient-home probe here and printed `needs login`.
+                let beforeRepair = poller.codexAccounts()
+                expectEqual(beforeRepair.filter { $0.isStranded }.count, 1,
+                            "codex list marks exactly the stranded row")
+                expectEqual(beforeRepair.first { $0.accountId == "user-stranded" }?.isStranded, true,
+                            "…and it is the same row the poller reports")
+                expect(beforeRepair.allSatisfy { !($0.isStranded && $0.isAbsent) },
+                       "no row is ever both absent and stranded")
+                expectEqual(beforeRepair.filter { $0.isAbsent }.count, 1,
+                            "the declared placeholder is still the only absent row")
+                expect(CodexCLI.strandedLabel != CodexCLI.absentLabel
+                       && CodexCLI.strandedLabel != CodexCLI.driftLabel,
+                       "stranded is its own status word, distinct from absent and drift")
+
+                poller.reportStrandedCodexIdentities()
+                let status = poller.credentialStatuses.first { $0.accountId == "user-stranded" }
+                expectEqual(status?.status, TokenStatus.missing, "a stranded row reports .missing")
+                expectEqual(status?.lastError, OAuthPoller.strandedCodexMessage,
+                            "…with the shared, actionable reason rather than a bare status word")
+                expect(!poller.credentialStatuses.contains { $0.accountId == "user-home" },
+                       "reporting stranded rows writes no status for a healthy registration")
+
+                // Persisted for a headless host, which has no popover to hover.
+                let verify = try openDatabase(dbPath, readonly: true)
+                expectEqual(try verify.scalar(
+                                "SELECT last_error FROM oauth_credentials WHERE account_id = 'user-stranded'"
+                            ) as? String,
+                            OAuthPoller.strandedCodexMessage,
+                            "the reason is persisted to oauth_credentials.last_error")
+                // The staleness backstop (#148) must keep firing: this row was
+                // not polled, so it must not acquire a fresh last_poll_at.
+                expectEqual(try verify.scalar(
+                                "SELECT last_poll_at FROM oauth_credentials WHERE account_id = 'user-stranded'"
+                            ) as? String,
+                            nil,
+                            "a diagnostic must never claim the row was polled — last_poll_at stays untouched")
+
+                // The message is safe to log and to persist: no home path (there
+                // is none) and no identity.
+                expect(!OAuthPoller.strandedCodexMessage.contains("/Users/")
+                       && !OAuthPoller.strandedCodexMessage.contains(NSHomeDirectory()),
+                       "the stranded message carries no home path")
+                expect(OAuthPoller.strandedCodexMessage.contains("codex add --home"),
+                       "…and names the command that fixes it")
+
+                // Repairing the row clears the condition with no bookkeeping:
+                // stranding is derived, exactly like absence.
+                poller.saveCodexHomeAccount(
+                    accountId: "user-stranded", email: "stranded@example.com", plan: "pro",
+                    codexHome: "/tmp/selftest-stranded-repair-\(UUID().uuidString)"
+                )
+                expect(poller.strandedCodexCredentials().isEmpty,
+                       "registering a home un-strands the row on the very next read")
+                expect(poller.loadActiveCredentials().contains { $0.accountId == "user-stranded" },
+                       "…and it rejoins the poll set")
+
+                expect(poller.codexAccounts().allSatisfy { !$0.isStranded },
+                       "…and `codex list` stops marking it too, with no bookkeeping to update")
+
+                // The import-time warning fires on exactly the shape that
+                // becomes stranded: an account with no home of its own on a
+                // host that already has other OpenAI accounts. Both import
+                // paths (`codex import` and the popover button) ask this one
+                // predicate, so they cannot disagree.
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider)
+                    VALUES ('user-imported', 'imp@example.com', 'imp@example.com', 'pro', ?, 4, 'openai')
+                """, now)
+                try db.run("""
+                    INSERT INTO oauth_credentials
+                        (account_id, label, source, provider, access_token, is_active, created_at, updated_at)
+                    VALUES ('user-imported', 'imp@example.com', 'codex', 'openai', 'tok-imported', 1, ?, ?)
+                """, now, now)
+                expect(poller.importWillStrand(accountId: "user-imported"),
+                       "a token-only import onto a multi-account host is warned about at import time")
+                expect(!poller.importWillStrand(accountId: "user-home"),
+                       "…and an account that has its own registered home is not")
+                expect(OAuthPoller.importWillStrandWarning.contains("codex add --home"),
+                       "the import warning names the command that prevents the dead end")
+                expect(!OAuthPoller.importWillStrandWarning.contains(NSHomeDirectory()),
+                       "…and carries no home path")
+            } catch {
+                checks += 1
+                failures.append("stranded codex identity test threw: \(error)")
+            }
+        }
+    }
+
+    /// #194: `pollOpenAI`'s "every tier exhausted" report used the literal
+    /// `"No access token"`, inherited from `pollAnthropic`. Since #104 this app
+    /// stores no OpenAI credential at all, so for an OpenAI row that sentence is
+    /// permanently true, never the cause, and points at a fix (paste a token)
+    /// that the design deliberately removed. Pinned as a literal-absence
+    /// assertion because the regression is a *wording* one — it compiles fine.
+    private static func testExhaustedTiersMessageNeverClaimsAMissingToken() {
+        let ambiguous = OAuthPoller.exhaustedTiersMessage(home: .ambiguous)
+        let ambient = OAuthPoller.exhaustedTiersMessage(home: .ambient)
+        let explicit = OAuthPoller.exhaustedTiersMessage(home: .explicit("/tmp/selftest-codex-home"))
+
+        for message in [ambiguous, ambient, explicit] {
+            expect(!message.lowercased().contains("no access token"),
+                   "an OpenAI row never has a stored token by design — saying so names no cause")
+        }
+        expect(ambiguous.contains("codex add --home"),
+               "the ambiguous case names the registration that resolves it")
+        expect(ambiguous != ambient,
+               "ambiguity and an unreadable home are different problems with different fixes")
+        expectEqual(ambient, explicit,
+               "…while a registered home and an inherited one fail for the same reason: nothing readable")
+        // These strings reach `debug.log` and `oauth_credentials.last_error`.
+        for message in [ambiguous, ambient, explicit] {
+            expect(!message.contains("/tmp/selftest-codex-home") && !message.contains(NSHomeDirectory()),
+                   "a home path names a user and must never appear in a persisted diagnostic")
         }
     }
 

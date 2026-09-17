@@ -406,6 +406,21 @@ class OAuthPoller: ObservableObject {
             )
         }
 
+        /// This host *did* provision this identity, and no longer has any
+        /// credential path to poll it with (#194) — the same three "nothing to
+        /// poll with" conditions as `isAbsent`, separated only by having taken a
+        /// reading here. Same rule the popover and `reportStrandedCodexIdentities`
+        /// apply (`isStrandedCodexIdentity`), so `codex list` cannot name this
+        /// condition differently from the status the poller writes.
+        var isStranded: Bool {
+            isStrandedCodexIdentity(
+                provider: .openai,
+                hasStoredToken: hasStoredToken,
+                hasCodexHome: codexHome != nil,
+                hasLocalReading: hasLocalReading
+            )
+        }
+
         /// The `codex provision <label>` argument that would fill this gap, or
         /// nil when the payload carried no label. Only ever a bare label — a
         /// value containing a path separator is rejected rather than echoed,
@@ -1174,14 +1189,31 @@ class OAuthPoller: ObservableObject {
     /// 2. A **token-free** row whose account has a registered `codex_home`
     ///    (`claude-monitor codex add --home`). Registering an account by its
     ///    home deliberately never reads or stores a token, so its credential row
-    ///    carries `access_token = NULL` and `source = 'codex-home'`; without
-    ///    this clause it would register fine, list fine, and never poll.
+    ///    carries `access_token = NULL` and, by convention, `source =
+    ///    'codex-home'`; without this clause it would register fine, list fine,
+    ///    and never poll.
+    ///
+    /// **Clause 2 keys on `accounts.codex_home`, not on `source`** (#194). The
+    /// `'codex-home'` label is a descriptive tag written by
+    /// `saveCodexHomeAccount`, never an input to this test — a row registered by
+    /// home polls whatever its `source` says, and a legacy `source = 'codex'`
+    /// row polls too whenever it still carries a token. Anyone diagnosing a
+    /// stale OpenAI account from `source` alone is reading the wrong column.
     ///
     /// Clause 2 is written as narrowly as it can be — `provider = 'openai'` and
     /// a non-NULL `codex_home` — rather than relaxing the token predicate for
     /// all OpenAI rows, so a token-less row from any *other* source (e.g. an
     /// `accounts import` bundle exported from a host that had a home) is not
     /// resurrected into the poll set on a host where it has no home to read.
+    ///
+    /// The cost of that narrowness is a row that satisfies **neither** clause
+    /// and therefore never reaches `pollOpenAI` at all — so no status, no
+    /// error, and no log line is ever written for it. That is a real, reachable
+    /// state (#123's migration nulls every stored OpenAI token, stranding any
+    /// account added by token paste that has no home), which is why
+    /// `strandedCodexCredentials` / `reportStrandedCodexIdentities` exist:
+    /// this enumeration stays exactly as narrow as it is, and a *separate*
+    /// pass reports the rows it deliberately drops.
     func loadActiveCredentials() -> [OAuthCredential] {
         guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
         do {
@@ -1236,6 +1268,159 @@ class OAuthPoller: ObservableObject {
         } catch {
             flog.error("Failed to load credentials: \(error.localizedDescription)", category: fcat)
             return []
+        }
+    }
+
+    // MARK: - Stranded Codex identities (#194)
+
+    /// What a stranded row's status should say. One literal, because the
+    /// popover hover, `debug.log`, and `oauth_credentials.last_error` must not
+    /// name this condition three different ways — and because `SelfTest` pins
+    /// it. Carries no home path (there is none by construction) and no
+    /// identity, so it is safe to log and to persist.
+    nonisolated static let strandedCodexMessage =
+        "No pollable Codex credential on this host: this account has no stored token and "
+        + "no registered CODEX_HOME, so its usage stopped updating. Re-register it with "
+        + "`claude-monitor codex add --home <path>` (or `claude-monitor codex provision <label>`)."
+
+    /// What to tell someone whose freshly-imported account cannot survive the
+    /// next launch (#194). One literal, shared by `codex import` and the
+    /// popover's "Import Codex Account", so the CLI and the UI cannot describe
+    /// the same trap two different ways.
+    nonisolated static let importWillStrandWarning =
+        "This host has more than one OpenAI account and none of them is registered to a "
+        + "CODEX_HOME of its own, so no Codex home can speak for this one. Its stored token is "
+        + "cleared on the next launch (this app keeps no OpenAI credential) and it will then "
+        + "stop updating. Register a home for it: `claude-monitor codex add --home <path>`."
+
+    /// Whether the account just imported will be stranded once its stored token
+    /// is cleared — i.e. no home may speak for it.
+    ///
+    /// That is exactly `resolveCodexHome`'s `.ambiguous`, asked of the shared
+    /// rule rather than re-deriving "which home?" a second way. Called right
+    /// after an import, while the token still exists, so the warning lands
+    /// while the operator is at the keyboard rather than a fortnight later when
+    /// the chart flatlines.
+    func importWillStrand(accountId: String) -> Bool {
+        let registered = codexAccounts().first { $0.accountId == accountId }?.codexHome
+        if case .ambiguous = Self.resolveCodexHome(
+            registered: registered, openAIAccountCount: openAIAccountCount()
+        ) { return true }
+        return false
+    }
+
+    /// Every OpenAI credential row `loadActiveCredentials` deliberately drops
+    /// **and** that this host has a usage reading for — i.e. the rows for which
+    /// `isStrandedCodexIdentity` is true.
+    ///
+    /// Deliberately *not* folded into `loadActiveCredentials`: these rows must
+    /// stay out of the poll set (there is nothing on this host to poll them
+    /// with, and #104 rules out reviving a stored credential). They only need a
+    /// voice, which is what `reportStrandedCodexIdentities` gives them.
+    ///
+    /// The predicate is the same shared SQL every other absent/stranded surface
+    /// uses (`storedTokenCountSQL`, #169) so the two states can never overlap or
+    /// leave a gap between them. A *missing* `usage_history` table degrades to
+    /// "no reading", i.e. nothing is reported — the opposite direction from
+    /// `openAIAccountCount`'s degradation, and correct for the same reason each
+    /// is: this pass fails closed toward staying silent, while that count fails
+    /// closed toward withholding the ambient home.
+    func strandedCodexCredentials() -> [OAuthCredential] {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
+        do {
+            let db = try openDatabase(dbPath, readonly: true)
+            let accountColumns = tableColumns(db, "accounts")
+            let credentialColumns = tableColumns(db, "oauth_credentials")
+            // Nothing to strand on a database old enough to predate providers.
+            guard accountColumns.contains("provider"), !credentialColumns.isEmpty else { return [] }
+
+            let homeRegistered = accountColumns.contains("codex_home")
+                ? "(a.codex_home IS NOT NULL AND TRIM(a.codex_home) != '')"
+                : "0"
+            let hasLocalReading = tableColumns(db, "usage_history").isEmpty
+                ? "0"
+                : "EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = a.id)"
+            let storedToken = storedTokenCountSQL(accountRef: "a.id")
+
+            let stmt = try db.prepare("""
+                SELECT c.id, c.account_id, c.label, c.source
+                FROM oauth_credentials c
+                JOIN accounts a ON a.id = c.account_id
+                WHERE c.is_active = 1
+                  AND COALESCE(a.provider, 'anthropic') = 'openai'
+                  AND NOT \(homeRegistered)
+                  AND \(storedToken) = 0
+                  AND \(hasLocalReading)
+            """)
+
+            return stmt.map { row in
+                // Every credential field this row could carry is genuinely
+                // absent — that absence *is* the condition being reported.
+                OAuthCredential(
+                    id: row[0] as? Int64,
+                    accountId: row[1] as? String,
+                    provider: .openai,
+                    label: (row[2] as? String) ?? "Unknown",
+                    source: (row[3] as? String) ?? "token",
+                    accessToken: nil,
+                    refreshToken: nil,
+                    expiresAt: nil,
+                    tokenExpiresAt: nil,
+                    subscriptionType: nil,
+                    rateLimitTier: nil,
+                    isActive: true,
+                    codexHome: nil
+                )
+            }
+        } catch {
+            flog.error("strandedCodexCredentials failed: \(error.localizedDescription)", category: fcat)
+            return []
+        }
+    }
+
+    /// Credentials already told once that they are stranded. A stranded row is
+    /// an indefinite steady state, not a transient, so the log line and the
+    /// persisted `last_error` are written once per process rather than every
+    /// poll interval — the same dedupe discipline as
+    /// `loggedAmbiguousCodexHome` / `loggedCodexCapabilityGap`.
+    private var loggedStrandedCodexIdentity: Set<Int64> = []
+
+    /// Give the rows `loadActiveCredentials` drops an honest status.
+    ///
+    /// Called from `pollAll`/`pollDue` beside that enumeration, because those
+    /// are exactly the moments the host decides what it *can* poll — reporting
+    /// what it cannot belongs in the same breath. The in-memory status is
+    /// refreshed every cycle (cheap, and it re-arms after a row is repaired and
+    /// then broken again); only the log line and the `last_error` write are
+    /// deduped.
+    ///
+    /// `last_poll_at` is deliberately left alone: nothing polled this account,
+    /// and bumping it would make the cause-independent staleness backstop
+    /// (#148) report the row as fresh — the diagnostic would erase the symptom
+    /// it exists to explain.
+    func reportStrandedCodexIdentities() {
+        for credential in strandedCodexCredentials() {
+            updateCredentialStatus(credential, status: .missing, error: Self.strandedCodexMessage)
+            guard let id = credential.id, loggedStrandedCodexIdentity.insert(id).inserted else { continue }
+            flog.warning("\(credential.label): \(Self.strandedCodexMessage)", category: fcat)
+            persistCredentialError(id: id, error: Self.strandedCodexMessage)
+        }
+    }
+
+    /// Record a diagnostic against a credential row **without** claiming it was
+    /// polled. `updateCredentialLastPoll` writes `last_poll_at` alongside
+    /// `last_error`; a row nothing polled must not get that timestamp.
+    private func persistCredentialError(id: Int64, error: String) {
+        guard FileManager.default.fileExists(atPath: dbPath) else { return }
+        do {
+            let db = try openDatabase(dbPath)
+            let now = ISO8601DateFormatter().string(from: Date())
+            try db.run(
+                "UPDATE oauth_credentials SET last_error = ?, updated_at = ? WHERE id = ?",
+                error, now, id
+            )
+        } catch {
+            flog.error("Failed to record credential diagnostic: \(error.localizedDescription)", category: fcat)
         }
     }
 
@@ -1319,6 +1504,11 @@ class OAuthPoller: ObservableObject {
     /// by spacing sequential calls so they naturally spread out.
     func pollAll() async {
         let credentials = loadActiveCredentials()
+        // Report what this host *cannot* poll in the same breath as deciding
+        // what it can (#194) — before the early return, because a host whose
+        // only OpenAI accounts are stranded has no active credentials at all
+        // and would otherwise be the one host that never hears about it.
+        reportStrandedCodexIdentities()
         guard !credentials.isEmpty else {
             flog.info("pollAll: no active credentials", category: fcat)
             return
@@ -1336,6 +1526,7 @@ class OAuthPoller: ObservableObject {
     /// Poll any accounts whose poll interval has elapsed. Returns count of accounts polled.
     func pollDue() async -> Int {
         let credentials = loadActiveCredentials()
+        reportStrandedCodexIdentities()
         guard !credentials.isEmpty else { return 0 }
 
         let now = Date()
@@ -1568,8 +1759,32 @@ class OAuthPoller: ObservableObject {
             updateCredentialStatus(credential, status: codexFailure.tokenStatus, error: reason)
             return
         }
-        updateCredentialStatus(credential, status: .missing, error: "No access token")
+        updateCredentialStatus(credential, status: .missing,
+                               error: Self.exhaustedTiersMessage(home: home))
         throw AnthropicAPIError.unauthorized
+    }
+
+    /// Why every tier is exhausted, when no tier left a more specific failure
+    /// behind (#194).
+    ///
+    /// This path used to report `"No access token"`, inherited from
+    /// `pollAnthropic`. For an OpenAI row that is never true and never
+    /// actionable: since #104 this app stores no OpenAI credential at all, so
+    /// "no token" is the permanent, uninformative baseline rather than the
+    /// thing that went wrong. What actually went wrong is which home — if any —
+    /// was allowed to speak for the account, so that is what it says now.
+    ///
+    /// Pure and `nonisolated` so `SelfTest` can pin every shape without a
+    /// database or a subprocess.
+    nonisolated static func exhaustedTiersMessage(home: CodexHomeResolution) -> String {
+        if case .ambiguous = home {
+            return "No Codex home may speak for this account: this host has more than one "
+                + "OpenAI account and none of them is registered to this one. Register it with "
+                + "`claude-monitor codex add --home <path>`."
+        }
+        return "No Codex credential could be read for this account: `codex app-server` is "
+            + "unavailable and its Codex home has no readable auth.json. Check that `codex` is "
+            + "installed and logged in."
     }
 
     // MARK: - Codex app-server fallback bookkeeping
@@ -1658,7 +1873,14 @@ class OAuthPoller: ObservableObject {
         /// compared emails, so a row with `email IS NULL` could still be handed
         /// the ambient home's numbers. Ambiguity is now resolved by *counting
         /// candidates*, which needs no identity on either side and therefore has
-        /// no NULL-email gap. The account falls through to its stored credential.
+        /// no NULL-email gap.
+        ///
+        /// **There is nothing below this to fall through to.** An earlier
+        /// version of this comment said the account "falls through to its stored
+        /// credential"; #104 removed that rung, so both home-reading tiers are
+        /// simply skipped and the poll reports
+        /// `exhaustedTiersMessage(home:)` — which names the ambiguity and the
+        /// `codex add --home` that resolves it (#194).
         case ambiguous
 
         /// The home the read tiers should be constructed with, or nil to mean

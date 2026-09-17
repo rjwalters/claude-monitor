@@ -220,6 +220,38 @@ func isAbsentCodexIdentity(
     provider == .openai && !hasStoredToken && !hasCodexHome && !hasLocalReading
 }
 
+/// Whether an account row names a Codex identity this host *did* provision but
+/// can no longer poll — "stranded" (#194).
+///
+/// Exactly `isAbsentCodexIdentity` with its last condition flipped, and that is
+/// the whole point: the first three conditions say "no credential path exists
+/// here" and `hasLocalReading` is the only thing that separates the two states.
+/// A row with a reading was demonstrably set up on this host once, so telling
+/// its owner to `codex provision` a *new* identity would be wrong — what they
+/// need is to re-register the one they already have.
+///
+/// This state is reachable without anybody doing anything: a pre-#104 account
+/// added by token paste carries `access_token` and no `codex_home`, and #123's
+/// healing migration nulls that token (`UPDATE oauth_credentials SET
+/// access_token = NULL ... WHERE provider = 'openai'`). Both halves of
+/// `loadActiveCredentials`'s admission test then fail, so the row drops out of
+/// the poll set entirely — `pollOpenAI` is never reached, no status is written,
+/// and `isAbsentCodexIdentity` correctly declines to claim it. Before #194 that
+/// left *no* surface saying why the row stopped advancing: the staleness
+/// backstop (#148) reported *that* it had, and nothing reported the cause or
+/// the fix. `OAuthPoller.reportStrandedCodexIdentities` is what closes that.
+///
+/// Like absence it is derived, never stored: register a home (or paste a token)
+/// and the row stops being stranded on the next cycle.
+func isStrandedCodexIdentity(
+    provider: AccountProvider,
+    hasStoredToken: Bool,
+    hasCodexHome: Bool,
+    hasLocalReading: Bool
+) -> Bool {
+    provider == .openai && !hasStoredToken && !hasCodexHome && hasLocalReading
+}
+
 /// The `hasStoredToken` input to `isAbsentCodexIdentity`, spelled as SQL —
 /// **once** (#169).
 ///
@@ -613,6 +645,16 @@ class UsageStore: ObservableObject {
     /// again the very next launch. Ongoing polling never misses it:
     /// `OAuthPoller.pollOpenAI` reads through the `codex app-server` /
     /// `auth.json` tiers instead of the stored credential.
+    ///
+    /// **That last sentence holds only while some home may speak for the
+    /// account** (#194). An account whose only credential path *was* the stored
+    /// token — added by paste, never given a `codex_home` — is left by this pass
+    /// with neither, so `loadActiveCredentials` drops it and it stops updating
+    /// for good. That is a legitimate consequence of #104 (the token was a dead
+    /// secret either way), not a bug in this migration; what was a bug is that
+    /// it used to happen in complete silence. `isStrandedCodexIdentity` names
+    /// the resulting state and `OAuthPoller.reportStrandedCodexIdentities`
+    /// reports it. This is also why `codex import` warns at the point of paste.
     // Pure function of its `db` argument — touches no instance/class
     // main-actor state, so it stays callable from the CLI/headless paths.
     private nonisolated static func nullOutOpenAITokens(_ db: Connection) {
