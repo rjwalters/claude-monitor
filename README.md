@@ -247,14 +247,28 @@ claude-monitor codex list
 # user-77c… pro         drift → user-0d4…  /Users/you/.codex-spare
 # openai-b… —           absent             (not provisioned on this host)
 #   → claude-monitor codex provision agent3
+# user-5e1… pro         stranded           (none registered — nothing left to poll with)
+#   → claude-monitor codex add --home <path>
 ```
 
 `list` reports each home's live state: **logged in**, **needs login** (the home
 exists but `codex login` hasn't been run in it), **home missing** (the directory
 is gone — re-register), **drift** (see below), **absent** (see
 [Declaring which identities a host should have](#declaring-which-identities-a-host-should-have)),
-or **unknown** when `codex` itself is absent or too old. Both commands take
-`--db <path>` to work against a throwaway store.
+**stranded** (see below), or **unknown** when `codex` itself is absent or too
+old. Both commands take `--db <path>` to work against a throwaway store.
+
+**stranded** means this host has polled the account before but now has nothing
+left to poll it with: no stored token (this app keeps no OpenAI credential —
+they are cleared on every launch, see `codex import` below) and no `CODEX_HOME`
+of its own. It is the state an account added by *token import* ends up in once
+it is no longer the host's only OpenAI account, and it is permanent until a home
+is registered — the row simply stops updating. Neither a stranded nor an absent
+row is ever probed against the ambient `~/.codex`: that home belongs to at most
+one account, so asking it would report a stranger's login state as this row's.
+Fix it with `codex add --home <path>` (or `codex provision <label>` to create
+the home and log in). The popover names the same condition in the hover text on
+the affected row's status dot.
 
 **drift** means that home is now logged in as a *different* account than the row
 it was registered against — someone ran `codex login` in it again with another
@@ -357,6 +371,14 @@ Prefer `codex add`: it stores no token at all. `codex import` still stores one
 transiently to validate the credential and identify the account, but a
 healing migration nulls it out again on the app's very next launch (#104) —
 ongoing polling reads through the tiers above, not the stored copy.
+
+**That only holds while some home can speak for the account.** Once this host
+has a second OpenAI account, the ambient `~/.codex` belongs to at most one of
+them and may speak for neither, so an imported account with no `CODEX_HOME` of
+its own has no tier left and stops updating for good — the **stranded** state
+above. `codex import` warns when it detects this at import time; either way the
+fix is to give the account a home of its own with `codex add --home` or
+`codex provision`.
 
 </details>
 

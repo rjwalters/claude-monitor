@@ -960,6 +960,14 @@ struct SummaryRow: View {
         if isDrifted, let detail = credentialStatus?.lastError, !detail.isEmpty {
             return detail
         }
+        // A `.missing` OpenAI row is the other state whose bare status word says
+        // nothing useful — "missing" names the symptom, never which of the
+        // several causes applies or what fixes it. When the poller composed a
+        // reason (`OAuthPoller.strandedCodexMessage`, `exhaustedTiersMessage`),
+        // show that instead (#194).
+        if tokenStatus == .missing, let detail = credentialStatus?.lastError, !detail.isEmpty {
+            return detail
+        }
         return tokenStatus.rawValue
     }
 
@@ -1577,8 +1585,15 @@ struct AddAccountView: View {
             let (accountId, error) = await oauthPoller.importCodexCredential()
             await MainActor.run {
                 isAdding = false
-                if accountId != nil {
-                    statusMessage = "Added OpenAI account"
+                if let accountId = accountId {
+                    // #194: an imported token is cleared on the next launch, so
+                    // an account with no home of its own that this host cannot
+                    // resolve ambiguously is a silent dead end. Say so here —
+                    // the same warning `codex import` prints, from the same
+                    // rule — rather than letting the row quietly stop updating.
+                    statusMessage = oauthPoller.importWillStrand(accountId: accountId)
+                        ? "Added OpenAI account — \(OAuthPoller.importWillStrandWarning)"
+                        : "Added OpenAI account"
                     store.loadFromDatabase()
                     onImported?()
                 } else {

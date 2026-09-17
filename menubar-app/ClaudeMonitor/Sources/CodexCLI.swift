@@ -377,18 +377,36 @@ enum CodexCLI {
         Task {
             var sawDrift = false
             var absentRemediations: [String] = []
+            var sawStranded = false
             if !accounts.isEmpty {
                 print("ACCOUNT   PLAN        AUTH               CODEX_HOME")
                 for account in accounts {
-                    // An absent identity is never probed: there is no home to
-                    // ask, and asking the *ambient* one would report some other
-                    // account's login state as if it were this row's (#135).
-                    let status = account.isAbsent ? absentLabel : await authStatus(for: account)
+                    // Neither an absent nor a stranded identity is ever probed:
+                    // there is no home to ask, and asking the *ambient* one
+                    // would report some other account's login state as if it
+                    // were this row's (#135, #194). Before #194 a stranded row
+                    // took that ambient probe and printed `needs login` — a
+                    // stranger's answer, and remediation pointing at a home this
+                    // row does not own.
+                    let status: String
+                    if account.isAbsent {
+                        status = absentLabel
+                    } else if account.isStranded {
+                        status = strandedLabel
+                        sawStranded = true
+                    } else {
+                        status = await authStatus(for: account)
+                    }
                     if status.hasPrefix(driftLabel) { sawDrift = true }
                     let plan = (account.plan ?? "—").padded(to: 11)
-                    let home = account.isAbsent
-                        ? "(not provisioned on this host)"
-                        : (account.codexHome ?? "(default: $CODEX_HOME, else ~/.codex)")
+                    let home: String
+                    if account.isAbsent {
+                        home = "(not provisioned on this host)"
+                    } else if account.isStranded {
+                        home = "(none registered — nothing left to poll with)"
+                    } else {
+                        home = account.codexHome ?? "(default: $CODEX_HOME, else ~/.codex)"
+                    }
                     print("\(account.accountId.prefix(8))… \(plan) \(status.padded(to: 18)) \(home)")
                     if account.isAbsent {
                         let remediation = account.provisionLabel.map {
@@ -396,6 +414,9 @@ enum CodexCLI {
                         } ?? "  → claude-monitor codex provision <label>"
                         print(remediation)
                         absentRemediations.append(remediation)
+                    }
+                    if account.isStranded {
+                        print("  → claude-monitor codex add --home <path>")
                     }
                 }
             } else {
@@ -422,6 +443,14 @@ enum CodexCLI {
                 print("          `codex provision` line printed above to create the home, log in,")
                 print("          and register it. That converts this placeholder into a real")
                 print("          polling account rather than adding a second row.")
+            }
+            if sawStranded {
+                print("`\(strandedLabel)` → this host has polled this account before, but it now has no")
+                print("            stored token (this app keeps no OpenAI credential — they are")
+                print("            cleared on every launch) and no CODEX_HOME of its own, so there is")
+                print("            nothing left to poll it with and its usage has stopped updating.")
+                print("            Register a home for it with the `codex add --home` line above, or")
+                print("            `claude-monitor codex provision <label>` to create one and log in.")
             }
             if sawDrift {
                 print("`\(driftLabel)` → this CODEX_HOME is now logged in as a different account than the")
@@ -455,6 +484,18 @@ enum CodexCLI {
     /// `driftLabel` carries. `nonisolated` because those UI call sites read it
     /// from views that carry no `@MainActor` annotation of their own.
     nonisolated static let absentLabel = "absent"
+
+    /// The status word for an identity this host provisioned and can no longer
+    /// poll (#194). Its own word for the same reason `absent` is: `needs login`
+    /// would name a home that could be logged in, and there is no home here at
+    /// all — only a row whose stored token was cleared by #104's migration.
+    ///
+    /// Not `private` so `SelfTest` can pin it distinct from `absentLabel` and
+    /// `driftLabel`. The popover has no badge of its own for this state — the
+    /// staleness dot (#148) already flags the row, and the hover carries
+    /// `OAuthPoller.strandedCodexMessage`, which is the same rule stated as a
+    /// full sentence rather than a second status word to keep in sync.
+    nonisolated static let strandedLabel = "stranded"
 
     /// `~/.codex*` directories on disk that are not already covered by a
     /// registered account — pure filesystem discovery, no writes, no login.
@@ -660,10 +701,32 @@ enum CodexCLI {
                 CLIArgs.fail(result.error ?? "Import failed")
             }
             print("Imported OpenAI account \(accountId.prefix(8))… from \(resolved)")
+            warnIfImportWillStrand(poller, accountId: accountId)
             exportRanking(storePath)
             exit(0)
         }
         dispatchMain()
+    }
+
+    /// Say so at the point of import when this account cannot survive the next
+    /// launch (#194).
+    ///
+    /// `codex import` stores a token exactly once, to validate the credential
+    /// and identify the account; `UsageStore.nullOutOpenAITokens` then clears it
+    /// on **every** subsequent launch (#104). Polling continues through the home
+    /// tiers — unless no home may speak for this account, in which case the
+    /// import has silently produced a row that will stop updating and never say
+    /// why.
+    ///
+    /// The decision and the wording both come from `OAuthPoller`, shared with
+    /// the popover's "Import Codex Account" button, which reaches
+    /// `importCodexCredential` without passing through this CLI at all. Warn
+    /// only: the import succeeded and the row is worth having (it names an
+    /// identity, and `reportStrandedCodexIdentities` keeps reporting it).
+    private static func warnIfImportWillStrand(_ poller: OAuthPoller, accountId: String) {
+        guard poller.importWillStrand(accountId: accountId) else { return }
+        FileHandle.standardError.write(
+            Data("Warning: \(OAuthPoller.importWillStrandWarning)\n".utf8))
     }
 
     // MARK: - Shared helpers
