@@ -103,6 +103,7 @@ enum SelfTest {
         testFullHistoryDecimationAlwaysKeepsNilWeeklyPercent()
         testHistoryCutoffExcludesOlderRows()
         testTokenHistoryRoundTripAndCutoff()
+        testUnattributedTokenDataFallsBackToHostTotal()
         testTranscriptSchemaMatchesLegacyShape()
         testTranscriptSchemaPreservesLegacyRows()
         testTranscriptImportOverFixtureTree()
@@ -2806,6 +2807,72 @@ enum SelfTest {
             } catch {
                 checks += 1
                 failures.append("loadTokenHistory round-trip test threw: \(error)")
+            }
+        }
+    }
+
+    /// #201: `token_sessions.inferred_account_id` is deliberately left NULL
+    /// for every row #197's transcript importer writes (transcripts carry no
+    /// account identity, and the pre-#197 "whichever account was polled most
+    /// recently" inference was removed on purpose). Before this fix, that
+    /// meant `loadTokenHistory(for:)`/`hasTokenData(for:)` returned exactly
+    /// the same "nothing here" result for this fixture as they would for a
+    /// completely empty database — this test pins the fallback that now
+    /// distinguishes the two: a host that has ingested unattributed spend
+    /// must still surface it via `hasAnyTokenUsageData()` +
+    /// `loadHostTotalTokenHistory`, while a genuinely empty host reports
+    /// neither.
+    private static func testUnattributedTokenDataFallsBackToHostTotal() {
+        withSelfTestTempDir("token-history-unattributed") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+
+                // Case 1: a genuinely empty database — no token_usage rows at
+                // all. Must report "nothing to show", not a false fallback.
+                let emptyStore = UsageStore(dbPath: dbPath)
+                expectEqual(emptyStore.hasAnyTokenUsageData(), false,
+                            "a database with zero token_usage rows has no host-total data")
+                expectEqual(emptyStore.loadHostTotalTokenHistory(daysBack: 30).count, 0,
+                            "host-total history is empty when nothing has been ingested")
+
+                // Case 2: rows exist, but neither override_account_id nor
+                // inferred_account_id is populated — the exact shape #197
+                // writes on every fresh import.
+                let db = try openDatabase(dbPath)
+                try db.run("""
+                    INSERT INTO token_sessions
+                        (session_id, first_message_ts, override_account_id, inferred_account_id)
+                    VALUES ('sess-unattributed', '2026-01-01T00:00:00Z', NULL, NULL)
+                """)
+                try db.run("""
+                    INSERT INTO token_usage
+                        (session_id, timestamp, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+                    VALUES ('sess-unattributed', ?, 200, 75, 20, 10)
+                """, isoTimestamp(secondsAgo: 60))
+
+                let store = UsageStore(dbPath: dbPath)
+
+                // The per-account surfaces still (correctly) see nothing —
+                // no account was ever attributed.
+                expectEqual(store.hasTokenData(for: "acct-any"), false,
+                            "hasTokenData(for:) stays false when nothing is attributed to that account")
+                expectEqual(store.loadTokenHistory(for: "acct-any", daysBack: 30).count, 0,
+                            "loadTokenHistory(for:) stays empty when nothing is attributed to that account")
+
+                // But the host-agnostic surface now sees the ingested spend.
+                expectEqual(store.hasAnyTokenUsageData(), true,
+                            "hasAnyTokenUsageData() is true once any token_usage row exists, attributed or not")
+                let hostTotal = store.loadHostTotalTokenHistory(daysBack: 30)
+                expectEqual(hostTotal.count, 1, "host-total history includes the unattributed row")
+                expectEqual(hostTotal.first?.inputTokens, 200, "host-total input_tokens round-trips")
+                expectEqual(hostTotal.first?.outputTokens, 75, "host-total output_tokens round-trips")
+                expectEqual(hostTotal.first?.cacheCreationTokens, 20, "host-total cache_creation_tokens round-trips")
+                expectEqual(hostTotal.first?.cacheReadTokens, 10, "host-total cache_read_tokens round-trips")
+                expectEqual(hostTotal.first?.billableTokens, 295, "host-total billableTokens excludes cache reads")
+            } catch {
+                checks += 1
+                failures.append("unattributed token data host-total fallback test threw: \(error)")
             }
         }
     }
