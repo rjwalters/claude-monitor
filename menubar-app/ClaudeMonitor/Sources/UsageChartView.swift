@@ -41,6 +41,12 @@ struct UsageChartWindow: View {
     let dataPoints: [UsageDataPoint]
     let fullDataPoints: [FullUsageDataPoint]
     let tokenDataPoints: [TokenDataPoint]
+    /// True when `tokenDataPoints` is a host-wide total (#201) rather than
+    /// data actually attributed to `account` — see
+    /// `UsageStore.loadHostTotalTokenHistory`. Must gate every label the
+    /// token chart shows so a host-total fallback is never presented as if
+    /// it were this account's own spend.
+    let tokenDataIsHostTotal: Bool
     let store: UsageStore
     let oauthPoller: OAuthPoller?
     let otherAccountsData: [AccountTrace]  // Data for other accounts
@@ -178,6 +184,13 @@ struct UsageChartWindow: View {
     /// Check if we have token data to display
     var hasTokenData: Bool {
         !tokenDataPoints.isEmpty
+    }
+
+    /// Token chart section title — distinguishes a genuine per-account series
+    /// from the #201 host-total fallback so the two are never visually
+    /// indistinguishable.
+    var tokenChartTitle: String {
+        tokenDataIsHostTotal ? "Token Usage (Host Total)" : "Token Usage"
     }
 
     /// Convert range position (0-1) to actual date within 7-day window
@@ -343,7 +356,7 @@ struct UsageChartWindow: View {
                 // Usage chart with mode toggle
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text(chartMode == .percent ? "Weekly Usage" : "Token Usage")
+                        Text(chartMode == .percent ? "Weekly Usage" : tokenChartTitle)
                             .font(.headline)
                         Spacer()
 
@@ -370,6 +383,19 @@ struct UsageChartWindow: View {
                             }
                             .buttonStyle(.plain)
                         }
+                    }
+
+                    // #201: a host-total fallback stands in for per-account
+                    // attribution when nothing has been attributed yet (every
+                    // freshly-imported transcript leaves
+                    // token_sessions.inferred_account_id NULL by design —
+                    // see UsageStore.loadHostTotalTokenHistory). Must be
+                    // labeled every time it's shown so it's never mistaken
+                    // for this account's own spend.
+                    if chartMode == .tokens && tokenDataIsHostTotal {
+                        Text("Not yet attributed to a specific account — shown as a host-wide total.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
 
                     if chartMode == .percent {
@@ -1147,7 +1173,21 @@ enum ChartWindowController {
 
         let dataPoints = store.loadHistory(for: account.id)
         let fullDataPoints = store.loadFullHistory(for: account.id)
-        let tokenDataPoints = store.loadTokenHistory(for: account.id)
+
+        // #201: `loadTokenHistory` reads only rows attributed to this
+        // account (`token_sessions.override_account_id`/`inferred_account_id`),
+        // which is NULL for every row #197's transcript importer writes —
+        // there is no external session_id -> account_id mapping in this repo
+        // yet (rjwalters/loom#8059). Rather than render an empty chart
+        // identically to a host with zero ingested tokens, fall back to an
+        // explicitly-labeled host-wide total when this account has nothing
+        // attributed but the host has ingested data somewhere.
+        var tokenDataPoints = store.loadTokenHistory(for: account.id)
+        var tokenDataIsHostTotal = false
+        if tokenDataPoints.isEmpty && store.hasAnyTokenUsageData() {
+            tokenDataPoints = store.loadHostTotalTokenHistory()
+            tokenDataIsHostTotal = true
+        }
 
         // Named per-model sub-limits (OpenAI additional_rate_limits[]), one
         // series per provider-chosen limit_name. Empty for Anthropic accounts
@@ -1200,6 +1240,7 @@ enum ChartWindowController {
             dataPoints: dataPoints,
             fullDataPoints: fullDataPoints,
             tokenDataPoints: tokenDataPoints,
+            tokenDataIsHostTotal: tokenDataIsHostTotal,
             store: store,
             oauthPoller: oauthPoller,
             otherAccountsData: otherAccountsData,

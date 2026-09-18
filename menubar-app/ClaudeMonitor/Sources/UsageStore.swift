@@ -1501,7 +1501,14 @@ class UsageStore: ObservableObject {
         }
     }
 
-    /// Check if token data exists for an account
+    /// Check if token data exists **attributed to this specific account**
+    /// (`token_sessions.override_account_id`/`inferred_account_id`). Since
+    /// #197, `inferred_account_id` is deliberately left NULL for every
+    /// imported transcript (transcripts carry no account identity), so this
+    /// returns `false` on a host that has ingested plenty of token spend but
+    /// attributed none of it yet — see `hasAnyTokenUsageData()` for the
+    /// account-agnostic "is there anything to show at all" question, and
+    /// `loadHostTotalTokenHistory` for the #201 fallback series built from it.
     func hasTokenData(for accountId: String) -> Bool {
         do {
             guard FileManager.default.fileExists(atPath: dbPath) else {
@@ -1526,6 +1533,94 @@ class UsageStore: ObservableObject {
         } catch {
             print("Error checking token data: \(error)")
             return false
+        }
+    }
+
+    /// True when this host has ingested *any* `token_usage` rows at all,
+    /// independent of `token_sessions` attribution (#201). This is what
+    /// separates "nothing has been imported" from "plenty has been imported,
+    /// but #197 deliberately leaves `inferred_account_id` NULL and no
+    /// external mapping (rjwalters/loom#8059) has attributed it to an account
+    /// yet" — `hasTokenData(for:)` alone reads identically (`false`) for
+    /// both, which is the bug #201 fixes. A caller with `false` here has
+    /// nothing to show under any surface; a caller with `true` here but
+    /// `hasTokenData(for:) == false` for every account should fall back to
+    /// `loadHostTotalTokenHistory`.
+    func hasAnyTokenUsageData() -> Bool {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return false
+            }
+            let db = try openDatabase(dbPath, readonly: true)
+            let count = try db.scalar("SELECT COUNT(*) FROM token_usage") as? Int64 ?? 0
+            return count > 0
+        } catch {
+            print("Error checking token_usage presence: \(error)")
+            return false
+        }
+    }
+
+    /// Host-wide hourly token usage, summed across **every** `token_usage`
+    /// row regardless of `token_sessions` account attribution (#201). This is
+    /// the account-agnostic fallback the issue's "Ask option 2" describes:
+    /// per-session attribution isn't derivable in this repo (transcripts
+    /// carry no account identity), but total spend across the host is still
+    /// an honest number to show. Deliberately does **not** guess which
+    /// account "owns" a session — that is the last-polled-account inference
+    /// #197 removed on purpose — so every caller of this method must label
+    /// the result as a host total, never as this account's own history.
+    /// Superseded automatically once rjwalters/loom#8059's session_id ->
+    /// account_id mapping lands and populates `override_account_id`:
+    /// `loadTokenHistory(for:)` starts returning non-empty results again and
+    /// callers should prefer it.
+    nonisolated func loadHostTotalTokenHistory(daysBack: Int = 7) -> [TokenDataPoint] {
+        do {
+            guard FileManager.default.fileExists(atPath: dbPath) else {
+                return []
+            }
+
+            let db = try openDatabase(dbPath, readonly: true)
+            let cutoffString = cutoffISOString(daysBack: daysBack)
+
+            let sql = """
+                SELECT
+                    strftime('%Y-%m-%dT%H:00:00Z', timestamp) as hour,
+                    SUM(input_tokens) as input_tokens,
+                    SUM(output_tokens) as output_tokens,
+                    SUM(cache_creation_tokens) as cache_creation_tokens,
+                    SUM(cache_read_tokens) as cache_read_tokens
+                FROM token_usage
+                WHERE timestamp >= ?
+                GROUP BY hour
+                ORDER BY hour ASC
+            """
+
+            var dataPoints: [TokenDataPoint] = []
+            let statement = try db.prepare(sql)
+
+            for row in statement.bind(cutoffString) {
+                if let hourStr = row[0] as? String,
+                   let date = UsageRecord.parseISO(hourStr) {
+                    let inputTokens = (row[1] as? Int64) ?? 0
+                    let outputTokens = (row[2] as? Int64) ?? 0
+                    let cacheCreationTokens = (row[3] as? Int64) ?? 0
+                    let cacheReadTokens = (row[4] as? Int64) ?? 0
+
+                    dataPoints.append(TokenDataPoint(
+                        timestamp: date,
+                        inputTokens: inputTokens,
+                        outputTokens: outputTokens,
+                        cacheCreationTokens: cacheCreationTokens,
+                        cacheReadTokens: cacheReadTokens
+                    ))
+                }
+            }
+
+            return dataPoints
+
+        } catch {
+            print("Error loading host-total token history: \(error)")
+            return []
         }
     }
 
