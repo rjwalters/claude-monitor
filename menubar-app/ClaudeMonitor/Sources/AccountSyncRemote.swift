@@ -1,12 +1,4 @@
 import Foundation
-// `signal` / `SIGPIPE` / `SIG_IGN` are POSIX, not Foundation: Linux's
-// swift-corelibs-foundation does not re-export them, so the platform module has
-// to be imported explicitly for the headless build.
-#if canImport(Glibc)
-import Glibc
-#elseif canImport(Darwin)
-import Darwin
-#endif
 
 /// `claude-monitor accounts push|pull` — ssh fan-out built on the existing
 /// `AccountSync` export/import plumbing (#188).
@@ -234,68 +226,6 @@ enum AccountSyncRemote {
         var inputWriteFailed: Bool = false
     }
 
-    /// SIGPIPE's default disposition kills the **whole process**, which on a
-    /// fan-out means the first fast-failing host takes every remaining host with
-    /// it — silently, with exit 141 and no diagnostic at all. That is exactly
-    /// what happens with real ssh against a refused port: it exits before
-    /// reading its stdin, so any bundle larger than the pipe buffer (~64 KiB,
-    /// i.e. roughly a fleet's worth of accounts) blocks mid-write and then takes
-    /// EPIPE. Ignoring the signal turns that into an ordinary error return the
-    /// per-host loop can report and recover from.
-    ///
-    /// Installed lazily at the first subprocess launch (a `static let`
-    /// initializer is run-once and thread-safe) rather than at the CLI entry
-    /// point, so it covers every caller of `runProcess` — including `selftest`,
-    /// which drives `runPush` in-process and would otherwise be unable to test
-    /// this path at all.
-    private static let sigpipeIgnored: Bool = {
-        signal(SIGPIPE, SIG_IGN)
-        return true
-    }()
-
-    /// Accumulates one child stream on Foundation's reader queue.
-    ///
-    /// Both streams are drained *concurrently* rather than read in sequence:
-    /// reading stdout to EOF first would deadlock any child that fills the
-    /// 64 KiB stderr pipe buffer before finishing (an ssh banner, a chatty
-    /// remote). `@unchecked Sendable` over an `NSLock` follows the established
-    /// pattern in `CodexAppServer.swift` for state a Foundation callback and
-    /// the calling thread both touch.
-    private final class StreamDrain: @unchecked Sendable {
-        private let lock = NSLock()
-        private let finished = DispatchSemaphore(value: 0)
-        private var buffer = Data()
-
-        func append(_ chunk: Data) {
-            lock.lock()
-            buffer.append(chunk)
-            lock.unlock()
-        }
-
-        func finish() { finished.signal() }
-
-        func waitForEOF() -> Data {
-            finished.wait()
-            lock.lock()
-            defer { lock.unlock() }
-            return buffer
-        }
-    }
-
-    private static func drain(_ pipe: Pipe) -> StreamDrain {
-        let sink = StreamDrain()
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let chunk = handle.availableData
-            if chunk.isEmpty {
-                handle.readabilityHandler = nil
-                sink.finish()
-            } else {
-                sink.append(chunk)
-            }
-        }
-        return sink
-    }
-
     /// Runs `executable arguments…`, optionally feeding `input` to its stdin,
     /// and returns both captured streams plus the exit status.
     ///
@@ -308,7 +238,16 @@ enum AccountSyncRemote {
     static func runProcess(
         executable: String, arguments: [String], input: Data? = nil
     ) throws -> RemoteResult {
-        _ = sigpipeIgnored
+        // SIGPIPE's default disposition kills the **whole process**, which on a
+        // fan-out means the first fast-failing host takes every remaining host
+        // with it — silently, with exit 141 and no diagnostic at all. That is
+        // exactly what real ssh does against a refused port: it exits before
+        // reading its stdin, so any bundle larger than the pipe buffer (~64 KiB,
+        // i.e. roughly a fleet's worth of accounts) blocks mid-write and then
+        // takes EPIPE. Shared with the other subprocess call site (#202) rather
+        // than owned here, because `CodexAppServerClient` writes to a child's
+        // stdin too and had no guard at all.
+        SubprocessIO.ignoreSIGPIPE()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -321,8 +260,12 @@ enum AccountSyncRemote {
         let inPipe = Pipe()
         process.standardInput = input == nil ? FileHandle.nullDevice : inPipe
 
-        let outDrain = drain(outPipe)
-        let errDrain = drain(errPipe)
+        // Both streams are drained *concurrently* rather than read in sequence:
+        // reading stdout to EOF first would deadlock any child that fills the
+        // 64 KiB stderr pipe buffer before finishing (an ssh banner, a chatty
+        // remote).
+        let outDrain = PipeDrain(outPipe.fileHandleForReading)
+        let errDrain = PipeDrain(errPipe.fileHandleForReading)
 
         try process.run()
 

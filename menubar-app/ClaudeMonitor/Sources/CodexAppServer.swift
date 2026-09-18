@@ -817,25 +817,36 @@ final class CodexAppServerClient: Sendable {
 
         let stream = CodexLineStream()
         let readHandle = stdoutPipe.fileHandleForReading
-        // Framed synchronously on the callback's own (serial) delivery — see
-        // `CodexLineStream` for why an async hop here would reorder chunks.
-        readHandle.readabilityHandler = { handle in
-            stream.ingest(handle.availableData)
-        }
+        // Framed synchronously on the drain thread's own sequential reads — see
+        // `CodexLineStream` for why an async hop here would reorder chunks, and
+        // `PipeDrain` for why this is no longer a `readabilityHandler` (#202:
+        // corelibs-foundation drops the EOF callback when a child writes and
+        // then exits, which left `sawEOF` permanently false and downgraded
+        // #184's "exited before answering <method>: <stderr>" diagnostic to a
+        // bare timeout).
+        let stdoutDrain = PipeDrain(readHandle) { stream.ingest($0) }
 
         let stderrCapture = CodexStderrCapture()
         let stderrHandle = stderrPipe.fileHandleForReading
         // Drained the same way as stdout, and capped, so a chatty or hostile
         // child can't fill the pipe buffer and block, nor grow this unbounded.
-        stderrHandle.readabilityHandler = { handle in
-            stderrCapture.ingest(handle.availableData)
-        }
+        let stderrDrain = PipeDrain(stderrHandle) { stderrCapture.ingest($0) }
+
+        // The child may exit before reading a single request (a rejected CLI
+        // argument: #184). Without this the `send` below writes into a pipe with
+        // no reader and SIGPIPE kills the whole app — exit 141, no diagnostic.
+        SubprocessIO.ignoreSIGPIPE()
 
         do {
             try process.run()
         } catch {
-            readHandle.readabilityHandler = nil
-            stderrHandle.readabilityHandler = nil
+            // Nothing was spawned, so Foundation never closed the parent's copy
+            // of either write end — the drains would sit in `read()` until the
+            // pipes deallocate. Closing explicitly releases them now.
+            try? stdoutPipe.fileHandleForWriting.close()
+            try? stderrPipe.fileHandleForWriting.close()
+            await stdoutDrain.finishAndClose(timeout: timeouts.gracefulExit)
+            await stderrDrain.finishAndClose(timeout: timeouts.gracefulExit)
             throw CodexAppServerError.launchFailed(error.localizedDescription)
         }
 
@@ -917,10 +928,10 @@ final class CodexAppServerClient: Sendable {
 
         do {
             let result = try await exchange()
-            await Self.reap(process, stdin: stdin, stdout: readHandle, stderr: stderrHandle, timeouts: timeouts)
+            await Self.reap(process, stdin: stdin, stdout: stdoutDrain, stderr: stderrDrain, timeouts: timeouts)
             return result
         } catch {
-            await Self.reap(process, stdin: stdin, stdout: readHandle, stderr: stderrHandle, timeouts: timeouts)
+            await Self.reap(process, stdin: stdin, stdout: stdoutDrain, stderr: stderrDrain, timeouts: timeouts)
             throw error
         }
     }
@@ -1025,9 +1036,12 @@ final class CodexAppServerClient: Sendable {
     /// gone by the first `waitForExit`. Only a wedged child reaches the
     /// escalation, and even then this is bounded by
     /// `gracefulExit + terminateGrace + 2`.
-    private static func reap(_ process: Process, stdin: FileHandle, stdout: FileHandle, stderr: FileHandle, timeouts: Timeouts) async {
-        stdout.readabilityHandler = nil
-        stderr.readabilityHandler = nil
+    /// The drains are **not** torn down before the kill ladder: they stop on
+    /// their own when the child's exit closes the write ends, and letting them
+    /// run to that point is what keeps the child's last stderr line — the one
+    /// naming why it died — in `CodexStderrCapture` instead of truncated.
+    /// `finishAndClose` then joins them (bounded) and releases the read fds.
+    private static func reap(_ process: Process, stdin: FileHandle, stdout: PipeDrain, stderr: PipeDrain, timeouts: Timeouts) async {
         try? stdin.close()
 
         if await !waitForExit(process, within: timeouts.gracefulExit) {
@@ -1039,8 +1053,8 @@ final class CodexAppServerClient: Sendable {
                 _ = await waitForExit(process, within: 2)
             }
         }
-        try? stdout.close()
-        try? stderr.close()
+        await stdout.finishAndClose(timeout: timeouts.gracefulExit)
+        await stderr.finishAndClose(timeout: timeouts.gracefulExit)
     }
 
     /// Poll `isRunning` until the child is gone; true if it exited in time.

@@ -158,6 +158,7 @@ enum SelfTest {
         testAccountSyncPushSurvivesSSHThatNeverReadsStdin()
         testAccountSyncPullImportsPeerBundle()
         testAccountSyncPullRejectsUndecodableBodyWithoutEchoingIt()
+        testPipeDrainDeliversEOFAfterChildWriteThenExit()
         testMergeDuplicateAccountsSharingEmail()
         testAccountDeletionRemovesCredentials()
         testPurgeOrphanedCredentialsMigration()
@@ -2533,6 +2534,17 @@ enum SelfTest {
     /// no two threads ever touch it concurrently.
     private final class AsyncOutcomeBox: @unchecked Sendable {
         var snapshot: ProviderUsageSnapshot?
+        var error: Error?
+    }
+
+    /// The synchronous counterpart of `AsyncOutcomeBox`, for a bounded wait on
+    /// a plain (non-`async`) throwing call run on a background thread — see
+    /// `testPipeDrainDeliversEOFAfterChildWriteThenExit`. `@unchecked
+    /// Sendable` on the same basis as `AsyncOutcomeBox`: exactly one writer
+    /// (the background thread, before it signals), exactly one reader (the
+    /// calling thread, only after the semaphore wait returns).
+    private final class RemoteResultBox: @unchecked Sendable {
+        var result: AccountSyncRemote.RemoteResult?
         var error: Error?
     }
 
@@ -6233,6 +6245,56 @@ enum SelfTest {
                 checks += 1
                 failures.append("pull decode-failure test threw: \(error)")
             }
+        }
+    }
+
+    /// Regression test for #202: `PipeDrain`'s whole reason for existing is
+    /// that `FileHandle.readabilityHandler`'s EOF callback is **not**
+    /// reliably delivered by swift-corelibs-foundation when a child writes
+    /// and then exits — the issue measured a stock `swift:6.1` container
+    /// losing it on roughly two runs in three for exactly this shape
+    /// (`echo hi >&2; exit 3`), which is indistinguishable from a permanent
+    /// hang once the old drain's `waitForEOF()` depended on that callback.
+    /// Repeating it here, through the same `AccountSyncRemote.runProcess`
+    /// the push/pull tests above exercise indirectly, pins the fix at the
+    /// primitive rather than only through call sites that might stop
+    /// exercising the race for unrelated reasons later.
+    ///
+    /// Each iteration is bounded independently of `runProcess` itself (a
+    /// background thread + timed semaphore, the same shape `runBlocking`
+    /// uses for the async call sites) so a reintroduced hang fails this one
+    /// check loudly instead of wedging the rest of the self-test run — the
+    /// exact failure mode #202 reported for the documented Linux
+    /// verification path.
+    private static func testPipeDrainDeliversEOFAfterChildWriteThenExit() {
+        let iterations = 25
+        for iteration in 0..<iterations {
+            let box = RemoteResultBox()
+            let semaphore = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async {
+                do {
+                    box.result = try AccountSyncRemote.runProcess(
+                        executable: "/bin/sh", arguments: ["-c", "echo hi >&2; exit 3"])
+                } catch {
+                    box.error = error
+                }
+                semaphore.signal()
+            }
+
+            checks += 1
+            guard semaphore.wait(timeout: .now() + 5) == .success else {
+                failures.append(
+                    "pipeDrain: iteration \(iteration)/\(iterations) did not return within 5s — "
+                        + "this is the #202 hang, not a slow child")
+                continue
+            }
+            guard let result = box.result else {
+                failures.append("pipeDrain: iteration \(iteration) threw: \(box.error?.localizedDescription ?? "unknown error")")
+                continue
+            }
+            expectEqual(result.status, 3, "iteration \(iteration): the child's own exit status is observed")
+            expectEqual(String(data: result.stderr, encoding: .utf8), "hi\n",
+                        "iteration \(iteration): stderr written just before exit is still captured")
         }
     }
 
