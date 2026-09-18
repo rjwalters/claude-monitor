@@ -74,6 +74,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bootstrap script could not detect the problem in advance. `import` now
   creates the store, its parent directory, and its schema. `export` keeps its
   own guard. (#188)
+- **`selftest` hung indefinitely in a local `swift:6.1` container on every
+  subprocess-spawning test** — the documented Linux verification path
+  (`swift build && .build/debug/ClaudeMonitor selftest`) could not actually
+  run the suite there, even though CI's identical image passed. Root cause:
+  `FileHandle.readabilityHandler`'s terminating empty-chunk callback is not
+  reliably delivered by swift-corelibs-foundation when a child writes and
+  then exits — the kernel can hand the read source its data and its hangup in
+  the same wakeup, so the source fires once and is torn down without a
+  trailing EOF call. Both subprocess call sites (`AccountSyncRemote.runProcess`
+  for `accounts push`/`pull`, and `CodexAppServerClient`'s app-server
+  handshake) now drain each pipe on a dedicated blocking-read thread
+  (`SubprocessIO.swift`'s new `PipeDrain`) instead, where `read()` returning 0
+  is EOF unconditionally on every platform. (#202)
 
 ## [1.20.0] - 2026-08-17
 
