@@ -67,6 +67,8 @@ enum ClaudeMonitorEntry {
             CodexCLI.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.dropFirst().first == "tokens" {
             TokensCLI.main(Array(CommandLine.arguments.dropFirst(2)))
+        } else if CommandLine.arguments.dropFirst().first == "calibrate" {
+            CalibrationCLI.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.dropFirst().first == "selftest" {
             SelfTest.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.contains("--version") {
@@ -232,6 +234,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // token-history chart, not the live percentages, so it does not
             // participate in the reload/export decision below.
             _ = await oauthPoller.syncTranscriptTokensIfDue()
+            // Quota calibration (#198) derives from usage_history + token_usage
+            // on the same slow cadence, and likewise feeds no live percentage.
+            _ = await oauthPoller.recomputeQuotaCalibrationIfDue()
             if polled > 0 || fableProbed > 0 {
                 await MainActor.run {
                     usageStore.loadFromDatabase()

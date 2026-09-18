@@ -55,6 +55,10 @@ OAuth tokens you provide, and renders the data locally on your Mac.
   token-spend history alongside the percentage readings — see
   [Transcript Token Ingest](#transcript-token-ingest-tokens-sync). Counters
   only; message content is never read into the database or the log.
+- **Quota calibration.** A rolling daily series of what one weekly rate-limit
+  point actually costs — in tokens, cost-equivalent tokens, and dollars —
+  exportable as JSON or CSV for an external consumer to watch for step changes.
+  See [Quota Calibration](#quota-calibration-calibrate).
 - **All data stored locally** in SQLite at `~/.claude-monitor/usage.db`.
 
 ## Quick Install
@@ -725,6 +729,7 @@ claude-monitor                  # poll loop, logs to stdout + ~/.claude-monitor/
 claude-monitor --once           # one poll cycle, write ranking.json, exit
 claude-monitor --interval 300   # override per-account poll interval (seconds, min 60)
 claude-monitor --version        # print the version and exit
+claude-monitor calibrate        # daily tokens/cost per weekly point, JSON on stdout
 claude-monitor selftest         # self-check (no network/credentials); non-zero exit on failure
 ```
 
@@ -978,6 +983,128 @@ sqlite3 ~/.claude-monitor/usage.db \
      FROM token_usage GROUP BY day ORDER BY day DESC LIMIT 7;"
 ```
 
+## Quota Calibration (`calibrate`)
+
+The two series above answer different halves of the same question. Usage polls
+say *how much of a weekly window is gone*; transcript ingest says *how many
+tokens were spent*. Put them together and you get the number that actually
+matters: **what one weekly rate-limit point costs.** Watch that figure over
+time and a silent re-pricing of the quota shows up as a step change instead of
+as an unexplained shortfall at the end of a week.
+
+```bash
+claude-monitor calibrate                      # trailing 14 days, JSON on stdout
+claude-monitor calibrate --days 30 --csv      # CSV instead
+claude-monitor calibrate --scope pool         # pool rows only
+claude-monitor calibrate --no-recompute       # print what is stored, don't rewrite
+claude-monitor calibrate --help
+```
+
+Results land in the `quota_calibration_daily` table and are recomputed
+automatically on a **1-hour** cadence by the poll loop (macOS app and headless
+alike). The CLI works on Linux without `--headless` and takes `--db`.
+
+### What a row means
+
+One row per `(UTC day, scope)`, where scope is `pool` (all Anthropic accounts
+summed) or `account`:
+
+```jsonc
+{
+  "schema": 1,
+  "generated_at": "2026-09-17T12:00:00Z",
+  "window_days": 14,
+  "min_points_for_ratio": 5,
+  "weights_version": "2026-09-18",          // the dated price table used
+  "weights_source": "Anthropic published API list prices …",
+  "cost_equivalent_token_baseline": "Sonnet-class input tokens at $3.00/MTok",
+  "rows": [
+    {
+      "day": "2026-09-16",
+      "scope": "pool",
+      "points_consumed": 304,               // sum of positive weekly-% deltas
+      "accounts_reporting": 20,             // the denominator moves — see below
+      "points_per_account": 15.2,
+      "input_tokens": 41000000,
+      "output_tokens": 1900000,
+      "cache_creation_tokens": 12000000,
+      "cache_read_tokens": 930000000,
+      "raw_tokens": 984900000,              // the plain sum — NOT a cost
+      "cost_equivalent_tokens": 214300000,  // cost, expressed in baseline tokens
+      "cost_usd": 642.9,
+      "raw_tokens_per_point": 3239802.63,
+      "cost_equivalent_tokens_per_point": 705000.0,
+      "cost_usd_per_point": 2.115,          // the headline figure
+      "weights_version": "2026-09-18"
+    }
+  ]
+}
+```
+
+- **Points are counted as the sum of *positive* `weekly_all_percent` deltas**,
+  so a weekly reset (a drop to zero) contributes nothing rather than a negative
+  spike. `weekly_all_percent` is integer-valued on a real host, so **one weekly
+  point is the measurement quantum** — which is why a per-point ratio only
+  makes sense over a day or more, never over a single poll sample.
+- **The account denominator moves.** Accounts get added, retired, or simply
+  fail to poll, so a bare pool total is not comparable across days. Every pool
+  row carries `accounts_reporting` and `points_per_account` alongside the raw
+  total. "Reported" means *produced at least one reading that day*, not
+  *consumed something*.
+- **`raw_tokens` is not a cost.** A cache-read token is billed at a tenth of an
+  input token and a cache write at 1.25×, so a million cache reads are a
+  million raw tokens but only a hundred thousand cost-equivalent ones. The
+  pre-v2.0 native host conflated the two; both are emitted here so the
+  difference is visible rather than assumed.
+- **`cost_equivalent_tokens` is a cost in token units** — the number of
+  baseline (Sonnet-class, $3.00/MTok) input tokens that would have cost the
+  same. It is emitted alongside `cost_usd` because a token figure stays
+  comparable with the raw counts in the same row.
+- **Only Anthropic accounts are included.** An OpenAI/Codex account's weekly
+  percentage is a share of a completely different quota and its spend never
+  appears in Claude Code transcripts, so mixing the two would produce a
+  meaningless number.
+
+### Reading it safely
+
+- **A missing key means *unknown*, never `0`** (an empty field in CSV). Reading
+  an absent `cost_usd_per_point` as zero would report a quota that had become
+  free — the exact inverse of the alarm this series exists to raise.
+- **Low-signal days report no ratio.** A day that accumulated fewer than
+  `--min-points` (default 5) weekly points keeps its real point count but emits
+  no `…_per_point` keys at all: with a 1-point quantum, a smaller denominator
+  produces a precise-looking number that is not. Tune with `--min-points`.
+- **The current UTC day carries `"partial": true`.** It is only half observed,
+  so it is not comparable with completed days.
+- **Per-account token attribution is opt-in and rare.** An account row always
+  carries that account's own points, but token and cost columns appear **only**
+  where an explicit session→account mapping exists
+  (`token_sessions.override_account_id`, which subagent transcripts inherit
+  through `parent_session_id`). There is deliberately no fallback to "whichever
+  account polled most recently" — across ~20 staggered accounts that guess is
+  close to uniform noise, and an honest absence beats a plausible fabrication.
+  Pool-level rows need no attribution to be correct, which is why they are the
+  sound default.
+- **Prices go stale.** `weights_version` names the dated table each row was
+  computed under (`QuotaCalibration.currentWeights` in the source). When
+  Anthropic re-prices a model, add a new dated table — a series computed
+  against a stale one drifts silently.
+
+### Idempotence
+
+Every run rewrites the *whole* trailing window from the source series inside
+one transaction, rather than appending to what is already there. Running it
+twice over unchanged inputs produces byte-identical rows and cannot duplicate
+them, so the hourly cadence can never accumulate drift. `quota_calibration_daily`
+is derived state — deleting it costs nothing but a recompute.
+
+```bash
+sqlite3 ~/.claude-monitor/usage.db \
+  "SELECT day, points_per_account, cost_usd_per_point
+     FROM quota_calibration_daily
+    WHERE scope = 'pool' ORDER BY day DESC LIMIT 14;"
+```
+
 ## Auto-Start on Login (Optional)
 
 ```bash
@@ -1099,6 +1226,18 @@ sqlite3 ~/.claude-monitor/usage.db \
   "SELECT COUNT(*), MAX(timestamp) FROM token_usage;"
 ```
 
+`quota_calibration_daily` holds the derived
+[quota-calibration series](#quota-calibration-calibrate) — one row per UTC day
+per scope (`pool` or `account`). It is derived state: every recompute rewrites
+the whole trailing window, so deleting it costs nothing but a recompute.
+
+```bash
+sqlite3 ~/.claude-monitor/usage.db \
+  "SELECT day, accounts_reporting, points_per_account, cost_usd_per_point
+     FROM quota_calibration_daily WHERE scope = 'pool'
+    ORDER BY day DESC LIMIT 7;"
+```
+
 **`accounts` table contract for external consumers:** `email` is the stable
 join key external tooling should key off of — notably `loom-daemon tokens
 import-from-monitor`, which matches accounts by `email` to build its token
@@ -1160,6 +1299,8 @@ claude-monitor/
 │       ├── CodexCLI.swift          # `claude-monitor codex provision|add|list|import` CLI surface
 │       ├── TranscriptImporter.swift # Incremental Claude Code transcript → token_usage/token_sessions ingest
 │       ├── TokensCLI.swift         # `claude-monitor tokens sync` CLI surface
+│       ├── QuotaCalibration.swift  # Daily tokens/cost per weekly rate-limit point + dated price table
+│       ├── CalibrationCLI.swift    # `claude-monitor calibrate` CLI surface (JSON/CSV export)
 │       ├── RateLimitWindow.swift   # Provider-agnostic window/snapshot model
 │       ├── UsageProviderClient.swift # UsageProviderClient protocol + credentials
 │       ├── SelfTest.swift          # `claude-monitor selftest` portable-core assertions

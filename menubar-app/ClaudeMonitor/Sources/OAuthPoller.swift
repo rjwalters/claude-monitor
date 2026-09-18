@@ -1640,6 +1640,61 @@ class OAuthPoller: ObservableObject {
         }
     }
 
+    /// How often the daily quota-calibration series is recomputed, in seconds.
+    ///
+    /// Matches the transcript ingest cadence rather than the usage poll's: the
+    /// series is bucketed per UTC *day*, so recomputing it more often than its
+    /// slowest input refreshes would just rewrite identical rows.
+    var calibrationInterval: TimeInterval = 3600  // 1 hour
+
+    private var lastCalibration: Date?
+
+    /// Recompute the trailing quota-calibration window if its (slow) cadence
+    /// has elapsed. Returns the run's result, or nil when it was not due or the
+    /// run failed.
+    ///
+    /// Deliberately **not** folded into `syncTranscriptTokensIfDue`: the points
+    /// half of the series comes from `usage_history`, which this poller writes
+    /// on every cycle whether or not a transcript tree exists at all. A host
+    /// without Claude Code installed still has a meaningful points series, and
+    /// gating its calibration on a transcript import that can never succeed
+    /// there would leave the table permanently empty — the exact complaint
+    /// #196 was filed about.
+    ///
+    /// Runs on a detached task for the same reason the importer does: it is
+    /// SQLite-bound work measured in hundreds of milliseconds on a fleet-sized
+    /// history, which must not sit on the main actor behind a UI.
+    @discardableResult
+    func recomputeQuotaCalibrationIfDue(force: Bool = false) async -> QuotaCalibration.RecomputeResult? {
+        let now = Date()
+        if !force, let last = lastCalibration, now.timeIntervalSince(last) < calibrationInterval {
+            return nil
+        }
+        // Stamped before the run, not after — a slow or failing recompute must
+        // not become a hot loop (same rule as the transcript ingest above).
+        lastCalibration = now
+
+        let path = dbPath
+        do {
+            let result = try await Task.detached(priority: .utility) {
+                try QuotaCalibration.recompute(dbPath: path)
+            }.value
+            flog.info("Quota calibration — \(result.summary)", category: fcat)
+            return result
+        } catch let error as QuotaCalibration.CalibrationError {
+            // A host that has never launched the app has no database yet; that
+            // is a normal cold-start state, not a fault worth a warning.
+            if case .databaseMissing = error { return nil }
+            flog.warning("Quota calibration failed: \(error)", category: fcat)
+            return nil
+        } catch {
+            flog.warning(
+                "Quota calibration failed: \(QuotaCalibration.redactPath("\(error)"))",
+                category: fcat)
+            return nil
+        }
+    }
+
     private func pollWithRetry(_ credential: OAuthCredential, maxRetries: Int = 2) async {
         var retryDelay: UInt64 = 2_000_000_000
 

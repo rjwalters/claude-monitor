@@ -76,6 +76,10 @@ enum HeadlessRunner {
         // (see `OAuthPoller.tokenSyncInterval`); this first call is what makes
         // `--once` do a useful slice of the backfill too.
         _ = await poller.syncTranscriptTokensIfDue()
+        // Quota calibration (#198) is derived from the two series above, on the
+        // same slow cadence. Runs after the ingest so a `--once` invocation
+        // calibrates against the tokens it just imported.
+        _ = await poller.recomputeQuotaCalibrationIfDue()
         RankingExporter.exportNow()
         logSummary(store: store)
 
@@ -99,6 +103,7 @@ enum HeadlessRunner {
             // ranking export below — token ingest feeds the history tables,
             // not the live quota figures ranking.json publishes.
             _ = await poller.syncTranscriptTokensIfDue()
+            _ = await poller.recomputeQuotaCalibrationIfDue()
             if polled > 0 || probed > 0 {
                 RankingExporter.exportNow()
                 logSummary(store: store)
@@ -168,6 +173,9 @@ enum HeadlessRunner {
           tokens              Import Claude Code transcript token counters into
                               token_sessions/token_usage (`tokens sync`); also
                               runs automatically on a slow cadence
+          calibrate           Daily quota-calibration series (tokens and cost
+                              per weekly rate-limit point) as JSON or CSV on
+                              stdout; also recomputed on a slow cadence
           codex               Manage OpenAI/Codex accounts by their CODEX_HOME
                               (provision|add|list|import; no credential is
                               stored — codex itself is asked for usage)

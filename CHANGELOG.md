@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`claude-monitor calibrate`** — a rolling daily quota-calibration series:
+  what one weekly rate-limit point actually costs, in tokens, cost-equivalent
+  tokens, and dollars. Joins `usage_history.weekly_all_percent` (how much quota
+  went) with `token_usage` (how many tokens that was) into one row per UTC day,
+  pool-wide and per account, stored in the new `quota_calibration_daily` table
+  and exportable as JSON or CSV on stdout (`--days`, `--format`, `--scope`,
+  `--min-points`, `--no-recompute`, `--db`; Linux-capable without `--headless`).
+  The poll loop recomputes it on a 1-hour cadence.
+
+  Correctness details that are load-bearing rather than incidental: samples are
+  ordered by `(parsed instant, rowid)` so the same-second synthetic/real row
+  pair a weekly reset writes cannot invert and migrate a day's consumption
+  across midnight; cost is priced **per model while the model is still known**,
+  so a cache read (0.1x an input token) is never mistaken for an input token by
+  a raw `input + output + cache_*` sum; per-account token attribution is written
+  only where an explicit `token_sessions.override_account_id` mapping exists,
+  never by the old "whichever account polled most recently" inference; every
+  pool row carries `accounts_reporting` because the denominator genuinely moves;
+  a day below `--min-points` (default 5 — one weekly point is the measurement
+  quantum) keeps its point count and reports no ratio; and an unknown value is
+  an omitted key, never `0`. Prices live in one dated table stamped on every
+  row. Recompute is idempotent by construction — the whole trailing window is
+  rewritten in one transaction. (#198)
+
 - **`claude-monitor accounts push HOST...` / `accounts pull HOST`** — converge a
   fleet's account records and OAuth credentials over ssh without ever writing a
   plaintext-token file. The bundle is serialized in memory and streamed into
