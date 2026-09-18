@@ -57,8 +57,11 @@ OAuth tokens you provide, and renders the data locally on your Mac.
   only; message content is never read into the database or the log.
 - **Quota calibration.** A rolling daily series of what one weekly rate-limit
   point actually costs — in tokens, cost-equivalent tokens, and dollars —
-  exportable as JSON or CSV for an external consumer to watch for step changes.
-  See [Quota Calibration](#quota-calibration-calibrate).
+  exportable as JSON or CSV for an external consumer to watch for step changes,
+  plotted as its own chart mode on the per-account history window, and backed
+  by a built-in step-change alert (pool-wide tokens/point) that shows a small
+  badge on the menu-bar icon and is logged in headless mode. See
+  [Quota Calibration](#quota-calibration-calibrate).
 - **All data stored locally** in SQLite at `~/.claude-monitor/usage.db`.
 
 ## Quick Install
@@ -1104,6 +1107,39 @@ sqlite3 ~/.claude-monitor/usage.db \
      FROM quota_calibration_daily
     WHERE scope = 'pool' ORDER BY day DESC LIMIT 14;"
 ```
+
+### Chart mode and the step-change alert
+
+The per-account history window (opened by clicking an account row) gains a
+**Tokens/Point** chart mode alongside % of Quota and Tokens — one point per UTC
+day, plotting that account's `raw_tokens_per_point`. Like the Tokens mode, it
+only appears in the mode picker once the account actually has calibration data
+to show; an account with none simply never offers it.
+
+Separately, a pure, unit-tested rule in the portable core
+(`QuotaCalibration.evaluateStepChangeAlerts`) watches the **pool-wide** series
+for a step change: it compares a 3-day trailing average of `tokens_per_point`
+against the trailing 14-day baseline median, and alerts when the recent figure
+falls to **1.5× or more below** that baseline. Two properties keep it from
+misfiring on the exact incident that motivated it (#196 — a step down in
+tokens/point that partially reverted ten days later):
+
+- **Direction-aware.** Only a *drop* ever alerts. A rise — including a
+  depressed regime partially recovering — is the healthy direction and never
+  triggers, however large.
+- **Edge-triggered with a latch.** An alert fires once, on the day the ratio
+  first crosses the threshold; it does not repeat on every subsequent day the
+  ratio stays depressed, and can only fire again after the ratio actually
+  recovers back above the threshold and later drops a second time.
+
+On macOS this shows as a small distinct dot next to the menu-bar percentage —
+deliberately a different visual channel from the existing severity coloring
+(red/orange/black-or-white), not a fourth shade competing with it — and is
+suppressed under the same staleness rule that already blanks the percentage
+for a stale or drifted account. In headless mode there is no menu bar to draw
+into, so the alert is logged instead (`debug.log`, and stdout when run with
+`--once`/foreground). The alert is re-evaluated on the same 1-hour cadence as
+the calibration recompute above.
 
 ## Auto-Start on Login (Optional)
 

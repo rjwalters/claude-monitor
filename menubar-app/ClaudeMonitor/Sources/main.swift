@@ -255,6 +255,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         var percent: Int = 0
         var isWeeklyLimit = false
+        var calibrationAlertActive = false
 
         // Menubar follows the user's pinned account, or falls back to most-available.
         let targetAccount = usageStore.accounts.first(where: { $0.id == usageStore.effectivePrimaryAccountId })
@@ -280,15 +281,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     percent = Int(account.latestPercent ?? 0)
                     isWeeklyLimit = true
                 }
+                // Pool-wide quota-calibration step-change alert (#199) —
+                // suppressed under the identical rule as the percent readout
+                // above: a badge combining "no current reading" with "there's
+                // a warning" would be a contradiction, not useful signal.
+                calibrationAlertActive = oauthPoller.hasActiveCalibrationAlert
             }
         }
 
         // Create Stats-style image with "LLM" label and percentage
-        button.image = createStatsStyleImage(percent: percent, isWeeklyLimit: isWeeklyLimit)
+        button.image = createStatsStyleImage(
+            percent: percent, isWeeklyLimit: isWeeklyLimit, calibrationAlertActive: calibrationAlertActive)
         button.title = ""
     }
 
-    func createStatsStyleImage(percent: Int, isWeeklyLimit: Bool) -> NSImage {
+    func createStatsStyleImage(percent: Int, isWeeklyLimit: Bool, calibrationAlertActive: Bool = false) -> NSImage {
         let labelFont = NSFont.systemFont(ofSize: 7, weight: .light)
         let valueFont = NSFont.systemFont(ofSize: 12, weight: .regular)
 
@@ -331,10 +338,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let valueSize = (percentText as NSString).size(withAttributes: valueAttrs)
         let blockWidth = max(labelSize.width, valueSize.width)
         // 2pt padding on each side for breathing room
-        let width = ceil(blockWidth) + 4
+        let contentWidth = ceil(blockWidth) + 4
+
+        // A calibration step-change alert (#199) gets its own small dot to the
+        // right of the label/percentage block, in a color no `PercentSeverity`
+        // band ever uses (red/orange/black-or-white) — a distinct visual
+        // channel, not a fourth shade competing with the existing three.
+        let badgeDiameter: CGFloat = 5
+        let badgeGap: CGFloat = 3
+        let width = contentWidth + (calibrationAlertActive ? badgeDiameter + badgeGap : 0)
 
         let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { rect in
-            let xOffset = (width - blockWidth) / 2
+            let xOffset = (contentWidth - blockWidth) / 2
 
             let labelRect = CGRect(x: xOffset, y: 14, width: blockWidth, height: 7)
             let labelStr = NSAttributedString(string: labelText, attributes: labelAttrs)
@@ -343,6 +358,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let valueRect = CGRect(x: xOffset, y: 3, width: blockWidth, height: 13)
             let valueStr = NSAttributedString(string: percentText, attributes: valueAttrs)
             valueStr.draw(with: valueRect)
+
+            if calibrationAlertActive {
+                let badgeRect = CGRect(
+                    x: contentWidth + badgeGap, y: height - badgeDiameter - 2,
+                    width: badgeDiameter, height: badgeDiameter)
+                NSColor.systemTeal.setFill()
+                NSBezierPath(ovalIn: badgeRect).fill()
+            }
 
             return true
         }

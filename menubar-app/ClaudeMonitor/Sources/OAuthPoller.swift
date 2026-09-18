@@ -1680,6 +1680,7 @@ class OAuthPoller: ObservableObject {
                 try QuotaCalibration.recompute(dbPath: path)
             }.value
             flog.info("Quota calibration — \(result.summary)", category: fcat)
+            evaluateCalibrationAlerts(dbPath: path)
             return result
         } catch let error as QuotaCalibration.CalibrationError {
             // A host that has never launched the app has no database yet; that
@@ -1692,6 +1693,79 @@ class OAuthPoller: ObservableObject {
                 "Quota calibration failed: \(QuotaCalibration.redactPath("\(error)"))",
                 category: fcat)
             return nil
+        }
+    }
+
+    /// How many days of pool history to read back for step-change alert
+    /// evaluation (#199). Must cover at least `recentWindowDays +
+    /// baselineWindowDays` (3 + 14 by default); the extra slack absorbs a host
+    /// that has not calibrated in a while, so its first post-restart baseline
+    /// isn't needlessly starved of days.
+    private static let calibrationAlertLookbackDays = 30
+
+    /// How many days a detected step-change alert (#199) stays "current" for
+    /// the menu-bar badge, counted from the alert's own day. Roughly a work
+    /// week: long enough that a badge checked once a day is never missed,
+    /// short enough that a months-old, long-resolved regime does not sit lit
+    /// forever.
+    private static let calibrationAlertVisibilityDays = 7
+
+    /// Every step-change alert (#199) found in the last
+    /// `calibrationAlertLookbackDays` of pool history, oldest first. Read by
+    /// the menu-bar badge (`hasActiveCalibrationAlert`) and by `SelfTest`;
+    /// headless mode never reads it — see `evaluateCalibrationAlerts`, which
+    /// logs unconditionally and is the entire alert surface there.
+    @Published private(set) var calibrationAlerts: [QuotaCalibration.StepChangeAlert] = []
+
+    /// The day of the last alert this poller has already logged, so an
+    /// unchanged alert found on every subsequent hourly recompute is not
+    /// re-logged forever.
+    private var lastLoggedCalibrationAlertDay: String?
+
+    /// Whether the most recently detected step-change alert (#199) is still
+    /// "current" enough to warrant the menu-bar badge — see
+    /// `calibrationAlertVisibilityDays`. `main.swift` additionally suppresses
+    /// this for a stale primary account, the same rule `AccountFreshness
+    /// .shouldSuppressPercent` already applies to the percent readout.
+    var hasActiveCalibrationAlert: Bool {
+        guard let latest = calibrationAlerts.last,
+              let alertDay = QuotaCalibration.parseUTCDay(latest.day) else { return false }
+        let ageDays = Date().timeIntervalSince(alertDay) / 86_400
+        return ageDays <= Double(Self.calibrationAlertVisibilityDays)
+    }
+
+    /// Re-evaluates the pool-wide step-change alert rule against the
+    /// accumulated calibration history and logs any newly-found alert.
+    ///
+    /// This is the **entire** alert surface in headless mode (#199): headless
+    /// has no UI to render a badge into, so the log line this writes is the
+    /// only place the alert is ever surfaced there. On macOS, `main.swift`
+    /// additionally reads `calibrationAlerts`/`hasActiveCalibrationAlert` from
+    /// the same state to render the menu-bar badge — one evaluation, two
+    /// presentations.
+    ///
+    /// Called after a successful `recompute`; a failure here is logged and
+    /// swallowed rather than propagated, since the calibration table itself
+    /// was already written successfully by the caller.
+    private func evaluateCalibrationAlerts(dbPath: String) {
+        do {
+            let poolRows = try QuotaCalibration.loadSeries(
+                dbPath: dbPath, days: Self.calibrationAlertLookbackDays, scope: .pool)
+            let alerts = QuotaCalibration.evaluateStepChangeAlerts(poolRows: poolRows)
+            calibrationAlerts = alerts
+            if let latest = alerts.last, latest.day != lastLoggedCalibrationAlertDay {
+                lastLoggedCalibrationAlertDay = latest.day
+                flog.warning(
+                    "Quota calibration step-change alert: pool tokens/point on \(latest.day) fell to "
+                        + "\(String(format: "%.2f", latest.ratio))x its trailing baseline "
+                        + "(\(String(format: "%.1f", latest.recentTokensPerPoint)) vs. baseline "
+                        + "\(String(format: "%.1f", latest.baselineTokensPerPoint)))",
+                    category: fcat)
+            }
+        } catch {
+            flog.warning(
+                "Quota calibration alert evaluation failed: \(QuotaCalibration.redactPath("\(error)"))",
+                category: fcat)
         }
     }
 
@@ -2535,6 +2609,21 @@ class OAuthPoller: ObservableObject {
             // the archive keeps up with new fields the provider adds.
             let rawData = headersJSON(rawFields)
 
+            // `weekly_sonnet_percent` is dead (noticed during #196's research,
+            // cleaned up here as #199's last phase): the ping-based wire this
+            // poller reads from (see the project-level "Ping-based polling"
+            // note) carries no per-model sub-limit, so this literal `0.0` is
+            // the only value ever written here, and nothing downstream reads
+            // the column back as a real percentage — `UsageStore`'s own
+            // full-history SELECT keeps it only to preserve column order, and
+            // this file's own reset-detection read-back above (`prev[3]`)
+            // only ever carries that same `0.0` forward into the synthetic
+            // rows. The column itself stays: `applySchema` only ever adds
+            // columns (never drops one, see `addColumnIfMissing`), an older
+            // host's rows genuinely hold pre-ping-era per-model percentages,
+            // and `DROP COLUMN` is a schema migration with its own
+            // blast-radius review, not a one-line cleanup bundled into an
+            // unrelated feature's PR.
             try db.run("""
                 INSERT INTO usage_history (
                     account_id, timestamp, primary_percent, session_percent,

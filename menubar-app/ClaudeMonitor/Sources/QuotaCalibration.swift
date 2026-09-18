@@ -995,11 +995,153 @@ enum QuotaCalibration {
         return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\""
     }
 
+    // MARK: - Step-change alerts (#199, phase 3 of #196)
+
+    /// One pool-wide quota-calibration step-change alert: the day
+    /// `rawTokensPerPoint`'s `recentWindowDays`-trailing average fell to at or
+    /// below `1 / threshold` of its trailing baseline median — evidence the
+    /// pool's quota *accounting* shifted (fewer tokens buying the same weekly
+    /// point), not that workload moved. See `evaluateStepChangeAlerts` for the
+    /// full rule.
+    struct StepChangeAlert: Sendable, Equatable {
+        /// UTC day the alert fired on (the last day of the "recent" window).
+        let day: String
+        /// `recentWindowDays`-trailing average of `rawTokensPerPoint` ending on `day`.
+        let recentTokensPerPoint: Double
+        /// Median `rawTokensPerPoint` over the `baselineWindowDays` immediately
+        /// preceding the recent window (non-overlapping with it).
+        let baselineTokensPerPoint: Double
+        /// `recentTokensPerPoint / baselineTokensPerPoint`. Always `<= 1 /
+        /// threshold` for an emitted alert — the rule is direction-aware, see below.
+        let ratio: Double
+    }
+
+    /// Evaluates a pool-scope `rawTokensPerPoint` series for step-change
+    /// alerts (#199).
+    ///
+    /// **The rule, and why it needs to be more than "1.5x the trailing
+    /// median"**: #196's motivating incident was a *drop* in tokens-per-point
+    /// (the pool started burning weekly-limit points faster for the same
+    /// token spend) that **partially reverted** ten days later. A naive
+    /// symmetric "moved more than 1.5x" rule fires correctly on the initial
+    /// step but fires *again* on the recovery — which is backwards, since the
+    /// recovery is the pool getting healthier, not worse. Two properties fix
+    /// that, and both are required (either alone reproduces the bug against
+    /// the reference series below):
+    ///
+    /// 1. **Direction-aware.** Only a *decrease* past the threshold
+    ///    (`ratio <= 1 / threshold`) is ever an alert. An *increase* (quota
+    ///    accounting got more generous, or a depressed regime is recovering)
+    ///    never alerts, no matter how large — there is nothing to warn about.
+    /// 2. **Edge-triggered with a latch ("hysteretic" per #199's ask), not
+    ///    level-triggered.** An alert fires only the first day the ratio
+    ///    crosses at/below `1 / threshold` (`armed → disarmed`); it does not
+    ///    repeat on every subsequent day the ratio stays depressed, and it can
+    ///    only fire again after the ratio actually recovers back above
+    ///    `1 / threshold` (`disarmed → armed`) and later drops a second time.
+    ///    Re-arming this way — an actual recovery, not a fixed cooldown —
+    ///    is what lets a hovering-near-the-line ratio neither spam nor
+    ///    silently miss a later, second drop.
+    ///
+    /// The baseline for day `i` is the median of the `baselineWindowDays` days
+    /// immediately **preceding** the `recentWindowDays`-day recent window
+    /// (non-overlapping with it, so a step doesn't dilute the very baseline it
+    /// is compared against). A day is only evaluated once at least
+    /// `minBaselineDays` of that baseline is available — the earliest days of
+    /// a freshly-populated table cannot see a full baseline, and a median over
+    /// a handful of points is not evidence of anything.
+    ///
+    /// Verified against #198's reference series
+    /// (`SelfTest.calibrationReferenceSeries`, a live 20-account host,
+    /// 2026-08-24…09-17, under the assumption stated in #196's incident
+    /// report that the account-side token workload was flat across it, which
+    /// makes `rawTokensPerPoint` move inversely with the reported
+    /// points-per-account): the 09-05/09-06 step (points/account/day ~15→35)
+    /// produces exactly **one** alert, on 2026-09-06, and the partial
+    /// reversion starting 2026-09-10 — an *increase* back toward baseline —
+    /// never re-triggers it (`SelfTest`'s calibration alert tests pin this).
+    ///
+    /// - Parameters:
+    ///   - poolRows: `DailyRow`s to evaluate; only `scope == .pool` rows are
+    ///     used (account-scope rows are ignored — a single account's ratio is
+    ///     far noisier than the pool's), in any order (sorted here by `day`).
+    ///   - recentWindowDays: length of the "now" window (default 3, #199's ask).
+    ///   - baselineWindowDays: length of the trailing baseline window (default 14).
+    ///   - minBaselineDays: minimum populated baseline days required before a
+    ///     day is evaluated at all (default 7, half of `baselineWindowDays`).
+    ///   - threshold: the alert threshold (default 1.5, #199's ask).
+    static func evaluateStepChangeAlerts(
+        poolRows: [DailyRow],
+        recentWindowDays: Int = 3,
+        baselineWindowDays: Int = 14,
+        minBaselineDays: Int = 7,
+        threshold: Double = 1.5
+    ) -> [StepChangeAlert] {
+        guard threshold > 0, recentWindowDays > 0, baselineWindowDays > 0 else { return [] }
+
+        let values: [(day: String, value: Double)] = poolRows
+            .filter { $0.scope == .pool }
+            .sorted { $0.day < $1.day }
+            .compactMap { row in row.rawTokensPerPoint.map { (row.day, $0) } }
+
+        guard values.count >= recentWindowDays else { return [] }
+        let disarmRatio = 1.0 / threshold
+
+        var alerts: [StepChangeAlert] = []
+        var armed = true
+
+        for i in (recentWindowDays - 1)..<values.count {
+            let recentSlice = values[(i - recentWindowDays + 1)...i]
+            let recent = recentSlice.reduce(0.0) { $0 + $1.value } / Double(recentWindowDays)
+
+            // The baseline window ends the day before the recent window
+            // starts — deliberately non-overlapping (see the doc comment).
+            let baselineEndExclusive = i - recentWindowDays + 1
+            let baselineStart = max(0, baselineEndExclusive - baselineWindowDays)
+            guard baselineEndExclusive - baselineStart >= minBaselineDays else { continue }
+            let baseline = median(values[baselineStart..<baselineEndExclusive].map(\.value))
+            guard baseline > 0 else { continue }
+
+            let ratio = recent / baseline
+            if ratio <= disarmRatio {
+                if armed {
+                    alerts.append(StepChangeAlert(
+                        day: values[i].day, recentTokensPerPoint: recent,
+                        baselineTokensPerPoint: baseline, ratio: ratio))
+                    armed = false
+                }
+            } else {
+                armed = true
+            }
+        }
+        return alerts
+    }
+
+    /// The median of `values`. `values` must be non-empty (every call site
+    /// guards a minimum count first).
+    private static func median(_ values: [Double]) -> Double {
+        let sorted = values.sorted()
+        let count = sorted.count
+        if count % 2 == 1 { return sorted[count / 2] }
+        return (sorted[count / 2 - 1] + sorted[count / 2]) / 2
+    }
+
     // MARK: - Helpers
 
     /// Midnight UTC of the day containing `date`.
     static func utcDayStart(_ date: Date) -> Date {
         Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 86400).rounded(.down) * 86400)
+    }
+
+    /// Parses a `YYYY-MM-DD` UTC day string (as produced by `utcDayString`)
+    /// back into midnight UTC of that day. `nil` for anything not in that
+    /// exact shape.
+    static func parseUTCDay(_ day: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.date(from: day)
     }
 
     /// `YYYY-MM-DD` in UTC. Pinned to `en_US_POSIX` and GMT rather than left to

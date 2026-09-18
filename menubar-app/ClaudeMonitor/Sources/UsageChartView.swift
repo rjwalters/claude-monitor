@@ -6,6 +6,10 @@ import Charts
 enum ChartMode: String, CaseIterable {
     case percent = "% of Quota"
     case tokens = "Tokens"
+    /// Daily `tokens_per_point` (#199, visualizing #198's
+    /// `quota_calibration_daily`) — "how much did one weekly rate-limit point
+    /// cost, in tokens, on this day".
+    case calibration = "Tokens/Point"
 }
 
 /// Data for a single account's chart trace
@@ -47,6 +51,7 @@ struct UsageChartWindow: View {
     /// token chart shows so a host-total fallback is never presented as if
     /// it were this account's own spend.
     let tokenDataIsHostTotal: Bool
+    let calibrationDataPoints: [CalibrationDataPoint]
     let store: UsageStore
     let oauthPoller: OAuthPoller?
     let otherAccountsData: [AccountTrace]  // Data for other accounts
@@ -160,6 +165,56 @@ struct UsageChartWindow: View {
                 dataPoints: trace.dataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate },
                 color: trace.color
             )
+        }
+    }
+
+    /// Filtered calibration data points based on the current range selection.
+    var filteredCalibrationDataPoints: [CalibrationDataPoint] {
+        guard calibrationDataPoints.count >= 2 else { return calibrationDataPoints }
+        let startDate = dateForRangePosition(rangeStart)
+        let endDate = dateForRangePosition(rangeEnd)
+        return calibrationDataPoints.filter { $0.timestamp >= startDate && $0.timestamp <= endDate }
+    }
+
+    /// Maximum `tokensPerPoint` value in the filtered range (for Y-axis
+    /// scaling), with 10% headroom so the topmost point isn't drawn flush
+    /// against the axis. `1` when there is nothing to plot — `chartYScale`
+    /// still needs a non-zero domain even though the empty-state view (not
+    /// the chart) is what actually renders in that case.
+    var maxCalibrationValue: Double {
+        let maxVal = filteredCalibrationDataPoints.map(\.tokensPerPoint).max() ?? 0
+        return maxVal > 0 ? maxVal * 1.1 : 1
+    }
+
+    /// Whether this account has any calibration data to plot at all — gates
+    /// the `.calibration` mode out of the picker exactly as `hasTokenData`
+    /// already gates `.tokens`.
+    var hasCalibrationData: Bool {
+        !calibrationDataPoints.isEmpty
+    }
+
+    /// Modes actually worth offering for this account. `.percent` is always
+    /// present (it is what `dataPoints` — already asserted non-empty above —
+    /// backs); `.tokens` and `.calibration` are offered only when there is
+    /// data for them, so a mode with nothing to show is never reachable.
+    var availableChartModes: [ChartMode] {
+        var modes: [ChartMode] = [.percent]
+        if hasTokenData { modes.append(.tokens) }
+        if hasCalibrationData { modes.append(.calibration) }
+        return modes
+    }
+
+    /// The one headline the chart section shows, covering every `ChartMode`.
+    /// `.tokens` defers to `tokenChartTitle` so the #201 host-total
+    /// qualification is spelled in exactly one place; `.calibration` is
+    /// deliberately *not* qualified that way — a tokens-per-point figure is a
+    /// pool-scope ratio computed by `QuotaCalibration`, not this account's
+    /// attributed spend, so the host-total caveat does not apply to it.
+    var chartModeHeadline: String {
+        switch chartMode {
+        case .percent: return "Weekly Usage"
+        case .tokens: return tokenChartTitle
+        case .calibration: return "Tokens per Point"
         }
     }
 
@@ -356,19 +411,23 @@ struct UsageChartWindow: View {
                 // Usage chart with mode toggle
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text(chartMode == .percent ? "Weekly Usage" : tokenChartTitle)
+                        Text(chartModeHeadline)
                             .font(.headline)
                         Spacer()
 
-                        // Chart mode toggle (only show if we have token data)
-                        if hasTokenData {
+                        // Chart mode toggle — `.tokens`/`.calibration` only
+                        // appear once there is actually data for them (#199
+                        // mirrors the pre-existing `.tokens` gate below), so
+                        // an account with neither never offers a mode with
+                        // nothing to show.
+                        if availableChartModes.count > 1 {
                             Picker("", selection: $chartMode) {
-                                ForEach(ChartMode.allCases, id: \.self) { mode in
+                                ForEach(availableChartModes, id: \.self) { mode in
                                     Text(mode.rawValue).tag(mode)
                                 }
                             }
                             .pickerStyle(.segmented)
-                            .frame(width: 160)
+                            .frame(width: availableChartModes.count > 2 ? 230 : 160)
                         }
 
                         if !otherAccountsData.isEmpty {
@@ -492,7 +551,7 @@ struct UsageChartWindow: View {
                         }
                     }
                     .frame(height: 220)
-                    } else {
+                    } else if chartMode == .tokens {
                         // Token chart
                         Chart {
                             // Other accounts tokens (rendered first so primary is on top)
@@ -528,6 +587,70 @@ struct UsageChartWindow: View {
                                 AxisValueLabel {
                                     if let tokens = value.as(Double.self) {
                                         Text(formatTokenCount(Int64(tokens)))
+                                            .font(.caption)
+                                    }
+                                }
+                            }
+                        }
+                        .chartXAxis {
+                            AxisMarks(values: midnightDates) { value in
+                                AxisGridLine(stroke: StrokeStyle(lineWidth: 1))
+                                AxisValueLabel {
+                                    if let date = value.as(Date.self) {
+                                        Text(formatDateShort(date))
+                                            .font(.caption)
+                                    }
+                                }
+                            }
+                            AxisMarks(values: fourHourDates) { _ in
+                                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [4, 4]))
+                            }
+                        }
+                        .frame(height: 220)
+                    } else if calibrationDataPoints.isEmpty {
+                        // Calibration mode with nothing to plot (#199) —
+                        // unreachable via the picker (it's gated out of
+                        // `availableChartModes`), kept as a defensive
+                        // fallback rather than rendering an empty `Chart`.
+                        VStack(spacing: 12) {
+                            Image(systemName: "chart.line.uptrend.xyaxis")
+                                .font(.largeTitle)
+                                .foregroundColor(.secondary)
+                            Text("No calibration data yet")
+                                .font(.headline)
+                            Text("Needs both usage history and token history\nfor this account")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                        .frame(height: 220)
+                    } else {
+                        // Calibration chart (#199): daily tokens-per-point.
+                        Chart {
+                            ForEach(filteredCalibrationDataPoints) { point in
+                                LineMark(
+                                    x: .value("Time", point.timestamp),
+                                    y: .value("Tokens/Point", point.tokensPerPoint),
+                                    series: .value("Account", "primary")
+                                )
+                                .foregroundStyle(Color.blue)
+
+                                PointMark(
+                                    x: .value("Time", point.timestamp),
+                                    y: .value("Tokens/Point", point.tokensPerPoint)
+                                )
+                                .foregroundStyle(Color.blue)
+                                .symbolSize(30)
+                            }
+                        }
+                        .chartYScale(domain: 0...maxCalibrationValue)
+                        .chartXScale(domain: dateForRangePosition(rangeStart)...dateForRangePosition(rangeEnd))
+                        .chartYAxis {
+                            AxisMarks(position: .leading) { value in
+                                AxisGridLine()
+                                AxisValueLabel {
+                                    if let tokensPerPoint = value.as(Double.self) {
+                                        Text(String(format: "%.0f", tokensPerPoint))
                                             .font(.caption)
                                     }
                                 }
@@ -1189,6 +1312,13 @@ enum ChartWindowController {
             tokenDataIsHostTotal = true
         }
 
+        // #199: the per-day tokens-per-point series. Independent of the
+        // token-history fallback above — it is read from
+        // `quota_calibration_daily`, which `QuotaCalibration.recompute`
+        // already scopes per account (falling back to the pool row), so it
+        // needs no host-total substitution of its own.
+        let calibrationDataPoints = store.loadCalibrationHistory(for: account.id)
+
         // Named per-model sub-limits (OpenAI additional_rate_limits[]), one
         // series per provider-chosen limit_name. Empty for Anthropic accounts
         // and for any account with none recorded — the chart hides the
@@ -1241,6 +1371,7 @@ enum ChartWindowController {
             fullDataPoints: fullDataPoints,
             tokenDataPoints: tokenDataPoints,
             tokenDataIsHostTotal: tokenDataIsHostTotal,
+            calibrationDataPoints: calibrationDataPoints,
             store: store,
             oauthPoller: oauthPoller,
             otherAccountsData: otherAccountsData,

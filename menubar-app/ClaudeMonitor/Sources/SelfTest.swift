@@ -126,6 +126,9 @@ enum SelfTest {
         testCalibrationDayBoundariesAreUTC()
         testCalibrationWindowBoundIsPrefixSafe()
         testCalibrationSchemaMigrationAndUniqueness()
+        testCalibrationStepChangeAlertFiresOnceOnReferenceSeries()
+        testCalibrationStepChangeAlertIgnoresSubThresholdMove()
+        testCalibrationStepChangeAlertNoDataNoAlert()
         testOpenAIImportResolvesExistingAccountByEmail()
         testExportAccountsEnvIncludesAllProviders()
         testExportAccountsEnvExcludesTokenlessCodexAccount()
@@ -4269,6 +4272,95 @@ enum SelfTest {
                 failures.append("calibration schema test threw: \(error)")
             }
         }
+    }
+
+    // MARK: - Calibration step-change alerts (#199, phase 3 of #196)
+
+    /// Builds synthetic pool-scope `DailyRow`s from `calibrationReferenceSeries`
+    /// without touching the database: `rawTokensPerPoint(day) = 100.0 /
+    /// pointsPerAccount(day)`, under the flat-workload assumption #196's
+    /// incident report states explicitly ("Every account in the pool went
+    /// from ~15 points/day to ~33 points/day ... with a flat workload") — a
+    /// constant per-account token spend divided by a moving points-per-account
+    /// figure is exactly what makes tokens-per-point move inversely with it.
+    /// The `100.0` numerator is an arbitrary flat-workload constant: the alert
+    /// rule only ever compares ratios, so no result here depends on its value.
+    private static func syntheticTokensPerPointRows(
+        from series: [(day: String, accounts: Int, pointsPerAccount: Double)] = calibrationReferenceSeries
+    ) -> [QuotaCalibration.DailyRow] {
+        series.map { spec in
+            QuotaCalibration.DailyRow(
+                day: spec.day, scope: .pool, accountId: nil,
+                pointsConsumed: spec.pointsPerAccount * Double(spec.accounts),
+                accountsReporting: spec.accounts,
+                pointsPerAccount: spec.pointsPerAccount,
+                tokens: nil, costUSD: nil, costEquivalentTokens: nil,
+                rawTokensPerPoint: 100.0 / spec.pointsPerAccount,
+                costEquivalentTokensPerPoint: nil, costUSDPerPoint: nil,
+                weightsVersion: "test", computedAt: "")
+        }
+    }
+
+    /// The headline acceptance check (#199): replaying the reference series
+    /// (2026-08-24…09-17) raises exactly one alert, on the day of the step
+    /// (2026-09-06), and the partial reversion starting 2026-09-10 — an
+    /// *increase* back toward baseline — never re-triggers it. See
+    /// `QuotaCalibration.evaluateStepChangeAlerts` for why both direction-
+    /// awareness and the edge-triggered latch are required for this to hold.
+    private static func testCalibrationStepChangeAlertFiresOnceOnReferenceSeries() {
+        let rows = syntheticTokensPerPointRows()
+        let alerts = QuotaCalibration.evaluateStepChangeAlerts(poolRows: rows)
+        expectEqual(alerts.count, 1,
+                    "the reference series' 09-05/09-06 step produces exactly one alert, "
+                     + "not one per depressed day and not a second one on the 09-10 recovery")
+        expectEqual(alerts.first?.day, "2026-09-06",
+                     "the alert fires on the day the ratio first crosses the threshold")
+        if let alert = alerts.first {
+            expect(alert.ratio <= 1.0 / 1.5,
+                   "an emitted alert's ratio must actually be at/below the disarm threshold")
+        }
+    }
+
+    /// A sustained but sub-threshold move (a steady 20% drop, well short of
+    /// the 1.5x/~33% drop the rule requires) must never alert, no matter how
+    /// long it persists — the rule is a magnitude threshold, not a trend
+    /// detector.
+    private static func testCalibrationStepChangeAlertIgnoresSubThresholdMove() {
+        let start = ISO8601DateFormatter().date(from: "2026-01-01T00:00:00Z")!
+        var rows: [QuotaCalibration.DailyRow] = []
+        for i in 0..<40 {
+            let day = QuotaCalibration.utcDayString(start.addingTimeInterval(Double(i) * 86_400))
+            let value = i < 20 ? 10.0 : 8.0  // a sustained 20% drop after day 20
+            rows.append(QuotaCalibration.DailyRow(
+                day: day, scope: .pool, accountId: nil,
+                pointsConsumed: 0, accountsReporting: 20, pointsPerAccount: 0,
+                tokens: nil, costUSD: nil, costEquivalentTokens: nil,
+                rawTokensPerPoint: value, costEquivalentTokensPerPoint: nil, costUSDPerPoint: nil,
+                weightsVersion: "test", computedAt: ""))
+        }
+        let alerts = QuotaCalibration.evaluateStepChangeAlerts(poolRows: rows)
+        expectEqual(alerts.count, 0,
+                    "a sustained 20% drop stays well inside the 1.5x threshold and must not alert")
+    }
+
+    /// No rows (a fresh table, or an account with nothing calibrated yet)
+    /// produces no alerts rather than a crash or a fabricated one.
+    private static func testCalibrationStepChangeAlertNoDataNoAlert() {
+        expectEqual(QuotaCalibration.evaluateStepChangeAlerts(poolRows: []).count, 0,
+                    "no rows at all produces no alerts")
+
+        // Fewer rows than the recent window itself: still nothing to compare.
+        let start = ISO8601DateFormatter().date(from: "2026-01-01T00:00:00Z")!
+        let sparse: [QuotaCalibration.DailyRow] = (0..<2).map { i in
+            QuotaCalibration.DailyRow(
+                day: QuotaCalibration.utcDayString(start.addingTimeInterval(Double(i) * 86_400)),
+                scope: .pool, accountId: nil, pointsConsumed: 0, accountsReporting: 5,
+                pointsPerAccount: 0, tokens: nil, costUSD: nil, costEquivalentTokens: nil,
+                rawTokensPerPoint: 10.0, costEquivalentTokensPerPoint: nil, costUSDPerPoint: nil,
+                weightsVersion: "test", computedAt: "")
+        }
+        expectEqual(QuotaCalibration.evaluateStepChangeAlerts(poolRows: sparse).count, 0,
+                    "fewer days than the recent window itself produces no alerts")
     }
 
     // MARK: - OpenAI import account resolution
