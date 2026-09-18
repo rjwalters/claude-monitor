@@ -65,6 +65,8 @@ enum ClaudeMonitorEntry {
             AccountSyncCLI.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.dropFirst().first == "codex" {
             CodexCLI.main(Array(CommandLine.arguments.dropFirst(2)))
+        } else if CommandLine.arguments.dropFirst().first == "tokens" {
+            TokensCLI.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.dropFirst().first == "selftest" {
             SelfTest.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.contains("--version") {
@@ -225,6 +227,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Fable-tier probe runs on its own (slower) cadence and writes the
             // premium/overage headers the UI reads.
             let fableProbed = await oauthPoller.probeFableDue()
+            // Transcript token ingest (#197) runs on a slower cadence still,
+            // and self-throttles — a no-op on almost every tick. It feeds the
+            // token-history chart, not the live percentages, so it does not
+            // participate in the reload/export decision below.
+            _ = await oauthPoller.syncTranscriptTokensIfDue()
             if polled > 0 || fableProbed > 0 {
                 await MainActor.run {
                     usageStore.loadFromDatabase()

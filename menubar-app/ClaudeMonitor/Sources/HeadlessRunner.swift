@@ -72,6 +72,10 @@ enum HeadlessRunner {
 
         await poller.pollAll()
         _ = await poller.probeFableDue()
+        // Transcript token ingest (#197) runs on its own, much slower cadence
+        // (see `OAuthPoller.tokenSyncInterval`); this first call is what makes
+        // `--once` do a useful slice of the backfill too.
+        _ = await poller.syncTranscriptTokensIfDue()
         RankingExporter.exportNow()
         logSummary(store: store)
 
@@ -90,6 +94,11 @@ enum HeadlessRunner {
 
             let polled = await poller.pollDue()
             let probed = await poller.probeFableDue()
+            // Self-throttling: a no-op on most ticks, one transcript scan per
+            // `tokenSyncInterval`. Its result deliberately does not gate the
+            // ranking export below — token ingest feeds the history tables,
+            // not the live quota figures ranking.json publishes.
+            _ = await poller.syncTranscriptTokensIfDue()
             if polled > 0 || probed > 0 {
                 RankingExporter.exportNow()
                 logSummary(store: store)
@@ -156,6 +165,9 @@ enum HeadlessRunner {
 
         Subcommands:
           accounts            Export/import accounts + credentials
+          tokens              Import Claude Code transcript token counters into
+                              token_sessions/token_usage (`tokens sync`); also
+                              runs automatically on a slow cadence
           codex               Manage OpenAI/Codex accounts by their CODEX_HOME
                               (provision|add|list|import; no credential is
                               stored — codex itself is asked for usage)

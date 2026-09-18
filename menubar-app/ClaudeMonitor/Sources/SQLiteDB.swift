@@ -236,6 +236,23 @@ final class Statement: Sequence, IteratorProtocol {
         return self
     }
 
+    /// Non-variadic `bind` — the same binding, for a call site that already
+    /// holds its values as an array (`TranscriptImporter` reuses one prepared
+    /// statement across thousands of rows rather than re-preparing per row via
+    /// `Connection.run`).
+    @discardableResult
+    func bind(values: [Any?]) -> Statement {
+        bindValues(values)
+        return self
+    }
+
+    /// Runs the statement to completion with whatever is currently bound, for
+    /// a DML statement whose rows are not iterated. Pairs with
+    /// `bind(values:)`; `Connection.run` remains the one-shot convenience.
+    func run() throws {
+        try runToCompletion()
+    }
+
     fileprivate func bindValues(_ values: [Any?]) {
         sqlite3_reset(handle)
         sqlite3_clear_bindings(handle)

@@ -50,6 +50,11 @@ OAuth tokens you provide, and renders the data locally on your Mac.
   long-lived token (right-click its row → "Roll Token…"). A temporary stopgap
   until Anthropic ships a token-management API — see
   [Rolling a Token](#rolling-a-token-revoke--re-mint).
+- **Transcript token ingest.** Claude Code's own session transcripts are read
+  on a slow cadence for their per-message token counters, giving an actual
+  token-spend history alongside the percentage readings — see
+  [Transcript Token Ingest](#transcript-token-ingest-tokens-sync). Counters
+  only; message content is never read into the database or the log.
 - **All data stored locally** in SQLite at `~/.claude-monitor/usage.db`.
 
 ## Quick Install
@@ -538,6 +543,7 @@ against `/v1/messages`.
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  SQLite — ~/.claude-monitor/usage.db                                     │
 │    accounts │ oauth_credentials │ usage_history │ settings               │
+│    token_sessions │ token_usage  (transcript token counters)             │
 │    (accounts.provider / oauth_credentials.provider tag the upstream)     │
 └────────────────────────────────┬─────────────────────────────────────────┘
                                  │ read by
@@ -917,6 +923,61 @@ atomically, so a reader never sees a partial document.
 - No credential material ever appears in this file, and neither does a
   `CODEX_HOME` path.
 
+## Transcript Token Ingest (`tokens sync`)
+
+The percentages this app polls tell you how much of a quota window is gone;
+they do not tell you how many tokens that was. Claude Code writes that number
+itself — every assistant turn in a session transcript carries a
+`message.usage` block — so the app reads those counters back into
+`token_usage` / `token_sessions` and keeps a real token-spend history
+(it is what the per-account chart's token series is drawn from, and the
+denominator any quota-calibration work needs).
+
+```bash
+claude-monitor tokens sync            # import new transcript counters
+claude-monitor tokens sync --all      # no per-run file cap (full backfill)
+claude-monitor tokens sync --help
+```
+
+The poll loop calls the same importer automatically on a **1-hour** cadence
+(vs. the 10-minute usage poll) — the CLI exists for an immediate backfill and
+for scripting.
+
+**What it reads.** `~/.claude/projects/**/*.jsonl`, recursively — including
+`subagents/agent-*.jsonl` sidechain transcripts, which on a subagent-driven
+host carry a large share of the real spend. Override the root with
+`--root <dir>`, `$CLAUDE_CONFIG_DIR` (Claude Code's own variable), or
+`$CLAUDE_MONITOR_TRANSCRIPT_ROOT`.
+
+**What it stores.** Per message: uuid, timestamp, model name and the four
+token counters. **Never the message content.** Transcripts contain user data
+and file contents; the importer decodes only counters, so nothing else can
+reach the database or `debug.log`.
+
+**Incremental by design.** A fleet host can hold 10⁵ transcripts. A file is
+opened only when its mtime is newer than the stamp recorded for it
+(`token_sessions.last_import_ts`), so a re-run over an unchanged tree reads
+nothing. Each run opens at most 2000 files, newest first, and reports how many
+it deferred; re-run (or pass `--all`) to drain a backlog. Imports are
+idempotent — `token_usage.message_uuid` is UNIQUE, so re-importing a file that
+grew by one record inserts exactly that one record.
+
+**Attribution is deliberately absent.** `inferred_account_id` is left NULL.
+Transcripts carry no account identity at all, and the pre-v2.0 importer's
+"whichever account was polled most recently" guess is noise on a host with
+~20 staggered accounts. `token_sessions.parent_session_id` records the session
+a subagent transcript belongs to, so an external session→account mapping can
+join on `COALESCE(parent_session_id, session_id)` when one exists.
+
+Query it like any other table:
+
+```bash
+sqlite3 ~/.claude-monitor/usage.db \
+  "SELECT date(timestamp) AS day,
+          SUM(input_tokens + output_tokens + cache_creation_tokens) AS billable
+     FROM token_usage GROUP BY day ORDER BY day DESC LIMIT 7;"
+```
+
 ## Auto-Start on Login (Optional)
 
 ```bash
@@ -1028,6 +1089,16 @@ sqlite3 ~/.claude-monitor/usage.db \
   "SELECT timestamp, primary_percent FROM usage_history ORDER BY timestamp DESC LIMIT 10;"
 ```
 
+Token-spend tables (`token_sessions`, `token_usage`) are written by
+[transcript token ingest](#transcript-token-ingest-tokens-sync) and keep the
+column shapes the pre-v2.0 native host used, so a host that has been running
+since then keeps its historical rows:
+
+```bash
+sqlite3 ~/.claude-monitor/usage.db \
+  "SELECT COUNT(*), MAX(timestamp) FROM token_usage;"
+```
+
 **`accounts` table contract for external consumers:** `email` is the stable
 join key external tooling should key off of — notably `loom-daemon tokens
 import-from-monitor`, which matches accounts by `email` to build its token
@@ -1087,6 +1158,8 @@ claude-monitor/
 │       ├── OpenAIAPI.swift         # OpenAI/Codex client (wham/usage + token refresh)
 │       ├── CodexAppServer.swift    # Codex app-server JSON-RPC client (usage with no stored credential)
 │       ├── CodexCLI.swift          # `claude-monitor codex provision|add|list|import` CLI surface
+│       ├── TranscriptImporter.swift # Incremental Claude Code transcript → token_usage/token_sessions ingest
+│       ├── TokensCLI.swift         # `claude-monitor tokens sync` CLI surface
 │       ├── RateLimitWindow.swift   # Provider-agnostic window/snapshot model
 │       ├── UsageProviderClient.swift # UsageProviderClient protocol + credentials
 │       ├── SelfTest.swift          # `claude-monitor selftest` portable-core assertions
