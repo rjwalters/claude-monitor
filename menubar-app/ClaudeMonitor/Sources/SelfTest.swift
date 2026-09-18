@@ -112,6 +112,19 @@ enum SelfTest {
         testTranscriptImportMissingRootIsTyped()
         testTranscriptPathRedaction()
         testTranscriptRootResolution()
+        testCalibrationReproducesReferenceSeries()
+        testCalibrationResetOrderingTieBreaksOnRowid()
+        testCalibrationOrdersMixedISOShapesByInstant()
+        testCalibrationRecomputeIsIdempotent()
+        testCalibrationLowSignalDayHasNoRatio()
+        testCalibrationDayWithoutTokensOmitsCostEntirely()
+        testCalibrationAttributesTokensOnlyViaExplicitMapping()
+        testCalibrationExcludesNonAnthropicAccounts()
+        testCalibrationCostWeights()
+        testCalibrationExportFormats()
+        testCalibrationDayBoundariesAreUTC()
+        testCalibrationWindowBoundIsPrefixSafe()
+        testCalibrationSchemaMigrationAndUniqueness()
         testOpenAIImportResolvesExistingAccountByEmail()
         testExportAccountsEnvIncludesAllProviders()
         testExportAccountsEnvExcludesTokenlessCodexAccount()
@@ -3333,6 +3346,862 @@ enum SelfTest {
             "CLAUDE_CONFIG_DIR": "/tmp/cfg",
             "CLAUDE_MONITOR_TRANSCRIPT_ROOT": "/tmp/fixture"
         ]), "/tmp/fixture", "the explicit override wins")
+    }
+
+    // MARK: - Quota calibration (#198)
+    //
+    // The whole point of this series is to notice when a weekly point silently
+    // starts costing more, so a *plausible but wrong* number here is worse than
+    // no number at all. These checks therefore pin the two places the
+    // arithmetic can go quietly wrong — the ordering of same-second rows at a
+    // reset boundary, and the difference between a raw token sum and a
+    // cost-equivalent one — rather than only checking that rows appear.
+
+    /// Fixed clock for every calibration test, so a run at 23:59 UTC computes
+    /// the same windows as a run at 00:01.
+    private static let calibrationNow: Date =
+        UsageRecord.parseISO("2026-09-17T12:00:00Z") ?? Date(timeIntervalSince1970: 1_789_646_400)
+
+    /// An ISO 8601 instant `secondsIntoDay` after midnight UTC on `day`, in the
+    /// exact shape `OAuthPoller.writeUsageToDB` writes (whole seconds, `Z`).
+    private static func calibrationISO(day: String, secondsIntoDay: Int) -> String {
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+        let midnight = dayFormatter.date(from: day) ?? Date(timeIntervalSince1970: 0)
+        return QuotaCalibration.isoString(midnight.addingTimeInterval(Double(secondsIntoDay)))
+    }
+
+    /// Creates a scratch database with `count` Anthropic account rows.
+    private static func calibrationFixture(
+        _ dir: URL, accounts count: Int, prefix: String = "acct"
+    ) throws -> (path: String, db: Connection) {
+        let dbPath = dir.appendingPathComponent("usage.db").path
+        UsageStore(dbPath: dbPath).ensureDatabase()
+        let db = try openDatabase(dbPath)
+        for index in 0..<count {
+            try db.run("""
+                INSERT INTO accounts (id, account_name, email, provider, last_updated)
+                VALUES (?, ?, ?, 'anthropic', '2026-09-17T00:00:00Z')
+            """, "\(prefix)-\(index)", "worker \(index)", "worker\(index)@example.com")
+        }
+        return (dbPath, db)
+    }
+
+    /// Inserts one `usage_history` row in the shape the poller writes.
+    private static func insertUsageRow(
+        _ db: Connection, account: String, at timestamp: String,
+        weekly: Double, synthetic: Bool = false
+    ) throws {
+        try db.run("""
+            INSERT INTO usage_history (account_id, timestamp, weekly_all_percent, is_synthetic)
+            VALUES (?, ?, ?, ?)
+        """, account, timestamp, weekly, synthetic ? 1 : 0)
+    }
+
+    /// The reference series this fixture reproduces: points consumed per
+    /// account per UTC day, and how many accounts reported that day.
+    ///
+    /// Taken from #196's measurement of a live 20-account host
+    /// (2026-09-17, positive-delta method over `usage_history.weekly_all_percent`):
+    /// `08-24…09-04` sits at 12.2–15.9 with one 21.5 outlier on 08-29, the
+    /// 09-05…09-09 run climbs to a 35.1 peak and decays, and 09-10 onward falls
+    /// back to 10.5–21.2. The **account denominator moves** across it (19 → 15
+    /// → 19 → 20), which is exactly why a bare pool total is not comparable
+    /// across days and every pool row has to carry `accounts_reporting`.
+    private static let calibrationReferenceSeries:
+        [(day: String, accounts: Int, pointsPerAccount: Double)] = [
+        ("2026-08-24", 19, 12.2), ("2026-08-25", 19, 13.4), ("2026-08-26", 19, 14.8),
+        ("2026-08-27", 19, 15.9), ("2026-08-28", 19, 12.6), ("2026-08-29", 19, 21.5),
+        ("2026-08-30", 19, 13.1), ("2026-08-31", 19, 14.2), ("2026-09-01", 19, 15.0),
+        ("2026-09-02", 19, 13.7), ("2026-09-03", 19, 12.9), ("2026-09-04", 19, 15.5),
+        ("2026-09-05", 19, 21.7), ("2026-09-06", 19, 35.1), ("2026-09-07", 15, 31.7),
+        ("2026-09-08", 19, 27.5), ("2026-09-09", 20, 23.4), ("2026-09-10", 20, 21.2),
+        ("2026-09-11", 20, 18.6), ("2026-09-12", 20, 16.4), ("2026-09-13", 20, 10.5),
+        ("2026-09-14", 20, 13.8), ("2026-09-15", 20, 17.1), ("2026-09-16", 20, 15.2),
+        ("2026-09-17", 20, 11.9),
+    ]
+
+    /// Synthesizes `usage_history` rows that consume the reference series'
+    /// points, and returns the exact pool total per day.
+    ///
+    /// The synthesis is faithful to what the poller actually writes:
+    /// `weekly_all_percent` moves in whole points (it is integer-valued on a
+    /// real host — one point is the measurement quantum), each day opens with a
+    /// carry-forward sample equal to the previous day's last reading, and when
+    /// the weekly window fills it rolls over through the exact three-row
+    /// sequence `writeUsageToDB` emits: a synthetic carry-forward row one
+    /// second early, a synthetic `0` row, and the real row **sharing that same
+    /// second**.
+    ///
+    /// Per-account integers are distributed so their mean hits the day's target
+    /// (the reference figures are means over a whole pool, so they are not
+    /// integers even though every individual account's consumption is).
+    @discardableResult
+    private static func writeReferenceUsageFixture(
+        _ db: Connection,
+        series: [(day: String, accounts: Int, pointsPerAccount: Double)],
+        prefix: String = "acct"
+    ) throws -> [String: Double] {
+        var current: [String: Double] = [:]
+        var expectedPoolPoints: [String: Double] = [:]
+        try db.execute("BEGIN")
+        for spec in series {
+            let poolTotal = Int((spec.pointsPerAccount * Double(spec.accounts)).rounded())
+            expectedPoolPoints[spec.day] = Double(poolTotal)
+            let base = poolTotal / spec.accounts
+            let remainder = poolTotal % spec.accounts
+            for index in 0..<spec.accounts {
+                let account = "\(prefix)-\(index)"
+                let points = base + (index < remainder ? 1 : 0)
+                var value = current[account] ?? 0
+                var offset = 600
+
+                // Opening sample: carries the previous reading forward, so it
+                // contributes a zero delta and only marks the account as
+                // *reporting* today.
+                try insertUsageRow(db, account: account,
+                                   at: calibrationISO(day: spec.day, secondsIntoDay: offset),
+                                   weekly: value)
+                offset += 300
+
+                var remaining = points
+                while remaining > 0 {
+                    if value + 1 > 100 {
+                        // Weekly rollover, in the poller's exact row order.
+                        try insertUsageRow(db, account: account,
+                                           at: calibrationISO(day: spec.day, secondsIntoDay: offset - 1),
+                                           weekly: value, synthetic: true)
+                        try insertUsageRow(db, account: account,
+                                           at: calibrationISO(day: spec.day, secondsIntoDay: offset),
+                                           weekly: 0, synthetic: true)
+                        try insertUsageRow(db, account: account,
+                                           at: calibrationISO(day: spec.day, secondsIntoDay: offset),
+                                           weekly: 0)
+                        value = 0
+                        offset += 300
+                        continue
+                    }
+                    value += 1
+                    try insertUsageRow(db, account: account,
+                                       at: calibrationISO(day: spec.day, secondsIntoDay: offset),
+                                       weekly: value)
+                    remaining -= 1
+                    offset += 300
+                }
+                current[account] = value
+            }
+        }
+        try db.execute("COMMIT")
+        return expectedPoolPoints
+    }
+
+    /// The headline acceptance check: replaying the reference-shaped series
+    /// must reproduce its per-day points-per-account figures to ±0.2.
+    ///
+    /// The tolerance is not slack for the arithmetic — the pool total is
+    /// asserted exactly — it absorbs only the rounding involved in hitting a
+    /// non-integer mean with integer per-account consumption (at worst
+    /// `0.5 / accounts`, i.e. 0.033 for the smallest day here).
+    private static func testCalibrationReproducesReferenceSeries() {
+        withSelfTestTempDir("calibration-reference") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 20)
+                let expected = try writeReferenceUsageFixture(
+                    fixture.db, series: calibrationReferenceSeries)
+
+                // 25 days back from 2026-09-17 reaches 2026-08-24, the first
+                // day of the reference window.
+                let window = QuotaCalibration.Window(days: 25, now: calibrationNow)
+                expectEqual(window.startDay, "2026-08-24",
+                            "a 25-day trailing window from 2026-09-17 opens on 2026-08-24")
+                expectEqual(window.endDay, "2026-09-17", "and closes on the current UTC day")
+
+                let series = try QuotaCalibration.computeRows(
+                    db: fixture.db, window: window, now: calibrationNow)
+                let poolByDay = Dictionary(
+                    uniqueKeysWithValues: series.rows
+                        .filter { $0.scope == .pool }
+                        .map { ($0.day, $0) })
+
+                expectEqual(poolByDay.count, calibrationReferenceSeries.count,
+                            "every reference day produces exactly one pool row")
+
+                for spec in calibrationReferenceSeries {
+                    guard let row = poolByDay[spec.day] else {
+                        checks += 1
+                        failures.append("calibration: no pool row for \(spec.day)")
+                        continue
+                    }
+                    expectEqual(row.accountsReporting, spec.accounts,
+                                "\(spec.day): accounts_reporting tracks the accounts that actually reported")
+                    expect(abs(row.pointsConsumed - (expected[spec.day] ?? -1)) < 1e-6,
+                           "\(spec.day): pool points \(row.pointsConsumed) != synthesized total "
+                            + "\(expected[spec.day] ?? -1) — the positive-delta sum lost or invented points")
+                    expect(abs(row.pointsPerAccount - spec.pointsPerAccount) <= 0.2,
+                           "\(spec.day): points/account \(row.pointsPerAccount) is not within ±0.2 of the "
+                            + "reference \(spec.pointsPerAccount)")
+                }
+
+                // Per-account rows exist for every reporting account, and their
+                // points sum back to the pool row — the normalization is a
+                // presentation of the same quantity, not a second measurement.
+                let day = "2026-09-07"
+                let accountRows = series.rows.filter { $0.scope == .account && $0.day == day }
+                expectEqual(accountRows.count, 15,
+                            "\(day) emits one account row per reporting account (the short day)")
+                let summed = accountRows.reduce(0.0) { $0 + $1.pointsConsumed }
+                expect(abs(summed - (poolByDay[day]?.pointsConsumed ?? -1)) < 1e-6,
+                       "per-account points sum to the pool total for \(day)")
+            } catch {
+                checks += 1
+                failures.append("calibration reference-series test threw: \(error)")
+            }
+        }
+    }
+
+    /// The ordering constraint this whole feature hinges on.
+    ///
+    /// When a weekly reset is detected, `OAuthPoller.writeUsageToDB` inserts a
+    /// synthetic carry-forward row, a synthetic `0` row, and then the real row
+    /// — and the last two share a whole-second timestamp (observed live:
+    /// `2026-09-17T18:07:09Z|0.0|is_synthetic=1` immediately followed by
+    /// `2026-09-17T18:07:09Z|0.0|is_synthetic=0`). Ordering by timestamp alone
+    /// leaves that pair unordered.
+    ///
+    /// This fixture is built so the two orderings give *different* answers: the
+    /// reset lands at the very end of a UTC day, so getting the tie wrong does
+    /// not merely reshuffle deltas inside one day — it moves a day's worth of
+    /// consumption across the midnight boundary and manufactures a spurious
+    /// positive delta on the following day. Correct: 19 points then 3.
+    /// Timestamp-only ordering: 7 points then 15.
+    private static func testCalibrationResetOrderingTieBreaksOnRowid() {
+        withSelfTestTempDir("calibration-tie") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 1)
+                let account = "acct-0"
+
+                try insertUsageRow(fixture.db, account: account,
+                                   at: calibrationISO(day: "2026-03-01", secondsIntoDay: 36_000),
+                                   weekly: 80)
+                try insertUsageRow(fixture.db, account: account,
+                                   at: calibrationISO(day: "2026-03-01", secondsIntoDay: 82_800),
+                                   weekly: 87)
+                // Reset, in the poller's insert order. The synthetic `0` and
+                // the real row share second 86_399 of 2026-03-01.
+                try insertUsageRow(fixture.db, account: account,
+                                   at: calibrationISO(day: "2026-03-01", secondsIntoDay: 86_398),
+                                   weekly: 87, synthetic: true)
+                try insertUsageRow(fixture.db, account: account,
+                                   at: calibrationISO(day: "2026-03-01", secondsIntoDay: 86_399),
+                                   weekly: 0, synthetic: true)
+                try insertUsageRow(fixture.db, account: account,
+                                   at: calibrationISO(day: "2026-03-01", secondsIntoDay: 86_399),
+                                   weekly: 12)
+                try insertUsageRow(fixture.db, account: account,
+                                   at: calibrationISO(day: "2026-03-02", secondsIntoDay: 3_600),
+                                   weekly: 13)
+                try insertUsageRow(fixture.db, account: account,
+                                   at: calibrationISO(day: "2026-03-02", secondsIntoDay: 7_200),
+                                   weekly: 15)
+
+                let window = QuotaCalibration.Window(
+                    days: 3,
+                    now: UsageRecord.parseISO("2026-03-03T12:00:00Z") ?? Date())
+                let points = try QuotaCalibration.dailyPoints(db: fixture.db, window: window)
+
+                expectEqual(points.byDay["2026-03-01"]?.total, 19.0,
+                            "the reset day keeps (87-80) + (12-0); a timestamp-only ordering "
+                            + "would report 7 and strand the 12 points")
+                expectEqual(points.byDay["2026-03-02"]?.total, 3.0,
+                            "the following day keeps only its own (13-12) + (15-13); a "
+                            + "timestamp-only ordering would manufacture 15 by deltaing 13 off 0")
+            } catch {
+                checks += 1
+                failures.append("calibration tie-break test threw: \(error)")
+            }
+        }
+    }
+
+    /// Timestamps must be compared as *instants*, not as text.
+    ///
+    /// This codebase writes ISO 8601 in two shapes (with and without fractional
+    /// seconds), and `"…:09.500Z" < "…:09Z"` lexically — `.` sorts below `Z` —
+    /// while being the *later* instant. A text-ordered window would therefore
+    /// invert this pair and discard a real increment as a negative delta. The
+    /// rowids are laid out so they cannot rescue the comparison.
+    private static func testCalibrationOrdersMixedISOShapesByInstant() {
+        withSelfTestTempDir("calibration-iso-shapes") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 1)
+                // Inserted fractional-first, so rowid order agrees with the
+                // (wrong) text order and only instant comparison can fix it.
+                try insertUsageRow(fixture.db, account: "acct-0",
+                                   at: "2026-03-01T10:00:09.500Z", weekly: 5)
+                try insertUsageRow(fixture.db, account: "acct-0",
+                                   at: "2026-03-01T10:00:09Z", weekly: 4)
+
+                let window = QuotaCalibration.Window(
+                    days: 2,
+                    now: UsageRecord.parseISO("2026-03-02T12:00:00Z") ?? Date())
+                let points = try QuotaCalibration.dailyPoints(db: fixture.db, window: window)
+                expectEqual(points.byDay["2026-03-01"]?.total, 1.0,
+                            "4 then 5 is one point; text ordering would see 5 then 4 and report none")
+            } catch {
+                checks += 1
+                failures.append("calibration ISO-shape ordering test threw: \(error)")
+            }
+        }
+    }
+
+    /// Recomputing the same window twice must produce the same rows, with no
+    /// duplicates — the property that lets the poll loop call this on a timer
+    /// forever without the table drifting.
+    private static func testCalibrationRecomputeIsIdempotent() {
+        withSelfTestTempDir("calibration-idempotent") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 20)
+                try writeReferenceUsageFixture(
+                    fixture.db, series: calibrationReferenceSeries)
+
+                let first = try QuotaCalibration.recompute(
+                    dbPath: fixture.path, days: 25, now: calibrationNow)
+                let firstRows = try QuotaCalibration.loadSeries(
+                    dbPath: fixture.path, days: 25, now: calibrationNow)
+                let second = try QuotaCalibration.recompute(
+                    dbPath: fixture.path, days: 25, now: calibrationNow)
+                let secondRows = try QuotaCalibration.loadSeries(
+                    dbPath: fixture.path, days: 25, now: calibrationNow)
+
+                expectEqual(second.poolRows, first.poolRows,
+                            "a second recompute writes the same number of pool rows")
+                expectEqual(second.accountRows, first.accountRows,
+                            "…and the same number of account rows")
+                expectEqual(secondRows.count, firstRows.count,
+                            "the stored series does not grow on recompute")
+                // `computed_at` is the one field that legitimately moves, and
+                // the injected clock pins it, so the rows compare equal whole.
+                expect(secondRows == firstRows,
+                       "every stored row is identical after a second recompute")
+
+                var stored = 0
+                let stmt = try fixture.db.prepare(
+                    "SELECT COUNT(*) FROM quota_calibration_daily")
+                for row in stmt { stored = Int((row[0] as? Int64) ?? 0) }
+                expectEqual(stored, firstRows.count,
+                            "no row outside the read window survived as a duplicate")
+            } catch {
+                checks += 1
+                failures.append("calibration idempotency test threw: \(error)")
+            }
+        }
+    }
+
+    /// A day that accumulated too few points keeps its (real) point count but
+    /// reports **no** per-point ratio — absent, not a wildly-scaled number.
+    /// One weekly point is the measurement quantum, so a 2-point denominator
+    /// carries ±25% error that a bare ratio would hide.
+    private static func testCalibrationLowSignalDayHasNoRatio() {
+        withSelfTestTempDir("calibration-low-signal") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 1)
+                // 2 points on 04-01 (below the default floor of 5), 9 on 04-02.
+                for (day, values) in [("2026-04-01", [10.0, 11.0, 12.0]),
+                                      ("2026-04-02", [12.0, 16.0, 21.0])] {
+                    for (index, value) in values.enumerated() {
+                        try insertUsageRow(fixture.db, account: "acct-0",
+                                           at: calibrationISO(day: day, secondsIntoDay: 600 + index * 3600),
+                                           weekly: value)
+                    }
+                }
+                // Plenty of tokens on both days, so only the denominator differs.
+                try fixture.db.run("""
+                    INSERT INTO token_sessions (session_id, first_message_ts)
+                    VALUES ('sess-low', '2026-04-01T00:00:00Z')
+                """)
+                for day in ["2026-04-01", "2026-04-02"] {
+                    try fixture.db.run("""
+                        INSERT INTO token_usage
+                            (session_id, timestamp, model, input_tokens, output_tokens,
+                             cache_creation_tokens, cache_read_tokens, message_uuid)
+                        VALUES ('sess-low', ?, 'claude-sonnet-4-5-20250929', 1000, 500, 0, 0, ?)
+                    """, calibrationISO(day: day, secondsIntoDay: 7200), "uuid-\(day)")
+                }
+
+                let window = QuotaCalibration.Window(
+                    days: 3, now: UsageRecord.parseISO("2026-04-03T12:00:00Z") ?? Date())
+                let rows = try QuotaCalibration.computeRows(db: fixture.db, window: window)
+                    .rows.filter { $0.scope == .pool }
+                let byDay = Dictionary(uniqueKeysWithValues: rows.map { ($0.day, $0) })
+
+                expectEqual(byDay["2026-04-01"]?.pointsConsumed, 2.0,
+                            "the low-signal day still records the points it really saw")
+                expect(byDay["2026-04-01"]?.costUSDPerPoint == nil,
+                       "…but reports no cost-per-point, because 2 points is below the floor")
+                expect(byDay["2026-04-01"]?.rawTokensPerPoint == nil,
+                       "…and no tokens-per-point either")
+                expect(byDay["2026-04-01"]?.costEquivalentTokens != nil,
+                       "the day's absolute cost is still known — only the ratio is suppressed")
+
+                expectEqual(byDay["2026-04-02"]?.pointsConsumed, 9.0, "the next day clears the floor")
+                expect(byDay["2026-04-02"]?.costUSDPerPoint != nil,
+                       "…so it does report a cost-per-point")
+            } catch {
+                checks += 1
+                failures.append("calibration low-signal test threw: \(error)")
+            }
+        }
+    }
+
+    /// A day with points but **no** transcript coverage reports no token
+    /// columns at all. Zero would read as "this quota was free", which is the
+    /// inverse of the alarm this series exists to raise.
+    private static func testCalibrationDayWithoutTokensOmitsCostEntirely() {
+        withSelfTestTempDir("calibration-no-tokens") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 1)
+                for (index, value) in [10.0, 20.0, 30.0].enumerated() {
+                    try insertUsageRow(fixture.db, account: "acct-0",
+                                       at: calibrationISO(day: "2026-05-01", secondsIntoDay: 600 + index * 3600),
+                                       weekly: value)
+                }
+                let window = QuotaCalibration.Window(
+                    days: 2, now: UsageRecord.parseISO("2026-05-02T12:00:00Z") ?? Date())
+                let pool = try QuotaCalibration.computeRows(db: fixture.db, window: window)
+                    .rows.first { $0.scope == .pool && $0.day == "2026-05-01" }
+
+                expectEqual(pool?.pointsConsumed, 20.0, "the points half of the series stands alone")
+                expect(pool?.tokens == nil, "no transcript coverage means no token counts")
+                expect(pool?.costUSD == nil, "…no cost")
+                expect(pool?.costEquivalentTokens == nil, "…and no cost-equivalent tokens — not 0")
+
+                let json = try QuotaCalibration.jsonString(
+                    rows: [pool!], windowDays: 2,
+                    minPointsForRatio: QuotaCalibration.defaultMinPointsForRatio,
+                    now: calibrationNow)
+                expect(!json.contains("cost_usd"),
+                       "an unknown cost is an OMITTED key, never a null or a zero")
+                expect(json.contains("\"points_consumed\""),
+                       "what is known is still emitted")
+            } catch {
+                checks += 1
+                failures.append("calibration no-token-day test threw: \(error)")
+            }
+        }
+    }
+
+    /// Per-account token attribution requires an **explicit** session→account
+    /// mapping. `token_sessions.inferred_account_id` is the deleted native
+    /// host's "whichever account polled most recently" guess — #197 leaves it
+    /// NULL on purpose, and a legacy database's stale values must never be
+    /// promoted back into a cost figure. Only `override_account_id` counts,
+    /// and a subagent transcript inherits its parent session's.
+    private static func testCalibrationAttributesTokensOnlyViaExplicitMapping() {
+        withSelfTestTempDir("calibration-attribution") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 3)
+                let day = "2026-06-01"
+                for index in 0..<3 {
+                    for (step, value) in [10.0, 20.0].enumerated() {
+                        try insertUsageRow(fixture.db, account: "acct-\(index)",
+                                           at: calibrationISO(day: day, secondsIntoDay: 600 + step * 3600),
+                                           weekly: value)
+                    }
+                }
+
+                // 1. Explicitly mapped to acct-0.
+                try fixture.db.run("""
+                    INSERT INTO token_sessions (session_id, first_message_ts, override_account_id)
+                    VALUES ('sess-mapped', ?, 'acct-0')
+                """, calibrationISO(day: day, secondsIntoDay: 0))
+                // 2. Only the legacy inference — must NOT attribute to acct-1.
+                try fixture.db.run("""
+                    INSERT INTO token_sessions (session_id, first_message_ts, inferred_account_id)
+                    VALUES ('sess-inferred', ?, 'acct-1')
+                """, calibrationISO(day: day, secondsIntoDay: 0))
+                // 3. A subagent transcript whose own row has no mapping, but
+                //    whose parent session is mapped to acct-0 (#197's
+                //    `parent_session_id` exists precisely for this join).
+                try fixture.db.run("""
+                    INSERT INTO token_sessions (session_id, first_message_ts, parent_session_id)
+                    VALUES ('agent-abc', ?, 'sess-mapped')
+                """, calibrationISO(day: day, secondsIntoDay: 0))
+
+                for (session, uuid) in [("sess-mapped", "u1"), ("sess-inferred", "u2"), ("agent-abc", "u3")] {
+                    try fixture.db.run("""
+                        INSERT INTO token_usage
+                            (session_id, timestamp, model, input_tokens, output_tokens,
+                             cache_creation_tokens, cache_read_tokens, message_uuid)
+                        VALUES (?, ?, 'claude-sonnet-4-5-20250929', 1000, 100, 0, 0, ?)
+                    """, session, calibrationISO(day: day, secondsIntoDay: 7200), uuid)
+                }
+
+                let window = QuotaCalibration.Window(
+                    days: 2, now: UsageRecord.parseISO("2026-06-02T12:00:00Z") ?? Date())
+                let rows = try QuotaCalibration.computeRows(db: fixture.db, window: window).rows
+
+                let pool = rows.first { $0.scope == .pool && $0.day == day }
+                expectEqual(pool?.tokens?.input, 3000,
+                            "the pool row counts every session's tokens, mapped or not — "
+                            + "pool-level totals need no attribution to be correct")
+
+                let byAccount = Dictionary(
+                    uniqueKeysWithValues: rows
+                        .filter { $0.scope == .account && $0.day == day }
+                        .map { ($0.accountId ?? "", $0) })
+                expectEqual(byAccount.count, 3, "every reporting account gets a row for its own points")
+                expectEqual(byAccount["acct-0"]?.tokens?.input, 2000,
+                            "the mapped session and its subagent both attribute to acct-0")
+                expect(byAccount["acct-1"]?.tokens == nil,
+                       "inferred_account_id is NOT a mapping — acct-1 gets points but no tokens")
+                expect(byAccount["acct-1"]?.costUSDPerPoint == nil,
+                       "…and therefore no cost-per-point, rather than a fabricated one")
+                expectEqual(byAccount["acct-1"]?.pointsConsumed, 10.0,
+                            "its points are still real and still reported")
+                expect(byAccount["acct-2"]?.tokens == nil,
+                       "an account with no mapped session at all is likewise token-free")
+            } catch {
+                checks += 1
+                failures.append("calibration attribution test threw: \(error)")
+            }
+        }
+    }
+
+    /// An OpenAI account's `weekly_all_percent` is a percentage of a completely
+    /// different quota, and its spend never appears in Claude Code transcripts.
+    /// Folding it into this series would produce a number with no meaning.
+    private static func testCalibrationExcludesNonAnthropicAccounts() {
+        withSelfTestTempDir("calibration-provider") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 1)
+                try fixture.db.run("""
+                    INSERT INTO accounts (id, account_name, email, provider, last_updated)
+                    VALUES ('openai-0', 'codex', 'codex@example.com', 'openai', '2026-07-02T00:00:00Z')
+                """)
+                let day = "2026-07-01"
+                for (index, value) in [10.0, 30.0].enumerated() {
+                    try insertUsageRow(fixture.db, account: "acct-0",
+                                       at: calibrationISO(day: day, secondsIntoDay: 600 + index * 3600),
+                                       weekly: value)
+                    try insertUsageRow(fixture.db, account: "openai-0",
+                                       at: calibrationISO(day: day, secondsIntoDay: 900 + index * 3600),
+                                       weekly: value * 2)
+                }
+
+                let window = QuotaCalibration.Window(
+                    days: 2, now: UsageRecord.parseISO("2026-07-02T12:00:00Z") ?? Date())
+                let rows = try QuotaCalibration.computeRows(db: fixture.db, window: window).rows
+                let pool = rows.first { $0.scope == .pool && $0.day == day }
+                expectEqual(pool?.pointsConsumed, 20.0,
+                            "only the Anthropic account's 20 points count")
+                expectEqual(pool?.accountsReporting, 1,
+                            "the OpenAI account is not part of the denominator either")
+                expect(!rows.contains { $0.accountId == "openai-0" },
+                       "and it gets no account row of its own")
+            } catch {
+                checks += 1
+                failures.append("calibration provider-filter test threw: \(error)")
+            }
+        }
+    }
+
+    /// The price table, and the distinction the deleted native host got wrong:
+    /// a raw `input + output + cache_creation + cache_read` sum is **not** a
+    /// cost-equivalent token count.
+    private static func testCalibrationCostWeights() {
+        let weights = QuotaCalibration.currentWeights
+
+        let opus45 = weights.price(for: "claude-opus-4-5-20251101")
+        expect(opus45.recognized, "Opus 4.5 is priced")
+        expectEqual(opus45.price.inputUSDPerMTok, 5.00, "Opus 4.5 input rate")
+        let opus41 = weights.price(for: "claude-opus-4-1-20250805")
+        expectEqual(opus41.price.inputUSDPerMTok, 15.00,
+                    "Opus 4.1 is matched before the bare 'opus' catch-all, not after")
+        expectEqual(weights.price(for: "claude-sonnet-4-5-20250929").price.inputUSDPerMTok, 3.00,
+                    "Sonnet input rate")
+        expectEqual(weights.price(for: "claude-3-5-haiku-20241022").price.inputUSDPerMTok, 0.80,
+                    "Claude 3.5 Haiku's id puts the version before the family name")
+
+        let unknown = weights.price(for: "some-future-model-9")
+        expect(!unknown.recognized, "an unrecognized model is reported as such")
+        expectEqual(unknown.price.inputUSDPerMTok, weights.fallback.inputUSDPerMTok,
+                    "…and priced at the fallback rather than dropped or billed at zero")
+
+        // The ratios #196 measured hold across every priced family: a cache
+        // write is 1.25x an input token and a cache read 0.1x.
+        for family in weights.families {
+            expect(abs(family.price.cacheWriteUSDPerMTok - family.price.inputUSDPerMTok * 1.25) < 1e-9,
+                   "\(family.pattern): cache write is 1.25x input")
+            expect(abs(family.price.cacheReadUSDPerMTok - family.price.inputUSDPerMTok * 0.1) < 1e-9,
+                   "\(family.pattern): cache read is 0.1x input")
+        }
+
+        // One million Sonnet input tokens costs $3, which is one million
+        // cost-equivalent tokens by definition of the baseline.
+        let sonnet = weights.price(for: "claude-sonnet-4-5-20250929").price
+        let inputCost = sonnet.costUSD(input: 1_000_000, output: 0, cacheCreation: 0, cacheRead: 0)
+        expect(abs(inputCost - 3.0) < 1e-9, "1M Sonnet input tokens cost $3.00")
+        expect(abs(weights.costEquivalentTokens(usd: inputCost) - 1_000_000) < 1e-3,
+               "…i.e. exactly 1M cost-equivalent tokens")
+
+        // The same *raw* million tokens as cache reads costs a tenth as much —
+        // which is the whole reason a raw sum cannot stand in for cost.
+        let cacheCost = sonnet.costUSD(input: 0, output: 0, cacheCreation: 0, cacheRead: 1_000_000)
+        expect(abs(weights.costEquivalentTokens(usd: cacheCost) - 100_000) < 1e-3,
+               "1M cache-read tokens is 1M raw tokens but only 100k cost-equivalent ones")
+    }
+
+    /// End-to-end through the table and both export formats: the stored row
+    /// round-trips, unknown values stay absent in JSON *and* CSV, and the CSV
+    /// header and rows have the same width.
+    private static func testCalibrationExportFormats() {
+        withSelfTestTempDir("calibration-export") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 2)
+                let day = "2026-09-16"
+                for index in 0..<2 {
+                    for (step, value) in [0.0, 10.0, 20.0].enumerated() {
+                        try insertUsageRow(fixture.db, account: "acct-\(index)",
+                                           at: calibrationISO(day: day, secondsIntoDay: 600 + step * 3600),
+                                           weekly: value)
+                    }
+                }
+                try fixture.db.run("""
+                    INSERT INTO token_sessions (session_id, first_message_ts, override_account_id)
+                    VALUES ('sess-export', ?, 'acct-0')
+                """, calibrationISO(day: day, secondsIntoDay: 0))
+                try fixture.db.run("""
+                    INSERT INTO token_usage
+                        (session_id, timestamp, model, input_tokens, output_tokens,
+                         cache_creation_tokens, cache_read_tokens, message_uuid)
+                    VALUES ('sess-export', ?, 'claude-sonnet-4-5-20250929',
+                            1000000, 0, 0, 1000000, 'uuid-export')
+                """, calibrationISO(day: day, secondsIntoDay: 7200))
+
+                let result = try QuotaCalibration.recompute(
+                    dbPath: fixture.path, days: 3, now: calibrationNow)
+                expectEqual(result.windowStartDay, "2026-09-15", "the 3-day window opens on 09-15")
+                expect(result.unknownModels.isEmpty, "the fixture's model is priced")
+
+                let rows = try QuotaCalibration.loadSeries(
+                    dbPath: fixture.path, days: 3, now: calibrationNow)
+                guard let pool = rows.first(where: { $0.scope == .pool && $0.day == day }) else {
+                    checks += 1
+                    failures.append("calibration export: no pool row for \(day)")
+                    return
+                }
+                expectEqual(pool.pointsConsumed, 40.0, "two accounts x 20 points")
+                expectEqual(pool.accountsReporting, 2, "both reported")
+                expectEqual(pool.pointsPerAccount, 20.0, "normalized by the accounts that reported")
+                expectEqual(pool.tokens?.raw, 2_000_000, "raw tokens are the plain sum")
+                // $3.00 of input + $0.30 of cache reads = $3.30 -> 1.1M
+                // cost-equivalent tokens, barely half the raw count.
+                expect(abs((pool.costUSD ?? 0) - 3.30) < 1e-6, "cost is priced per model")
+                expect(abs((pool.costEquivalentTokens ?? 0) - 1_100_000) < 1.0,
+                       "cost-equivalent tokens are materially below the raw sum")
+                expect(abs((pool.costUSDPerPoint ?? 0) - 3.30 / 40.0) < 1e-9,
+                       "cost per weekly point is the headline figure")
+
+                // A separate scope filter must not change the numbers.
+                let poolOnly = try QuotaCalibration.loadSeries(
+                    dbPath: fixture.path, days: 3, scope: .pool, now: calibrationNow)
+                expect(poolOnly.allSatisfy { $0.scope == .pool }, "--scope pool filters to pool rows")
+                expectEqual(poolOnly.count, rows.filter { $0.scope == .pool }.count,
+                            "…without dropping any of them")
+
+                // JSON: unknown stays absent, known is present, today is flagged.
+                let json = try QuotaCalibration.jsonString(
+                    rows: rows, windowDays: 3,
+                    minPointsForRatio: QuotaCalibration.defaultMinPointsForRatio,
+                    now: calibrationNow)
+                guard let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8))
+                        as? [String: Any],
+                      let emitted = parsed["rows"] as? [[String: Any]] else {
+                    checks += 1
+                    failures.append("calibration export: JSON did not parse into the expected shape")
+                    return
+                }
+                expectEqual(parsed["schema"] as? Int, QuotaCalibration.exportSchemaVersion,
+                            "the export declares its schema version")
+                expectEqual(parsed["weights_version"] as? String,
+                            QuotaCalibration.currentWeights.version,
+                            "…and the dated price table it was computed under")
+                let poolJSON = emitted.first { ($0["scope"] as? String) == "pool" && ($0["day"] as? String) == day }
+                expect(poolJSON?["account_id"] == nil, "a pool row carries no account_id key")
+                expect(poolJSON?["partial"] == nil,
+                       "a completed day is not flagged partial")
+                expect((poolJSON?["cost_usd_per_point"] as? Double) != nil,
+                       "the headline ratio is present when it is known")
+
+                let accountJSON = emitted.first {
+                    ($0["scope"] as? String) == "account" && ($0["account_id"] as? String) == "acct-1"
+                }
+                expect(accountJSON != nil, "the unmapped account still gets a row")
+                expect(accountJSON?["cost_usd"] == nil,
+                       "…with its unknown cost omitted rather than zeroed")
+
+                // CSV: same column count on every line, empty field for unknown.
+                let csv = QuotaCalibration.csv(rows: rows, now: calibrationNow)
+                let lines = csv.split(separator: "\n").map(String.init)
+                expectEqual(lines.first, QuotaCalibration.csvColumns.joined(separator: ","),
+                            "the CSV header is generated from the shared column list")
+                expectEqual(lines.count, rows.count + 1, "one CSV line per row plus the header")
+                let width = QuotaCalibration.csvColumns.count
+                expect(lines.allSatisfy { $0.split(separator: ",", omittingEmptySubsequences: false).count == width },
+                       "every CSV row has exactly \(width) fields")
+                let accountLine = lines.first { $0.hasPrefix("\(day),account,acct-1,") }
+                expect(accountLine?.hasSuffix(",,,,,,,,,,\(QuotaCalibration.currentWeights.version)") == true,
+                       "an unknown CSV value is an EMPTY field, never 0 — got: \(accountLine ?? "nil")")
+            } catch {
+                checks += 1
+                failures.append("calibration export test threw: \(error)")
+            }
+        }
+    }
+
+    /// Days are UTC calendar days, and the current (incomplete) one is flagged
+    /// so a consumer does not read a half-observed day as a step change.
+    private static func testCalibrationDayBoundariesAreUTC() {
+        withSelfTestTempDir("calibration-utc") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 1)
+                // 23:30Z and 00:30Z straddle midnight — in any timezone west of
+                // UTC these would land on the same local day.
+                try insertUsageRow(fixture.db, account: "acct-0",
+                                   at: "2026-09-16T23:30:00Z", weekly: 10)
+                try insertUsageRow(fixture.db, account: "acct-0",
+                                   at: "2026-09-16T23:59:00Z", weekly: 14)
+                try insertUsageRow(fixture.db, account: "acct-0",
+                                   at: "2026-09-17T00:30:00Z", weekly: 20)
+
+                let window = QuotaCalibration.Window(days: 3, now: calibrationNow)
+                let points = try QuotaCalibration.dailyPoints(db: fixture.db, window: window)
+                expectEqual(points.byDay["2026-09-16"]?.total, 4.0,
+                            "the 23:30 -> 23:59 increment belongs to 09-16")
+                expectEqual(points.byDay["2026-09-17"]?.total, 6.0,
+                            "the increment observed at 00:30Z belongs to the new UTC day")
+
+                let rows = try QuotaCalibration.computeRows(db: fixture.db, window: window,
+                                                            now: calibrationNow).rows
+                let json = try QuotaCalibration.jsonString(
+                    rows: rows.filter { $0.scope == .pool }, windowDays: 3,
+                    minPointsForRatio: QuotaCalibration.defaultMinPointsForRatio,
+                    now: calibrationNow)
+                guard let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8))
+                        as? [String: Any],
+                      let emitted = parsed["rows"] as? [[String: Any]] else { return }
+                let today = emitted.first { ($0["day"] as? String) == "2026-09-17" }
+                let yesterday = emitted.first { ($0["day"] as? String) == "2026-09-16" }
+                expectEqual(today?["partial"] as? Bool, true,
+                            "the current UTC day is flagged partial — it is only half observed")
+                expect(yesterday?["partial"] == nil, "a completed day carries no partial flag")
+            } catch {
+                checks += 1
+                failures.append("calibration UTC-boundary test threw: \(error)")
+            }
+        }
+    }
+
+    /// The window's SQL bound is a bare `YYYY-MM-DD` prefix, not an ISO
+    /// instant, and that is load-bearing: `"…T00:00:00.001Z"` sorts *below*
+    /// `"…T00:00:00Z"` as text (`.` < `Z`), so an ISO bound would silently drop
+    /// a fractional-second record in the window's opening second. Transcript
+    /// timestamps always carry fractional seconds, so this is the normal shape,
+    /// not an exotic one.
+    private static func testCalibrationWindowBoundIsPrefixSafe() {
+        withSelfTestTempDir("calibration-bound") { dir in
+            do {
+                let fixture = try calibrationFixture(dir, accounts: 1)
+                let window = QuotaCalibration.Window(days: 3, now: calibrationNow)
+                expectEqual(window.startDay, "2026-09-15", "the 3-day window opens on 09-15")
+                expectEqual(window.seedDay, "2026-09-14", "with one day of seed lookback")
+
+                // A usage sample in the seed day's opening second, and one in
+                // the window's opening second — both fractional.
+                try insertUsageRow(fixture.db, account: "acct-0",
+                                   at: "2026-09-14T00:00:00.001Z", weekly: 1)
+                try insertUsageRow(fixture.db, account: "acct-0",
+                                   at: "2026-09-15T00:00:00.001Z", weekly: 9)
+                try fixture.db.run("""
+                    INSERT INTO token_sessions (session_id, first_message_ts)
+                    VALUES ('sess-bound', '2026-09-15T00:00:00.001Z')
+                """)
+                try fixture.db.run("""
+                    INSERT INTO token_usage
+                        (session_id, timestamp, model, input_tokens, output_tokens,
+                         cache_creation_tokens, cache_read_tokens, message_uuid)
+                    VALUES ('sess-bound', '2026-09-15T00:00:00.001Z',
+                            'claude-sonnet-4-5-20250929', 700000, 0, 0, 0, 'uuid-bound')
+                """)
+
+                let points = try QuotaCalibration.dailyPoints(db: fixture.db, window: window)
+                expectEqual(points.byDay["2026-09-15"]?.total, 8.0,
+                            "the seed row at 09-14T00:00:00.001Z is read, so 09-15 sees 9-1 = 8 "
+                            + "points; an ISO seed bound would have excluded it and reported none")
+
+                let tokens = try QuotaCalibration.dailyTokens(db: fixture.db, window: window)
+                expectEqual(tokens.pool["2026-09-15"]?.totals.input, 700000,
+                            "a fractional-second token record in the window's opening second counts")
+            } catch {
+                checks += 1
+                failures.append("calibration window-bound test threw: \(error)")
+            }
+        }
+    }
+
+    /// The calibration table must be created by `applySchema` on a database
+    /// that predates it, without disturbing what is already there, and it must
+    /// refuse a duplicate `(day, scope, account)` even though `account_id` is
+    /// NULL for pool rows (SQLite does not enforce uniqueness across NULLs in
+    /// a PRIMARY KEY, which is why the guard is an expression index).
+    private static func testCalibrationSchemaMigrationAndUniqueness() {
+        withSelfTestTempDir("calibration-schema") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                // A database with the pre-#198 tables only.
+                let seed = try openDatabase(dbPath)
+                try seed.execute("""
+                    CREATE TABLE accounts (id TEXT PRIMARY KEY, account_name TEXT, email TEXT);
+                    CREATE TABLE usage_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        account_id TEXT NOT NULL, timestamp TEXT NOT NULL,
+                        weekly_all_percent REAL, is_synthetic INTEGER DEFAULT 0);
+                """)
+                try seed.run("INSERT INTO accounts (id, email) VALUES ('legacy-0', 'legacy@example.com')")
+                try seed.run("""
+                    INSERT INTO usage_history (account_id, timestamp, weekly_all_percent)
+                    VALUES ('legacy-0', '2026-09-16T10:00:00Z', 5.0)
+                """)
+
+                let db = try openDatabase(dbPath)
+                try UsageStore.applySchema(db)
+                expect(!tableColumns(db, "quota_calibration_daily").isEmpty,
+                       "applySchema creates quota_calibration_daily on a database that predates it")
+
+                var legacyRows = 0
+                for row in try db.prepare("SELECT COUNT(*) FROM usage_history") {
+                    legacyRows = Int((row[0] as? Int64) ?? 0)
+                }
+                expectEqual(legacyRows, 1, "the pre-existing history is untouched by the migration")
+
+                let insert = """
+                    INSERT INTO quota_calibration_daily
+                        (day, scope, account_id, weights_version, computed_at)
+                    VALUES ('2026-09-16', 'pool', NULL, 'test', '2026-09-17T00:00:00Z')
+                """
+                try db.run(insert)
+                var duplicated = true
+                do { try db.run(insert) } catch { duplicated = false }
+                expect(!duplicated,
+                       "a duplicate pool row for the same day is rejected — the unique index "
+                        + "keys on IFNULL(account_id, ''), because a NULL PRIMARY KEY column "
+                        + "would not be enforced")
+            } catch {
+                checks += 1
+                failures.append("calibration schema test threw: \(error)")
+            }
+        }
     }
 
     // MARK: - OpenAI import account resolution

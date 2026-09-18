@@ -535,6 +535,50 @@ class UsageStore: ObservableObject {
             CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_token_sessions_account
                 ON token_sessions(inferred_account_id);
+            -- Daily quota-calibration series (#198): what one weekly
+            -- rate-limit point costs, per UTC day, pool-wide and per account.
+            -- Written only by `QuotaCalibration.recompute`, which rewrites a
+            -- whole trailing window inside one transaction — so this table is
+            -- derived state, safe to delete, and never the source of truth for
+            -- anything.
+            --
+            -- Deliberately a NEW table rather than the legacy `quota_calibration`
+            -- the pre-v2.0 native host declared (deleted in `b9db622`, and never
+            -- actually populated even on hosts that ran it). That table's
+            -- `account_id` is NOT NULL, which cannot express a pool-level row,
+            -- and `CREATE TABLE IF NOT EXISTS` cannot reshape a table that
+            -- already exists — so reusing the name would leave a fresh install
+            -- and a legacy install disagreeing about the columns.
+            --
+            -- `account_id` is NULL for a pool row. SQLite does not enforce
+            -- uniqueness across a NULL PRIMARY KEY column, hence the expression
+            -- index below rather than `PRIMARY KEY (day, scope, account_id)`.
+            CREATE TABLE IF NOT EXISTS quota_calibration_daily (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                account_id TEXT,
+                points_consumed REAL,
+                accounts_reporting INTEGER,
+                points_per_account REAL,
+                input_tokens INTEGER,
+                output_tokens INTEGER,
+                cache_creation_tokens INTEGER,
+                cache_read_tokens INTEGER,
+                raw_tokens INTEGER,
+                cost_equivalent_tokens REAL,
+                cost_usd REAL,
+                raw_tokens_per_point REAL,
+                cost_equivalent_tokens_per_point REAL,
+                cost_usd_per_point REAL,
+                weights_version TEXT NOT NULL,
+                computed_at TEXT NOT NULL,
+                FOREIGN KEY (account_id) REFERENCES accounts(id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_calibration_day_scope
+                ON quota_calibration_daily(day, scope, IFNULL(account_id, ''));
+            CREATE INDEX IF NOT EXISTS idx_quota_calibration_day
+                ON quota_calibration_daily(day DESC);
         """)
 
         // Migration: add token_rolled_at to older DBs. `updated_at` can't serve
