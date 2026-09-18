@@ -103,6 +103,15 @@ enum SelfTest {
         testFullHistoryDecimationAlwaysKeepsNilWeeklyPercent()
         testHistoryCutoffExcludesOlderRows()
         testTokenHistoryRoundTripAndCutoff()
+        testTranscriptSchemaMatchesLegacyShape()
+        testTranscriptSchemaPreservesLegacyRows()
+        testTranscriptImportOverFixtureTree()
+        testTranscriptImportIsIncrementalAndIdempotent()
+        testTranscriptImportPersistsNoMessageContent()
+        testTranscriptImportBudgetDefersRemainder()
+        testTranscriptImportMissingRootIsTyped()
+        testTranscriptPathRedaction()
+        testTranscriptRootResolution()
         testOpenAIImportResolvesExistingAccountByEmail()
         testExportAccountsEnvIncludesAllProviders()
         testExportAccountsEnvExcludesTokenlessCodexAccount()
@@ -2745,34 +2754,21 @@ enum SelfTest {
 
     /// `loadTokenHistory` had zero coverage before #179; this confirms it
     /// still maps `token_usage`/`token_sessions` rows correctly and applies
-    /// the shared cutoff after the extraction. `token_usage`/`token_sessions`
-    /// are not part of `UsageStore.ensureDatabase()`'s own schema (they are
-    /// populated by a separate ingestion path), so this test creates them
-    /// directly with exactly the columns `loadTokenHistory`'s SQL reads.
+    /// the shared cutoff after the extraction. Since #197 both tables are part
+    /// of `UsageStore.applySchema`, so the fixture is built through
+    /// `ensureDatabase()` — which also pins that the shipped schema is the one
+    /// this read path's SQL actually works against.
     private static func testTokenHistoryRoundTripAndCutoff() {
         withSelfTestTempDir("token-history") { dir in
             do {
                 let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
                 let db = try openDatabase(dbPath)
 
-                try db.execute("""
-                    CREATE TABLE token_sessions (
-                        session_id TEXT PRIMARY KEY,
-                        override_account_id TEXT,
-                        inferred_account_id TEXT
-                    );
-                    CREATE TABLE token_usage (
-                        session_id TEXT,
-                        timestamp TEXT,
-                        input_tokens INTEGER,
-                        output_tokens INTEGER,
-                        cache_creation_tokens INTEGER,
-                        cache_read_tokens INTEGER
-                    );
-                """)
                 try db.run("""
-                    INSERT INTO token_sessions (session_id, override_account_id, inferred_account_id)
-                    VALUES ('sess-1', NULL, 'acct-token')
+                    INSERT INTO token_sessions
+                        (session_id, first_message_ts, override_account_id, inferred_account_id)
+                    VALUES ('sess-1', '2026-01-01T00:00:00Z', NULL, 'acct-token')
                 """)
                 try db.run("""
                     INSERT INTO token_usage
@@ -2799,6 +2795,544 @@ enum SelfTest {
                 failures.append("loadTokenHistory round-trip test threw: \(error)")
             }
         }
+    }
+
+    // MARK: - Transcript token ingest (#197)
+
+    /// The legacy (pre-v2.0) column list for `token_sessions`, in order, as
+    /// the deleted native host created it
+    /// (`b9db622^:native-host/claude_monitor_host.cjs:59-75`). An existing
+    /// host still holds ~85k rows keyed by this shape, so `applySchema` must
+    /// reproduce it rather than invent a new one.
+    private static let legacyTokenSessionColumns = [
+        "session_id", "project_path", "first_message_ts", "last_message_ts",
+        "inferred_account_id", "override_account_id", "total_input_tokens",
+        "total_output_tokens", "total_cache_creation_tokens",
+        "total_cache_read_tokens", "message_count", "last_import_ts"
+    ]
+
+    /// The legacy column list for `token_usage` (`...cjs:76-87`).
+    private static let legacyTokenUsageColumns = [
+        "id", "session_id", "timestamp", "model", "input_tokens", "output_tokens",
+        "cache_creation_tokens", "cache_read_tokens", "message_uuid"
+    ]
+
+    /// The legacy DDL verbatim — used to build a "database written by the old
+    /// native host" fixture that `applySchema` then has to leave alone.
+    private static let legacyTokenDDL = """
+        CREATE TABLE token_sessions (
+          session_id TEXT PRIMARY KEY,
+          project_path TEXT,
+          first_message_ts TEXT NOT NULL,
+          last_message_ts TEXT,
+          inferred_account_id TEXT,
+          override_account_id TEXT,
+          total_input_tokens INTEGER DEFAULT 0,
+          total_output_tokens INTEGER DEFAULT 0,
+          total_cache_creation_tokens INTEGER DEFAULT 0,
+          total_cache_read_tokens INTEGER DEFAULT 0,
+          message_count INTEGER DEFAULT 0,
+          last_import_ts TEXT,
+          FOREIGN KEY (inferred_account_id) REFERENCES accounts(id),
+          FOREIGN KEY (override_account_id) REFERENCES accounts(id)
+        );
+        CREATE TABLE token_usage (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          model TEXT,
+          input_tokens INTEGER DEFAULT 0,
+          output_tokens INTEGER DEFAULT 0,
+          cache_creation_tokens INTEGER DEFAULT 0,
+          cache_read_tokens INTEGER DEFAULT 0,
+          message_uuid TEXT UNIQUE,
+          FOREIGN KEY (session_id) REFERENCES token_sessions(session_id)
+        );
+        """
+
+    /// Column names of `table` in declaration order (`tableColumns` returns an
+    /// unordered `Set`, and column *order* is part of what "column-compatible
+    /// with the legacy shape" means for an existing database).
+    private static func orderedColumns(_ db: Connection, _ table: String) -> [String] {
+        guard let stmt = try? db.prepare("PRAGMA table_info(\(table))") else { return [] }
+        return stmt.compactMap { $0[1] as? String }
+    }
+
+    /// A fresh database must come up with both token tables in the legacy
+    /// shape — same columns, same order — plus the one additive column #197
+    /// introduces.
+    private static func testTranscriptSchemaMatchesLegacyShape() {
+        withSelfTestTempDir("token-schema") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                UsageStore(dbPath: dbPath).ensureDatabase()
+                // Read-write: the UNIQUE-constraint probe below inserts.
+                let db = try openDatabase(dbPath)
+
+                expectEqual(orderedColumns(db, "token_sessions"),
+                            legacyTokenSessionColumns + ["parent_session_id"],
+                            "token_sessions keeps the legacy column order, plus parent_session_id")
+                expectEqual(orderedColumns(db, "token_usage"), legacyTokenUsageColumns,
+                            "token_usage matches the legacy column list exactly")
+
+                // The UNIQUE constraint on message_uuid *is* the idempotency
+                // key — a schema that dropped it would let re-imports double
+                // every row without erroring.
+                try db.run("""
+                    INSERT INTO token_sessions (session_id, first_message_ts) VALUES ('s', '2026-01-01T00:00:00Z')
+                """)
+                try db.run("""
+                    INSERT INTO token_usage (session_id, timestamp, message_uuid)
+                    VALUES ('s', '2026-01-01T00:00:00Z', 'dup')
+                """)
+                var rejected = false
+                do {
+                    try db.run("""
+                        INSERT INTO token_usage (session_id, timestamp, message_uuid)
+                        VALUES ('s', '2026-01-01T00:00:00Z', 'dup')
+                    """)
+                } catch {
+                    rejected = true
+                }
+                expect(rejected, "a duplicate message_uuid must violate the UNIQUE constraint")
+            } catch {
+                checks += 1
+                failures.append("token schema shape test threw: \(error)")
+            }
+        }
+    }
+
+    /// A database carrying the old native host's tables and rows must survive
+    /// `applySchema` untouched: same rows, same values, same column order —
+    /// `CREATE TABLE IF NOT EXISTS` must be a no-op over it, and the additive
+    /// migration must not disturb what is already there.
+    private static func testTranscriptSchemaPreservesLegacyRows() {
+        withSelfTestTempDir("token-schema-legacy") { dir in
+            do {
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let db = try openDatabase(dbPath)
+                try db.execute(legacyTokenDDL)
+                try db.run("""
+                    INSERT INTO token_sessions
+                        (session_id, project_path, first_message_ts, last_message_ts,
+                         inferred_account_id, total_input_tokens, message_count, last_import_ts)
+                    VALUES ('legacy-sess', '~/.claude/projects/legacy', '2026-01-04T02:00:00Z',
+                            '2026-01-04T02:51:05Z', 'acct-legacy', 4242, 7, '2026-01-04T03:00:00Z')
+                """)
+                try db.run("""
+                    INSERT INTO token_usage
+                        (session_id, timestamp, model, input_tokens, output_tokens, message_uuid)
+                    VALUES ('legacy-sess', '2026-01-04T02:51:05Z', 'claude-opus-4', 11, 22, 'legacy-uuid')
+                """)
+
+                try UsageStore.applySchema(db)
+
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM token_usage") as? Int64, 1,
+                            "the legacy token_usage row survives applySchema")
+                expectEqual(try db.scalar(
+                    "SELECT total_input_tokens FROM token_sessions WHERE session_id = 'legacy-sess'"
+                ) as? Int64, 4242, "legacy session totals are not reshaped")
+                expectEqual(try db.scalar(
+                    "SELECT inferred_account_id FROM token_sessions WHERE session_id = 'legacy-sess'"
+                ) as? String, "acct-legacy", "a legacy row's existing attribution is left alone")
+                expectEqual(try db.scalar(
+                    "SELECT message_uuid FROM token_usage WHERE session_id = 'legacy-sess'"
+                ) as? String, "legacy-uuid", "legacy message rows keep their idempotency key")
+                expectEqual(orderedColumns(db, "token_usage"), legacyTokenUsageColumns,
+                            "migration does not reshape a legacy token_usage table")
+                expectEqual(orderedColumns(db, "token_sessions"),
+                            legacyTokenSessionColumns + ["parent_session_id"],
+                            "migration only appends to a legacy token_sessions table")
+                expectEqual(try db.scalar(
+                    "SELECT parent_session_id FROM token_sessions WHERE session_id = 'legacy-sess'"
+                ) as? String, nil, "the new column backfills as NULL — a legacy row is its own session")
+            } catch {
+                checks += 1
+                failures.append("legacy token schema preservation test threw: \(error)")
+            }
+        }
+    }
+
+    // MARK: Transcript fixtures
+
+    /// Marker planted in every fixture's message body. Nothing derived from a
+    /// transcript's *content* may ever reach the database or a log line, so
+    /// the privacy test below searches for exactly this string.
+    private static let transcriptContentMarker = "SELFTEST-TRANSCRIPT-BODY-e3f1c2"
+
+    private static func assistantLine(
+        uuid: String,
+        timestamp: String,
+        sessionId: String,
+        input: Int = 10,
+        output: Int = 5,
+        cacheCreation: Int = 2,
+        cacheRead: Int = 1,
+        isSidechain: Bool = false,
+        model: String = "claude-sonnet-5"
+    ) -> String {
+        """
+        {"type":"assistant","uuid":"\(uuid)","timestamp":"\(timestamp)",\
+        "sessionId":"\(sessionId)","isSidechain":\(isSidechain),\
+        "cwd":"/home/fixture/project","gitBranch":"main","version":"2.0.0",\
+        "message":{"id":"msg_\(uuid)","role":"assistant","model":"\(model)",\
+        "content":[{"type":"text","text":"\(transcriptContentMarker)"}],\
+        "usage":{"input_tokens":\(input),"output_tokens":\(output),\
+        "cache_creation_input_tokens":\(cacheCreation),"cache_read_input_tokens":\(cacheRead),\
+        "service_tier":"standard","cache_creation":{"ephemeral_5m_input_tokens":\(cacheCreation),\
+        "ephemeral_1h_input_tokens":0},"server_tool_use":{"web_search_requests":0}}}}
+        """
+    }
+
+    /// A user turn — no `message.usage`, and the body is the user's own text.
+    private static func userLine(uuid: String, timestamp: String, sessionId: String) -> String {
+        """
+        {"type":"user","uuid":"\(uuid)","timestamp":"\(timestamp)","sessionId":"\(sessionId)",\
+        "message":{"role":"user","content":"\(transcriptContentMarker)"}}
+        """
+    }
+
+    /// An assistant record with no `usage` member at all (a streaming
+    /// fragment): must be skipped without erroring, not counted.
+    private static func assistantLineWithoutUsage(uuid: String, timestamp: String, sessionId: String) -> String {
+        """
+        {"type":"assistant","uuid":"\(uuid)","timestamp":"\(timestamp)","sessionId":"\(sessionId)",\
+        "message":{"id":"msg_\(uuid)","role":"assistant","model":"claude-sonnet-5",\
+        "content":[{"type":"text","text":"\(transcriptContentMarker)"}]}}
+        """
+    }
+
+    private static func writeTranscript(
+        _ url: URL, lines: [String], modified: Date
+    ) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url)
+        try FileManager.default.setAttributes([.modificationDate: modified], ofItemAtPath: url.path)
+    }
+
+    /// Builds a transcript tree with the shapes that actually occur on a real
+    /// host, including the two the deleted importer got wrong:
+    ///
+    /// * `<project>/<session>.jsonl` — a top-level transcript;
+    /// * `<project>/<session>/subagents/agent-<hash>.jsonl` — a **nested**
+    ///   subagent transcript whose records are `isSidechain: true` and whose
+    ///   `sessionId` is the *parent* session. The old importer both skipped
+    ///   `agent-*` by name and never recursed, so it saw neither;
+    /// * records with no `usage`, a user turn, and a truncated final line
+    ///   (transcripts are appended live).
+    ///
+    /// Returns the root and the number of usage-bearing records in it.
+    @discardableResult
+    private static func buildTranscriptFixture(in root: URL, modified: Date) throws -> Int {
+        let projectA = root.appendingPathComponent("-home-fixture-project-a")
+        try writeTranscript(
+            projectA.appendingPathComponent("sess-1.jsonl"),
+            lines: [
+                userLine(uuid: "u-1", timestamp: "2026-09-17T10:00:00.000Z", sessionId: "sess-1"),
+                assistantLine(uuid: "a-1", timestamp: "2026-09-17T10:00:01.000Z", sessionId: "sess-1",
+                              input: 10, output: 5, cacheCreation: 2, cacheRead: 1),
+                assistantLineWithoutUsage(uuid: "a-frag", timestamp: "2026-09-17T10:00:02.000Z", sessionId: "sess-1"),
+                assistantLine(uuid: "a-2", timestamp: "2026-09-17T10:00:03.000Z", sessionId: "sess-1",
+                              input: 100, output: 50, cacheCreation: 20, cacheRead: 10),
+                "{\"type\":\"assistant\",\"uuid\":\"trunc\",\"mess"   // half-written tail line
+            ],
+            modified: modified)
+
+        // Nested subagent transcript: agent-* name, sidechain records, parent
+        // sessionId — every property the old importer dropped.
+        try writeTranscript(
+            projectA.appendingPathComponent("sess-1/subagents/agent-abc123.jsonl"),
+            lines: [
+                assistantLine(uuid: "a-3", timestamp: "2026-09-17T10:05:00.000Z", sessionId: "sess-1",
+                              input: 7, output: 3, cacheCreation: 0, cacheRead: 0, isSidechain: true)
+            ],
+            modified: modified)
+
+        let projectB = root.appendingPathComponent("-home-fixture-project-b")
+        try writeTranscript(
+            projectB.appendingPathComponent("sess-2.jsonl"),
+            lines: [
+                assistantLine(uuid: "a-4", timestamp: "2026-09-17T11:00:00.000Z", sessionId: "sess-2",
+                              input: 1, output: 1, cacheCreation: 0, cacheRead: 0)
+            ],
+            modified: modified)
+
+        return 4
+    }
+
+    /// A sync over the fixture tree imports one `token_usage` row per
+    /// usage-bearing assistant record — `agent-*.jsonl` and `isSidechain`
+    /// records included (#197's central correction to the deleted importer) —
+    /// and skips records with no `usage` without erroring.
+    private static func testTranscriptImportOverFixtureTree() {
+        withSelfTestTempDir("token-ingest") { dir in
+            do {
+                let root = dir.appendingPathComponent("projects")
+                let expectedRecords = try buildTranscriptFixture(in: root, modified: Date().addingTimeInterval(-3600))
+                let dbPath = dir.appendingPathComponent("usage.db").path
+
+                let stats = try TranscriptImporter.sync(dbPath: dbPath, root: root.path, fileBudget: 0)
+                expectEqual(stats.filesScanned, 3, "the walk finds the nested subagent transcript too")
+                expectEqual(stats.filesRead, 3, "every file is read on a cold database")
+                expectEqual(stats.messagesImported, expectedRecords,
+                            "one token_usage row per usage-bearing assistant record")
+                expectEqual(stats.sessionsWritten, 3, "one token_sessions row per transcript file")
+                expectEqual(stats.filesFailed, 0, "a truncated tail line is not a file-level failure")
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM token_usage") as? Int64, 4,
+                            "four token_usage rows land in the database")
+                expectEqual(try db.scalar(
+                    "SELECT COUNT(*) FROM token_usage WHERE session_id = 'agent-abc123'") as? Int64, 1,
+                    "the agent-*.jsonl record is imported, not excluded by name")
+                expectEqual(try db.scalar(
+                    "SELECT parent_session_id FROM token_sessions WHERE session_id = 'agent-abc123'"
+                ) as? String, "sess-1",
+                    "a subagent transcript records the parent session it belongs to")
+                expectEqual(try db.scalar(
+                    "SELECT parent_session_id FROM token_sessions WHERE session_id = 'sess-1'"
+                ) as? String, nil, "a top-level transcript is its own session")
+                expectEqual(try db.scalar(
+                    "SELECT COUNT(*) FROM token_usage WHERE message_uuid = 'a-frag'") as? Int64, 0,
+                    "an assistant record without message.usage is skipped")
+                expectEqual(try db.scalar(
+                    "SELECT COUNT(*) FROM token_usage WHERE message_uuid = 'u-1'") as? Int64, 0,
+                    "a user turn is never a token_usage row")
+
+                // Counters and session totals.
+                expectEqual(try db.scalar(
+                    "SELECT input_tokens FROM token_usage WHERE message_uuid = 'a-2'") as? Int64, 100,
+                    "input_tokens maps from message.usage.input_tokens")
+                expectEqual(try db.scalar(
+                    "SELECT cache_creation_tokens FROM token_usage WHERE message_uuid = 'a-2'") as? Int64, 20,
+                    "cache_creation_tokens maps from cache_creation_input_tokens")
+                expectEqual(try db.scalar(
+                    "SELECT cache_read_tokens FROM token_usage WHERE message_uuid = 'a-2'") as? Int64, 10,
+                    "cache_read_tokens maps from cache_read_input_tokens")
+                expectEqual(try db.scalar(
+                    "SELECT model FROM token_usage WHERE message_uuid = 'a-1'") as? String, "claude-sonnet-5",
+                    "the model name is carried through")
+                expectEqual(try db.scalar(
+                    "SELECT total_input_tokens FROM token_sessions WHERE session_id = 'sess-1'") as? Int64, 110,
+                    "session totals sum the file's usage-bearing records")
+                expectEqual(try db.scalar(
+                    "SELECT message_count FROM token_sessions WHERE session_id = 'sess-1'") as? Int64, 2,
+                    "message_count counts usage-bearing records only")
+                expectEqual(try db.scalar(
+                    "SELECT first_message_ts FROM token_sessions WHERE session_id = 'sess-1'"
+                ) as? String, "2026-09-17T10:00:01.000Z", "first_message_ts is the earliest usage record")
+                expectEqual(try db.scalar(
+                    "SELECT last_message_ts FROM token_sessions WHERE session_id = 'sess-1'"
+                ) as? String, "2026-09-17T10:00:03.000Z", "last_message_ts is the latest usage record")
+
+                // Attribution is deliberately left to a future consumer (#196,
+                // rjwalters/loom#8059) rather than re-guessed from poll order.
+                expectEqual(try db.scalar(
+                    "SELECT COUNT(*) FROM token_sessions WHERE inferred_account_id IS NOT NULL") as? Int64, 0,
+                    "inferred_account_id stays NULL — no last-polled-account guessing")
+            } catch {
+                checks += 1
+                failures.append("transcript fixture import test threw: \(error)")
+            }
+        }
+    }
+
+    /// Re-running over an unchanged tree must open nothing and insert nothing
+    /// — no `message_uuid` UNIQUE violation, no duplicated rows. Appending a
+    /// single record to a single file must then open exactly that one file:
+    /// the whole point of keying on mtime (a fleet host has ~10^5
+    /// transcripts, so a full re-read per poll is not an option).
+    private static func testTranscriptImportIsIncrementalAndIdempotent() {
+        withSelfTestTempDir("token-ingest-incremental") { dir in
+            do {
+                let root = dir.appendingPathComponent("projects")
+                let baseTime = Date().addingTimeInterval(-3600)
+                try buildTranscriptFixture(in: root, modified: baseTime)
+                let dbPath = dir.appendingPathComponent("usage.db").path
+
+                let first = try TranscriptImporter.sync(dbPath: dbPath, root: root.path, fileBudget: 0)
+                expectEqual(first.filesRead, 3, "cold run reads every file")
+
+                let second = try TranscriptImporter.sync(dbPath: dbPath, root: root.path, fileBudget: 0)
+                expectEqual(second.filesScanned, 3, "the second run still scans the tree")
+                expectEqual(second.filesRead, 0, "an unchanged tree opens no files at all")
+                expectEqual(second.filesSkipped, 3, "every unchanged file is skipped on mtime")
+                expectEqual(second.messagesImported, 0, "a re-run imports no rows")
+                expectEqual(second.sessionsWritten, 0, "a re-run rewrites no sessions")
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar("SELECT COUNT(*) FROM token_usage") as? Int64, 4,
+                            "the re-run neither duplicated nor lost rows")
+
+                // Append one record to one file and make it visibly newer.
+                let touched = root.appendingPathComponent("-home-fixture-project-b/sess-2.jsonl")
+                var lines = (try String(contentsOf: touched, encoding: .utf8))
+                    .split(separator: "\n").map(String.init)
+                lines.append(assistantLine(uuid: "a-5", timestamp: "2026-09-17T11:30:00.000Z",
+                                           sessionId: "sess-2", input: 9, output: 9))
+                try writeTranscript(touched, lines: lines, modified: baseTime.addingTimeInterval(600))
+
+                let third = try TranscriptImporter.sync(dbPath: dbPath, root: root.path, fileBudget: 0)
+                expectEqual(third.filesRead, 1, "only the touched file is opened")
+                expectEqual(third.filesSkipped, 2, "the untouched files are still skipped")
+                expectEqual(third.messagesImported, 1,
+                            "only the appended record is new — the pre-existing uuid is ignored")
+                expectEqual(third.messagesSeen, 2, "the whole touched file is re-read")
+
+                let after = try openDatabase(dbPath, readonly: true)
+                expectEqual(try after.scalar("SELECT COUNT(*) FROM token_usage") as? Int64, 5,
+                            "exactly one row was added")
+                expectEqual(try after.scalar(
+                    "SELECT message_count FROM token_sessions WHERE session_id = 'sess-2'") as? Int64, 2,
+                    "the touched session's totals are recomputed, not doubled")
+                expectEqual(try after.scalar(
+                    "SELECT total_input_tokens FROM token_sessions WHERE session_id = 'sess-2'") as? Int64, 10,
+                    "session totals reflect the file as it now stands")
+            } catch {
+                checks += 1
+                failures.append("transcript incremental import test threw: \(error)")
+            }
+        }
+    }
+
+    /// Transcript bodies are user data and file contents. Nothing derived from
+    /// them may be persisted or logged: the importer decodes counters only, so
+    /// the marker planted in every fixture message must appear nowhere in the
+    /// database bytes (nor in the summary line that is what gets logged).
+    private static func testTranscriptImportPersistsNoMessageContent() {
+        withSelfTestTempDir("token-ingest-privacy") { dir in
+            do {
+                let root = dir.appendingPathComponent("projects")
+                try buildTranscriptFixture(in: root, modified: Date().addingTimeInterval(-3600))
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let stats = try TranscriptImporter.sync(dbPath: dbPath, root: root.path, fileBudget: 0)
+
+                expect(!stats.summary.contains(transcriptContentMarker),
+                       "the logged summary line must not echo transcript content")
+
+                // Scan the raw database, including any sidecar journal — the
+                // marker must not be anywhere in the bytes this feature wrote.
+                let marker = Data(transcriptContentMarker.utf8)
+                for suffix in ["", "-wal", "-journal"] {
+                    let path = dbPath + suffix
+                    guard FileManager.default.fileExists(atPath: path),
+                          let bytes = try? Data(contentsOf: URL(fileURLWithPath: path)) else { continue }
+                    expect(bytes.range(of: marker) == nil,
+                           "transcript content must not reach usage.db\(suffix)")
+                }
+
+                // And explicitly: every text column the importer writes.
+                let db = try openDatabase(dbPath, readonly: true)
+                for sql in ["SELECT session_id, project_path, first_message_ts, last_message_ts, parent_session_id FROM token_sessions",
+                            "SELECT session_id, timestamp, model, message_uuid FROM token_usage"] {
+                    for row in try db.prepare(sql) {
+                        for value in row {
+                            guard let text = value as? String else { continue }
+                            expect(!text.contains(transcriptContentMarker),
+                                   "a stored column must not contain transcript content")
+                        }
+                    }
+                }
+            } catch {
+                checks += 1
+                failures.append("transcript privacy test threw: \(error)")
+            }
+        }
+    }
+
+    /// The per-run file budget must defer the remainder rather than drop it:
+    /// a cold fleet host has a five-figure backlog, and draining it over
+    /// several runs is what keeps a single poll cycle from stalling for
+    /// minutes. Newest-first ordering means the recent spend arrives first.
+    private static func testTranscriptImportBudgetDefersRemainder() {
+        withSelfTestTempDir("token-ingest-budget") { dir in
+            do {
+                let root = dir.appendingPathComponent("projects")
+                let baseTime = Date().addingTimeInterval(-7200)
+                try buildTranscriptFixture(in: root, modified: baseTime)
+                // Make one file unambiguously the newest so the ordering
+                // assertion below is about policy, not filesystem luck.
+                let newest = root.appendingPathComponent("-home-fixture-project-b/sess-2.jsonl")
+                try FileManager.default.setAttributes(
+                    [.modificationDate: baseTime.addingTimeInterval(3600)], ofItemAtPath: newest.path)
+
+                let dbPath = dir.appendingPathComponent("usage.db").path
+                let first = try TranscriptImporter.sync(dbPath: dbPath, root: root.path, fileBudget: 1)
+                expectEqual(first.filesRead, 1, "the budget caps files opened per run")
+                expectEqual(first.filesDeferred, 2, "the remainder is deferred, not dropped")
+
+                let db = try openDatabase(dbPath, readonly: true)
+                expectEqual(try db.scalar(
+                    "SELECT COUNT(*) FROM token_sessions WHERE session_id = 'sess-2'") as? Int64, 1,
+                    "the newest transcript is the one imported first")
+
+                let second = try TranscriptImporter.sync(dbPath: dbPath, root: root.path, fileBudget: 0)
+                expectEqual(second.filesRead, 2, "a later run picks up exactly the deferred files")
+                expectEqual(second.filesDeferred, 0, "the backlog drains")
+                let after = try openDatabase(dbPath, readonly: true)
+                expectEqual(try after.scalar("SELECT COUNT(*) FROM token_usage") as? Int64, 4,
+                            "the full tree is imported once the backlog drains")
+            } catch {
+                checks += 1
+                failures.append("transcript budget test threw: \(error)")
+            }
+        }
+    }
+
+    /// A missing transcript tree is a normal state (a host without Claude
+    /// Code), and must surface as a typed, path-redacted error rather than a
+    /// crash or an empty success that hides a misconfigured root.
+    private static func testTranscriptImportMissingRootIsTyped() {
+        withSelfTestTempDir("token-ingest-missing") { dir in
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            let missing = dir.appendingPathComponent("nope/projects").path
+            do {
+                _ = try TranscriptImporter.sync(dbPath: dbPath, root: missing, fileBudget: 0)
+                checks += 1
+                failures.append("a missing transcript root must throw, not report success")
+            } catch let error as TranscriptImporter.ImportError {
+                guard case .rootMissing = error else {
+                    checks += 1
+                    failures.append("a missing root must be .rootMissing, got \(error)")
+                    return
+                }
+                expect(true, "a missing transcript root is reported as .rootMissing")
+            } catch {
+                checks += 1
+                failures.append("a missing root threw the wrong error type: \(error)")
+            }
+        }
+    }
+
+    /// `redactPath` is what keeps a username out of `debug.log` and out of
+    /// `oauth_credentials.last_error`, both for a bare path and for a path
+    /// quoted inside a longer error message.
+    private static func testTranscriptPathRedaction() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        expectEqual(TranscriptImporter.redactPath("\(home)/.claude/projects"),
+                    "~/.claude/projects", "a bare home-relative path collapses to ~")
+        expectEqual(TranscriptImporter.redactPath("unable to open \(home)/.claude-monitor/usage.db (14)"),
+                    "unable to open ~/.claude-monitor/usage.db (14)",
+                    "a path quoted mid-message is redacted too")
+        expectEqual(TranscriptImporter.redactPath("/var/tmp/elsewhere"), "/var/tmp/elsewhere",
+                    "a path outside the home directory is left alone")
+    }
+
+    /// The transcript root honors Claude Code's own `CLAUDE_CONFIG_DIR` and
+    /// the importer's test/escape-hatch override, in that precedence.
+    private static func testTranscriptRootResolution() {
+        expectEqual(TranscriptImporter.defaultTranscriptRoot(environment: [:]),
+                    FileManager.default.homeDirectoryForCurrentUser
+                        .appendingPathComponent(".claude/projects").path,
+                    "the default root is ~/.claude/projects")
+        expectEqual(TranscriptImporter.defaultTranscriptRoot(
+            environment: ["CLAUDE_CONFIG_DIR": "/tmp/cfg"]), "/tmp/cfg/projects",
+            "CLAUDE_CONFIG_DIR moves the root the way Claude Code moves it")
+        expectEqual(TranscriptImporter.defaultTranscriptRoot(environment: [
+            "CLAUDE_CONFIG_DIR": "/tmp/cfg",
+            "CLAUDE_MONITOR_TRANSCRIPT_ROOT": "/tmp/fixture"
+        ]), "/tmp/fixture", "the explicit override wins")
     }
 
     // MARK: - OpenAI import account resolution

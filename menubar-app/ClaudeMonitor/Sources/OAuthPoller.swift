@@ -1576,6 +1576,70 @@ class OAuthPoller: ObservableObject {
         return probed
     }
 
+    // MARK: - Transcript token ingest (#197)
+
+    /// How often the Claude Code transcript importer runs, in seconds.
+    /// Deliberately an order of magnitude slower than the usage poll: the
+    /// usage poll asks an API "how much quota is left *now*", which is only
+    /// useful fresh, whereas token counters are a historical series whose
+    /// consumers (quota calibration, #196) look at hours and days. The scan
+    /// also costs a stat per transcript across a five-figure tree, which is
+    /// not something to repeat every ten minutes for data nobody reads that
+    /// often.
+    var tokenSyncInterval: TimeInterval = 3600  // 1 hour
+
+    private var lastTokenSync: Date?
+    /// A host without Claude Code installed has no transcript tree at all.
+    /// That is a normal steady state, not a fault, so it is said once per
+    /// process instead of every cycle.
+    private var reportedMissingTranscriptRoot = false
+
+    /// Import transcript token counters if the (slow) ingest cadence has
+    /// elapsed. Returns the run's stats, or nil when it was not due or the
+    /// run failed. Call it from the same loop that polls usage — it is cheap
+    /// when not due, and self-throttling when it is.
+    ///
+    /// The import itself runs on a detached task: it is filesystem- and
+    /// SQLite-bound and can take seconds on a cold host, which is exactly the
+    /// kind of work that must not sit on the main actor behind a UI. Only
+    /// `Sendable` values cross the boundary (a path in, counters out).
+    @discardableResult
+    func syncTranscriptTokensIfDue(force: Bool = false) async -> TranscriptImporter.ImportStats? {
+        let now = Date()
+        if !force, let last = lastTokenSync, now.timeIntervalSince(last) < tokenSyncInterval {
+            return nil
+        }
+        // Stamped before the run, not after: a failing or slow import must not
+        // turn into a hot loop that retries on every 30-second tick.
+        lastTokenSync = now
+
+        let path = dbPath
+        do {
+            let stats = try await Task.detached(priority: .utility) {
+                try TranscriptImporter.sync(dbPath: path)
+            }.value
+            flog.info("Transcript token ingest — \(stats.summary)", category: fcat)
+            return stats
+        } catch let error as TranscriptImporter.ImportError {
+            if case .rootMissing = error {
+                if !reportedMissingTranscriptRoot {
+                    reportedMissingTranscriptRoot = true
+                    flog.info("Transcript token ingest: \(error)", category: fcat)
+                }
+                return nil
+            }
+            flog.warning("Transcript token ingest failed: \(error)", category: fcat)
+            return nil
+        } catch {
+            // Redacted because a SQLite open failure can quote the database
+            // path, and that path names a user.
+            flog.warning(
+                "Transcript token ingest failed: \(TranscriptImporter.redactPath("\(error)"))",
+                category: fcat)
+            return nil
+        }
+    }
+
     private func pollWithRetry(_ credential: OAuthCredential, maxRetries: Int = 2) async {
         var retryDelay: UInt64 = 2_000_000_000
 

@@ -12,6 +12,8 @@ enum ClaudeMonitorEntry {
             AccountSyncCLI.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.dropFirst().first == "codex" {
             CodexCLI.main(Array(CommandLine.arguments.dropFirst(2)))
+        } else if CommandLine.arguments.dropFirst().first == "tokens" {
+            TokensCLI.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.dropFirst().first == "selftest" {
             SelfTest.main(Array(CommandLine.arguments.dropFirst(2)))
         } else {

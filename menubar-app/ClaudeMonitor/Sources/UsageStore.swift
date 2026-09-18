@@ -494,6 +494,47 @@ class UsageStore: ObservableObject {
                 token_expires_at TEXT,
                 FOREIGN KEY (account_id) REFERENCES accounts(id)
             );
+            -- Token spend read out of Claude Code's own transcripts by
+            -- `TranscriptImporter` (#197). These two tables are reproduced
+            -- **byte-for-byte** from the pre-v2.0 native host's schema
+            -- (`b9db622^:native-host/claude_monitor_host.cjs:59-91`): a host
+            -- that ran that importer still holds ~85k rows here, and
+            -- `CREATE TABLE IF NOT EXISTS` must therefore leave them exactly
+            -- as they are rather than reshape them. Do not reorder, rename,
+            -- or retype a column in this block — add new ones through
+            -- `addColumnIfMissing` below instead.
+            CREATE TABLE IF NOT EXISTS token_sessions (
+                session_id TEXT PRIMARY KEY,
+                project_path TEXT,
+                first_message_ts TEXT NOT NULL,
+                last_message_ts TEXT,
+                inferred_account_id TEXT,
+                override_account_id TEXT,
+                total_input_tokens INTEGER DEFAULT 0,
+                total_output_tokens INTEGER DEFAULT 0,
+                total_cache_creation_tokens INTEGER DEFAULT 0,
+                total_cache_read_tokens INTEGER DEFAULT 0,
+                message_count INTEGER DEFAULT 0,
+                last_import_ts TEXT,
+                FOREIGN KEY (inferred_account_id) REFERENCES accounts(id),
+                FOREIGN KEY (override_account_id) REFERENCES accounts(id)
+            );
+            CREATE TABLE IF NOT EXISTS token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                model TEXT,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_creation_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                message_uuid TEXT UNIQUE,
+                FOREIGN KEY (session_id) REFERENCES token_sessions(session_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_usage_session ON token_usage(session_id);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_token_sessions_account
+                ON token_sessions(inferred_account_id);
         """)
 
         // Migration: add token_rolled_at to older DBs. `updated_at` can't serve
@@ -541,6 +582,23 @@ class UsageStore: ObservableObject {
         // use explicit column lists, which is what keeps this column host-local.
         addColumnIfMissing(db, table: "accounts",
                            column: "codex_home", definition: "TEXT")
+
+        // Migration (transcript ingest, #197): the Claude session a subagent
+        // transcript belongs to.
+        //
+        // `token_sessions.session_id` is the transcript *file's* key — which
+        // for a top-level transcript already is the session id, but for
+        // `subagents/agent-<hash>.jsonl` is the agent's own file name. Keying
+        // per file is what makes `last_import_ts` a usable per-file
+        // incremental stamp; this nullable column carries the parent session
+        // id those records themselves report, so a future consumer can join
+        // subagent spend onto its session with
+        // `COALESCE(parent_session_id, session_id)` — the key the external
+        // session→account mapping (rjwalters/loom#8059) will use. NULL means
+        // "this row is its own session", which is exactly the state every
+        // pre-#197 row is already in, so nothing has to be backfilled.
+        addColumnIfMissing(db, table: "token_sessions",
+                           column: "parent_session_id", definition: "TEXT")
 
         // Heal rows whose provider is absent/blank — a database edited by an
         // external tool, or one where an earlier ADD COLUMN raced.
