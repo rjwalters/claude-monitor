@@ -352,6 +352,16 @@ struct TokenDataPoint: Identifiable {
     }
 }
 
+/// One day of an account's quota-calibration series (#199, chart
+/// visualization of #198's `quota_calibration_daily`). `tokensPerPoint` is
+/// `rawTokensPerPoint`; a day below `QuotaCalibration.defaultMinPointsForRatio`
+/// has no ratio at all and simply has no point here (never a fabricated 0).
+struct CalibrationDataPoint: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let tokensPerPoint: Double
+}
+
 // `@Published`-driven state is only ever read/written from the main thread
 // today (SwiftUI views on macOS; a single Task-driven headless loop that
 // pumps via `dispatchMain()` on Linux) — @MainActor isolation matches actual
@@ -1497,6 +1507,30 @@ class UsageStore: ObservableObject {
 
         } catch {
             print("Error loading token history: \(error)")
+            return []
+        }
+    }
+
+    /// Per-account `tokens_per_point` history for the calibration chart series
+    /// (#199): one point per UTC day, oldest first. Reads the already-computed
+    /// `quota_calibration_daily` table only — it never recomputes it, matching
+    /// `loadNamedLimitHistory`/`loadTokenHistory`'s read-only role; recompute
+    /// happens on `OAuthPoller`'s slow cadence.
+    // Touches no @Published main-actor state — same rationale as
+    // `loadNamedLimitHistory`.
+    nonisolated func loadCalibrationHistory(for accountId: String, daysBack: Int = 30) -> [CalibrationDataPoint] {
+        do {
+            let rows = try QuotaCalibration.loadSeries(dbPath: dbPath, days: daysBack, scope: .account)
+            return rows
+                .filter { $0.accountId == accountId }
+                .compactMap { row -> CalibrationDataPoint? in
+                    guard let tokensPerPoint = row.rawTokensPerPoint,
+                          let date = QuotaCalibration.parseUTCDay(row.day) else { return nil }
+                    return CalibrationDataPoint(timestamp: date, tokensPerPoint: tokensPerPoint)
+                }
+                .sorted { $0.timestamp < $1.timestamp }
+        } catch {
+            print("Error loading calibration history: \(error)")
             return []
         }
     }
