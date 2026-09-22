@@ -1326,14 +1326,12 @@ gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'
 
 ### If DIRTY: Attempt Automated Rebase
 
-**When a PR has merge conflicts, attempt automated rebase before routing to Doctor.**
-
-This reduces the Doctor→Judge→Merge cycle by handling simple conflicts directly.
+**When a PR has merge conflicts, attempt automated rebase before routing to
+Doctor** — this reduces the Doctor→Judge→Merge cycle for simple conflicts.
 
 **Both `gh pr edit` fallback writes below are verdict-label writes** — run the
-Verdict-Time CAS Recheck immediately before each one (see "Verdict-Time CAS
-Recheck" above) and abort instead of writing if it finds your claim lost or
-another Judge's verdict already landed.
+Verdict-Time CAS Recheck immediately before each (see above) and abort instead
+of writing if your claim is lost or another Judge's verdict already landed.
 
 ```bash
 PR_NUMBER=<number>
@@ -1342,8 +1340,7 @@ MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateSta
 if [ "$MERGE_STATE" = "DIRTY" ]; then
     echo "PR has merge conflicts - attempting automated rebase"
 
-    # Checkout PR branch (worktree-aware — see "PR Branch Isolation" and
-    # "Worktree-Aware Code Access")
+    # Checkout PR branch (worktree-aware — see "PR Branch Isolation")
     ISSUE_NUM=$(gh pr view $PR_NUMBER --json headRefName --jq '.headRefName' | sed 's/feature\/issue-//')
     if [ -d ".loom/worktrees/issue-${ISSUE_NUM}" ]; then
         cd ".loom/worktrees/issue-${ISSUE_NUM}"
@@ -1359,24 +1356,27 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
         # Fall back to current behavior (see below)
     fi
 
-    # Fetch latest main
     git fetch origin main
+
+    # Commits ahead pre-rebase, for the payload-drop guard below (#8298).
+    PRE_REBASE_AHEAD=$(git rev-list --count origin/main..HEAD)
 
     # Attempt rebase
     if git rebase origin/main; then
-        # Version-bearing-file sync gate (#7168, #7341; largely moot after
-        # #7743): this auto-rebase pushes directly, never through
-        # create-pr.sh, so gate BEFORE the push below, folded into the same
-        # push condition. Under #7743 no PR carries a version-bearing edit,
-        # so a clean rebase lands exactly origin/main's values; if the gate
-        # still fires, this branch itself carries one (usually a pre-#7743
-        # bump commit): never hand-patch the version-bearing files yourself
-        # and never run `version.sh bump` (the printed Fix: predates #7743)
-        # -- fall back to the change request below, naming the file(s) to
-        # revert to origin/main's values.
+        # Version-bearing-file sync gate (#7168/#7341, moot after #7743): gate
+        # BEFORE push since this auto-rebase pushes directly. On failure,
+        # never hand-patch the version-bearing files yourself or run
+        # `version.sh bump` -- fall back below instead.
         GATE_OK=true
         if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
             echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - falling back to change request"
+            GATE_OK=false
+        fi
+        # Payload-drop guard (#8298): rebase succeeded but the tree is now
+        # identical to origin/main, silently dropping this PR's content (only
+        # flagged when the branch had real commits ahead pre-rebase).
+        if [ "$GATE_OK" = true ] && [ "$PRE_REBASE_AHEAD" -gt 0 ] && git diff --quiet origin/main HEAD; then
+            echo "Rebase silently dropped PR payload (empty diff vs origin/main) - falling back to change request"
             GATE_OK=false
         fi
         # Rebase succeeded - push changes
@@ -1387,7 +1387,7 @@ if [ "$MERGE_STATE" = "DIRTY" ]; then
         else
             echo "Push failed - falling back to change request"
             git rebase --abort 2>/dev/null || true
-            # Fall back: apply loom:merge-conflict + loom:changes-requested
+            # Fall back: merge-conflict + changes-requested
             ./.loom/scripts/post-verdict.sh $PR_NUMBER changes-requested "$VERDICT_SHA" --body "$(cat <<'EOF'
 ❌ **Changes Requested - Merge Conflict**
 
@@ -1409,7 +1409,7 @@ EOF
         echo "Rebase failed (complex conflicts) - falling back to change request"
         git rebase --abort
 
-        # Fall back: apply loom:merge-conflict + loom:changes-requested
+        # Fall back: merge-conflict + changes-requested
         ./.loom/scripts/post-verdict.sh $PR_NUMBER changes-requested "$VERDICT_SHA" --body "$(cat <<'EOF'
 ❌ **Changes Requested - Merge Conflict**
 
@@ -1439,6 +1439,7 @@ fi
 | Concurrent push during rebase | `--force-with-lease` fails safely, fall back |
 | Detached HEAD after checkout | Skip rebase, fall back to change request |
 | Rebase succeeds but CI may fail | Continue to evaluation - CI verification handles this |
+| Rebase succeeds but diff vs `origin/main` is empty | Payload-drop guard fires (#8298); fall back to change request |
 
 ### If BEHIND: Attempt Rebase
 
@@ -1447,11 +1448,9 @@ fi
 git fetch origin main
 git rebase origin/main
 
-# Version-bearing-file sync gate (#7168, #7341; moot after #7743) -- see the
-# DIRTY path's gate comment above. If it fires, this branch carries its own
-# version-bearing edit: never hand-patch VERSION/CLAUDE.md/etc. and never run
-# `version.sh bump` (the printed Fix: predates #7743) -- abort the push and
-# request changes naming the file(s) to revert to origin/main's values.
+# Version-bearing-file sync gate (#7168/#7341, moot after #7743) -- see
+# DIRTY path's gate above. On failure, abort and request changes naming
+# the file(s) to revert to origin/main's values.
 if [ -x ./.loom/scripts/version-check-gate.sh ] && ! ./.loom/scripts/version-check-gate.sh --fix-hint "then push."; then
   echo "Version-bearing files out of sync after rebase (see BLOCKER:/Fix: above) - aborting push"
   exit 1
@@ -2473,13 +2472,11 @@ Include a "Test Execution" section in your evaluation comment:
 |----------|---------------|
 | No test plan in PR | Note absence in evaluation; don't block approval |
 | Test plan requires manual observation | Flag as "not executed" with reason |
-| Test step involves long-running process (>2 min) | Skip with explanation |
 | Test step is unclear or ambiguous | Ask for clarification in change request |
-| Test plan references external services | Skip with explanation |
 | All test plan steps are observation-only | Document that none were automatable |
 | Test plan step fails | Report the failure; use judgment on whether to block approval |
 
-**Important:** Test plan execution supplements the evaluation — it is not a blocking requirement. The Judge should use judgment about whether test plan failures warrant requesting changes or are acceptable with a note. **The one carve-out is the next subsection**: for a PR touching browser-driving / scraper / DOM-parsing code, **or** one whose linked issue reports an "X was silently dropped / missed / not observed" failure (#6883), the live-verification evidence described there *is* blocking.
+**Important:** Test plan execution supplements the evaluation — it is not a blocking requirement; use judgment about whether a failure warrants requesting changes or is acceptable with a note. **The one carve-out is the next subsection**, whose live-verification evidence *is* blocking whenever either of its two triggers fires.
 
 ### Live Verification and the Circular-Fixture Smell
 
@@ -2630,12 +2627,9 @@ restores exactly the silent close it exists to prevent.
 
 Builder's PR template (`builder-pr.md` § "Test-First Discipline") asks every
 PR touching executing code to carry a `TDD:` line in its `## Test Plan`
-section. This is the in-Builder half of the maker/checker pattern adapted
-from damusix/atomic-claude (#5849, ADR-0015
-`docs/adr/0015-builder-test-first-checkpoint.md`) — Judge's job here is the
-**checker** half: re-verify the claim against the diff rather than trust it,
-the same way `atomic-reviewer.md` treats an implementer's unverified test
-claim as a hard bug when it doesn't match reality.
+section (#5849, ADR-0015 `docs/adr/0015-builder-test-first-checkpoint.md`).
+That is the maker half of the maker/checker pattern; you are the **checker** —
+re-verify the claim rather than trust it.
 
 **Extracting and checking the claim:**
 
@@ -2645,39 +2639,45 @@ gh pr view <number> --json body --jq '.body' | grep -E '^TDD:'
 
 # If it claims "yes", confirm the referenced path is actually in the diff
 gh pr diff <number> --name-only | grep -F "<path from the TDD: yes line>"
+
+# ...then RUN that test against the merge-base tree; it must FAIL there.
+# Prints VERIFIED / CONTRADICTED / UNRUNNABLE. Recipe: judge-reference.md
+# -> "Merge-Base Run for a `TDD: yes` Claim".
+tdd_merge_base_run "$(git merge-base origin/main HEAD)" "<path>" <test command>
 ```
+
+**Path presence is not verification (#8265).** The grep answers *"did a test
+file with that name change?"*, never *"does that test fail without the fix?"* —
+the only thing `TDD: yes` asserts. A test in the diff can still be vacuous,
+tautological, exercise a mirror of the logic defined inside the test file
+itself, or assert the buggy behavior; one ran 189/189 green at a merge base
+where its own grep target had zero occurrences.
 
 **Verdict table:**
 
-| `TDD:` line | Diff evidence | Judge action |
+| `TDD:` line | Evidence | Judge action |
 |---|---|---|
 | Absent entirely | — | **Advisory only.** Note the absence in the evaluation comment; do not block. |
 | `no — <reason>` | Reason plausible for this diff (docs/config-only, refactor with pre-existing coverage, etc.) | **Advisory only.** Accept, do not block. |
-| `no — <reason>` | Reason implausible (diff clearly adds new behavior with no pre-existing coverage and no stated exemption reason holds up) | Use judgment — same as any other unconvincing PR claim; typically a non-blocking note unless it signals a real gap in test coverage worth its own "Testing" finding. |
-| `yes — <path>` | Referenced path **is** in the changed-files list | Accept as verified — no further action needed. |
-| `yes — <path>` | Referenced path is **not** in the changed-files list, or no test file changed in the diff at all | **Blocking.** Request changes: the claim is contradicted by the diff, the same class of finding as any other inaccurate PR-description claim (e.g. a checked acceptance-criteria box that isn't actually done). |
+| `no — <reason>` | Reason implausible (diff clearly adds new behavior, no pre-existing coverage) | Use judgment, as with any unconvincing PR claim; typically a non-blocking note unless it signals a real coverage gap worth its own "Testing" finding. |
+| `yes — <path>` | Path **is** in the changed-files list **and** the test **fails** at the merge base, for the reason the fix addresses | **Accept as verified.** |
+| `yes — <path>` | Path is in the diff but the test **passes** at the merge base | **Blocking.** Contradicted, same class as a path missing from the diff: a test that passes on the unfixed tree did not drive the fix. Ask for it to be tightened until it fails there. |
+| `yes — <path>` | Path is in the diff but the test **cannot be run in isolation** (harness/env limit, live forge, unportable fixture) | **Advisory — say so explicitly** in the verdict, naming what blocked the run. Never write it up as verified; silent acceptance is the hole this row closes. |
+| `yes — <path>` | Referenced path is **not** in the changed-files list, or no test file changed at all | **Blocking.** The claim is contradicted by the diff — same class as any other inaccurate PR-description claim (e.g. a checked acceptance-criteria box that isn't done). |
 
-**Why this split (not a single advisory/blocking toggle):** a missing line or
-a plausible exemption costs nothing to accept — this checkpoint would
-otherwise punish design/investigation/docs PRs (like the one that introduced
-it) that have no code to test-first. A **contradicted** `yes` claim is
-different in kind: it's a misrepresentation, not an absence of discipline,
-and blocking on it is cheap (comparing one claimed path against the actual
-diff) and closes exactly the self-report gap the maker/checker pattern
-targets. Full rationale: ADR-0015.
-
-**This does not replace the "Testing" criteria above** (adequate coverage,
-edge cases, descriptive test names) — it is a narrower, additional check
-specifically about whether the *stated* TDD claim holds up, independent of
-whether the tests themselves are good.
+**Advisory on absence, blocking on contradiction:** a missing line or a
+plausible exemption costs nothing to accept; a false `yes` is a
+misrepresentation, and falsifying it is cheap. Narrower than the "Testing"
+criteria above (coverage, edge cases, naming), not a replacement. Full
+rationale: ADR-0015 §2 and §4.
 
 ## Scoped Test Execution
 
 When running quality checks (step 7), use **scoped test execution** — run only the tests relevant to the changed files — to cut evaluation time while keeping confidence that the changed code is correct.
 
-**The full scoped-test cookbook** (changed-file detection, config-change full-suite trigger, per-language strategies — `pytest-testmon`, `jest --changedSince`, `vitest --changed`, `cargo test -p <crate>` — the full-suite fallback, and the strategy-documentation template) **lives in [`judge-reference.md`](judge-reference.md) → "Scoped Test Execution".** Read and follow it when running step 7.
+**The full scoped-test cookbook** (changed-file detection, config-change full-suite trigger, per-language strategies, the full-suite fallback, the strategy-documentation template, and the merge-base-tree recipe) **lives in [`judge-reference.md`](judge-reference.md) → "Scoped Test Execution".** Read and follow it when running step 7.
 
-**Your environment is not a clean shell (#5388)**: a dispatched sweep/daemon child inherits `LOOM_FORCE_SCOPE=protected` and `LOOM_GUARD_DECISION_LOG=1`, which can flip a repo's own guard-hook test suite away from the *factory-default* behavior it asserts (e.g. a suite named like `test-guard-destructive*.sh`). Before requesting changes on failures from such a suite, check `env | grep -E '^LOOM_(FORCE_SCOPE|GUARD_DECISION_LOG)='` and re-run with `env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <command>` if either is set — see `.loom/docs/guard-hooks.md` → "Known consequence".
+**Your environment is not a clean shell (#5388)**: a dispatched sweep/daemon child inherits `LOOM_FORCE_SCOPE=protected` and `LOOM_GUARD_DECISION_LOG=1`, which can flip a guard-hook suite (e.g. `test-guard-destructive*.sh`) away from the *factory-default* behavior it asserts. Before requesting changes on such a failure, re-run with `env -u LOOM_FORCE_SCOPE -u LOOM_GUARD_DECISION_LOG <command>` — see `.loom/docs/guard-hooks.md` → "Known consequence".
 
 ## Feedback Style
 
@@ -2728,6 +2728,12 @@ No mechanical check enforces this — grepping verdicts for unsourced claims
 would false-positive constantly on ordinary review prose. The bar is a
 habit: before writing a sentence that states a fact about code or behavior,
 ask whether you ran something to know it, and say so either way.
+
+**A role-prompt or operator-dispatch-brief PR is a related, flaggable case**:
+one that names neither the pressure-test scenario it was run against nor
+which existing rules were checked in the conflict audit is missing
+verification for the same reason an unmeasured claim above is — see
+`.loom/docs/role-prompt-authoring.md` → "Verification".
 
 ## Handling Minor Concerns
 
