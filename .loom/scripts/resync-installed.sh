@@ -51,6 +51,14 @@
 #   .loom/runtimes/         <- defaults/runtimes/         (recursive; BACKFILLED if absent, #4688)
 #   .loom/bin/              <- defaults/.loom/bin/        (recursive; live consumer CLI)
 #   .claude/commands/loom/  <- defaults/.claude/commands/loom/ (recursive)
+#   .agents/skills/         <- defaults/.agents/skills/       (recursive; BACKFILLED if
+#                                                              absent like .loom/runtimes/
+#                                                              above, #8673 — MARKER-GATED,
+#                                                              not a plain resync_tree(): a
+#                                                              destination SKILL.md missing
+#                                                              the `<!-- loom-managed-skill -->`
+#                                                              marker is left alone and
+#                                                              logged, see resync_agent_skills())
 #   .claude/README.md       <- defaults/.claude/README.md      (single file, #5264)
 #   .github/CONFIGURATION.md <- defaults/.github/CONFIGURATION.md (single file, #5264)
 #   .loom/biome.jsonc       <- defaults/.loom/biome.jsonc      (single file, BACKFILLED
@@ -768,6 +776,12 @@ LABEL_CHECK_BROKEN=0
 # unrunnable is not a clean bill of health, even though the sync itself worked.
 GUARD_CHECK_BROKEN=0
 
+# The ownership marker every `loom-daemon generate-agent-skills`-produced
+# SKILL.md carries (issue #8673) — see resync_agent_skills() below. Kept as a
+# literal here rather than sourced from the Rust `agent_skills::MARKER`
+# constant: this script must run on a bare checkout with no built binary.
+AGENT_SKILL_MARKER="<!-- loom-managed-skill -->"
+
 IGNORE_FILE="$WRITE_ROOT/.loom/resync-ignore"
 
 # #6515: every distinct "$rel" ever checked against is_ignored (the "did you
@@ -1012,17 +1026,265 @@ removed_line_count() {
         2>/dev/null | wc -l | tr -d '[:space:]'
 }
 
-# dst_diverged_from_resync_lineage <dst>
-#   True (0 / success) when $dst's most recent commit (in the checkout it
-#   physically lives in — WRITE_ROOT, which is either the primary checkout or
-#   a #6106 staging worktree; either way a linked worktree of the SAME repo,
-#   so both share one object database and history) is anything OTHER than a
-#   routine resync commit — i.e. this installed copy has diverged from pure
-#   upstream lineage and needs protecting. False (1) when the last commit WAS
-#   a resync, or when $dst has no git history at all (nothing to protect, so
-#   never gates).
+# ---------- content-based lineage proof (#8676) ----------
+#
+# The subject heuristic above answers "who last TOUCHED this file", which is
+# only a proxy for the question that actually matters: "is this installed
+# content something Loom's own tooling put here, or a local fix?". The proxy
+# is wrong for every file that has not been touched since the repo's ORIGINAL
+# install, because that install's commit subject is whatever the installing
+# human typed. Real fleet examples, none of which match any alternative above:
+#
+#     tooling: install Repo Skills and Loom into the map repo
+#     Upgrade Loom to 0.18.0 (resync installed surfaces + role prompts)
+#     Install Loom orchestration (quick install from rjwalters/loom@cd4ab46e)
+#
+# So the first time upstream EDITED such a file, the old upstream text being
+# replaced was read as "lines unique to the installed copy" and the update was
+# blocked as a phantom local fix. #8676's incident: commit 25fbc1bb3 renamed
+# the jq variable `end` to `range_end` in scripts/archive-transcripts.sh for jq
+# 1.6 compatibility, and every repo on an older install reported that legitimate
+# fix blocked, each needing a hand-run --force. (Named without the `--arg` flag
+# prefix on purpose: test-jq-reserved-word-args.sh is a repo-wide `git grep` for
+# that literal shape in `*.sh` and cannot tell a comment from a live binding.)
+#
+# Decide by CONTENT first. If the installed file is byte-identical to its
+# source counterpart as that stood at the version this repo currently has
+# installed, then every byte of it came from a known upstream release and
+# there is no local fix to protect — whatever the last commit's subject says.
+# The installed version comes from .loom/install-metadata.json (loom_commit,
+# re-stamped by restamp_metadata() on every successful resync, else a
+# v<loom_version> tag) resolved in SOURCE_ROOT, the source checkout
+# resolve_defaults() already located.
+#
+# That exact-version comparison alone is not enough, because the RECORDED
+# version drifts ahead of the installed bytes: restamp_metadata() rewrites
+# loom_commit to the source HEAD on every non-dry run and runs BEFORE the
+# blocked-file exit, so the very run that blocks a file also records a version
+# whose content that file no longer matches. So the content proof accepts any
+# revision of that path reachable from the recorded version, not just the
+# recorded one — see dst_matches_any_ancestor_of_lineage_ref() below.
+#
+# This is strictly a NARROWING of the gate: it can only ever turn a BLOCK into
+# an update, never the reverse, and only on positive proof of pure upstream
+# lineage. Anything that makes the proof unobtainable — SOURCE_ROOT is not a
+# git checkout (tarball / vendored source), the recorded commit is absent from
+# it (never fetched, GC'd, shallow clone), no matching tag, missing or
+# "unknown" metadata, an unresolvable source path — falls straight through to
+# the subject heuristic and behaves exactly as it did before #8676. None of
+# Loom's installers clone shallowly today (`scripts/install-loom.sh` and
+# `install.sh` both do a full clone), so on a normal fleet host the recorded
+# short sha resolves and this fallback is the exception rather than the rule.
+#
+# The one local edit this cannot tell from upstream content is a deliberate
+# REVERT of an installed file to an older upstream revision of itself. That is
+# accepted: #7864 protects hand-written fixes that upstream does not have, and
+# resync's whole contract is to carry an installed surface forward to the
+# current release, so pinning an older upstream revision through this guard was
+# never the supported mechanism (.loom/resync-ignore is, and still
+# short-circuits ahead of this gate entirely).
+#
+# Deliberately NOT paired with a widened RESYNC_COMMIT_SUBJECT_RE. Teaching the
+# regex the hand-typed subjects above would mean matching free-form prose,
+# which is the misclassification #8098 removed; worse, it points the wrong way
+# — a subject like "Upgrade Loom to 0.18.0 (...)" that ALSO carried a hand fix
+# would become "routine" and be silently overwritten, the exact #7864 failure.
+# The one forward-looking half of that idea is already true: the only installer
+# path that commits installed surfaces (scripts/install/create-pr.sh) emits
+# `chore(loom): Install Loom <v> orchestration framework`, which the regex
+# already matches. Historical hand-typed subjects are what this content check
+# is for, and it handles them without weakening anything.
+
+# Resolved at most once per run (the answer cannot change mid-run) — "" until
+# INSTALLED_LINEAGE_RESOLVED flips to 1, and "" afterwards means unresolvable.
+INSTALLED_LINEAGE_REF=""
+INSTALLED_LINEAGE_RESOLVED=0
+
+# read_install_metadata_field <field>
+#   First non-empty string value of "<field>" in the installed metadata,
+#   preferring the tree the destination files themselves live in (WRITE_ROOT,
+#   i.e. the #6106 staging worktree when --output is in play) and falling back
+#   to the primary checkout. Deliberately sed-based, like resolve_defaults()
+#   above: this must work before/without jq or python3.
+read_install_metadata_field() {
+    local field="$1" meta value
+    for meta in "$WRITE_ROOT/.loom/install-metadata.json" "$REPO_ROOT/.loom/install-metadata.json"; do
+        [[ -f "$meta" ]] || continue
+        value="$(sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$meta" 2>/dev/null | head -1)"
+        if [[ -n "$value" ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# resolve_installed_lineage_ref
+#   0 when INSTALLED_LINEAGE_REF names a commit in SOURCE_ROOT that the
+#   installed surfaces were synced from; 1 when no such commit can be resolved.
+resolve_installed_lineage_ref() {
+    if [[ "$INSTALLED_LINEAGE_RESOLVED" -eq 1 ]]; then
+        [[ -n "$INSTALLED_LINEAGE_REF" ]]
+        return
+    fi
+    INSTALLED_LINEAGE_RESOLVED=1
+    INSTALLED_LINEAGE_REF=""
+
+    git -C "$SOURCE_ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 1
+
+    local commit version candidate
+    commit="$(read_install_metadata_field loom_commit || true)"
+    version="$(read_install_metadata_field loom_version || true)"
+
+    local candidates=()
+    [[ -n "$commit" ]] && candidates+=("$commit")
+    # Both spellings: Loom tags releases `vX.Y.Z`, but a source checkout of a
+    # fork/mirror may carry the bare version instead.
+    [[ -n "$version" ]] && candidates+=("v$version" "$version")
+
+    for candidate in ${candidates[@]+"${candidates[@]}"}; do
+        # restamp_metadata() writes the literal string "unknown" when it cannot
+        # read the source HEAD; never treat that as a ref.
+        [[ "$candidate" == "unknown" || "$candidate" == "vunknown" ]] && continue
+        if git -C "$SOURCE_ROOT" rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null 2>&1; then
+            INSTALLED_LINEAGE_REF="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# source_rel_path <src>
+#   $src's path relative to SOURCE_ROOT, with symlinks resolved, or "" (and a
+#   non-zero status) when it cannot be expressed that way. Source-side symlinks
+#   are real here: all of defaults/roles/*.md link to ../.claude/commands/loom/
+#   (#5222) and resync_tree() walks them with `find -L`, so without this a
+#   git lookup would fetch the link's TARGET PATH as its blob rather than the
+#   file's content. Resolution is one hop, not a chain — a deeper chain is left
+#   unresolved (falls back to the subject heuristic) rather than guessed at.
+#   `cd`+`pwd -P` rather than `readlink -f`, which is not portable to BSD/macOS.
+source_rel_path() {
+    local src="$1" dir base phys target root
+    dir="$(cd "$(dirname "$src")" 2>/dev/null && pwd -P)" || return 1
+    base="$(basename "$src")"
+    phys="$dir/$base"
+    if [[ -L "$phys" ]]; then
+        target="$(readlink "$phys" 2>/dev/null)" || return 1
+        [[ -n "$target" ]] || return 1
+        case "$target" in
+            /*) phys="$target" ;;
+            *)  dir="$(cd "$dir/$(dirname "$target")" 2>/dev/null && pwd -P)" || return 1
+                phys="$dir/$(basename "$target")" ;;
+        esac
+        [[ -L "$phys" ]] && return 1
+    fi
+    root="$(cd "$SOURCE_ROOT" 2>/dev/null && pwd -P)" || return 1
+    [[ "$phys" == "$root/"* ]] || return 1
+    printf '%s' "${phys#"$root/"}"
+}
+
+# dst_matches_lineage_ref_exactly <rel> <dst>
+#   True (0) when $dst is byte-identical to <rel>'s content at exactly
+#   INSTALLED_LINEAGE_REF. The common case, and a single object lookup.
+dst_matches_lineage_ref_exactly() {
+    local rel="$1" dst="$2"
+    # `<rev>:./<path>` is resolved relative to the -C directory, so this stays
+    # correct even when SOURCE_ROOT is a subdirectory of its git repo.
+    # cat-file -e first so a missing path is distinguished from empty content
+    # (a failed `git show` prints nothing, which `cmp` would call equal to an
+    # empty destination file).
+    git -C "$SOURCE_ROOT" cat-file -e "${INSTALLED_LINEAGE_REF}:./${rel}" 2>/dev/null || return 1
+    git -C "$SOURCE_ROOT" show "${INSTALLED_LINEAGE_REF}:./${rel}" 2>/dev/null \
+        | cmp -s - "$dst" 2>/dev/null
+}
+
+# dst_matches_any_ancestor_of_lineage_ref <rel> <dst>
+#   True (0) when $dst is byte-identical to <rel>'s content at ANY commit
+#   reachable from INSTALLED_LINEAGE_REF — i.e. the installed bytes are some
+#   upstream revision of this very path, not necessarily the recorded one.
+#
+#   Needed because the recorded version DRIFTS AHEAD of the installed bytes.
+#   restamp_metadata() rewrites loom_commit to the source HEAD on every non-dry
+#   run, and it runs BEFORE the blocked-file exit — so the very run that blocks
+#   a file also records a version whose content that file no longer matches.
+#   One blocked run is therefore enough to make the exact-ref rung above fail
+#   forever after, which is precisely the state #8676's 23 fleet repos are
+#   already in: they observed the block, and any `loom update` since stamped
+#   their metadata past the upstream commit that caused it. Without this rung
+#   the fix would only help repos that had not yet run a non-dry resync.
+#
+#   Reachability is anchored at INSTALLED_LINEAGE_REF rather than the source
+#   HEAD so "upstream content this repo could actually have received" stays the
+#   claim being proved; a revision that exists only on some unrelated branch, or
+#   only after the recorded version, proves nothing about how these bytes got
+#   here. Comparison is by blob id via one batched cat-file, so the cost is two
+#   processes and a path-filtered walk (~45ms on a 5k-commit history) on the
+#   rare file that is about to be blocked.
+dst_matches_any_ancestor_of_lineage_ref() {
+    local rel="$1" dst="$2" dst_blob commits hits
+    # --no-filters keeps this consistent with the exact rung, which compares
+    # against `git show` output (canonical, unfiltered repo content). A repo
+    # with a content filter on this path simply fails to match and falls
+    # through to the subject heuristic, which is the conservative direction.
+    dst_blob="$(git -C "$SOURCE_ROOT" hash-object --no-filters -- "$dst" 2>/dev/null)" || return 1
+    [[ -n "$dst_blob" ]] || return 1
+    commits="$(git -C "$SOURCE_ROOT" rev-list "$INSTALLED_LINEAGE_REF" -- "$rel" 2>/dev/null)" || return 1
+    [[ -n "$commits" ]] || return 1
+    # `grep -c`, NOT `grep -q`: this script runs under `set -o pipefail` (line
+    # 368), and `grep -q` exits the instant it matches, which SIGPIPEs the
+    # upstream `git cat-file` into status 141 and makes pipefail report the
+    # whole pipeline as failed — turning a SUCCESSFUL lineage proof into a
+    # phantom block, the very bug class #8676 is about. It only bites once the
+    # id list outgrows the pipe buffer, so it would have passed every small
+    # fixture here and surfaced only on a long-lived path. `-c` reads to EOF,
+    # so no early exit and no SIGPIPE; it exits 1 on zero matches, hence the
+    # `|| true` and the explicit count test.
+    #
+    # `missing`/`dangling` lines from cat-file cannot collide with an object id
+    # under -x (whole-line) matching, so an absent path is simply not a match.
+    hits="$(
+        while IFS= read -r commit; do
+            [[ -n "$commit" ]] && printf '%s:./%s\n' "$commit" "$rel"
+        done <<< "$commits" \
+            | git -C "$SOURCE_ROOT" cat-file --batch-check='%(objectname)' 2>/dev/null \
+            | grep -cxF "$dst_blob"
+    )" || true
+    [[ "$hits" =~ ^[0-9]+$ ]] && [[ "$hits" -gt 0 ]]
+}
+
+# dst_matches_installed_version <src> <dst>
+#   True (0) when $dst's bytes are provably an upstream revision of $src at or
+#   before the installed version — positive proof of pure upstream lineage.
+#   False (1) whenever no such revision matches OR the comparison cannot be
+#   made at all.
+dst_matches_installed_version() {
+    local src="$1" dst="$2" rel
+    [[ -n "$src" && -f "$dst" ]] || return 1
+    resolve_installed_lineage_ref || return 1
+    rel="$(source_rel_path "$src")" || return 1
+    [[ -n "$rel" ]] || return 1
+    dst_matches_lineage_ref_exactly "$rel" "$dst" && return 0
+    dst_matches_any_ancestor_of_lineage_ref "$rel" "$dst"
+}
+
+# dst_diverged_from_resync_lineage <dst> [src]
+#   True (0 / success) when this installed copy has diverged from pure upstream
+#   lineage and needs protecting. False (1) when it has not.
+#
+#   Two independent ways to be "not diverged", checked in this order:
+#     1. #8676: $dst is byte-identical to some revision of $src at or before the
+#        installed version — proof by content that upstream put every byte there.
+#     2. $dst's most recent commit (in the checkout it physically lives in —
+#        WRITE_ROOT, which is either the primary checkout or a #6106 staging
+#        worktree; either way a linked worktree of the SAME repo, so both share
+#        one object database and history) IS a routine install/resync commit,
+#        or $dst has no git history at all (nothing to protect, so never gates).
+#
+#   $src is optional so the function still answers usefully for a caller that
+#   only holds the destination path; omitting it just skips check 1.
 dst_diverged_from_resync_lineage() {
-    local dst="$1" subject
+    local dst="$1" src="${2:-}" subject
+    dst_matches_installed_version "$src" "$dst" && return 1
     subject="$(git -C "$WRITE_ROOT" log -1 --format='%s' -- "$dst" 2>/dev/null)"
     [[ -n "$subject" ]] || return 1
     [[ "$subject" =~ $RESYNC_COMMIT_SUBJECT_RE ]] && return 1
@@ -1153,7 +1415,7 @@ sync_one() {
     if [[ "$verb_past" == "updated" ]]; then
         local removed=0
         removed="$(removed_line_count "$src" "$dst")"
-        if [[ "${removed:-0}" -gt 0 ]] && dst_diverged_from_resync_lineage "$dst"; then
+        if [[ "${removed:-0}" -gt 0 ]] && dst_diverged_from_resync_lineage "$dst" "$src"; then
             if [[ "$FORCE" -eq 1 ]]; then
                 warn "$rel: forcing past local-divergence protection — this overwrite removes $removed line(s) present only in the installed copy (--force)."
             else
@@ -1298,6 +1560,42 @@ resync_tree() {
             continue
         fi
         sync_one "$src" "$dst_dir/$rel" "$report_prefix/$rel"
+    done < <(find -L "$src_dir" -type f -print0 2>/dev/null | sort -z)
+}
+
+# ---------- .agents/skills/ marker-gated resync (#8673) ----------
+#
+# Every `defaults/.agents/skills/loom-<name>/SKILL.md` is generated by
+# `loom-daemon generate-agent-skills` and carries $AGENT_SKILL_MARKER
+# immediately after its YAML frontmatter — the cross-vendor skill-discovery
+# surface Codex, Kimi Code, Mistral Vibe, and Grok read natively
+# (`runtime-adapters.md` §5). resync_tree()'s ordinary rule ("Loom owns a path
+# iff defaults/ ships it") is not precise enough here: a consumer could
+# author their OWN `.agents/skills/loom-custom/SKILL.md`, or hand-edit a
+# generated one and strip the marker to deliberately detach it from
+# generation — either way that destination file must never be silently
+# overwritten. resync_agent_skills() pre-filters on the marker before
+# deferring to sync_one() for everything else (the ignore-list, symlink
+# guard, staged atomic write, and #7864 local-divergence protection for files
+# that DO carry the marker and have diverged some other way).
+resync_agent_skills() {
+    local src_dir="$1" dst_dir="$2"
+    [[ -d "$src_dir" ]] || return 0
+    info "Resyncing ${dst_dir#"$WRITE_ROOT/"}/ from ${src_dir#"$REPO_ROOT/"}/ (marker-gated, #8673) ..."
+    local src rel dst first_line
+    while IFS= read -r -d '' src; do
+        rel="${src#"$src_dir/"}"
+        dst="$dst_dir/$rel"
+        if [[ -f "$dst" && ! -L "$dst" ]]; then
+            first_line=""
+            IFS= read -r first_line < "$dst" 2>/dev/null || true
+            if [[ "$first_line" != "$AGENT_SKILL_MARKER" ]] && ! grep -qF "$AGENT_SKILL_MARKER" "$dst" 2>/dev/null; then
+                note "  ${YELLOW}skipped${NC}   agents-skills/$rel ${YELLOW}(no $AGENT_SKILL_MARKER marker — consumer-authored or detached from generation)${NC}"
+                N_SKIPPED=$((N_SKIPPED + 1))
+                continue
+            fi
+        fi
+        sync_one "$src" "$dst" "agents-skills/$rel"
     done < <(find -L "$src_dir" -type f -print0 2>/dev/null | sort -z)
 }
 
@@ -1571,6 +1869,11 @@ fi
 if [[ -d "$WRITE_ROOT/.claude/commands/loom" ]]; then
     resync_tree "$DEFAULTS_DIR/.claude/commands/loom" "$WRITE_ROOT/.claude/commands/loom" "commands/loom" ".claude/commands/loom"
 fi
+# `.agents/skills/` (#8673): deliberately UNCONDITIONAL, like `.loom/runtimes/`
+# above (#4688) — it is a provisioning gap for any repo installed before this
+# surface existed, not an opt-in the consumer must already have. Marker-gated
+# (see resync_agent_skills() above), never a plain resync_tree() call.
+resync_agent_skills "$DEFAULTS_DIR/.agents/skills" "$WRITE_ROOT/.agents/skills"
 
 # ---------- single-file consumer-install docs (#5264) ----------
 #
