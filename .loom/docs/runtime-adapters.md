@@ -1546,6 +1546,153 @@ name host filesystem paths (`LOOM_PI_BIN`, `LOOM_OPENCODE_BIN`, `LOOM_DAEMON_BIN
 container has no business holding a Claude token, and the Claude token pool is
 not mounted into it at all.
 
+#### The credential boundary: placeholder + egress proxy (issue #8674)
+
+By-name forwarding keeps the key out of argv and off the container's
+filesystem, but **not out of the container**: the value is in the process
+environment, so `env`, `/proc/self/environ` or a shell hook inside the box can
+read it. Forge text is untrusted input by
+[`untrusted-external-content.md`](untrusted-external-content.md), and a live
+pooled account credential is the highest-value thing that input can reach.
+
+Credential substitution moves the boundary: the container gets a **per-launch
+placeholder** and its provider traffic is pointed at a host-side proxy that
+swaps the placeholder for the real credential on the way out. The real value
+never crosses the container boundary in any form.
+
+```json
+{
+  "runtimes": {
+    "containment": { "native": "ephemeral", "credentialProxy": true }
+  }
+}
+```
+
+| Precedence | Source |
+|---|---|
+| 1 (highest) | `LOOM_NATIVE_CREDENTIAL_PROXY` (`1`/`true`/`yes` enables; anything else disables) |
+| 2 | `.loom/config.json` → `runtimes.containment.credentialProxy` |
+| 3 (default) | off — the credential is forwarded by name, exactly as above |
+
+A **separate switch** from `runtimes.containment.native`, on purpose: turning
+containment on must not silently change how credentials reach a harness, and a
+provider whose path is not yet verified end to end has to be able to keep
+running contained on plain env-passthrough.
+
+**Which providers are proxied: per-profile opt-in.** A profile is proxied only
+when it declares a `credentialProxy` block. Every profile without one — which
+is every bundled profile except the `example-proxied-anthropic` template —
+stays env-passthrough even with the flag on.
+
+```json
+"credentialProxy": {
+  "upstream": "https://api.anthropic.com",
+  "header": "authorization-bearer",
+  "baseUrlEnv": ["ANTHROPIC_BASE_URL"]
+}
+```
+
+- `upstream` — the **one** origin this profile's credential may be sent to.
+  Validated at profile-selection time; userinfo, a query and a fragment are
+  refused rather than normalised away.
+- `header` — `authorization-bearer` (Claude Code's `ANTHROPIC_AUTH_TOKEN`
+  shape, and most OpenAI-compatible endpoints) or `x-api-key` (Anthropic's
+  native API-key header).
+- `baseUrlEnv` — the environment variables set inside the container to the
+  proxy's own base URL. A harness that reads its base URL from injected
+  *configuration* rather than the environment cannot be proxied yet.
+
+**What the proxy enforces.**
+
+| Property | Behaviour |
+|---|---|
+| Unknown placeholder | `401 unknown_placeholder`, logged; nothing is forwarded |
+| No credential presented | `401 missing_credential` |
+| Launch closed | `401 closed_launch` — invalidated the instant the container exits |
+| A request naming another host | `403 host_not_pinned`; the upstream is a property of the **record**, never of the request, so there is no open relay |
+| `CONNECT` / `TRACE` | `405` — tunnelling is refused outright |
+| Redirects | never followed: a `302` is how a response would walk the real credential off the pinned origin |
+| Other credential headers | stripped before forwarding, so a second header cannot ride along |
+
+**Placement.** The listener binds loopback and the container reaches it at
+`host.docker.internal` (mapped with `--add-host …:host-gateway`), which is the
+tightest option on Docker Desktop. On Linux `host.docker.internal` resolves to
+the bridge gateway and a loopback bind is *not* reachable there, so the
+listener binds the bridge gateway address instead — reachable by other
+containers on that bridge, which is why the placeholder is a per-launch bearer
+token rather than an ambient allowance: a neighbour without it gets a logged
+401. That bound is narrower than it sounds, though: the container↔proxy hop
+on this path is plaintext HTTP on a shared L2 bridge, and Docker grants
+`CAP_NET_RAW` by default, so a co-resident container can sniff (or ARP-spoof
+its way into) that hop and obtain the live placeholder rather than merely
+fail to guess it — the same hop also carries prompt and response bodies in
+the clear. The blast radius stays bounded (the real credential never crosses
+this hop, the pin confines use to one origin, and `close_all()` kills the
+placeholder at container exit), but on Linux the peer set is wider than
+loopback. `LOOM_EGRESS_PROXY_BIND` overrides the choice.
+
+**Filesystem, not just environment.** A per-repo API-key pool
+(`<workspace>/.loom/api-keys/`) sits under the read-write workspace mount and
+would be readable inside the container even with a clean environment, so a
+proxied dispatch masks it with an empty, read-only tmpfs. A shared pool
+(`~/.loom/api-keys/`) was never mounted.
+
+**Process shape.** This is the one dispatch path that does not `exec`: the
+listener has to outlive the `docker run`, so the dispatcher stays alive as its
+parent and the placeholder's lifetime is exactly the container's. The child
+keeps the dispatcher's process group, so existing process-group teardown reaps
+both and `--rm` still removes the container.
+
+**Fails closed, never falls back.** Every error in the substitution path is an
+error. A proxy that quietly degraded to env-passthrough would be
+indistinguishable from one that worked; the opt-out is the absent
+`credentialProxy` block, not a runtime fallback.
+
+**Claude's container (issue #8697).** `spawn-claude.sh`'s per-sweep container
+goes through the same proxy, behind its own default-off switch (env
+`LOOM_SWEEP_CREDENTIAL_PROXY` > `runtimes.containment.claudeCredentialProxy` >
+off; no effect unless `runtimes.containment.enabled` is on):
+
+```json
+{ "runtimes": { "containment": { "enabled": true, "claudeCredentialProxy": true } } }
+```
+
+A shell adapter cannot host the listener, so it shells out to `loom-daemon
+worker proxy-exec --docker-workspace <ws>`, which reuses the registry,
+placeholder and listener above and owns the proxy's docker flags. With the
+switch on, the account is selected on the **host**, the `docker run` receives
+`CLAUDE_CODE_OAUTH_TOKEN=<placeholder>` and `ANTHROPIC_BASE_URL=<proxy>` (both
+by name), `<workspace>/.loom/tokens/` and `.loom/api-keys/` are masked with an
+empty tmpfs, and the shared token pool is not mounted. A missing subcommand or
+an unset host credential is an exit-78 refusal, never a plain `docker run`
+with the real token. `proxy-exec` sits between the sweep and the docker client,
+so a signal sent to that one pid does not reach docker; cancellation uses the
+daemon's process-group kill, which does, exactly as on the native path.
+
+Claude Code sends an OAuth token as `Authorization: Bearer` plus an
+`anthropic-beta` list that includes `oauth-2025-04-20`. It sends both to
+`ANTHROPIC_BASE_URL`, so the `authorization-bearer` swap is all an OAuth token
+needs. The beta header passes through unchanged. An env-supplied token has no
+refresh chain.
+
+Three consequences of the proxied Claude path:
+
+- **No mid-sweep rotation.** The pool is not visible inside the container, so
+  `claude-wrapper.sh` cannot rotate to another account. An exhausted account
+  ends the launch instead, and the host pool does not get its bad-mark
+  (#8818).
+- **No survival across a hard daemon stop.** The proxy's lifetime is the
+  launch's. `restart --drain` is unaffected.
+- **Some requests bypass the proxy.** They go straight to `api.anthropic.com`
+  carrying the placeholder, where they fail harmlessly. Examples: telemetry and
+  profile lookups.
+
+**Scope.** Per-launch usage attribution and `429`-driven bad-marking at the
+proxy are follow-ups on #8674. The end-to-end live verification of both a
+Claude-shaped and an API-key-native profile is tracked there too. The automated
+suite covers the swap, the refusals and the dispatch argv, not a real provider
+call.
+
 **Known limitation: file-path credentials are not mounted (#8454).** The
 by-name forwarding above assumes a credential's VALUE is the secret itself —
 correct for every API-key profile that ships bundled today. It is wrong for a
