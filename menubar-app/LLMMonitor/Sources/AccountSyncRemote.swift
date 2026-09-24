@@ -1,6 +1,6 @@
 import Foundation
 
-/// `claude-monitor accounts push|pull` — ssh fan-out built on the existing
+/// `llm-monitor accounts push|pull` — ssh fan-out built on the existing
 /// `AccountSync` export/import plumbing (#188).
 ///
 /// **The whole point is that the bundle never becomes a file.** `export` →
@@ -21,6 +21,12 @@ enum AccountSyncRemote {
     /// `--remote-bin`, which matters more often than it looks: a
     /// non-interactive `ssh HOST <command>` shell does **not** source the
     /// profile that usually puts `~/.local/bin` on `PATH`.
+    ///
+    /// Deliberately still the **pre-rename** name: every 2.x install keeps a
+    /// `claude-monitor` alias, and a peer still on 1.x has only that name, so
+    /// it is the one spelling that resolves on both. Switch to `llm-monitor`
+    /// once the fleet is past 1.x (tracked with the `~/.claude-monitor`
+    /// symlink removal).
     static let defaultRemoteBinary = "claude-monitor"
 
     /// The follow-on step `--then-loom` runs on whichever host received the
@@ -155,7 +161,7 @@ enum AccountSyncRemote {
     }
 
     /// What `--dry-run` runs instead of shipping anything: proves the host is
-    /// reachable and that `claude-monitor` resolves there, while putting **no
+    /// reachable and that `llm-monitor` resolves there, while putting **no
     /// credential on the wire** for a mere preview.
     static func remoteProbeCommand(remoteBinary: String) -> String {
         "\(shellQuote(remoteBinary)) --version"
@@ -168,7 +174,7 @@ enum AccountSyncRemote {
     // MARK: - ssh binary resolution
 
     /// Explicit override, and the seam `selftest` points at a stub `ssh`.
-    static let sshOverrideEnvKey = "CLAUDE_MONITOR_SSH_BIN"
+    static let sshOverrideEnvKey = "LLM_MONITOR_SSH_BIN"
 
     /// First executable `ssh` among: the override, each `PATH` entry, then the
     /// absolute locations ssh ships in. Mirrors `CodexBinary.resolve` — a
@@ -179,7 +185,7 @@ enum AccountSyncRemote {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
     ) -> String? {
-        if let override = environment[sshOverrideEnvKey]?
+        if let override = AppPaths.environment("SSH_BIN", in: environment)?
             .trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
             // A broken override is a configuration mistake worth failing on,
             // not something to paper over with PATH.
@@ -466,7 +472,7 @@ enum AccountSyncRemote {
 
     // MARK: - Shared helpers
 
-    /// `--dry-run` for both verbs: reachability plus "is `claude-monitor`
+    /// `--dry-run` for both verbs: reachability plus "is `llm-monitor`
     /// actually on this host's non-interactive PATH", which is the failure that
     /// bites a fan-out in practice. No bundle is produced and nothing is
     /// written on either side.

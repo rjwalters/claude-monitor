@@ -1,10 +1,10 @@
 import Foundation
 
-/// `claude-monitor zai import|add|list` — register z.ai GLM Coding Plan keys
+/// `llm-monitor zai import|add|list` — register z.ai GLM Coding Plan keys
 /// and show their quota. One-shot, no `--headless` needed, works on Linux.
 ///
 /// Keys are read from `~/.zai/coding-plan-<label>.env` (the chezmoi-managed
-/// directory; `$CLAUDE_MONITOR_ZAI_DIR` overrides it), one `ZAI_API_KEY=…`
+/// directory; `$LLM_MONITOR_ZAI_DIR` overrides it), one `ZAI_API_KEY=…`
 /// line per file. **A key is never printed or logged** — only labels, emails,
 /// and derived percentages.
 ///
@@ -188,7 +188,7 @@ enum ZaiCLI {
         store.loadFromDatabase()
         let accounts = store.accounts.filter { $0.provider == .zai }
         guard !accounts.isEmpty else {
-            print("No z.ai accounts registered. Add them with: claude-monitor zai import")
+            print("No z.ai accounts registered. Add them with: llm-monitor zai import")
             return
         }
         func pct(_ value: Double?) -> String { value.map { String(format: "%.0f%%", $0) } ?? "—" }
@@ -229,13 +229,13 @@ enum ZaiCLI {
 
     private static func printUsage() {
         print("""
-            Usage: claude-monitor zai <subcommand> [options]
+            Usage: llm-monitor zai <subcommand> [options]
 
             Register z.ai (GLM Coding Plan) API keys and show their quota.
 
             Subcommands:
               import [--dir <path>]     Register every coding-plan-<label>.env in the key
-                                        directory (default ~/.zai, or $CLAUDE_MONITOR_ZAI_DIR).
+                                        directory (default ~/.zai, or $LLM_MONITOR_ZAI_DIR).
                                         Each file holds one ZAI_API_KEY=… line; an
                                         "(account: <email>)" header comment names the account.
                                         The app also does this automatically at launch.
@@ -245,7 +245,7 @@ enum ZaiCLI {
               list                      Show each z.ai account's last stored 5h / weekly usage.
 
             Common options:
-              --db <path>               Use this database instead of ~/.claude-monitor/usage.db
+              --db <path>               Use this database instead of ~/.llm-monitor/usage.db
               -h, --help                Show this help
             """)
     }

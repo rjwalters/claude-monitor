@@ -1,28 +1,29 @@
-# systemd unit for claude-monitor headless mode (Linux / Loom hosts).
+# systemd unit for llm-monitor headless mode (Linux / Loom hosts).
 #
 # Install:
-#   sudo cp ClaudeMonitor /usr/local/bin/claude-monitor
-#   cp scripts/claude-monitor.service ~/.config/systemd/user/
+#   sudo cp LLMMonitor /usr/local/bin/llm-monitor
+#   sudo ln -sfn llm-monitor /usr/local/bin/claude-monitor   # pre-2.0 alias
+#   cp scripts/llm-monitor.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
-#   systemctl --user enable --now claude-monitor
+#   systemctl --user enable --now llm-monitor
 #
-# The binary copied to /usr/local/bin/claude-monitor must be built with
+# The binary copied to /usr/local/bin/llm-monitor must be built with
 # `swift build -c release --static-swift-stdlib`; a non-static build fails at
 # startup with "cannot open shared object file" on any host without the Swift
 # toolchain. See README "Build (Linux)".
 #
-# Logs: journalctl --user -u claude-monitor -f
-# (also written to ~/.claude-monitor/debug.log)
+# Logs: journalctl --user -u llm-monitor -f
+# (also written to ~/.llm-monitor/debug.log)
 
 [Unit]
-Description=Claude Monitor headless usage poller
+Description=LLM Monitor headless usage poller
 # No network-online ordering: this is a *user* unit (systemctl --user), and
 # network-online.target only has a provider in the system manager — the
 # ordering would be a silent no-op here. The poller retries transient network
 # errors itself, and Restart=on-failure covers startup before network is up.
 
 [Service]
-ExecStart=/usr/local/bin/claude-monitor
+ExecStart=/usr/local/bin/llm-monitor
 Restart=on-failure
 RestartSec=30
 

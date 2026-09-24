@@ -77,13 +77,13 @@ enum TranscriptImporter {
     /// Root of the transcript tree, honoring the same overrides Claude Code
     /// itself uses, plus a test-only override.
     ///
-    /// * `CLAUDE_MONITOR_TRANSCRIPT_ROOT` — points the importer at a fixture
+    /// * `LLM_MONITOR_TRANSCRIPT_ROOT` — points the importer at a fixture
     ///   tree (used by `selftest`; also an escape hatch for an operator whose
     ///   transcripts live somewhere unusual).
     /// * `CLAUDE_CONFIG_DIR` — Claude Code's own config-dir override.
     /// * otherwise `~/.claude/projects`.
     static func defaultTranscriptRoot(environment: [String: String] = ProcessInfo.processInfo.environment) -> String {
-        if let override = environment["CLAUDE_MONITOR_TRANSCRIPT_ROOT"], !override.isEmpty {
+        if let override = AppPaths.environment("TRANSCRIPT_ROOT", in: environment) {
             return override
         }
         if let configDir = environment["CLAUDE_CONFIG_DIR"], !configDir.isEmpty {
@@ -94,8 +94,7 @@ enum TranscriptImporter {
     }
 
     static var defaultDBPath: String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/usage.db").path
+        AppPaths.databasePath
     }
 
     // MARK: - Results

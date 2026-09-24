@@ -106,8 +106,7 @@ enum QuotaCalibration {
     private static let seedLookbackDays = 1
 
     static var defaultDBPath: String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/usage.db").path
+        AppPaths.databasePath
     }
 
     // MARK: - Cost weights
@@ -870,7 +869,7 @@ enum QuotaCalibration {
     /// change, and an absent key means **unknown**, never zero.
     static let exportSchemaVersion = 1
 
-    /// JSON document for `claude-monitor calibrate --format json`.
+    /// JSON document for `llm-monitor calibrate --format json`.
     ///
     /// Every optional ratio is **omitted** rather than emitted as `null` when
     /// unknown, so a consumer that reaches for a missing key gets nothing
@@ -954,7 +953,7 @@ enum QuotaCalibration {
         "cost_usd_per_point", "weights_version",
     ]
 
-    /// CSV for `claude-monitor calibrate --format csv`. An unknown value is an
+    /// CSV for `llm-monitor calibrate --format csv`. An unknown value is an
     /// **empty field**, never `0` — the CSV analogue of an omitted JSON key.
     static func csv(rows: [DailyRow], now: Date = Date()) -> String {
         let today = utcDayString(now)

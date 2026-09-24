@@ -1,12 +1,12 @@
 #!/bin/bash
 # Build macOS menu bar app for distribution
-# Output: ClaudeMonitor.app bundle
+# Output: LLMMonitor.app bundle
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-APP_DIR="$PROJECT_ROOT/menubar-app/ClaudeMonitor"
+APP_DIR="$PROJECT_ROOT/menubar-app/LLMMonitor"
 BUILD_DIR="$PROJECT_ROOT/build"
 
 echo "Building macOS app..."
@@ -52,13 +52,13 @@ fi
 swift build -c release
 
 # Create app bundle structure
-APP_BUNDLE="$BUILD_DIR/ClaudeMonitor.app"
+APP_BUNDLE="$BUILD_DIR/LLMMonitor.app"
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 # Copy executable
-cp ".build/release/ClaudeMonitor" "$APP_BUNDLE/Contents/MacOS/"
+cp ".build/release/LLMMonitor" "$APP_BUNDLE/Contents/MacOS/"
 
 # Copy app icon
 cp "$APP_DIR/Assets/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/"
@@ -70,13 +70,13 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>ClaudeMonitor</string>
+    <string>LLMMonitor</string>
     <key>CFBundleIdentifier</key>
-    <string>com.claude-monitor.app</string>
+    <string>com.llm-monitor.app</string>
     <key>CFBundleName</key>
-    <string>Claude Monitor</string>
+    <string>LLM Monitor</string>
     <key>CFBundleDisplayName</key>
-    <string>Claude Monitor</string>
+    <string>LLM Monitor</string>
     <key>CFBundleVersion</key>
     <string>1.20.0</string>
     <key>CFBundleShortVersionString</key>
@@ -103,12 +103,12 @@ echo ""
 
 # Create zip for distribution
 cd "$BUILD_DIR"
-rm -f "ClaudeMonitor.zip"
-zip -r "ClaudeMonitor.zip" "ClaudeMonitor.app"
+rm -f "LLMMonitor.zip"
+zip -r "LLMMonitor.zip" "LLMMonitor.app"
 
 echo "Distribution archive:"
-echo "  File: $BUILD_DIR/ClaudeMonitor.zip"
-echo "  Size: $(du -h "ClaudeMonitor.zip" | cut -f1)"
+echo "  File: $BUILD_DIR/LLMMonitor.zip"
+echo "  Size: $(du -h "LLMMonitor.zip" | cut -f1)"
 echo ""
 echo "Note: The app is not signed. Users will need to:"
 echo "  1. Right-click and select 'Open' the first time"

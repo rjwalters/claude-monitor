@@ -1,7 +1,7 @@
 import Foundation
 
 /// Headless-safe account export/import for multi-host sync (issue #16). Reads
-/// and writes `~/.claude-monitor/usage.db` directly through `SQLiteDB.swift` —
+/// and writes `~/.llm-monitor/usage.db` directly through `SQLiteDB.swift` —
 /// no AppKit/SwiftUI/Combine — so it works identically on macOS and Linux.
 ///
 /// Export serializes account identity records plus their OAuth credentials
@@ -75,13 +75,12 @@ enum AccountSync {
         }
     }
 
-    /// `~/.claude-monitor/usage.db`, resolved the same way as
+    /// `~/.llm-monitor/usage.db`, resolved the same way as
     /// `UsageStore`/`OAuthPoller`. Every entry point below takes an explicit
     /// `dbPath` (defaulting to this) so callers — including tests — can point
     /// at an isolated database instead.
     static var defaultDBPath: String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/usage.db").path
+        AppPaths.databasePath
     }
 
     // MARK: - Export
@@ -114,7 +113,7 @@ enum AccountSync {
                 // be a copy of a secret OpenAI rotates on every use — a copy
                 // this export is guaranteed to invalidate the moment it's
                 // imported and refreshed elsewhere. Register a Codex account
-                // per host instead (`claude-monitor codex add --home`).
+                // per host instead (`llm-monitor codex add --home`).
                 guard provider != .openai else { continue }
 
                 let credStmt = try db.prepare("""
@@ -213,7 +212,7 @@ enum AccountSync {
         // `SQLITE_OPEN_CREATE`, and `applySchema` below already exists to bring
         // a pre-migration database up to date. Only the parent directory has to
         // be materialized first, exactly as `UsageStore.ensureDatabase` does,
-        // or SQLite answers `SQLITE_CANTOPEN` for a missing `~/.claude-monitor`.
+        // or SQLite answers `SQLITE_CANTOPEN` for a missing `~/.llm-monitor`.
         // Note `exportBundle` keeps its own `databaseMissing` guard: exporting
         // from a host that has never run the app has nothing to read, and
         // conjuring an empty database there would emit an empty bundle that

@@ -1,6 +1,6 @@
 import Foundation
 
-/// `claude-monitor tokens sync` — the one-shot CLI over `TranscriptImporter`
+/// `llm-monitor tokens sync` — the one-shot CLI over `TranscriptImporter`
 /// (#197). Like `accounts` and `codex`, it is reachable on both macOS and
 /// Linux without `--headless` and without any GUI code, so a headless Loom
 /// host can backfill its transcript token history on demand instead of
@@ -78,7 +78,7 @@ enum TokensCLI {
             print(stats.summary)
             if stats.filesDeferred > 0 {
                 print("\(stats.filesDeferred) file(s) deferred to a later run — "
-                    + "re-run `claude-monitor tokens sync` (or pass --all) to continue the backfill.")
+                    + "re-run `llm-monitor tokens sync` (or pass --all) to continue the backfill.")
             }
             exit(0)
         } catch {
@@ -88,20 +88,20 @@ enum TokensCLI {
 
     private static func printUsage() {
         print("""
-            claude-monitor tokens — import Claude Code transcript token counters
+            llm-monitor tokens — import Claude Code transcript token counters
             into the token_sessions / token_usage tables of usage.db.
 
             Usage:
-              claude-monitor tokens sync [--root <dir>] [--limit <n> | --all] [--db <path>]
+              llm-monitor tokens sync [--root <dir>] [--limit <n> | --all] [--db <path>]
 
             Options:
               --root <dir>   Transcript tree to scan
-                             (default: $CLAUDE_MONITOR_TRANSCRIPT_ROOT, else
+                             (default: $LLM_MONITOR_TRANSCRIPT_ROOT, else
                              $CLAUDE_CONFIG_DIR/projects, else ~/.claude/projects)
               --limit <n>    Maximum transcripts to open this run
                              (default \(TranscriptImporter.defaultFileBudget); newest first)
               --all          No per-run limit — full backfill, may take minutes
-              --db <path>    Database to write (default ~/.claude-monitor/usage.db)
+              --db <path>    Database to write (default ~/.llm-monitor/usage.db)
               --help, -h     Show this help
 
             The scan is incremental: a transcript is opened only when its mtime

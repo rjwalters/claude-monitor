@@ -42,13 +42,13 @@ jobs:
 
       - name: Build macOS App
         run: |
-          cd menubar-app/ClaudeMonitor
+          cd menubar-app/LLMMonitor
           swift build
 
       - name: Self-test (portable core)
         run: |
-          cd menubar-app/ClaudeMonitor
-          .build/debug/ClaudeMonitor selftest
+          cd menubar-app/LLMMonitor
+          .build/debug/LLMMonitor selftest
 
   build-linux:
     runs-on: ubuntu-latest
@@ -61,22 +61,28 @@ jobs:
 
       - name: Build (Linux headless)
         run: |
-          cd menubar-app/ClaudeMonitor
+          cd menubar-app/LLMMonitor
           swift build
 
       - name: Self-test (portable core)
         run: |
-          cd menubar-app/ClaudeMonitor
-          .build/debug/ClaudeMonitor selftest
+          cd menubar-app/LLMMonitor
+          .build/debug/LLMMonitor selftest
 
       - name: Smoke run (no credentials)
         run: |
-          cd menubar-app/ClaudeMonitor
-          .build/debug/ClaudeMonitor --once
+          cd menubar-app/LLMMonitor
+          .build/debug/LLMMonitor --once
           # The binary resolves home via homeDirectoryForCurrentUser (passwd
           # entry), while Actions containers set HOME elsewhere — check both.
           passwd_home=$(getent passwd "$(id -u)" | cut -d: -f6)
-          test -f "$passwd_home/.claude-monitor/usage.db" || test -f "$HOME/.claude-monitor/usage.db"
+          for h in "$passwd_home" "$HOME"; do
+            if test -f "$h/.llm-monitor/usage.db"; then
+              # The pre-2.0 name must stay a symlink to the new directory (loom-daemon reads it).
+              test "$(readlink "$h/.claude-monitor")" = ".llm-monitor" && found=1 && break
+            fi
+          done
+          test -n "${found:-}"
 
       # A plain `swift build` output is dynamically linked against the Swift
       # runtime, which is not installed on a bare Linux host — see #185. A
@@ -84,13 +90,13 @@ jobs:
       # runtime statically so the binary runs with no toolchain on the host.
       - name: Build static release binary (Linux headless)
         run: |
-          cd menubar-app/ClaudeMonitor
+          cd menubar-app/LLMMonitor
           swift build -c release --static-swift-stdlib
 
       - name: Verify no dynamic Swift/Foundation/dispatch dependency
         run: |
-          cd menubar-app/ClaudeMonitor
-          BIN=.build/release/ClaudeMonitor
+          cd menubar-app/LLMMonitor
+          BIN=.build/release/LLMMonitor
           echo "ldd output:"
           ldd "$BIN"
           if ldd "$BIN" | grep -qiE 'libswift|libfoundation|libdispatch'; then
@@ -101,28 +107,39 @@ jobs:
 
       - name: Self-test (static release binary)
         run: |
-          cd menubar-app/ClaudeMonitor
-          .build/release/ClaudeMonitor selftest
+          cd menubar-app/LLMMonitor
+          .build/release/LLMMonitor selftest
 
       - name: Smoke run (static release binary, no credentials)
         run: |
-          cd menubar-app/ClaudeMonitor
-          rm -rf "$HOME/.claude-monitor"
-          .build/release/ClaudeMonitor --once
+          cd menubar-app/LLMMonitor
+          rm -rf "$HOME/.claude-monitor" "$HOME/.llm-monitor"
+          .build/release/LLMMonitor --once
           passwd_home=$(getent passwd "$(id -u)" | cut -d: -f6)
-          test -f "$passwd_home/.claude-monitor/usage.db" || test -f "$HOME/.claude-monitor/usage.db"
+          for h in "$passwd_home" "$HOME"; do
+            if test -f "$h/.llm-monitor/usage.db"; then
+              # The pre-2.0 name must stay a symlink to the new directory (loom-daemon reads it).
+              test "$(readlink "$h/.claude-monitor")" = ".llm-monitor" && found=1 && break
+            fi
+          done
+          test -n "${found:-}"
 
       - name: Stage static release binary
         run: |
           mkdir -p dist
-          cp menubar-app/ClaudeMonitor/.build/release/ClaudeMonitor dist/claude-monitor-linux-x64
-          chmod 755 dist/claude-monitor-linux-x64
+          cp menubar-app/LLMMonitor/.build/release/LLMMonitor dist/llm-monitor-linux-x64
+          # Pre-2.0 asset name, still attached so a 1.x install-linux.sh
+          # --from-release keeps working. Remove with the ~/.claude-monitor symlink.
+          cp dist/llm-monitor-linux-x64 dist/claude-monitor-linux-x64
+          chmod 755 dist/llm-monitor-linux-x64 dist/claude-monitor-linux-x64
 
       - name: Upload static release binary as workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: claude-monitor-linux-x64
-          path: dist/claude-monitor-linux-x64
+          name: llm-monitor-linux-x64
+          path: |
+            dist/llm-monitor-linux-x64
+            dist/claude-monitor-linux-x64
           if-no-files-found: error
 
   # Attaches the static Linux binary built by build-linux to the GitHub
@@ -130,7 +147,7 @@ jobs:
   # — every push/PR run still builds and verifies the same binary above via
   # build-linux, it just doesn't get uploaded anywhere.
   publish-linux-release-asset:
-    name: Attach claude-monitor-linux-x64 to GitHub Release
+    name: Attach llm-monitor-linux-x64 to GitHub Release
     needs: build-linux
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
@@ -140,15 +157,15 @@ jobs:
       - name: Download static Linux binary artifact
         uses: actions/download-artifact@v4
         with:
-          name: claude-monitor-linux-x64
+          name: llm-monitor-linux-x64
           path: dist
 
       - name: Attach to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          chmod 755 dist/claude-monitor-linux-x64
+          chmod 755 dist/llm-monitor-linux-x64 dist/claude-monitor-linux-x64
           gh release upload "${{ github.event.release.tag_name }}" \
-            dist/claude-monitor-linux-x64 \
+            dist/llm-monitor-linux-x64 dist/claude-monitor-linux-x64 \
             --repo "${{ github.repository }}" \
             --clobber
