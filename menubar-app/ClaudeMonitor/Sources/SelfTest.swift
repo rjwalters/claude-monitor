@@ -69,6 +69,8 @@ enum SelfTest {
         testOpenAIUsageResponseMapping()
         testOpenAIRawFieldRedaction()
         testOpenAITokenExpiryParsing()
+        testZaiQuotaResponseMapping()
+        testZaiKeyFileParsing()
         testCodexAuthParsing()
         testCodexAppServerFraming()
         testCodexAppServerEnvelopeDecoding()
@@ -597,6 +599,100 @@ enum SelfTest {
     /// The wire contract, mapped onto the shared model: windows filed by
     /// duration, a null secondary window left nil, identity picked up from the
     /// same response, and per-model sub-limits landing in `named`.
+    // MARK: z.ai
+
+    /// A live `/api/monitor/usage/quota/limit` body (2026-09-24), numbers only.
+    static let zaiQuotaFixture = """
+        {"code":200,"msg":"Operation successful","success":true,
+         "data":{"level":"max","limits":[
+           {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,
+            "currentValue":7000,"remaining":21000,"percentage":25,"nextResetTime":1790400000000},
+           {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,
+            "currentValue":140045,"remaining":0,"percentage":100,"nextResetTime":1790617927983},
+           {"type":"TIME_LIMIT","unit":5,"number":1,"usage":4000,"currentValue":40,"percentage":1}]}}
+        """
+
+    private static func testZaiQuotaResponseMapping() {
+        expectEqual(AccountProvider(stored: "zai"), .zai, "stored 'zai' parses to .zai")
+        do {
+            let snapshot = try ZaiAPIClient.snapshot(
+                from: Data(zaiQuotaFixture.utf8), httpStatus: 200, accountKey: "zai:fixture@example.com")
+            expectEqual(snapshot.provider, .zai, "z.ai snapshot provider")
+            expectEqual(snapshot.accountKey, "zai:fixture@example.com", "account key is caller-supplied")
+            expectEqual(snapshot.plan, "max", "data.level is the plan")
+            let w = snapshot.rateLimit
+            expectEqual(w.session?.kind, .session, "unit 3 × 5 = the 5h session window")
+            expectEqual(w.session?.durationSeconds, 5 * 3600, "unit 3 is hours")
+            expectEqual(w.session?.usedPercent, 25, "percent = currentValue / usage (usage is the cap)")
+            expectEqual(w.weekly?.kind, .weekly, "unit 6 × 1 = the weekly window")
+            expectEqual(w.weekly?.usedPercent, 100, "spend past the cap clamps to 100")
+            expectEqual(w.weekly?.resetAt, Date(timeIntervalSince1970: 1790617927.983),
+                        "nextResetTime is epoch milliseconds")
+            expectEqual(w.overallStatus, "rejected", "an exhausted window makes the account rejected")
+            expectEqual(snapshot.rawFields["weekly_status"], "rejected",
+                        "derived weekly_status feeds ranking.json's exhausted mapping")
+            expectEqual(snapshot.rawFields["session_status"], "allowed", "derived session_status")
+            expect(w.named.keys.contains { $0.hasPrefix("TIME_LIMIT") },
+                   "a non-quota limit type is a named sub-limit, never the coding quota")
+
+            // An idle window has no nextResetTime and must not invent one.
+            let idle = zaiQuotaFixture.replacingOccurrences(of: ",\"nextResetTime\":1790400000000", with: "")
+            let idleSnapshot = try ZaiAPIClient.snapshot(from: Data(idle.utf8), httpStatus: 200, accountKey: "k")
+            expect(idleSnapshot.rateLimit.session?.resetAt == nil, "idle session window has no reset")
+        } catch {
+            expect(false, "z.ai fixture should map cleanly: \(error)")
+        }
+
+        // Errors arrive as HTTP 200 with the code in the body.
+        for (body, label) in [
+            (#"{"code":401,"msg":"token expired or incorrect","success":false}"#, "bad key"),
+            (#"{"code":1001,"msg":"Authentication parameter not received","success":false}"#, "no auth header"),
+        ] {
+            do {
+                _ = try ZaiAPIClient.snapshot(from: Data(body.utf8), httpStatus: 200, accountKey: "k")
+                expect(false, "z.ai \(label) body must not read as a successful reading")
+            } catch {
+                if case ProviderAPIError.unauthorized = error {} else {
+                    expect(false, "z.ai \(label) body should be .unauthorized, got \(error)")
+                }
+            }
+        }
+    }
+
+    private static func testZaiKeyFileParsing() {
+        let content = """
+            # z.ai GLM Coding Plan API key (account: agent-9@example.com). Created 2026-09-21.
+            #   grep '^ZAI_API_KEY=' ~/.zai/coding-plan-agent9.env | loom-daemon api-keys add zai agent9 --shared
+            ZAI_API_KEY="fixture-key.abc"
+            """
+        let parsed = ZaiKeyFile.parse(content, label: "agent9")
+        expectEqual(parsed?.email, "agent-9@example.com", "email from the (account: …) header")
+        expectEqual(parsed?.apiKey, "fixture-key.abc", "key unquoted; the grep comment is not the key")
+        expectEqual(parsed?.accountId, "zai:agent-9@example.com", "account id keyed on identity, not key")
+        expectEqual(ZaiKeyFile.accountId(email: nil, label: "agent9"), "zai:agent9", "label fallback id")
+        expect(ZaiKeyFile.parse("ZHIPU_API_KEY=dup\n", label: "x") == nil,
+               "opencode's ZHIPU_API_KEY file is not a registry entry")
+
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cm-zai-selftest-\(UUID().uuidString)").path
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let files = [
+            "coding-plan-b.env": "ZAI_API_KEY=key-b\n",
+            "coding-plan-a.env": "# (account: a@example.com)\nZAI_API_KEY=key-a\n",
+            "coding-plan-dup.env": "ZAI_API_KEY=key-a\n",
+            "coding-plan.env": "ZHIPU_API_KEY=key-a\n",
+            "README.md": "ZAI_API_KEY=not-a-key-file\n",
+        ]
+        for (name, body) in files {
+            try? body.write(toFile: (dir as NSString).appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let scanned = ZaiKeyFile.scan(directory: dir)
+        expectEqual(scanned.map(\.label), ["a", "b"],
+                    "scan: coding-plan-<label>.env only, sorted, duplicate keys dropped")
+        expectEqual(ZaiKeyFile.scan(directory: dir + "-missing").count, 0, "missing key dir is empty")
+    }
+
     private static func testOpenAIUsageResponseMapping() {
         do {
             let snapshot = try OpenAIAPIClient.snapshot(

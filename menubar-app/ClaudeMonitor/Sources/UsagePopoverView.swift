@@ -116,6 +116,18 @@ extension AccountProvider {
                 isApplicable: false,
                 meaning: "OpenAI/Codex: no extra-usage concept — not applicable."
             )
+        case (.zai, .premium):
+            return ProviderColumnEntry(
+                title: "Premium",
+                isApplicable: false,
+                meaning: "Z.ai: the GLM Coding Plan has one quota — not applicable."
+            )
+        case (.zai, .extra):
+            return ProviderColumnEntry(
+                title: "Extra",
+                isApplicable: false,
+                meaning: "Z.ai: no extra-usage concept — not applicable."
+            )
         }
     }
 }
@@ -209,6 +221,7 @@ struct ProviderBadge: View {
         // it reads as the artwork instead of a recoloured approximation.
         case .anthropic: return Color(red: 184 / 255, green: 115 / 255, blue: 82 / 255)
         case .openai: return Color(nsColor: .systemTeal)
+        case .zai: return Color(nsColor: .systemIndigo)
         }
     }
 
@@ -216,6 +229,7 @@ struct ProviderBadge: View {
         switch provider {
         case .anthropic: return ProviderGlyph.anthropic
         case .openai: return ProviderGlyph.openai
+        case .zai: return ProviderGlyph.zai
         }
     }
 
@@ -308,6 +322,27 @@ private enum ProviderGlyph {
         "...##....##.##..",
         "....#...#####...",
         ".....####.......",
+    ]
+
+    /// Z.ai: a plain 16×16 "Z" with a three-cell diagonal, so it has the
+    /// rosette's visual weight without imitating the vendor's logo.
+    static let zai = [
+        "..############..",
+        "..############..",
+        "...........###..",
+        "..........###...",
+        "..........###...",
+        ".........###....",
+        "........###.....",
+        ".......###......",
+        ".......###......",
+        "......###.......",
+        ".....###........",
+        "....###.........",
+        "....###.........",
+        "...###..........",
+        "..############..",
+        "..############..",
     ]
 }
 
