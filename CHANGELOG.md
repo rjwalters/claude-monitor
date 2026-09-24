@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **z.ai (GLM Coding Plan) accounts** — a third provider (`provider = zai`).
+  Keys in `~/.zai/coding-plan-<label>.env` are registered at launch (and by
+  `claude-monitor zai import|add|list`). They are polled via z.ai's read-only
+  `/api/monitor/usage/quota/limit` endpoint into the usual 5h / weekly columns,
+  and exported to `ranking.json` with `exhausted`/`rate_limited` status when a
+  window is spent. z.ai reports errors as HTTP 200 with the code in the body;
+  those are treated as auth failures, never as a reading.
+
 - **`claude-monitor calibrate`** — a rolling daily quota-calibration series:
   what one weekly rate-limit point actually costs, in tokens, cost-equivalent
   tokens, and dollars. Joins `usage_history.weekly_all_percent` (how much quota

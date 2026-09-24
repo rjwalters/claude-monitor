@@ -148,6 +148,7 @@ struct EnvImportResult {
 class OAuthPoller: ObservableObject {
     private let apiClient = AnthropicAPIClient()
     private let openAIClient = OpenAIAPIClient()
+    private let zaiClient = ZaiAPIClient()
     @Published var lastError: String?
     @Published var credentialStatuses: [CredentialStatus] = []
 
@@ -677,6 +678,15 @@ class OAuthPoller: ObservableObject {
                     refreshToken: account.refreshToken,
                     expiresAt: account.tokenExpiresAt
                 )
+            case (.zai, let token?):
+                (_, error) = await addZaiAccount(
+                    apiKey: token, email: account.email,
+                    label: account.homeLabel ?? account.email
+                )
+            case (.zai, nil):
+                // Identity-only declarations are a Codex concept (#135); a z.ai
+                // entry without its key has nothing to register.
+                error = "z.ai entry carries no API key"
             case (_, nil):
                 // A declared identity: no credential to validate, so nothing
                 // is fetched or authenticated — a placeholder row is created
@@ -693,6 +703,73 @@ class OAuthPoller: ObservableObject {
             ))
         }
 
+        return results
+    }
+
+    // MARK: - z.ai (GLM Coding Plan) accounts
+
+    /// Validate a z.ai API key by reading its quota once, then create/update
+    /// its account (`ZaiKeyFile.accountId`) and store the key. The response
+    /// carries no identity, so `email`/`label` are what the caller registered
+    /// it under; the first reading is written straight away so the account
+    /// shows up with data rather than as an empty row.
+    @discardableResult
+    func addZaiAccount(apiKey: String, email: String?, label: String) async -> (accountId: String?, error: String?) {
+        let apiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty else { return (nil, "Empty z.ai API key") }
+        let email = email.flatMap { looksLikeEmailAddress($0) ? $0 : nil }
+        let accountId = ZaiKeyFile.accountId(email: email, label: label)
+
+        let snapshot: ProviderUsageSnapshot
+        do {
+            snapshot = try await zaiClient.fetchUsage(apiKey: apiKey, accountKey: accountId)
+        } catch {
+            if case ProviderAPIError.unauthorized = error {
+                return (nil, "z.ai rejected the key for \(label) — expired or incorrect")
+            }
+            return (nil, "Could not read z.ai quota for \(label): \(error.localizedDescription)")
+        }
+
+        saveCredentialForAccount(
+            accountId: accountId, email: email, orgName: label,
+            plan: snapshot.plan ?? "coding-plan", accessToken: apiKey,
+            source: "zai-key", provider: .zai
+        )
+        writeSnapshotToDB(accountId: accountId, snapshot: snapshot)
+        flog.info("Registered z.ai account \(label) (\(snapshot.plan ?? "unknown plan"))", category: fcat)
+        return (accountId, nil)
+    }
+
+    /// The stored key for an existing z.ai account, if any — lets the
+    /// every-launch key-file sync skip the network for an unchanged key.
+    private func storedZaiKey(accountId: String) -> String? {
+        guard FileManager.default.fileExists(atPath: dbPath),
+              let db = try? openDatabase(dbPath, readonly: true) else { return nil }
+        return (try? db.scalar(
+            "SELECT access_token FROM oauth_credentials WHERE account_id = ? AND is_active = 1 LIMIT 1",
+            accountId
+        )) as? String
+    }
+
+    /// Register every `coding-plan-<label>.env` key in the z.ai key directory
+    /// (`ZaiKeyFile.defaultDirectory`, i.e. the chezmoi-managed `~/.zai`).
+    /// Runs on every launch alongside `syncFromAccountFiles`, so a rotated key
+    /// is picked up without a manual re-import; an unchanged key is a no-op
+    /// with no network call. Add-only: a key file that disappears never
+    /// deletes its account.
+    @discardableResult
+    func syncZaiKeyFiles(directory: String = ZaiKeyFile.defaultDirectory) async -> [EnvImportResult] {
+        var results: [EnvImportResult] = []
+        for file in ZaiKeyFile.scan(directory: directory) {
+            if storedZaiKey(accountId: file.accountId) == file.apiKey { continue }
+            let (_, error) = await addZaiAccount(apiKey: file.apiKey, email: file.email, label: file.label)
+            if let error = error {
+                flog.warning("syncZaiKeyFiles: \(error)", category: fcat)
+            }
+            results.append(EnvImportResult(
+                email: file.email ?? file.label, success: error == nil, error: error, provider: .zai
+            ))
+        }
         return results
     }
 
@@ -1065,9 +1142,13 @@ class OAuthPoller: ObservableObject {
         apply(masterAccountsPath, label: "master")
         apply(localAccountsPath, label: "local")
 
+        // z.ai keys live in their own chezmoi-managed directory rather than in
+        // the account list files; sync them on the same launch cadence.
+        let zaiResults = await syncZaiKeyFiles()
+
         guard !merged.isEmpty else {
             flog.info("syncFromAccountFiles: no account list files found", category: fcat)
-            return []
+            return zaiResults
         }
 
         flog.info("syncFromAccountFiles: importing \(merged.count) merged account(s)", category: fcat)
@@ -1092,7 +1173,7 @@ class OAuthPoller: ObservableObject {
             let (_, error) = await addAccountWithToken(token, email: pair.email)
             results.append(EnvImportResult(email: pair.email, success: error == nil, error: error))
         }
-        return results
+        return results + zaiResults
     }
 
     // MARK: - Save Credential for Account
@@ -1803,7 +1884,29 @@ class OAuthPoller: ObservableObject {
             try await pollAnthropic(credential)
         case .openai:
             try await pollOpenAI(credential)
+        case .zai:
+            try await pollZai(credential)
         }
+    }
+
+    /// Read one z.ai Coding Plan key's quota. A z.ai key is a static API key
+    /// (no refresh, no expiry), so this is the Anthropic shape: the stored
+    /// key is the whole credential.
+    private func pollZai(_ credential: OAuthCredential) async throws {
+        guard let key = credential.accessToken, !key.isEmpty else {
+            updateCredentialStatus(credential, status: .missing, error: "No API key")
+            throw AnthropicAPIError.unauthorized
+        }
+        guard let accountId = credential.accountId, !accountId.isEmpty else {
+            flog.warning("Credential \(credential.label) has no account_id", category: fcat)
+            return
+        }
+
+        let snapshot = try await zaiClient.fetchUsage(apiKey: key, accountKey: accountId)
+        writeSnapshotToDB(accountId: accountId, snapshot: snapshot)
+        updateCredentialLastPoll(credential, error: nil)
+        updateCredentialStatus(credential, status: .valid, error: nil)
+        lastError = nil
     }
 
     private func pollAnthropic(_ credential: OAuthCredential) async throws {

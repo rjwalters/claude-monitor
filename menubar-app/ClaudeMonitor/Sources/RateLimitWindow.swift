@@ -24,6 +24,9 @@ import Foundation
 enum AccountProvider: String, CaseIterable, Codable {
     case anthropic
     case openai
+    /// z.ai (Zhipu) GLM Coding Plan — static API keys, read via
+    /// `ZaiAPIClient`'s quota endpoint.
+    case zai
 
     /// Every account that predates multi-provider support is Anthropic, so an
     /// absent or unrecognized value resolves here rather than failing.
@@ -47,6 +50,7 @@ enum AccountProvider: String, CaseIterable, Codable {
         switch self {
         case .anthropic: return "Anthropic"
         case .openai: return "OpenAI"
+        case .zai: return "Z.ai"
         }
     }
 
@@ -57,6 +61,7 @@ enum AccountProvider: String, CaseIterable, Codable {
         switch self {
         case .anthropic: return "AN"
         case .openai: return "OA"
+        case .zai: return "ZA"
         }
     }
 }

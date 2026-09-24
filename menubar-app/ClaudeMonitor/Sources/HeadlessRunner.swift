@@ -179,6 +179,8 @@ enum HeadlessRunner {
           codex               Manage OpenAI/Codex accounts by their CODEX_HOME
                               (provision|add|list|import; no credential is
                               stored — codex itself is asked for usage)
+          zai                 Register z.ai GLM Coding Plan keys from ~/.zai and
+                              show their 5h/weekly quota (import|add|list)
           selftest            Run portable-core assertions (no network, no
                               credentials; exits non-zero on failure)
         """

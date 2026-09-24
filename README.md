@@ -428,6 +428,34 @@ What differs from an Anthropic row once it's added:
 > history in the 2026-08-15 supersession in
 > [`docs/spikes/2026-07-30-codex-usage-probe.md`](docs/spikes/2026-07-30-codex-usage-probe.md).
 
+### Adding a z.ai (GLM Coding Plan) Account
+
+z.ai Coding Plan keys are static API keys, so they work like Claude tokens:
+the key is stored and polled directly. Usage comes from
+`GET https://api.z.ai/api/monitor/usage/quota/limit`, which is read-only and
+spends no quota. It reports a **5-hour** window and a **weekly** window, shown
+in the same columns as Claude's.
+
+Keys are read from `~/.zai/coding-plan-<label>.env` (chezmoi-managed on
+operator Macs; override the directory with `$CLAUDE_MONITOR_ZAI_DIR`). Each
+file holds one `ZAI_API_KEY=…` line, and an `(account: <email>)` header comment
+names the account:
+
+```bash
+claude-monitor zai import     # register every coding-plan-<label>.env
+claude-monitor zai list       # last stored 5h / weekly usage per account
+# one key from a file or stdin (never argv):
+claude-monitor zai add agent3 --key-file ~/.zai/coding-plan-agent3.env
+```
+
+The app also scans that directory **at every launch**, so a rotated key is
+picked up without a re-import. An unchanged key is skipped without a network
+call, and a deleted file never removes its account. `coding-plan.env`
+(opencode's `ZHIPU_API_KEY` copy) is ignored, so it does not register a
+duplicate. Accounts are keyed `zai:<email>` (else `zai:<label>`), so a
+rotation rolls the credential in place. In `ranking.json` they appear with
+`"provider": "zai"`, and a spent window reports `exhausted`/`rate_limited`.
+
 ### Rolling a Token (revoke + re-mint)
 
 > **Temporary workaround.** Anthropic exposes no supported API to list, revoke,
@@ -1333,6 +1361,8 @@ claude-monitor/
 │       ├── OpenAIAPI.swift         # OpenAI/Codex client (wham/usage + token refresh)
 │       ├── CodexAppServer.swift    # Codex app-server JSON-RPC client (usage with no stored credential)
 │       ├── CodexCLI.swift          # `claude-monitor codex provision|add|list|import` CLI surface
+│       ├── ZaiAPI.swift            # z.ai GLM Coding Plan quota client + ~/.zai key-file scanner
+│       ├── ZaiCLI.swift            # `claude-monitor zai import|add|list` CLI surface
 │       ├── TranscriptImporter.swift # Incremental Claude Code transcript → token_usage/token_sessions ingest
 │       ├── TokensCLI.swift         # `claude-monitor tokens sync` CLI surface
 │       ├── QuotaCalibration.swift  # Daily tokens/cost per weekly rate-limit point + dated price table
