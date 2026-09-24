@@ -246,9 +246,9 @@ struct ZaiKeyFile: Equatable {
         return "zai:\(label)"
     }
 
-    /// Where key files are read from: `$CLAUDE_MONITOR_ZAI_DIR`, else `~/.zai`.
+    /// Where key files are read from: `$LLM_MONITOR_ZAI_DIR`, else `~/.zai`.
     static var defaultDirectory: String {
-        if let override = ProcessInfo.processInfo.environment["CLAUDE_MONITOR_ZAI_DIR"], !override.isEmpty {
+        if let override = AppPaths.environment("ZAI_DIR") {
             return override
         }
         return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".zai").path

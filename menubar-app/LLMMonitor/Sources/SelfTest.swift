@@ -1,12 +1,12 @@
 import Foundation
 
-/// `ClaudeMonitor selftest` — assertions over the portable core, runnable on
+/// `llm-monitor selftest` — assertions over the portable core, runnable on
 /// macOS and Linux with no network, no credentials, and no package
 /// dependencies (this project deliberately has none, so there is no XCTest
 /// target to hang tests off).
 ///
 /// Everything here operates on throwaway databases under a temporary
-/// directory; the real `~/.claude-monitor/usage.db` is never opened.
+/// directory; the real `~/.llm-monitor/usage.db` is never opened.
 /// Exits 0 when every check passes, 1 otherwise, so CI can gate on it.
 ///
 /// @MainActor: several checks exercise `UsageStore` (a main-actor-isolated
@@ -29,14 +29,14 @@ enum SelfTest {
 
         if arguments.contains("--help") || arguments.contains("-h") {
             print("""
-                Usage: ClaudeMonitor selftest [--db <path>] [--wire <path>] [--codex]
+                Usage: llm-monitor selftest [--db <path>] [--wire <path>] [--codex]
 
                 Runs assertions over the portable core (rate-limit window model,
                 schema migration). No network access and no credentials needed.
 
                   --db <path>   Additionally migrate an existing database *copy*
                                 and verify its accounts still load. Point this at
-                                a COPY of ~/.claude-monitor/usage.db — it writes.
+                                a COPY of ~/.llm-monitor/usage.db — it writes.
 
                   --wire <path> Additionally decode a captured OpenAI
                                 `GET /backend-api/wham/usage` body and report the
@@ -71,6 +71,7 @@ enum SelfTest {
         testOpenAITokenExpiryParsing()
         testZaiQuotaResponseMapping()
         testZaiKeyFileParsing()
+        testDataDirectoryMigration()
         testCodexAuthParsing()
         testCodexAppServerFraming()
         testCodexAppServerEnvelopeDecoding()
@@ -211,7 +212,7 @@ enum SelfTest {
     /// call via a UUID, and guarantees its removal (best-effort) once `body`
     /// returns or throws — the boilerplate every filesystem-touching test in
     /// this file previously repeated inline. `suffix`, when non-empty, is
-    /// spliced into the directory name (e.g. "codex" -> "claude-monitor-selftest-codex-<uuid>")
+    /// spliced into the directory name (e.g. "codex" -> "llm-monitor-selftest-codex-<uuid>")
     /// purely to make a stray leftover directory identifiable during manual
     /// debugging; it has no effect on test behavior. The directory-creation
     /// call is best-effort (`try?`, mirroring the cleanup `defer` below) rather
@@ -224,7 +225,7 @@ enum SelfTest {
         _ body: @MainActor (URL) throws -> T
     ) rethrows -> T {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("claude-monitor-selftest\(suffix.isEmpty ? "" : "-\(suffix)")-\(UUID().uuidString)")
+            .appendingPathComponent("llm-monitor-selftest\(suffix.isEmpty ? "" : "-\(suffix)")-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: dir) }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return try body(dir)
@@ -599,6 +600,58 @@ enum SelfTest {
     /// The wire contract, mapped onto the shared model: windows filed by
     /// duration, a null secondary window left nil, identity picked up from the
     /// same response, and per-model sub-limits landing in `named`.
+    // MARK: Data directory rename (2.0)
+
+    /// Every state `AppPaths.migrateLegacyDataDirectory` can meet, each in its
+    /// own scratch "home" so the real one is never touched.
+    private static func testDataDirectoryMigration() {
+        let fm = FileManager.default
+        func scratchHome(_ name: String) -> String {
+            let path = fm.temporaryDirectory
+                .appendingPathComponent("llm-monitor-selftest-home-\(name)-\(UUID().uuidString)").path
+            try? fm.createDirectory(atPath: path, withIntermediateDirectories: true)
+            return path
+        }
+        func join(_ home: String, _ name: String) -> String { (home as NSString).appendingPathComponent(name) }
+        func linkTarget(_ path: String) -> String? { try? fm.destinationOfSymbolicLink(atPath: path) }
+
+        // 1. A 1.x host: real ~/.claude-monitor with data → moved, symlinked.
+        let h1 = scratchHome("legacy")
+        defer { try? fm.removeItem(atPath: h1) }
+        try? fm.createDirectory(atPath: join(h1, ".claude-monitor"), withIntermediateDirectories: true)
+        try? "db".write(toFile: join(h1, ".claude-monitor/usage.db"), atomically: true, encoding: .utf8)
+        expectEqual(AppPaths.migrateLegacyDataDirectory(home: h1), .moved, "legacy dir is moved")
+        expectEqual(try? String(contentsOfFile: join(h1, ".llm-monitor/usage.db"), encoding: .utf8), "db",
+                    "data lands in ~/.llm-monitor")
+        expectEqual(linkTarget(join(h1, ".claude-monitor")), ".llm-monitor",
+                    "~/.claude-monitor becomes a relative symlink")
+        expectEqual(try? String(contentsOfFile: join(h1, ".claude-monitor/usage.db"), encoding: .utf8), "db",
+                    "the old path still reads the same file (loom-daemon's contract)")
+        expectEqual(AppPaths.migrateLegacyDataDirectory(home: h1), .alreadyMigrated, "second run is a no-op")
+
+        // 2. A fresh host: nothing → new dir plus the compatibility link.
+        let h2 = scratchHome("fresh")
+        defer { try? fm.removeItem(atPath: h2) }
+        expectEqual(AppPaths.migrateLegacyDataDirectory(home: h2), .linked, "fresh host is linked")
+        var isDir: ObjCBool = false
+        expect(fm.fileExists(atPath: join(h2, ".llm-monitor"), isDirectory: &isDir) && isDir.boolValue,
+               "fresh host gets ~/.llm-monitor")
+        expectEqual(linkTarget(join(h2, ".claude-monitor")), ".llm-monitor", "fresh host gets the link too")
+
+        // 3. Both real directories: nothing is moved, merged, or deleted.
+        let h3 = scratchHome("both")
+        defer { try? fm.removeItem(atPath: h3) }
+        try? fm.createDirectory(atPath: join(h3, ".claude-monitor"), withIntermediateDirectories: true)
+        try? fm.createDirectory(atPath: join(h3, ".llm-monitor"), withIntermediateDirectories: true)
+        try? "old".write(toFile: join(h3, ".claude-monitor/usage.db"), atomically: true, encoding: .utf8)
+        if case .conflict = AppPaths.migrateLegacyDataDirectory(home: h3) {} else {
+            expect(false, "two real data directories must be reported as a conflict")
+        }
+        expectEqual(try? String(contentsOfFile: join(h3, ".claude-monitor/usage.db"), encoding: .utf8), "old",
+                    "a conflict leaves the legacy data untouched")
+        expect(linkTarget(join(h3, ".claude-monitor")) == nil, "a conflict never replaces a real dir with a link")
+    }
+
     // MARK: z.ai
 
     /// A live `/api/monitor/usage/quota/limit` body (2026-09-24), numbers only.
@@ -1030,7 +1083,7 @@ enum SelfTest {
         expect(CodexAppServerError.binaryNotFound.isCapabilityGap,
                "a missing codex binary is a capability gap")
         expect(CodexAppServerError.binaryNotFound.errorDescription?
-                .contains("CLAUDE_MONITOR_CODEX_BIN") == true,
+                .contains("LLM_MONITOR_CODEX_BIN") == true,
                "the not-found message names the override that fixes it")
     }
 
@@ -1231,7 +1284,7 @@ enum SelfTest {
 
     /// Regression for #116: `flog.info` used to live inside `snapshot()`
     /// itself, which runs during **offline** fixture decoding (this very
-    /// selftest) as much as during a live poll — so a plain `ClaudeMonitor
+    /// selftest) as much as during a live poll — so a plain `llm-monitor
     /// selftest` run wrote ~14 lines into the user's real `debug.log`. The fix
     /// moved the log call into `fetchUsage()` (the caller that actually
     /// performed a live poll), leaving `snapshot()` free of I/O.
@@ -1244,8 +1297,7 @@ enum SelfTest {
     /// enqueued) — without padding the user's real `debug.log` with a marker
     /// line just to observe it.
     private static func testCodexSnapshotOfflinePathWritesNoLog() {
-        let logPath = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/debug.log").path
+        let logPath = AppPaths.path("debug.log")
         FileLogger.shared.sync()
         let before = FileManager.default.contents(atPath: logPath)?.count ?? 0
 
@@ -1291,7 +1343,11 @@ enum SelfTest {
 
                 expectEqual(
                     CodexBinary.resolve(environment: [CodexBinary.overrideEnvKey: stub, "PATH": "/nowhere"]),
-                    stub, "CLAUDE_MONITOR_CODEX_BIN wins over PATH"
+                    stub, "LLM_MONITOR_CODEX_BIN wins over PATH"
+                )
+                expectEqual(
+                    CodexBinary.resolve(environment: ["CLAUDE_MONITOR_CODEX_BIN": stub, "PATH": "/nowhere"]),
+                    stub, "the pre-rename CLAUDE_MONITOR_CODEX_BIN still works"
                 )
                 expect(
                     CodexBinary.resolve(environment: [
@@ -2198,7 +2254,7 @@ enum SelfTest {
 
                 // No homes on disk at all besides a registered one (edge case).
                 let onlyRegisteredDir = URL(fileURLWithPath: NSTemporaryDirectory())
-                    .appendingPathComponent("claude-monitor-selftest-discover-empty-\(UUID().uuidString)")
+                    .appendingPathComponent("llm-monitor-selftest-discover-empty-\(UUID().uuidString)")
                 try fm.createDirectory(at: onlyRegisteredDir, withIntermediateDirectories: true)
                 defer { try? fm.removeItem(at: onlyRegisteredDir) }
                 let noneDiscovered = CodexCLI.discoverUnregisteredHomes(
@@ -3523,7 +3579,11 @@ enum SelfTest {
         expectEqual(TranscriptImporter.defaultTranscriptRoot(environment: [
             "CLAUDE_CONFIG_DIR": "/tmp/cfg",
             "CLAUDE_MONITOR_TRANSCRIPT_ROOT": "/tmp/fixture"
-        ]), "/tmp/fixture", "the explicit override wins")
+        ]), "/tmp/fixture", "the explicit (pre-rename) override wins")
+        expectEqual(TranscriptImporter.defaultTranscriptRoot(environment: [
+            "CLAUDE_MONITOR_TRANSCRIPT_ROOT": "/tmp/legacy",
+            "LLM_MONITOR_TRANSCRIPT_ROOT": "/tmp/new"
+        ]), "/tmp/new", "LLM_MONITOR_* takes precedence over CLAUDE_MONITOR_*")
     }
 
     // MARK: - Quota calibration (#198)
@@ -4744,7 +4804,7 @@ enum SelfTest {
     private static func testParseAccountPairsBackwardCompatibleWithOldFormat() {
         let poller = OAuthPoller(dbPath: "/nonexistent/does-not-matter-for-parsing.db")
         let legacy = """
-            # Claude Monitor accounts — 2 account(s)
+            # LLM Monitor accounts — 2 account(s)
             ACCOUNT_EMAIL_1=one@example.com
             ACCOUNT_KEY_1=token-one
             ACCOUNT_EMAIL_2=two@example.com
@@ -4842,7 +4902,7 @@ enum SelfTest {
     private static func testParseAccountPairsAcceptsKeylessCodexIdentity() {
         let poller = OAuthPoller(dbPath: "/nonexistent/does-not-matter-for-parsing.db")
         let payload = """
-            # Claude Monitor accounts — 1 account(s) + 2 Codex identity/identities (no credential)
+            # LLM Monitor accounts — 1 account(s) + 2 Codex identity/identities (no credential)
             ACCOUNT_EMAIL_1=one@example.com
             ACCOUNT_KEY_1=token-one
             ACCOUNT_EMAIL_2=agent3@example.com
@@ -6076,7 +6136,7 @@ enum SelfTest {
                     #!/bin/sh
                     printf '%s\\n' "$*" > \(argvFile)
                     wc -c > \(stdinBytes)
-                    echo "ClaudeMonitor 9.9.9"
+                    echo "llm-monitor 9.9.9"
                     """)
 
                 var info: [String] = []
@@ -7464,7 +7524,7 @@ enum SelfTest {
         let client = CodexAppServerClient()
         guard client.isAvailable else {
             checks += 1
-            failures.append("--codex: no codex binary found (set CLAUDE_MONITOR_CODEX_BIN)")
+            failures.append("--codex: no codex binary found (set LLM_MONITOR_CODEX_BIN)")
             return
         }
 

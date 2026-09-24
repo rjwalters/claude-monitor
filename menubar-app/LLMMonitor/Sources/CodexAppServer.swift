@@ -161,7 +161,7 @@ enum CodexAppServerError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .binaryNotFound:
-            return "Codex CLI not found — install `@openai/codex`, or set CLAUDE_MONITOR_CODEX_BIN"
+            return "Codex CLI not found — install `@openai/codex`, or set LLM_MONITOR_CODEX_BIN"
         case .launchFailed(let detail):
             return "Could not start codex app-server: \(detail)"
         case .notLoggedIn(let home):
@@ -169,7 +169,7 @@ enum CodexAppServerError: Error, LocalizedError {
             // `oauth_credentials.last_error`, and a raw home path names a user.
             return "Codex home not logged in (\(redactHomePath(home))) — run `CODEX_HOME=\(redactHomePath(home)) codex login --device-auth`"
         case .homeMissing(let home):
-            return "Codex home \(redactHomePath(home)) does not exist — re-register with `claude-monitor codex add --home <path>`"
+            return "Codex home \(redactHomePath(home)) does not exist — re-register with `llm-monitor codex add --home <path>`"
         case .methodUnsupported(let method):
             return "codex app-server does not implement \(method) — upgrade to codex 0.147.0 or newer"
         case .timedOut(let method):
@@ -216,7 +216,7 @@ enum CodexAppServerError: Error, LocalizedError {
 /// — the worst possible place to discover it.
 enum CodexBinary {
     /// Explicit override, and the seam the self-test points at a stub binary.
-    static let overrideEnvKey = "CLAUDE_MONITOR_CODEX_BIN"
+    static let overrideEnvKey = "LLM_MONITOR_CODEX_BIN"
 
     /// Absolute fallbacks probed after `PATH`, covering Homebrew (both
     /// architectures) and the usual npm global prefixes.
@@ -237,7 +237,7 @@ enum CodexBinary {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         fileManager: FileManager = .default
     ) -> String? {
-        if let override = environment[overrideEnvKey]?
+        if let override = AppPaths.environment("CODEX_BIN", in: environment)?
             .trimmingCharacters(in: .whitespacesAndNewlines), !override.isEmpty {
             // An override that doesn't resolve is a configuration mistake worth
             // failing on, not something to silently paper over with PATH.
@@ -870,7 +870,7 @@ final class CodexAppServerClient: Sendable {
             // 1. initialize — `clientInfo{name,version}` is required.
             try Self.send(writer, [
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": ["clientInfo": ["name": "claude-monitor", "version": AppVersion.current]],
+                "params": ["clientInfo": ["name": "llm-monitor", "version": AppVersion.current]],
             ])
             let initializeResult = try await self.awaitReply(
                 id: 1, method: "initialize", stream: stream, process: process, stderr: stderrCapture, stderrDrain: stderrDrain,

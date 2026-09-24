@@ -3,7 +3,7 @@
 // poll loop. (On macOS the entry lives in main.swift and dispatches here
 // when launched with --headless.)
 @main
-enum ClaudeMonitorEntry {
+enum LLMMonitorEntry {
     @MainActor
     static func main() {
         // `accounts export|import` is a one-shot CLI operation, distinct from

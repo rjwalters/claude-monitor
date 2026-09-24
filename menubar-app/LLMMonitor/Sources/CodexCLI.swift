@@ -1,6 +1,6 @@
 import Foundation
 
-/// `claude-monitor codex` — manage OpenAI/ChatGPT (Codex) accounts.
+/// `llm-monitor codex` — manage OpenAI/ChatGPT (Codex) accounts.
 ///
 /// - `codex add --home <path>` registers an account **by its `CODEX_HOME`**,
 ///   storing no token at all. This is the path that makes more than one Codex
@@ -21,7 +21,7 @@ import Foundation
 /// One-shot CLI operations like `accounts export|import`: no `--headless` flag,
 /// no GUI, identical on macOS and Linux, so a headless Loom host can add an
 /// OpenAI account with `CODEX_HOME=… codex login --device-auth` followed by
-/// `claude-monitor codex add --home …`.
+/// `llm-monitor codex add --home …`.
 ///
 /// Nothing here ever prints a token or an email address; accounts are
 /// identified in output by the first 8 characters of their OpenAI account id.
@@ -270,7 +270,7 @@ enum CodexCLI {
         }
 
         guard let codexBin = CodexBinary.resolve() else {
-            CLIArgs.fail("Codex CLI not found — install `@openai/codex`, or set CLAUDE_MONITOR_CODEX_BIN (see --help)")
+            CLIArgs.fail("Codex CLI not found — install `@openai/codex`, or set LLM_MONITOR_CODEX_BIN (see --help)")
         }
 
         let storePath = parsed.dbPath
@@ -370,7 +370,7 @@ enum CodexCLI {
         guard !accounts.isEmpty || !unregisteredHomes.isEmpty else {
             print("No OpenAI (Codex) accounts registered, and no ~/.codex* homes found on disk. Add one with:")
             print("  CODEX_HOME=~/.codex-<label> codex login --device-auth")
-            print("  claude-monitor codex add --home ~/.codex-<label>")
+            print("  llm-monitor codex add --home ~/.codex-<label>")
             exit(0)
         }
 
@@ -410,13 +410,13 @@ enum CodexCLI {
                     print("\(account.accountId.prefix(8))… \(plan) \(status.padded(to: 18)) \(home)")
                     if account.isAbsent {
                         let remediation = account.provisionLabel.map {
-                            "  → claude-monitor codex provision \($0)"
-                        } ?? "  → claude-monitor codex provision <label>"
+                            "  → llm-monitor codex provision \($0)"
+                        } ?? "  → llm-monitor codex provision <label>"
                         print(remediation)
                         absentRemediations.append(remediation)
                     }
                     if account.isStranded {
-                        print("  → claude-monitor codex add --home <path>")
+                        print("  → llm-monitor codex add --home <path>")
                     }
                 }
             } else {
@@ -430,7 +430,7 @@ enum CodexCLI {
                 for home in unregisteredHomes {
                     let status = await authStatus(forUnregisteredHome: home)
                     print("\(status.padded(to: 18)) \(home)")
-                    print("  → claude-monitor codex add --home \(home)")
+                    print("  → llm-monitor codex add --home \(home)")
                 }
             }
 
@@ -450,13 +450,13 @@ enum CodexCLI {
                 print("            cleared on every launch) and no CODEX_HOME of its own, so there is")
                 print("            nothing left to poll it with and its usage has stopped updating.")
                 print("            Register a home for it with the `codex add --home` line above, or")
-                print("            `claude-monitor codex provision <label>` to create one and log in.")
+                print("            `llm-monitor codex provision <label>` to create one and log in.")
             }
             if sawDrift {
                 print("`\(driftLabel)` → this CODEX_HOME is now logged in as a different account than the")
                 print("          row it is registered against, so its usage is not attributed to that")
                 print("          row. Either log the home back in as the original account, or re-run")
-                print("          `claude-monitor codex add --home <home>` to register it as its own.")
+                print("          `llm-monitor codex add --home <home>` to register it as its own.")
             }
             exit(0)
         }
@@ -746,14 +746,14 @@ enum CodexCLI {
 
     private static func printUsage() {
         print("""
-            claude-monitor codex — manage OpenAI/ChatGPT (Codex) accounts so
+            llm-monitor codex — manage OpenAI/ChatGPT (Codex) accounts so
             their usage is polled alongside Anthropic accounts.
 
             Usage:
-              claude-monitor codex provision <label> [--db <path>]
-              claude-monitor codex add --home <path> [--db <path>]
-              claude-monitor codex list [--db <path>]
-              claude-monitor codex import [--auth <path>] [--db <path>]
+              llm-monitor codex provision <label> [--db <path>]
+              llm-monitor codex add --home <path> [--db <path>]
+              llm-monitor codex list [--db <path>]
+              llm-monitor codex import [--auth <path>] [--db <path>]
 
             provision  Collapse home-create + login + register into one
                     command: creates (or reuses) ~/.codex-<label> as the
@@ -761,12 +761,12 @@ enum CodexCLI {
                     --device-auth` against it interactively, and on success
                     registers it exactly as `add --home` does.
 
-                      claude-monitor codex provision work
+                      llm-monitor codex provision work
 
                     is equivalent to:
 
                       CODEX_HOME=~/.codex-work codex login --device-auth
-                      claude-monitor codex add --home ~/.codex-work
+                      llm-monitor codex add --home ~/.codex-work
 
                     `--device-auth` prints a code to paste into a browser on
                     any machine, so this works on a headless Linux host.
@@ -785,7 +785,7 @@ enum CodexCLI {
                     than one Codex account possible at all:
 
                       CODEX_HOME=~/.codex-work codex login --device-auth
-                      claude-monitor codex add --home ~/.codex-work
+                      llm-monitor codex add --home ~/.codex-work
 
                     `--device-auth` prints a code to paste into a browser on
                     any machine, so this works on a headless Linux host.
@@ -832,7 +832,7 @@ enum CodexCLI {
                     valid, renewal failing) or red (expired). Re-running this
                     command re-imports a fresh credential.
 
-            --db <path> overrides ~/.claude-monitor/usage.db (writing
+            --db <path> overrides ~/.llm-monitor/usage.db (writing
             ranking.json beside it) — mainly for exercising these commands end
             to end without touching the real store.
             """)

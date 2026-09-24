@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "ClaudeMonitor",
+    name: "LLMMonitor",
     platforms: [
         .macOS(.v14)
     ],
@@ -18,7 +18,7 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "ClaudeMonitor",
+            name: "LLMMonitor",
             dependencies: [
                 .target(name: "CSQLite", condition: .when(platforms: [.linux]))
             ],

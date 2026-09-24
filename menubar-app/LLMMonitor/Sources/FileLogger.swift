@@ -1,6 +1,6 @@
 import Foundation
 
-/// Writes timestamped debug lines to ~/.claude-monitor/debug.log
+/// Writes timestamped debug lines to ~/.llm-monitor/debug.log
 /// Automatically rotates when the file exceeds 1 MB.
 ///
 /// `@unchecked Sendable`: all mutable file/rotation state (`fileHandle`, and
@@ -15,15 +15,14 @@ final class FileLogger: @unchecked Sendable {
     /// journald/docker logs capture it alongside the debug.log file.
     var echoToStdout = false
 
-    private let queue = DispatchQueue(label: "com.claude-monitor.file-logger")
+    private let queue = DispatchQueue(label: "com.llm-monitor.file-logger")
     private let maxBytes: UInt64 = 1_048_576 // 1 MB
     private let logDir: String
     private let logPath: String
     private var fileHandle: FileHandle?
 
     private init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        logDir = "\(home)/.claude-monitor"
+        logDir = AppPaths.dataDirectory
         logPath = "\(logDir)/debug.log"
         openFile()
     }
