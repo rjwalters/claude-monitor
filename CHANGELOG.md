@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A Loom Codex profile with no reading kept a stale, misleading error.**
+  Snapshot mode set the in-memory status but never rewrote
+  `oauth_credentials.last_error`, so a linked pre-2.0 row went on showing its
+  old `Token refresh failed`. The stored field now carries the real cause. A
+  profile with no login says so and names
+  `loom-daemon accounts reauth codex <name>`. `last_poll_at` is left alone, so
+  the staleness backstop is unaffected.
+- **`ranking.json` wasn't written on launch.** The launch poll reloaded the
+  store but didn't export, so the file kept the previous process's account set
+  until some account came due again. It is now exported right after the launch
+  poll.
+
 ## [2.0.0] - 2026-09-25
 
 ### Summary

@@ -204,6 +204,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             await MainActor.run {
                 usageStore.loadFromDatabase()
                 updateStatusButton()
+                // Export right after the launch poll too, not only on the next
+                // due tick: otherwise ranking.json keeps the previous process's
+                // account set until some account comes due again.
+                RankingExporter.export()
                 flog.info("syncThenRefreshAll: loaded \(usageStore.accounts.count) account(s)", category: "App")
             }
         }

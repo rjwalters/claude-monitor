@@ -678,9 +678,14 @@ enum SelfTest {
             makeProfile("agent-9", accountId: nil, email: nil)
             makeProfile("robb", accountId: nil, email: nil)
             makeProfile("rjwalters", accountId: nil, email: nil)
+            makeProfile("agent-7", accountId: "acct-agent-7", email: "agent-7@example.com")
             fm.createFile(atPath: root + "/agent-1/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl",
                           contents: Data((codexRolloutLine + "\n").utf8))
             try? fm.createDirectory(atPath: root + "/.loom-bookkeeping", withIntermediateDirectories: true)
+            // agent-7 is logged in, but its only reading's weekly window reset a day ago.
+            let expiredLine = #"{"timestamp":"2026-01-01T00:00:00Z","payload":{"rate_limits":{"primary":{"used_percent":90.0,"window_minutes":10080,"resets_at":\#(Int(Date().timeIntervalSince1970) - 86400)}}}}"#
+            fm.createFile(atPath: root + "/agent-7/sessions/2026/09/23/rollout-2026-09-23T10-00-00-y.jsonl",
+                          contents: Data((expiredLine + "\n").utf8))
 
             // Pre-profile legacy rows: dead since their token was cleared (#123).
             let db = try! openDatabase(dbPath)
@@ -690,7 +695,7 @@ enum SelfTest {
             }
 
             let poller = OAuthPoller(dbPath: dbPath)
-            expectEqual(poller.syncCodexProfiles(root: root), 4, "every profile directory is registered, hidden ones skipped")
+            expectEqual(poller.syncCodexProfiles(root: root), 5, "every profile directory is registered, hidden ones skipped")
             expectEqual(poller.syncCodexProfiles(root: root), 0, "a second sync is a no-op")
 
             func row(_ id: String) -> (home: String?, mode: String?, email: String?)? {
@@ -707,7 +712,7 @@ enum SelfTest {
             expect(row("user-other")?.home == nil, "an unrelated home-less row is left alone")
 
             let creds = poller.loadActiveCredentials().filter { $0.isCodexSnapshotOnly }
-            expectEqual(creds.count, 4, "every profile row is in the poll set")
+            expectEqual(creds.count, 5, "every profile row is in the poll set")
             expect(creds.allSatisfy { $0.accessToken == nil }, "no profile credential row ever holds a token")
 
             // A poll reads the snapshot and stamps the row with when Codex
@@ -718,10 +723,26 @@ enum SelfTest {
             let liveLine = #"{"timestamp":"\#(observedISO)","payload":{"rate_limits":{"primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":\#(Int(Date().timeIntervalSince1970) + 3 * 86400)},"secondary":null,"plan_type":"pro"}}}"#
             fm.createFile(atPath: root + "/agent-1/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl",
                           contents: Data((liveLine + "\n").utf8))
+            try! db.run("UPDATE oauth_credentials SET last_error = 'Token refresh failed: Unauthorized', last_poll_at = NULL WHERE account_id = 'user-legacy-robb'")
             for credential in poller.loadActiveCredentials() where credential.isCodexSnapshotOnly {
                 poller.pollCodexSnapshot(credential)
                 poller.pollCodexSnapshot(credential)
             }
+            func stored(_ id: String) -> (error: String?, polled: String?) {
+                for r in try! db.prepare("SELECT last_error, last_poll_at FROM oauth_credentials WHERE account_id = ?").bind(id) {
+                    return (r[0] as? String, r[1] as? String)
+                }
+                return (nil, nil)
+            }
+            expectEqual(stored("user-legacy-robb").error, OAuthPoller.codexProfileNotLoggedInMessage(profile: "robb"),
+                        "a stale pre-snapshot error is replaced by the real cause, which names the reauth command")
+            expect(stored("user-legacy-robb").polled == nil,
+                   "a row with no reading never gets last_poll_at (the staleness backstop must still see it)")
+            expectEqual(stored("codex-profile:agent-9").error, OAuthPoller.codexProfileNotLoggedInMessage(profile: "agent-9"),
+                        "a never-logged-in profile persists the login diagnostic, not 'wait for a Codex turn'")
+            expectEqual(stored("acct-agent-7").error, OAuthPoller.rolledOverCodexSnapshotMessage,
+                        "a logged-in profile whose only reading rolled over says so")
+            expect(stored("acct-agent-1").error == nil, "a successful snapshot read clears last_error")
             var rows: [(String?, Double?)] = []
             for r in try! db.prepare("SELECT timestamp, weekly_all_percent FROM usage_history WHERE account_id = 'acct-agent-1' AND is_synthetic = 0").bind() {
                 rows.append((r[0] as? String, r[1] as? Double))
@@ -732,7 +753,8 @@ enum SelfTest {
             expectEqual(try! db.scalar("SELECT last_updated FROM accounts WHERE id = 'acct-agent-1'") as? String, observedISO,
                         "last_updated is the observation instant, so an idle account reads as stale")
             expectEqual(poller.credentialStatuses.first { $0.accountId == "codex-profile:agent-9" }?.lastError,
-                        OAuthPoller.noCodexSnapshotMessage, "a profile with no snapshot says so")
+                        OAuthPoller.codexProfileNotLoggedInMessage(profile: "agent-9"),
+                        "the in-memory status matches the persisted diagnostic")
 
             expect(OAuthPoller.isLoomCodexProfile(root + "/agent-1", root: root), "a profile home is recognized as Loom-owned")
             expect(!OAuthPoller.isLoomCodexProfile(root + "-other/agent-1", root: root), "a sibling path is not")
