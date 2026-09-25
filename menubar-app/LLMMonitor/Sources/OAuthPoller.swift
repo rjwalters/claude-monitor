@@ -78,6 +78,11 @@ struct OAuthCredential {
     /// `CodexAppServerClient` without a second query. nil = no registered home
     /// (the ambient `$CODEX_HOME`, else `~/.codex`).
     let codexHome: String?
+    /// `accounts.codex_home_mode`. `CodexProfiles.snapshotMode` means this
+    /// home is owned by a Loom session container and must only ever be read
+    /// from its rollout snapshots — never by spawning `codex`, never by
+    /// reading its bearer.
+    let codexHomeMode: String?
 
     init(
         id: Int64?,
@@ -92,7 +97,8 @@ struct OAuthCredential {
         subscriptionType: String?,
         rateLimitTier: String?,
         isActive: Bool,
-        codexHome: String? = nil
+        codexHome: String? = nil,
+        codexHomeMode: String? = nil
     ) {
         self.id = id
         self.accountId = accountId
@@ -107,7 +113,10 @@ struct OAuthCredential {
         self.rateLimitTier = rateLimitTier
         self.isActive = isActive
         self.codexHome = codexHome
+        self.codexHomeMode = codexHomeMode
     }
+
+    var isCodexSnapshotOnly: Bool { codexHomeMode == CodexProfiles.snapshotMode }
 }
 
 /// Raised when a credential's access token is past expiry and could not be
@@ -392,6 +401,9 @@ class OAuthPoller: ObservableObject {
         /// Whether this host has ever recorded a usage reading for this
         /// account — the conservative guard in `isAbsentCodexIdentity`.
         var hasLocalReading: Bool = false
+        /// A Loom-owned profile read only from rollout snapshots
+        /// (`CodexProfiles`). `codex list` must never probe it.
+        var isSnapshotOnly: Bool = false
 
         /// This host is expected to have this identity but was never
         /// provisioned with it (#135) — no stored token, no registered home,
@@ -450,6 +462,12 @@ class OAuthPoller: ObservableObject {
         let home = Self.normalizeCodexHome(rawHome)
         guard FileManager.default.fileExists(atPath: home) else {
             return (nil, CodexAppServerError.homeMissing(home).localizedDescription)
+        }
+        // A Loom profile's refresh chain belongs to its session container; the
+        // probe below spawns `codex` against the home, which may refresh it.
+        guard !Self.isLoomCodexProfile(home) else {
+            return (nil, "That home is a Loom Codex profile. It is registered automatically in read-only "
+                    + "snapshot mode (never probed), so there is nothing to add.")
         }
 
         // Read before the probe: an account id from auth.json lets registration
@@ -596,6 +614,7 @@ class OAuthPoller: ObservableObject {
             let accountColumns = tableColumns(db, "accounts")
             guard accountColumns.contains("provider") else { return [] }
             let hasCodexHome = accountColumns.contains("codex_home")
+            let hasCodexHomeMode = accountColumns.contains("codex_home_mode")
             // One shared spelling of "has a usable stored token" (#169) — this
             // site used to omit the `TRIM(...) != ''` guard the popover and
             // `ranking.json` applied, so an empty-string token made `codex list`
@@ -608,7 +627,8 @@ class OAuthPoller: ObservableObject {
                 SELECT a.id, \(hasCodexHome ? "a.codex_home" : "NULL"), a.plan,
                        \(storedTokenCount),
                        a.email, a.account_name,
-                       EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = a.id)
+                       EXISTS (SELECT 1 FROM usage_history u WHERE u.account_id = a.id),
+                       \(hasCodexHomeMode ? "a.codex_home_mode" : "NULL")
                 FROM accounts a
                 WHERE COALESCE(a.provider, 'anthropic') = 'openai'
                 ORDER BY a.sort_order, a.id
@@ -625,7 +645,8 @@ class OAuthPoller: ObservableObject {
                     hasStoredToken: ((row[3] as? Int64) ?? 0) > 0,
                     email: (row[4] as? String).flatMap { $0.isEmpty ? nil : $0 },
                     accountName: (row[5] as? String).flatMap { $0.isEmpty ? nil : $0 },
-                    hasLocalReading: ((row[6] as? Int64) ?? 0) != 0
+                    hasLocalReading: ((row[6] as? Int64) ?? 0) != 0,
+                    isSnapshotOnly: (row[7] as? String) == CodexProfiles.snapshotMode
                 ))
             }
             return rows
@@ -703,6 +724,141 @@ class OAuthPoller: ObservableObject {
         }
 
         return results
+    }
+
+    // MARK: - Loom Codex profiles (snapshot mode)
+
+    /// What a snapshot-mode row with no reading yet says. One literal for the
+    /// popover hover, `debug.log`, and `last_error`. Carries no path.
+    nonisolated static let noCodexSnapshotMessage =
+        "No rate-limit snapshot in this Loom Codex profile yet. One Codex turn on the "
+        + "account records one; this app never queries a Loom-owned profile directly."
+
+    /// Read one Loom profile's latest rate-limit snapshot. Never spawns
+    /// `codex`, never reads a credential (see `CodexProfiles`).
+    // Not private: SelfTest drives it directly (it is synchronous, so the
+    // real poll path runs without an async hop), like `updateCredentialStatus`.
+    func pollCodexSnapshot(_ credential: OAuthCredential) {
+        guard let accountId = credential.accountId, !accountId.isEmpty,
+              let home = credential.codexHome else { return }
+        guard let snapshot = CodexProfiles.latestSnapshot(home: home) else {
+            updateCredentialStatus(credential, status: .missing, error: Self.noCodexSnapshotMessage)
+            return
+        }
+        guard !snapshot.rateLimit.isEmpty else {
+            // Every window in the newest reading has rolled over since: the
+            // account's current usage is unknown, not what it was then.
+            updateCredentialStatus(credential, status: .valid, error:
+                "Last Codex snapshot has rolled over; usage is unknown until the account's next Codex turn.")
+            return
+        }
+        writeSnapshotToDB(accountId: accountId, snapshot: ProviderUsageSnapshot(
+            provider: .openai, accountKey: accountId, httpStatus: 200,
+            rateLimit: snapshot.rateLimit, plan: snapshot.plan,
+            rawFields: ["source": "codex-rollout-snapshot",
+                        "observed_at": ISO8601DateFormatter().string(from: snapshot.observedAt)]
+        ), observedAt: snapshot.observedAt)
+        if let plan = snapshot.plan, let db = try? openDatabase(dbPath) {
+            try? db.run("UPDATE accounts SET plan = ? WHERE id = ?", plan, accountId)
+        }
+        updateCredentialLastPoll(credential, error: nil)
+        updateCredentialStatus(credential, status: .valid, error: nil)
+    }
+
+    /// Whether `home` lives under Loom's Codex profile root, i.e. is owned by
+    /// Loom and must only be registered in snapshot mode.
+    nonisolated static func isLoomCodexProfile(_ home: String, root: String? = CodexProfiles.root()) -> Bool {
+        guard let root = root else { return false }
+        let base = (root as NSString).standardizingPath + "/"
+        return ((home as NSString).standardizingPath + "/").hasPrefix(base)
+    }
+
+    /// Register every Loom Codex profile as a snapshot-mode OpenAI account.
+    /// Add-only and idempotent, on the same every-launch cadence as the z.ai
+    /// key sync. A row is keyed on the profile's `tokens.account_id` when it
+    /// has one (what every other OpenAI row is keyed on), else
+    /// `codex-profile:<name>`.
+    ///
+    /// **Linking an existing row.** Before creating a new row, an existing
+    /// OpenAI row with no `codex_home` of its own is adopted when it is
+    /// plainly the same identity: its id matches, its email matches the
+    /// profile's `email` claim, or (for a profile that was never logged in and
+    /// so has no claim) its email's local part matches the profile name once
+    /// punctuation is ignored (`robb@…` → `robb`, `r.j.walters@…` →
+    /// `rjwalters`). That keeps a pre-profile account's history attached
+    /// instead of leaving a dead row beside a new one. A row that already has
+    /// a home is never taken over.
+    @discardableResult
+    func syncCodexProfiles(root: String? = CodexProfiles.root()) -> Int {
+        let profiles = CodexProfiles.scan(root: root)
+        guard !profiles.isEmpty, FileManager.default.fileExists(atPath: dbPath),
+              let db = try? openDatabase(dbPath) else { return 0 }
+        func normalized(_ s: String) -> String { s.lowercased().filter { $0.isLetter || $0.isNumber } }
+        var registered = 0
+        for profile in profiles {
+            let nativeId = CodexAuth.accountId(inHome: profile.home)
+            let email = CodexAuth.email(inHome: profile.home)
+            do {
+                // Already registered to this exact home: nothing to do.
+                if try db.scalar("SELECT COUNT(*) FROM accounts WHERE codex_home = ?", profile.home) as? Int64 ?? 0 > 0 {
+                    try db.run("UPDATE accounts SET codex_home_mode = ? WHERE codex_home = ?",
+                               CodexProfiles.snapshotMode, profile.home)
+                    continue
+                }
+                var target: String?
+                let candidates = try db.prepare("""
+                    SELECT id, email FROM accounts
+                    WHERE COALESCE(provider, 'anthropic') = 'openai'
+                      AND (codex_home IS NULL OR TRIM(codex_home) = '')
+                    ORDER BY sort_order, id
+                """)
+                for row in candidates {
+                    guard let id = row[0] as? String else { continue }
+                    let rowEmail = (row[1] as? String)?.lowercased()
+                    if id == nativeId || (email != nil && rowEmail == email!.lowercased()) {
+                        target = id; break
+                    }
+                    if email == nil, let local = rowEmail?.split(separator: "@").first,
+                       normalized(String(local)) == normalized(profile.name) {
+                        target = id; break
+                    }
+                }
+                let accountId = target ?? nativeId ?? CodexProfiles.accountIdPrefix + profile.name
+                let now = ISO8601DateFormatter().string(from: Date())
+                try db.run("""
+                    INSERT INTO accounts (id, account_name, email, plan, last_updated, sort_order, provider, codex_home, codex_home_mode)
+                    VALUES (?, ?, ?, NULL, NULL, COALESCE((SELECT MAX(sort_order) + 1 FROM accounts), 0), 'openai', ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        email = COALESCE(accounts.email, excluded.email),
+                        provider = 'openai',
+                        codex_home = excluded.codex_home,
+                        codex_home_mode = excluded.codex_home_mode
+                """, accountId, profile.name, email, profile.home, CodexProfiles.snapshotMode)
+                // A credential row with no token: its presence (active) is what
+                // puts the account in the poll set; it never holds a secret.
+                if let credId = try db.scalar(
+                    "SELECT id FROM oauth_credentials WHERE account_id = ? LIMIT 1", accountId) as? Int64 {
+                    try db.run("""
+                        UPDATE oauth_credentials SET provider = 'openai', source = 'loom-codex-profile',
+                            access_token = NULL, refresh_token = NULL, is_active = 1, updated_at = ?
+                        WHERE id = ?
+                    """, now, credId)
+                } else {
+                    try db.run("""
+                        INSERT INTO oauth_credentials (account_id, label, source, provider, access_token,
+                            refresh_token, token_expires_at, is_active, created_at, updated_at)
+                        VALUES (?, ?, 'loom-codex-profile', 'openai', NULL, NULL, NULL, 1, ?, ?)
+                    """, accountId, profile.name, now, now)
+                }
+                registered += 1
+                flog.info("Registered Loom Codex profile \(profile.name) in snapshot mode"
+                          + (target != nil ? " (linked to existing account \(accountId.prefix(8))…)" : ""),
+                          category: fcat)
+            } catch {
+                flog.error("syncCodexProfiles: \(profile.name): \(error.localizedDescription)", category: fcat)
+            }
+        }
+        return registered
     }
 
     // MARK: - z.ai (GLM Coding Plan) accounts
@@ -1142,6 +1298,8 @@ class OAuthPoller: ObservableObject {
         // z.ai keys live in their own chezmoi-managed directory rather than in
         // the account list files; sync them on the same launch cadence.
         let zaiResults = await syncZaiKeyFiles()
+        // Likewise Loom's Codex profiles, which need no network at all.
+        syncCodexProfiles()
 
         guard !merged.isEmpty else {
             flog.info("syncFromAccountFiles: no account list files found", category: fcat)
@@ -1306,6 +1464,7 @@ class OAuthPoller: ObservableObject {
             let hasTokenExpiry = columns.contains("token_expires_at")
             let accountColumns = tableColumns(db, "accounts")
             let hasCodexHome = accountColumns.contains("codex_home")
+            let hasCodexHomeMode = accountColumns.contains("codex_home_mode")
             let accountProvider = accountColumns.contains("provider")
                 ? "COALESCE(a.provider, 'anthropic')" : "'anthropic'"
             let homeRegistered = hasCodexHome
@@ -1317,7 +1476,8 @@ class OAuthPoller: ObservableObject {
                        c.subscription_type, c.rate_limit_tier, c.is_active,
                        \(hasProvider ? "c.provider" : "NULL"),
                        \(hasTokenExpiry ? "c.token_expires_at" : "NULL"),
-                       \(hasCodexHome ? "a.codex_home" : "NULL")
+                       \(hasCodexHome ? "a.codex_home" : "NULL"),
+                       \(hasCodexHomeMode ? "a.codex_home_mode" : "NULL")
                 FROM oauth_credentials c
                 LEFT JOIN accounts a ON a.id = c.account_id
                 WHERE c.is_active = 1
@@ -1338,7 +1498,8 @@ class OAuthPoller: ObservableObject {
                     subscriptionType: row[7] as? String,
                     rateLimitTier: row[8] as? String,
                     isActive: (row[9] as? Int64 ?? 1) == 1,
-                    codexHome: (row[12] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                    codexHome: (row[12] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                    codexHomeMode: (row[13] as? String).flatMap { $0.isEmpty ? nil : $0 }
                 ))
             }
 
@@ -1949,6 +2110,14 @@ class OAuthPoller: ObservableObject {
     /// `auth.json`) never marks the account unhealthy — it falls through
     /// silently. Only the last tier's own failure sets a status.
     private func pollOpenAI(_ credential: OAuthCredential) async throws {
+        // A Loom-owned profile never enters the ladder below: both of its rungs
+        // touch the home's credential (one by spawning `codex`, which may
+        // refresh it; one by reading its bearer), and that home's refresh chain
+        // belongs to its session container.
+        if credential.isCodexSnapshotOnly {
+            pollCodexSnapshot(credential)
+            return
+        }
         // The account id is not on the app-server wire at all, so the stored one
         // is what the higher tiers write against.
         let storedAccountId = credential.accountId.flatMap { $0.isEmpty ? nil : $0 }
@@ -2634,7 +2803,7 @@ class OAuthPoller: ObservableObject {
     /// 0 — an OpenAI account may legitimately report no session window, and
     /// storing 0 there would read downstream as "no session capacity used",
     /// inflating the account's apparent headroom.
-    private func writeSnapshotToDB(accountId: String, snapshot: ProviderUsageSnapshot) {
+    private func writeSnapshotToDB(accountId: String, snapshot: ProviderUsageSnapshot, observedAt: Date? = nil) {
         let windows = snapshot.rateLimit
         writeUsageToDB(
             accountId: accountId,
@@ -2645,7 +2814,8 @@ class OAuthPoller: ObservableObject {
             rawFields: snapshot.rawFields,
             probeModel: "\(snapshot.provider.rawValue)-usage",
             httpStatus: snapshot.httpStatus,
-            namedLimits: windows.named
+            namedLimits: windows.named,
+            observedAt: observedAt
         )
     }
 
@@ -2665,13 +2835,25 @@ class OAuthPoller: ObservableObject {
         rawFields: [String: String],
         probeModel: String,
         httpStatus: Int,
-        namedLimits: [String: RateLimitWindow] = [:]
+        namedLimits: [String: RateLimitWindow] = [:],
+        observedAt: Date? = nil
     ) {
         guard FileManager.default.fileExists(atPath: dbPath) else { return }
 
         do {
             let db = try openDatabase(dbPath)
-            let now = ISO8601DateFormatter().string(from: Date())
+            // `observedAt` is set when the reading was *recorded* earlier than
+            // it is being read (a Codex rollout snapshot): the row, and
+            // `last_updated`, carry that instant so the staleness backstop sees
+            // the reading's real age. Re-reading the same snapshot is a no-op.
+            let now = ISO8601DateFormatter().string(from: observedAt ?? Date())
+            if observedAt != nil {
+                let seen = try db.scalar(
+                    "SELECT COUNT(*) FROM usage_history WHERE account_id = ? AND timestamp = ? AND is_synthetic = 0",
+                    accountId, now
+                ) as? Int64 ?? 0
+                if seen > 0 { return }
+            }
 
             let primaryPercent = [sessionPercent, weeklyPercent].compactMap { $0 }.max()
 
@@ -2685,7 +2867,9 @@ class OAuthPoller: ObservableObject {
                 for prev in prevStmt.bind(accountId) {
                     let prevWeekly = (prev[2] as? Double) ?? 0
                     if prevWeekly - weeklyPercent > 5 {
-                        let midpointDate = Date()
+                        // Bracket the real row, which carries `observedAt`
+                        // when the reading predates this write.
+                        let midpointDate = observedAt ?? Date()
                         let midpointISO = ISO8601DateFormatter().string(from: midpointDate.addingTimeInterval(-1))
 
                         try db.run(

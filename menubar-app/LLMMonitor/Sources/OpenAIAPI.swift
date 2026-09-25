@@ -671,6 +671,31 @@ enum CodexAuth {
         return id
     }
 
+    /// **Only** the `email` claim of a home's `tokens.id_token`, never a token.
+    ///
+    /// Same contract as `accountId(inHome:)`: one non-secret identity field,
+    /// nil for every "can't tell" case. Used to label Loom's snapshot-mode
+    /// profiles (`CodexProfiles`), whose rollout logs carry no identity. The
+    /// JWT is decoded locally; its signature is irrelevant here because the
+    /// claim only names a row and authenticates nothing.
+    static func email(inHome home: String?) -> String? {
+        let path = authPath(inHome: home)
+        guard let data = FileManager.default.contents(atPath: path),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = root["tokens"] as? [String: Any],
+              let idToken = tokens["id_token"] as? String else { return nil }
+        let parts = idToken.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var payload = String(parts[1]).replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
+        guard let claims = Data(base64Encoded: payload)
+                .flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }),
+              let email = (claims["email"] as? String)?.trimmingCharacters(in: .whitespaces),
+              email.contains("@") else { return nil }
+        return email
+    }
+
     /// Load and parse a credential file. `path` defaults to `defaultAuthPath`.
     static func load(path: String? = nil) throws -> Credential {
         let path = path ?? defaultAuthPath

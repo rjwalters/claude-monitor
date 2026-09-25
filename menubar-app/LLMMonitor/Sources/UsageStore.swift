@@ -636,6 +636,15 @@ class UsageStore: ObservableObject {
         addColumnIfMissing(db, table: "accounts",
                            column: "codex_home", definition: "TEXT")
 
+        // Migration (Loom Codex profiles): how a registered `codex_home` may
+        // be read. NULL = the normal ladder (`codex app-server`, then a
+        // request-time `auth.json` bearer). `'snapshot'` = read only the
+        // rate-limit snapshots Codex writes into the home's rollout logs,
+        // never spawning `codex` or reading a credential, because a Loom
+        // session container owns that home's refresh chain (`CodexProfiles`).
+        addColumnIfMissing(db, table: "accounts",
+                           column: "codex_home_mode", definition: "TEXT")
+
         // Migration (transcript ingest, #197): the Claude session a subagent
         // transcript belongs to.
         //

@@ -72,6 +72,8 @@ enum SelfTest {
         testZaiQuotaResponseMapping()
         testZaiKeyFileParsing()
         testDataDirectoryMigration()
+        testCodexRolloutSnapshotParsing()
+        testCodexProfileSyncSnapshotMode()
         testCodexAuthParsing()
         testCodexAppServerFraming()
         testCodexAppServerEnvelopeDecoding()
@@ -600,6 +602,145 @@ enum SelfTest {
     /// The wire contract, mapped onto the shared model: windows filed by
     /// duration, a null secondary window left nil, identity picked up from the
     /// same response, and per-model sub-limits landing in `named`.
+    // MARK: Loom Codex profiles (snapshot mode)
+
+    /// A real codex-cli 0.156 `token_count` line, identity fields removed.
+    static let codexRolloutLine = #"{"timestamp":"2026-09-23T16:56:22.026Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","limit_name":null,"primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":1790713159},"secondary":null,"plan_type":"pro","rate_limit_reached_type":null}}}"#
+
+    private static func testCodexRolloutSnapshotParsing() {
+        let observedLine = Date(timeIntervalSince1970: 1790182582.026)
+        let before = Date(timeIntervalSince1970: 1790200000)   // after the reading, before its reset
+        let text = """
+            {"timestamp":"2026-09-23T10:00:00.000Z","payload":{"rate_limits":{"primary":{"used_percent":5.0,"window_minutes":10080,"resets_at":1790713159}}}}
+            not json at all
+            \(codexRolloutLine)
+            {"timestamp":"2026-09-23T16:57:00.000Z","type":"response_item","payload":{"text":"no limits here"}}
+            """
+        guard let snap = CodexProfiles.extractSnapshot(text: text, fallbackObservedAt: .distantPast, now: before) else {
+            expect(false, "a rollout with a rate_limits line must yield a snapshot"); return
+        }
+        expectEqual(snap.observedAt.timeIntervalSince1970.rounded(), observedLine.timeIntervalSince1970.rounded(),
+                    "observedAt is the winning line's own timestamp, and the LAST rate_limits line wins")
+        expect(snap.rateLimit.session == nil,
+               "primary with window_minutes 10080 is weekly, never the session window (kind by duration, not by slot)")
+        expectEqual(snap.rateLimit.weekly?.usedPercent, 43, "weekly used_percent")
+        expectEqual(snap.rateLimit.weekly?.resetAt, Date(timeIntervalSince1970: 1790713159),
+                    "integer resets_at is epoch seconds")
+        expectEqual(snap.plan, "pro", "plan_type rides along")
+
+        // Once the window's reset has passed, the reading no longer describes
+        // the current window: dropped, never carried forward.
+        let after = Date(timeIntervalSince1970: 1790713160)
+        let expired = CodexProfiles.extractSnapshot(text: codexRolloutLine, fallbackObservedAt: .distantPast, now: after)
+        expect(expired?.rateLimit.isEmpty == true && expired?.expiredWindows == 1,
+               "a rolled-over window is dropped rather than reported as current usage")
+
+        // Older vintages: relative resets_in_seconds, RFC 3339 resets_at, no line timestamp.
+        let mtime = Date(timeIntervalSince1970: 1790000000)
+        let legacy = #"{"msg":{"rate_limits":{"primary":{"used_percent":80,"window_minutes":300,"resets_in_seconds":600},"secondary":{"used_percent":20,"window_minutes":10080,"resets_at":"2026-09-30T00:00:00Z"}}}}"#
+        let old = CodexProfiles.extractSnapshot(text: legacy, fallbackObservedAt: mtime, now: mtime)
+        expectEqual(old?.observedAt, mtime, "no line timestamp falls back to the file mtime")
+        expectEqual(old?.rateLimit.session?.usedPercent, 80, "a 300-minute window is the session window")
+        expectEqual(old?.rateLimit.session?.resetAt, mtime.addingTimeInterval(600),
+                    "resets_in_seconds counts from the observation instant")
+        expectEqual(old?.rateLimit.weekly?.resetAt, UsageRecord.parseISO("2026-09-30T00:00:00Z"),
+                    "an RFC 3339 resets_at is accepted")
+        expect(CodexProfiles.extractSnapshot(text: #"{"rate_limits":{"primary":null,"secondary":null}}"#,
+                                            fallbackObservedAt: mtime) == nil,
+               "a rate_limits object with no usable window is no evidence")
+    }
+
+    private static func testCodexProfileSyncSnapshotMode() {
+        withSelfTestTempDir("codex-profiles") { dir in
+            let fm = FileManager.default
+            let root = dir.appendingPathComponent("codex-profiles").path
+            let dbPath = dir.appendingPathComponent("usage.db").path
+            UsageStore(dbPath: dbPath).ensureDatabase()
+
+            // Two logged-in profiles (one with an email claim), and two never
+            // logged in whose names match pre-existing home-less rows.
+            func makeProfile(_ name: String, accountId: String?, email: String?) {
+                let home = (root as NSString).appendingPathComponent(name)
+                try? fm.createDirectory(atPath: home + "/sessions/2026/09/23", withIntermediateDirectories: true)
+                if let accountId = accountId {
+                    var tokens: [String: Any] = ["account_id": accountId, "access_token": "SECRET-NEVER-READ"]
+                    if let email = email {
+                        let claims = try! JSONSerialization.data(withJSONObject: ["email": email])
+                        let b64 = claims.base64EncodedString().replacingOccurrences(of: "=", with: "")
+                            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
+                        tokens["id_token"] = "e30.\(b64).sig"
+                    }
+                    let auth = try! JSONSerialization.data(withJSONObject: ["tokens": tokens])
+                    fm.createFile(atPath: home + "/auth.json", contents: auth)
+                }
+            }
+            makeProfile("agent-1", accountId: "acct-agent-1", email: "agent-1@example.com")
+            makeProfile("agent-9", accountId: nil, email: nil)
+            makeProfile("robb", accountId: nil, email: nil)
+            makeProfile("rjwalters", accountId: nil, email: nil)
+            fm.createFile(atPath: root + "/agent-1/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl",
+                          contents: Data((codexRolloutLine + "\n").utf8))
+            try? fm.createDirectory(atPath: root + "/.loom-bookkeeping", withIntermediateDirectories: true)
+
+            // Pre-profile legacy rows: dead since their token was cleared (#123).
+            let db = try! openDatabase(dbPath)
+            for (id, email) in [("user-legacy-robb", "robb@example.com"), ("user-legacy-rj", "r.j.walters@example.com"),
+                                ("user-other", "someone@example.com")] {
+                try! db.run("INSERT INTO accounts (id, account_name, email, provider) VALUES (?, ?, ?, 'openai')", id, email, email)
+            }
+
+            let poller = OAuthPoller(dbPath: dbPath)
+            expectEqual(poller.syncCodexProfiles(root: root), 4, "every profile directory is registered, hidden ones skipped")
+            expectEqual(poller.syncCodexProfiles(root: root), 0, "a second sync is a no-op")
+
+            func row(_ id: String) -> (home: String?, mode: String?, email: String?)? {
+                for r in try! db.prepare("SELECT codex_home, codex_home_mode, email FROM accounts WHERE id = ?").bind(id) {
+                    return (r[0] as? String, r[1] as? String, r[2] as? String)
+                }
+                return nil
+            }
+            expectEqual(row("acct-agent-1")?.mode, CodexProfiles.snapshotMode, "a logged-in profile is keyed on its account_id, in snapshot mode")
+            expectEqual(row("acct-agent-1")?.email, "agent-1@example.com", "email comes from the id_token claim")
+            expectEqual(row("codex-profile:agent-9")?.home, root + "/agent-9", "a never-logged-in profile gets a codex-profile: id")
+            expectEqual(row("user-legacy-robb")?.home, root + "/robb", "robb@ is linked to the robb profile")
+            expectEqual(row("user-legacy-rj")?.home, root + "/rjwalters", "r.j.walters@ links to rjwalters (punctuation ignored)")
+            expect(row("user-other")?.home == nil, "an unrelated home-less row is left alone")
+
+            let creds = poller.loadActiveCredentials().filter { $0.isCodexSnapshotOnly }
+            expectEqual(creds.count, 4, "every profile row is in the poll set")
+            expect(creds.allSatisfy { $0.accessToken == nil }, "no profile credential row ever holds a token")
+
+            // A poll reads the snapshot and stamps the row with when Codex
+            // recorded it. The fixture's reset is relative to now, so the
+            // window stays live whenever this runs.
+            let observed = Date().addingTimeInterval(-7200)
+            let observedISO = ISO8601DateFormatter().string(from: observed)
+            let liveLine = #"{"timestamp":"\#(observedISO)","payload":{"rate_limits":{"primary":{"used_percent":43.0,"window_minutes":10080,"resets_at":\#(Int(Date().timeIntervalSince1970) + 3 * 86400)},"secondary":null,"plan_type":"pro"}}}"#
+            fm.createFile(atPath: root + "/agent-1/sessions/2026/09/23/rollout-2026-09-23T16-55-50-x.jsonl",
+                          contents: Data((liveLine + "\n").utf8))
+            for credential in poller.loadActiveCredentials() where credential.isCodexSnapshotOnly {
+                poller.pollCodexSnapshot(credential)
+                poller.pollCodexSnapshot(credential)
+            }
+            var rows: [(String?, Double?)] = []
+            for r in try! db.prepare("SELECT timestamp, weekly_all_percent FROM usage_history WHERE account_id = 'acct-agent-1' AND is_synthetic = 0").bind() {
+                rows.append((r[0] as? String, r[1] as? Double))
+            }
+            expectEqual(rows.count, 1, "re-reading an unchanged snapshot writes no second row")
+            expectEqual(rows.first?.0, observedISO, "the row carries the snapshot's own timestamp, not the poll time")
+            expectEqual(rows.first?.1, 43, "the weekly figure lands in weekly_all_percent")
+            expectEqual(try! db.scalar("SELECT last_updated FROM accounts WHERE id = 'acct-agent-1'") as? String, observedISO,
+                        "last_updated is the observation instant, so an idle account reads as stale")
+            expectEqual(poller.credentialStatuses.first { $0.accountId == "codex-profile:agent-9" }?.lastError,
+                        OAuthPoller.noCodexSnapshotMessage, "a profile with no snapshot says so")
+
+            expect(OAuthPoller.isLoomCodexProfile(root + "/agent-1", root: root), "a profile home is recognized as Loom-owned")
+            expect(!OAuthPoller.isLoomCodexProfile(root + "-other/agent-1", root: root), "a sibling path is not")
+            expectEqual(CodexProfiles.root(environment: ["LOOM_CODEX_PROFILE_ROOT": " "]), nil,
+                        "an explicitly empty LOOM_CODEX_PROFILE_ROOT disables profiles, as in loom-daemon")
+        }
+    }
+
     // MARK: Data directory rename (2.0)
 
     /// Every state `AppPaths.migrateLegacyDataDirectory` can meet, each in its
