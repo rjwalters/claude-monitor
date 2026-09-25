@@ -70,7 +70,8 @@ stashes, untracked files) always need an explicit opt-in.
 | /repo:scrub | What does the public surface expose? Code, history, issues, PRs, forks — report-only |
 | /repo:host-optimize | Prep/re-check a Mac (or Linux box) for heavy Loom/agent build use — Gatekeeper churn, backup-agent interference, build-tree bloat |
 | /repo:update-tools | Keep Loom/Anvil/Repo Skills installs current |
-| /repo:deps | Keep third-party deps current — verify/scaffold Dependabot (config + security flag), triage open Dependabot PRs |
+| /repo:deps | Keep third-party deps current — reconcile organization policy, Renovate or Dependabot, and bot PRs |
+| /repo:org-policy | Preview/install canonical organization preferences from the current client repo |
 
 ### Focused checks
 | /repo:docs | Documentation health — content, README structure, cross-refs |
@@ -99,7 +100,7 @@ their frontmatter descriptions.
   `.claude/commands/repo/`
 - Updating: `/repo:update-tools` for installed tool packages (source:
   https://github.com/rjwalters/repo); `/repo:deps` for third-party dependencies
-  (Dependabot setup + bot-PR triage)
+  (organization policy + updater setup + bot-PR triage)
 
 ## Steps — with a command argument
 

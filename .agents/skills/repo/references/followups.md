@@ -334,6 +334,20 @@ confidentiality flag there (e.g. `source_confidential = true`), treat that as
 authoritative and skip the keyword scan; a deliberate flag is a more reliable
 signal than prose matching and should not need re-confirming every session.
 
+`.repo/scrub.toml` also accepts a third, stricter value: the **string**
+`source_confidential = "block"` (distinct from the boolean `true` above).
+Where the boolean only strengthens step 4's warning, `"block"` changes step
+4's default disposition for `public`/`unknown` rows — see step 4 below. This
+is a separate, deliberate opt-in, not a stronger keyword match: the CLAUDE.md
+keyword scan above never sets block mode on its own, no matter how many
+confidentiality phrases it matches, because — as the next paragraph explains —
+a keyword scan cannot tell a real firewall statement apart from an unrelated
+use of the same word, which is a poor basis for something that changes what
+gets filed rather than just what gets printed. Only an explicit
+`.repo/scrub.toml` opt-in can select block mode. The default (no
+`source_confidential` key) and the boolean `true` case are unaffected by this
+paragraph and keep today's warn-only behavior exactly as described below.
+
 **When in doubt, warn** — this follows the same fail-closed convention step 3b
 already uses for an unresolved target visibility. A match on any phrase above
 sets `source-looks-confidential = true` regardless of the surrounding context
@@ -344,8 +358,10 @@ The one case that does **not** set the flag is a **missing** `CLAUDE.md` — no
 file means no signal to read, not a signal to assume one way or the other.
 
 This step reads no candidate bodies and re-derives no target visibility — it
-produces exactly one repo-wide boolean that step 4 combines with 3b's already-resolved
-`Vis` column.
+produces exactly one repo-wide boolean (`source-looks-confidential`), plus a
+second, independent repo-wide flag (`source-block-mode`, set only by the
+`.repo/scrub.toml` `"block"` string above and never by the keyword scan), that
+step 4 combines with 3b's already-resolved `Vis` column.
 
 ### 4. Report the proposed set and confirm
 
@@ -380,6 +396,37 @@ When 3c found no confidentiality signal, or every row's `Vis` is `private`
 (the one case that is not treated as public), show the table alone with no
 preamble warning — the ordinary confirm is sufficient.
 
+**If step 3c set `source-block-mode = true` (the `.repo/scrub.toml`
+`source_confidential = "block"` opt-in), replace the warning above with a
+hold instead** — this is a different posture from the advisory warning, not a
+louder version of it. Every row whose `Vis` is `public` or `unknown` is marked
+`HOLD — source firewall` in the table by default, the same convention step 3b
+already uses for `HOLD — needs redaction`, and that row is **not** filed by
+the ordinary "approve the set" confirmation below — filing it requires the
+operator to give a separate, explicit per-run override naming the held row(s)
+after being told the hold exists, not a bare "yes" to the table as a whole:
+
+```
+🔒 SOURCE FIREWALL ACTIVE — this repo's .repo/scrub.toml sets
+    source_confidential = "block". Every row below marked HOLD — source
+    firewall is held by default; approving the set below does NOT file
+    it. To file a held row anyway, say so explicitly for that row number
+    after this warning — a plain "yes" to the table is not an override.
+
+FOLLOW-UPS FROM THIS SESSION
+============================
+| # | Target repo        | Vis     | Title                              | Dedup                   | Hold                    |
+|---|--------------------|---------|------------------------------------|--------------------------|-------------------------|
+| 1 | rjwalters/repo     | public  | orphans check misses nested dirs   | NEW                     | HOLD — source firewall  |
+| 2 | rjwalters/repo     | private | internal note about this repo      | NEW                     | —                       |
+```
+
+A row targeting this repo, or any row whose `Vis` is `private`, is never held
+by block mode — only `public`/`unknown` rows are, the same fail-closed set the
+advisory warning above already targets. `--dry-run` still stops before any
+filing, block mode included, and does not by itself count as reviewing (let
+alone overriding) a hold.
+
 For each proposed issue show the target repo, its visibility, title, a body
 preview (context / repro / suggested acceptance criteria), and dedup status.
 Then confirm which to file. **If `--dry-run` was passed, stop here — file
@@ -394,10 +441,14 @@ targeting this repo still shows its visibility but carries no scrub obligation
 (step 3b skips it) — say so rather than leaving the cell blank.
 
 Like the rest of this command's confirmation gate, the step 3c warning is
-**purely advisory** — it never blocks filing and never auto-redacts a body;
-it exists only to put the source/target mismatch in front of the user at the
-moment they decide, the same "confirm, never auto-apply" posture the rest of
-the command already holds.
+**purely advisory** in the default case (no `.repo/scrub.toml`
+`source_confidential` key) and in the boolean `source_confidential = true`
+case — it never blocks filing and never auto-redacts a body; it exists only to
+put the source/target mismatch in front of the user at the moment they decide,
+the same "confirm, never auto-apply" posture the rest of the command already
+holds. Block mode (`source_confidential = "block"`), described just above, is
+the one deliberate exception: it is opt-in, structured, and never triggered by
+the CLAUDE.md keyword scan on its own.
 
 The `Dedup` column carries step 3's classification: `NEW`, a flagged
 near-match, or `ask` for an unresolved target. A flagged near-match may resolve
@@ -495,8 +546,17 @@ Filed issues are triaged like any other afterward — this command does not appl
    step 3c checks this repo's own `CLAUDE.md` (and any `.repo/scrub.toml`
    opt-in) for a confidentiality/pre-disclosure signal; when one is found and
    any row's `Vis` is `public` or `unknown`, step 4 shows a distinct warning
-   above the table, additive to the `Vis` column. This is advisory only,
-   exactly like the rest of this command's confirm-first posture — it never
-   blocks filing and never auto-redacts a body, and an unreadable or
-   ambiguous `CLAUDE.md` fails closed to warning rather than silently
-   skipping it.
+   above the table, additive to the `Vis` column. This is advisory only in the
+   default case (no `.repo/scrub.toml` `source_confidential` key) and in the
+   boolean `source_confidential = true` case, exactly like the rest of this
+   command's confirm-first posture — it never blocks filing and never
+   auto-redacts a body in those cases, and an unreadable or ambiguous
+   `CLAUDE.md` fails closed to warning rather than silently skipping it.
+8. **Hold, don't warn, when the source repo opts into block mode** —
+   `.repo/scrub.toml` may set `source_confidential = "block"`, a separate
+   structured opt-in from rule 7's boolean/default case. When set, step 4
+   marks every `public`/`unknown` row `HOLD — source firewall` by default and
+   does not file it under the ordinary set-level confirmation; filing a held
+   row requires an explicit per-run operator override naming that row. The
+   CLAUDE.md keyword scan alone never selects block mode — only the
+   structured `.repo/scrub.toml` opt-in does.

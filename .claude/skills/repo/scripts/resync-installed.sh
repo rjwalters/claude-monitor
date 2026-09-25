@@ -339,6 +339,7 @@ plan "hooks/repo/guard-destructive.sh"      ".claude/skills/repo/hooks/guard-des
 plan "hooks/repo/session-start-handoff.sh"  ".claude/skills/repo/hooks/session-start-handoff.sh" 1
 plan "scripts/repo/repo-remote.sh"          ".claude/skills/repo/scripts/repo-remote.sh"      1
 plan "scripts/repo/repo-scrub-forks.sh"     ".claude/skills/repo/scripts/repo-scrub-forks.sh" 1
+plan "scripts/repo/repo-org-policy.py"      ".claude/skills/repo/scripts/repo-org-policy.py" 1
 
 # Which commands belong to this install. A `--skills=` install is a deliberate
 # subset, so widening it here would install commands the operator declined; an
