@@ -20,11 +20,18 @@ recovery. Nonprivate escape flags and `LOOM_CODEX_NO_EXEC` previews are unchange
 
 ## Private context and control boundary
 
-The worker's cwd and project root are `/workspace/repo`; worktrees, installed
-helpers and guard bridges resolve inside that clone. The host retains the logical
-repository identity for dispatch, status and log collection. Account credentials
-stay in the external account profile; forge credentials are forwarded only to
-private Git/forge processes and never written into exports.
+The worker's cwd and project root are `/workspace/repo`; worktrees and installed
+helpers resolve inside that clone. **Guard code and effective guard policy do
+not**: they come from the image-owned, digest-sealed
+`loom-private-control-v1` bundle at `/opt/loom/private-control/`, whose identity
+is bound to the account/container/lease at admission and rechecked immediately
+before spawn and again in-container before the model is exec'd — see
+[private-control-bundle.md](private-control-bundle.md) for the supported
+image/CLI/protocol combinations, the forced policy map, the residual limitations
+and rollback. The host retains the logical repository identity for dispatch,
+status and log collection. Account credentials stay in the external account
+profile; forge credentials are forwarded only to private Git/forge processes and
+never written into exports.
 
 Private v1 refuses the SSH/host/Docker `run-job` executor. Run supported builds
 directly inside the clone. No host repository, Docker socket or daemon-control
