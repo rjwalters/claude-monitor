@@ -4,9 +4,9 @@
   "private": true,
   "scripts": {
     "worktree:return": "./.loom/scripts/worktree-return.sh",
-    "check:ci": "cd menubar-app/ClaudeMonitor && swift build",
+    "check:ci": "cd menubar-app/LLMMonitor && swift build",
     "check:all": "npm run check:ci && npm run test",
-    "test": "cd menubar-app/ClaudeMonitor && swift build && .build/debug/ClaudeMonitor selftest",
+    "test": "cd menubar-app/LLMMonitor && swift build && .build/debug/LLMMonitor selftest",
     "lint": "echo 'No linter configured. Customize this script for your project.' && exit 0"
   }
 }

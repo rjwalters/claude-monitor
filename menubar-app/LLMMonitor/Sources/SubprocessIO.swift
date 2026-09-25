@@ -120,7 +120,7 @@ final class PipeDrain: @unchecked Sendable {
         self.handle = handle
         self.onChunk = onChunk
         let thread = Thread { [self] in drainToEOF() }
-        thread.name = "claude-monitor.pipe-drain"
+        thread.name = "llm-monitor.pipe-drain"
         // Well above what a read loop needs; Foundation's default for a `Thread`
         // varies by platform and a 512 KiB floor keeps that from mattering.
         thread.stackSize = 512 * 1024

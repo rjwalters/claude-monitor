@@ -1,7 +1,7 @@
 import Foundation
 
 /// Headless poll loop — the AppDelegate cycle without any UI. This is the whole
-/// app on Linux (Loom hosts); on macOS it's reachable via `ClaudeMonitor
+/// app on Linux (Loom hosts); on macOS it's reachable via `LLMMonitor
 /// --headless` for testing. Same behavior as the menubar app: import accounts
 /// from the account list files, ping each account on a 10-minute cadence, probe
 /// the Fable tier on a 20-minute cadence, and emit ranking.json after each
@@ -25,7 +25,7 @@ enum HeadlessRunner {
             exit(0)
         }
         if args.contains("--version") {
-            print("claude-monitor \(AppVersion.current)")
+            print("llm-monitor \(AppVersion.current)")
             exit(0)
         }
 
@@ -60,7 +60,7 @@ enum HeadlessRunner {
     }
 
     private static func run(store: UsageStore, poller: OAuthPoller, once: Bool) async {
-        flog.info("claude-monitor headless v\(AppVersion.current) starting (poll interval \(Int(poller.pollInterval))s\(once ? ", single cycle" : ""))", category: "Headless")
+        flog.info("llm-monitor headless v\(AppVersion.current) starting (poll interval \(Int(poller.pollInterval))s\(once ? ", single cycle" : ""))", category: "Headless")
         store.ensureDatabase()
 
         var filesStamp = accountFilesStamp()
@@ -115,7 +115,7 @@ enum HeadlessRunner {
     private static func logSummary(store: UsageStore) {
         store.loadFromDatabase()
         guard !store.accounts.isEmpty else {
-            flog.warning("No accounts configured — add ~/.claude-monitor/accounts.env (ACCOUNT_EMAIL_N/ACCOUNT_KEY_N pairs)", category: "Headless")
+            flog.warning("No accounts configured — add ~/.llm-monitor/accounts.env (ACCOUNT_EMAIL_N/ACCOUNT_KEY_N pairs)", category: "Headless")
             return
         }
         let parts = store.sortedAccountsForPopover.map { account -> String in
@@ -139,9 +139,8 @@ enum HeadlessRunner {
 
     /// Concatenated mtimes of the account list files; changes when either is edited.
     private static func accountFilesStamp() -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser
         return ["accounts.env", "accounts.local.env"].map { name -> String in
-            let path = home.appendingPathComponent(".claude-monitor/\(name)").path
+            let path = AppPaths.path(name)
             let attrs = try? FileManager.default.attributesOfItem(atPath: path)
             let mtime = (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
             return "\(name):\(mtime)"
@@ -149,10 +148,10 @@ enum HeadlessRunner {
     }
 
     private static let usage = """
-        claude-monitor headless — polls account usage and writes
-        ~/.claude-monitor/usage.db and ~/.claude-monitor/ranking.json.
+        llm-monitor headless — polls account usage and writes
+        ~/.llm-monitor/usage.db and ~/.llm-monitor/ranking.json.
 
-        Usage: ClaudeMonitor [--headless] [options]
+        Usage: llm-monitor [--headless] [options]
           (on Linux the binary is always headless; --headless is implied)
 
         Options:
@@ -161,12 +160,12 @@ enum HeadlessRunner {
           --version           Print version and exit
           --help              Show this help
 
-        Accounts are read from ~/.claude-monitor/accounts.env and
+        Accounts are read from ~/.llm-monitor/accounts.env and
         accounts.local.env (ACCOUNT_EMAIL_N / ACCOUNT_KEY_N pairs); edits are
         picked up automatically while running.
 
         For multi-host sync of account records + credentials, see:
-          claude-monitor accounts --help
+          llm-monitor accounts --help
 
         Subcommands:
           accounts            Export/import accounts + credentials

@@ -1,6 +1,6 @@
 import Foundation
 
-/// `claude-monitor calibrate` — recompute and print the daily quota-calibration
+/// `llm-monitor calibrate` — recompute and print the daily quota-calibration
 /// series (#198).
 ///
 /// Like `accounts`, `codex` and `tokens`, this is a one-shot CLI reachable on
@@ -111,11 +111,11 @@ enum CalibrationCLI {
 
     private static func printUsage() {
         print("""
-            claude-monitor calibrate — daily quota-calibration series: what one
+            llm-monitor calibrate — daily quota-calibration series: what one
             weekly rate-limit point costs, per UTC day, pool-wide and per account.
 
             Usage:
-              claude-monitor calibrate [--days <n>] [--format json|csv]
+              llm-monitor calibrate [--days <n>] [--format json|csv]
                                        [--scope pool|account|all] [--min-points <p>]
                                        [--no-recompute] [--db <path>]
 
@@ -128,7 +128,7 @@ enum CalibrationCLI {
                                 per-point ratio is reported at all
                                 (default \(QuotaCalibration.defaultMinPointsForRatio))
               --no-recompute    Print the stored series without recomputing first
-              --db <path>       Database to read/write (default ~/.claude-monitor/usage.db)
+              --db <path>       Database to read/write (default ~/.llm-monitor/usage.db)
               --help, -h        Show this help
 
             The window is recomputed from the source series on every run and the

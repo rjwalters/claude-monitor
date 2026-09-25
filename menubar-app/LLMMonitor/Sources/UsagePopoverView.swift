@@ -263,7 +263,7 @@ struct AbsentBadge: View {
                 RoundedRectangle(cornerRadius: 3)
                     .stroke(Color.secondary.opacity(0.5), lineWidth: 1)
             )
-            .help("This host is expected to have this Codex identity but has never been provisioned with it. Codex homes are host-local and are never synced — run `claude-monitor codex provision <label>` here to create the home, log in, and register it.")
+            .help("This host is expected to have this Codex identity but has never been provisioned with it. Codex homes are host-local and are never synced — run `llm-monitor codex provision <label>` here to create the home, log in, and register it.")
             .accessibilityLabel("Absent — not provisioned on this host")
     }
 }
@@ -548,7 +548,7 @@ struct UsagePopoverView: View {
             HStack {
                 if showGitHubLink {
                     Button(action: {
-                        if let url = URL(string: "https://github.com/rjwalters/claude-monitor") {
+                        if let url = URL(string: "https://github.com/rjwalters/llm-monitor") {
                             NSWorkspace.shared.open(url)
                         }
                     }) {
@@ -728,7 +728,7 @@ struct UsagePopoverView: View {
     }
 
     /// Serialize accounts into env format and put them on the clipboard so
-    /// they can be pasted into a Claude Monitor on another machine. Anthropic
+    /// they can be pasted into a LLM Monitor on another machine. Anthropic
     /// accounts round-trip with their credential (#67); a Codex/OpenAI account
     /// has no credential to carry (#104/#123) and travels as an **identity
     /// only** — its email, provider, and home label — so the destination host
@@ -990,7 +990,7 @@ struct SummaryRow: View {
     /// never has to re-derive or restate what `codex list` already says.
     private var tokenStatusHelp: String {
         if isAbsent {
-            return "No credential on this host — this identity has never been provisioned here. Run `claude-monitor codex provision <label>`."
+            return "No credential on this host — this identity has never been provisioned here. Run `llm-monitor codex provision <label>`."
         }
         if isDrifted, let detail = credentialStatus?.lastError, !detail.isEmpty {
             return detail

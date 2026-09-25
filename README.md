@@ -1,8 +1,10 @@
-# Claude Monitor
+# LLM Monitor
 
-Monitor your Claude AI usage with a macOS menu-bar widget. Polls the Anthropic
-API with long-lived OAuth tokens (one or many) and surfaces quota, reset times,
-and usage trends without leaving your menu bar.
+Monitor your LLM subscription usage (**Claude**, **OpenAI Codex**, and **z.ai
+GLM Coding Plan** accounts, one or many) from a macOS menu-bar widget, or
+headless on Linux. It surfaces quota, reset times, and usage trends without
+leaving your menu bar. Formerly **Claude Monitor**; see
+[Upgrading to 2.0](#upgrading-to-20-claude-monitor--llm-monitor).
 
 ![Menu bar popover with the summary table](docs/window.png)
 ![Per-account usage history chart](docs/plot_window.png)
@@ -14,7 +16,7 @@ subscription usage (Pro/Max). The web dashboard at
 https://claude.ai/settings/usage shows your limits but has no programmatic
 equivalent.
 
-Claude Monitor calls the same internal endpoints that Claude Code uses, using
+LLM Monitor calls the same internal endpoints that Claude Code uses, using
 OAuth tokens you provide, and renders the data locally on your Mac.
 
 ## Features
@@ -62,7 +64,7 @@ OAuth tokens you provide, and renders the data locally on your Mac.
   by a built-in step-change alert (pool-wide tokens/point) that shows a small
   badge on the menu-bar icon and is logged in headless mode. See
   [Quota Calibration](#quota-calibration-calibrate).
-- **All data stored locally** in SQLite at `~/.claude-monitor/usage.db`.
+- **All data stored locally** in SQLite at `~/.llm-monitor/usage.db`.
 
 ## Quick Install
 
@@ -74,9 +76,9 @@ OAuth tokens you provide, and renders the data locally on your Mac.
 
 ### 2. Download
 
-Grab `ClaudeMonitor.zip` from
-[Releases](https://github.com/rjwalters/claude-monitor/releases), unzip, and
-move `ClaudeMonitor.app` to `/Applications`.
+Grab `LLMMonitor.zip` from
+[Releases](https://github.com/rjwalters/llm-monitor/releases), unzip, and
+move `LLMMonitor.app` to `/Applications`.
 
 **First run:** right-click → **Open** (required for unsigned apps).
 
@@ -124,8 +126,8 @@ regardless of how the accounts were added.
 Instead of importing by hand, keep a master list that the app loads every time
 it starts:
 
-- `~/.claude-monitor/accounts.env` — the master list (shared source of truth)
-- `~/.claude-monitor/accounts.local.env` — local overrides and additions (keep
+- `~/.llm-monitor/accounts.env` — the master list (shared source of truth)
+- `~/.llm-monitor/accounts.local.env` — local overrides and additions (keep
   this machine-specific; don't share it)
 
 Both use the same `ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` format. At launch the app
@@ -201,11 +203,11 @@ stored-credential fallback below it any more, so a home that isn't logged in
 (or a host with no `codex` binary and no readable `auth.json`) shows up as a
 red Token dot rather than quietly polling a stale copy of the credential.
 
-`codex` is located by absolute path, first hit wins: `$CLAUDE_MONITOR_CODEX_BIN`,
+`codex` is located by absolute path, first hit wins: `$LLM_MONITOR_CODEX_BIN`,
 then each `PATH` entry, then `/opt/homebrew/bin`, `/usr/local/bin`,
 `~/.local/bin`, `~/.npm-global/bin`, `~/.nvm/versions/node/current/bin`. (A macOS app launched from Finder inherits
 launchd's minimal `PATH`, which contains neither Homebrew's nor npm's bin
-directory — hence the explicit list.) Set `CLAUDE_MONITOR_CODEX_BIN` to point at
+directory — hence the explicit list.) Set `LLM_MONITOR_CODEX_BIN` to point at
 a specific install.
 
 **Registering an account: one `CODEX_HOME` per account.** `codex login` writes a
@@ -215,7 +217,7 @@ never worked before. Give each account its own home and register it by that
 path. The one-command way:
 
 ```bash
-claude-monitor codex provision work
+llm-monitor codex provision work
 ```
 
 `provision <label>` collapses "pick a home, log in, register it" into one
@@ -235,7 +237,7 @@ That one command is equivalent to the three manual steps it replaces:
 
 ```bash
 CODEX_HOME=~/.codex-work codex login --device-auth
-claude-monitor codex add --home ~/.codex-work
+llm-monitor codex add --home ~/.codex-work
 ```
 
 Reach for the manual form when you want the steps decoupled — e.g. running
@@ -252,15 +254,15 @@ and asks `codex` itself for the identity and usage. The credential stays where
 Codex CLI put it.
 
 ```bash
-claude-monitor codex list
+llm-monitor codex list
 # ACCOUNT   PLAN        AUTH               CODEX_HOME
 # user-3f2… pro         logged in          /Users/you/.codex-work
 # user-91a… plus        needs login        /Users/you/.codex-personal
 # user-77c… pro         drift → user-0d4…  /Users/you/.codex-spare
 # openai-b… —           absent             (not provisioned on this host)
-#   → claude-monitor codex provision agent3
+#   → llm-monitor codex provision agent3
 # user-5e1… pro         stranded           (none registered — nothing left to poll with)
-#   → claude-monitor codex add --home <path>
+#   → llm-monitor codex add --home <path>
 ```
 
 `list` reports each home's live state: **logged in**, **needs login** (the home
@@ -328,7 +330,7 @@ copy/paste you already use. **There is no config file and no new command.**
 2. On the host that should have them, click **Paste**. Each identity that
    isn't already present becomes a placeholder: an account row with no
    credential and no home. (On a headless host with no popover, put the same
-   keyless entries in `~/.claude-monitor/accounts.env` — see
+   keyless entries in `~/.llm-monitor/accounts.env` — see
    [Master account list](#master-account-list-auto-loaded-at-launch).)
 
 **No credential of any kind crosses in either direction, and neither does a
@@ -342,7 +344,7 @@ having to go looking:
   blank. It is never auto-selected for the menu bar and never ranks as
   "most available" on its empty reading.
 - **In `codex list`** — status `absent`, with the exact remediation beside it:
-  `→ claude-monitor codex provision agent3`.
+  `→ llm-monitor codex provision agent3`.
 - **In `ranking.json`** — `"absent": true` alongside `"status": "blocked"`, so
   an external load balancer excludes it whether or not it understands the new
   key (see [Ranking Export](#ranking-export-rankingjson)).
@@ -370,7 +372,7 @@ The original path still works, for hosts without a usable `codex` binary:
 
 ```bash
 codex login
-claude-monitor codex import    # or: Add Account → "Import Codex Account"
+llm-monitor codex import    # or: Add Account → "Import Codex Account"
 ```
 
 The importer reads `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, otherwise
@@ -413,7 +415,7 @@ What differs from an Anthropic row once it's added:
   entirely, and this app touches neither. The Token dot reports the outcome:
   green (a tier read succeeded), **red** (every tier failed — most often the
   home isn't logged in; hover for the reason, then run `codex login` or
-  register the right home with `claude-monitor codex add --home <path>`). A
+  register the right home with `llm-monitor codex add --home <path>`). A
   stale OpenAI account never fails silently.
 
 > **Historical note.** Earlier versions stored an OpenAI access/refresh token
@@ -437,15 +439,15 @@ spends no quota. It reports a **5-hour** window and a **weekly** window, shown
 in the same columns as Claude's.
 
 Keys are read from `~/.zai/coding-plan-<label>.env` (chezmoi-managed on
-operator Macs; override the directory with `$CLAUDE_MONITOR_ZAI_DIR`). Each
+operator Macs; override the directory with `$LLM_MONITOR_ZAI_DIR`). Each
 file holds one `ZAI_API_KEY=…` line, and an `(account: <email>)` header comment
 names the account:
 
 ```bash
-claude-monitor zai import     # register every coding-plan-<label>.env
-claude-monitor zai list       # last stored 5h / weekly usage per account
+llm-monitor zai import     # register every coding-plan-<label>.env
+llm-monitor zai list       # last stored 5h / weekly usage per account
 # one key from a file or stdin (never argv):
-claude-monitor zai add agent3 --key-file ~/.zai/coding-plan-agent3.env
+llm-monitor zai add agent3 --key-file ~/.zai/coding-plan-agent3.env
 ```
 
 The app also scans that directory **at every launch**, so a rotated key is
@@ -520,7 +522,7 @@ aborts with a clear error).
 
 Because these endpoints are undocumented, they may change without notice. If a
 roll stops working, the script template in `TokenRoller.revokeAllScript`
-(`menubar-app/ClaudeMonitor/Sources/TokenRoller.swift`) is the single place to
+(`menubar-app/LLMMonitor/Sources/TokenRoller.swift`) is the single place to
 update.
 
 Finally, server-side revocation is known to lag or silently fail (see
@@ -570,13 +572,13 @@ against `/v1/messages`.
 │  OAuth credentials                                                       │
 │    - `claude setup-token` (single, paste-in)            [anthropic]      │
 │    - `.env` bulk import (ACCOUNT_EMAIL_N / ACCOUNT_KEY_N) [anthropic]    │
-│    - `claude-monitor codex import` (~/.codex/auth.json)   [openai]       │
-│    - `claude-monitor codex add --home <path>` (no token)  [openai]       │
+│    - `llm-monitor codex import` (~/.codex/auth.json)   [openai]       │
+│    - `llm-monitor codex add --home <path>` (no token)  [openai]       │
 └────────────────────────────────┬─────────────────────────────────────────┘
                                  │ stored in
                                  ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  SQLite — ~/.claude-monitor/usage.db                                     │
+│  SQLite — ~/.llm-monitor/usage.db                                     │
 │    accounts │ oauth_credentials │ usage_history │ settings               │
 │    token_sessions │ token_usage  (transcript token counters)             │
 │    (accounts.provider / oauth_credentials.provider tag the upstream)     │
@@ -612,20 +614,20 @@ against `/v1/messages`.
 ### Build & Run
 
 ```bash
-git clone https://github.com/rjwalters/claude-monitor.git
-cd claude-monitor/menubar-app/ClaudeMonitor
+git clone https://github.com/rjwalters/llm-monitor.git
+cd llm-monitor/menubar-app/LLMMonitor
 swift build
-.build/debug/ClaudeMonitor &
+.build/debug/LLMMonitor &
 ```
 
 CI (`.github/workflows/build.yml`) runs on pushes to `main` and on pull requests:
 two jobs build the package — macOS and a `swift:6.1` Linux container — and each
-runs `ClaudeMonitor selftest`, with the Linux job also smoke-running `--once`.
+runs `LLMMonitor selftest`, with the Linux job also smoke-running `--once`.
 
 **Manually re-triggering CI.** The `push`/`pull_request` webhook deliveries
 that normally queue a run can silently stop firing for a stretch of time —
 with no change to the workflow file, Actions settings, or repo state (see
-[#66](https://github.com/rjwalters/claude-monitor/issues/66)). Since the
+[#66](https://github.com/rjwalters/llm-monitor/issues/66)). Since the
 workflow also carries a bare `workflow_dispatch:` trigger, you can queue a run
 directly against any branch (including an open PR's head) without depending
 on that webhook:
@@ -650,9 +652,9 @@ incident.
 The script auto-detects the installed `claude-code` version (from
 `claude --version`, falling back to the npm global listing) and patches
 the User-Agent string in `AnthropicAPI.swift` before compiling. Output:
-`build/ClaudeMonitor.app` and `build/ClaudeMonitor.zip`.
+`build/LLMMonitor.app` and `build/LLMMonitor.zip`.
 
-When replacing `/Applications/ClaudeMonitor.app`, you must `rm -rf` the old
+When replacing `/Applications/LLMMonitor.app`, you must `rm -rf` the old
 bundle before copying — `cp -R` over a running app does not replace the
 binary. See `CLAUDE.md` for the exact sequence.
 
@@ -660,7 +662,7 @@ binary. See `CLAUDE.md` for the exact sequence.
 
 The same package builds on Linux as a headless daemon — no UI, same poll loop
 (account-file sync, 10-minute usage pings, 20-minute Fable probes) writing the
-same `~/.claude-monitor/usage.db` and `ranking.json`. This is what Loom hosts
+same `~/.llm-monitor/usage.db` and `ranking.json`. This is what Loom hosts
 run.
 
 ### Quick install (recommended)
@@ -679,7 +681,7 @@ systemd user unit, seed accounts — in one idempotent, re-runnable command:
 ./scripts/install-linux.sh --from-source
 
 # Already have a binary (built by hand, copied from another host, ...):
-./scripts/install-linux.sh --binary /path/to/ClaudeMonitor
+./scripts/install-linux.sh --binary /path/to/LLMMonitor
 
 # System-wide install instead of the per-user default (sudo used only here):
 ./scripts/install-linux.sh --from-release --prefix /usr/local
@@ -701,8 +703,8 @@ installs, upgrades, or troubleshooting.
 ### Build (Linux)
 
 The quickest path needs no Swift toolchain at all: every
-[GitHub Release](https://github.com/rjwalters/claude-monitor/releases) carries
-a statically-linked `claude-monitor-linux-x64` asset (no dynamic Swift/
+[GitHub Release](https://github.com/rjwalters/llm-monitor/releases) carries
+a statically-linked `llm-monitor-linux-x64` asset (no dynamic Swift/
 Foundation dependency — verified in CI via `ldd`), so `curl`-ing it down and
 `chmod +x` is enough to run it on a bare host. To build from source instead:
 
@@ -711,9 +713,9 @@ Requires a Swift toolchain ([swift.org](https://www.swift.org/install/) or the
 
 ```bash
 sudo apt-get install libsqlite3-dev   # (yum: sqlite-devel)
-cd claude-monitor/menubar-app/ClaudeMonitor
+cd llm-monitor/menubar-app/LLMMonitor
 swift build -c release --static-swift-stdlib
-sudo cp .build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+sudo cp .build/release/LLMMonitor /usr/local/bin/llm-monitor
 ```
 
 **Use `--static-swift-stdlib` for any binary you intend to deploy.** A plain
@@ -731,9 +733,9 @@ out — no Swift install on either the build host or the target (verified
 2026-09-16, ~47 s):
 
 ```bash
-docker run --rm -v "$PWD/menubar-app/ClaudeMonitor:/src" -w /src swift:6.1 bash -c \
+docker run --rm -v "$PWD/menubar-app/LLMMonitor:/src" -w /src swift:6.1 bash -c \
   'apt-get update -qq && apt-get install -y -qq libsqlite3-dev && swift build -c release --static-swift-stdlib'
-sudo cp menubar-app/ClaudeMonitor/.build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+sudo cp menubar-app/LLMMonitor/.build/release/LLMMonitor /usr/local/bin/llm-monitor
 ```
 
 Run it from the repository root (the bind mount is relative to `$PWD`).
@@ -746,22 +748,22 @@ Ubuntu 24.04; on a minimal image install it with `apt-get install libsqlite3-0`.
 Confirm the binary has no other unmet dependencies:
 
 ```bash
-ldd /usr/local/bin/claude-monitor | grep 'not found'   # should print nothing
+ldd /usr/local/bin/llm-monitor | grep 'not found'   # should print nothing
 ```
 
 ### Run
 
-Put your accounts in `~/.claude-monitor/accounts.env`
+Put your accounts in `~/.llm-monitor/accounts.env`
 (`ACCOUNT_EMAIL_N` / `ACCOUNT_KEY_N` pairs, same format as the app's bulk
 import — see [Multiple Accounts](#multiple-accounts)), then:
 
 ```bash
-claude-monitor                  # poll loop, logs to stdout + ~/.claude-monitor/debug.log
-claude-monitor --once           # one poll cycle, write ranking.json, exit
-claude-monitor --interval 300   # override per-account poll interval (seconds, min 60)
-claude-monitor --version        # print the version and exit
-claude-monitor calibrate        # daily tokens/cost per weekly point, JSON on stdout
-claude-monitor selftest         # self-check (no network/credentials); non-zero exit on failure
+llm-monitor                  # poll loop, logs to stdout + ~/.llm-monitor/debug.log
+llm-monitor --once           # one poll cycle, write ranking.json, exit
+llm-monitor --interval 300   # override per-account poll interval (seconds, min 60)
+llm-monitor --version        # print the version and exit
+llm-monitor calibrate        # daily tokens/cost per weekly point, JSON on stdout
+llm-monitor selftest         # self-check (no network/credentials); non-zero exit on failure
 ```
 
 `selftest` also takes `--db <path>` (migrate and verify a **copy** of a real
@@ -770,40 +772,40 @@ database — it writes, so never point it at the live `usage.db`) and
 OpenAI wire contract; prints only derived numbers, never identity fields).
 `--codex` additionally runs one real `codex app-server` handshake against the
 installed binary (opt-in: it needs a logged-in Codex home).
-Run `claude-monitor selftest --help` for details.
+Run `llm-monitor selftest --help` for details.
 
 Edits to `accounts.env` / `accounts.local.env` are picked up automatically
 while the daemon runs. A sample systemd user unit is provided at
-`scripts/claude-monitor.service`.
+`scripts/llm-monitor.service`.
 
-On macOS the same headless loop is available as `ClaudeMonitor --headless`
-(the bare binary or the app bundle's `Contents/MacOS/ClaudeMonitor`).
-`ClaudeMonitor --version` prints the version and exits on macOS with or
+On macOS the same headless loop is available as `LLMMonitor --headless`
+(the bare binary or the app bundle's `Contents/MacOS/LLMMonitor`).
+`LLMMonitor --version` prints the version and exits on macOS with or
 without `--headless` — it never launches the GUI. `--once` and `--interval`
 are headless-loop flags: bare (without `--headless`) they print an error to
 stderr and exit non-zero rather than launching a duplicate GUI instance, e.g.
-`ClaudeMonitor --headless --once`.
+`LLMMonitor --headless --once`.
 
 ## Multi-Host Sync
 
-When multiple hosts each run their own `claude-monitor` (e.g. two Macs + a
+When multiple hosts each run their own `llm-monitor` (e.g. two Macs + a
 fleet of headless Linux workers), account records and OAuth credentials added
-on one host don't automatically appear on the others. `claude-monitor accounts
+on one host don't automatically appear on the others. `llm-monitor accounts
 push` / `pull` converges them over ssh — no GUI required, works identically on
 macOS and Linux:
 
 ```bash
 # From the host that has the account: fan it out to the whole fleet.
-claude-monitor accounts push robb-pro loom-worker-1 loom-worker-2
+llm-monitor accounts push robb-pro loom-worker-1 loom-worker-2
 
 # Check reachability first, without sending anything:
-claude-monitor accounts push robb-pro loom-worker-1 --dry-run
+llm-monitor accounts push robb-pro loom-worker-1 --dry-run
 
 # On a Loom host, chain the step that always follows an import:
-claude-monitor accounts push loom-worker-1 --then-loom
+llm-monitor accounts push loom-worker-1 --then-loom
 
 # Bootstrapping a fresh host instead? Pull from a peer that already has them.
-claude-monitor accounts pull robb-studio
+llm-monitor accounts pull robb-studio
 ```
 
 - **Nothing is written to disk on either side.** `push` serializes the bundle
@@ -817,7 +819,7 @@ claude-monitor accounts pull robb-studio
   prefixed with the host name. The exit status is non-zero if **any** host
   failed, so a bootstrap script can gate on it.
 - **`--dry-run` sends nothing.** It checks that each host is reachable and that
-  `claude-monitor` resolves there (reporting its version) — the failure that
+  `llm-monitor` resolves there (reporting its version) — the failure that
   actually bites a fan-out — without putting a credential on the wire for a
   preview.
 - **`--then-loom`** runs `loom-daemon tokens import-from-monitor --shared` on
@@ -838,11 +840,11 @@ are still the right tool when there is no ssh path between two hosts:
 
 ```bash
 # On the source host: dump account records + credentials to a file (0600).
-claude-monitor accounts export --output accounts.json
+llm-monitor accounts export --output accounts.json
 
 # Copy it to each destination host over a trusted channel (scp, etc.),
 # then converge that host's own usage.db:
-claude-monitor accounts import accounts.json
+llm-monitor accounts import accounts.json
 ```
 
 - **What's synced:** Anthropic account identity (id, name, email, plan) and
@@ -855,7 +857,7 @@ claude-monitor accounts import accounts.json
   against a per-account `CODEX_HOME`, and OpenAI supports exactly one
   `auth.json` per machine — shipping a copy of that credential to another host
   only guarantees the two hosts take turns invalidating each other's copy.
-  Register a Codex account on each host instead: `claude-monitor codex
+  Register a Codex account on each host instead: `llm-monitor codex
   provision <label>`. To carry across *which identities a host should have*
   (names only, still no credentials), use the popover's Copy/Paste — see
   [Declaring which identities a host should have](#declaring-which-identities-a-host-should-have).
@@ -868,7 +870,7 @@ claude-monitor accounts import accounts.json
   `--dry-run` previews the account count without writing anything, and `-` as
   the path reads the export from stdin.
 - **A fresh host needs no prior store:** `import` creates
-  `~/.claude-monitor/usage.db` (directory, file, and schema) when the
+  `~/.llm-monitor/usage.db` (directory, file, and schema) when the
   destination has never launched the app or the daemon, so a new worker can be
   converged before it has polled once. `export` still refuses a host with no
   store — there is nothing there to export, and an empty bundle would look
@@ -882,14 +884,14 @@ claude-monitor accounts import accounts.json
   natural next step but out of scope for the first pass here.
 - **No `--headless` flag needed** — `accounts export`/`import` are one-shot
   operations, reachable directly on both platforms even from the macOS GUI
-  build: `ClaudeMonitor accounts export ...`.
+  build: `LLMMonitor accounts export ...`.
 
-Run `claude-monitor accounts --help` for the full flag list.
+Run `llm-monitor accounts --help` for the full flag list.
 
 ## Ranking Export (`ranking.json`)
 
 After every poll cycle the app writes a small, **non-secret**, email-keyed
-snapshot to `~/.claude-monitor/ranking.json` for external multi-account load
+snapshot to `~/.llm-monitor/ranking.json` for external multi-account load
 balancers (notably `loom-daemon`, which uses it to pick a token). It's written
 atomically, so a reader never sees a partial document.
 
@@ -970,9 +972,9 @@ itself — every assistant turn in a session transcript carries a
 denominator any quota-calibration work needs).
 
 ```bash
-claude-monitor tokens sync            # import new transcript counters
-claude-monitor tokens sync --all      # no per-run file cap (full backfill)
-claude-monitor tokens sync --help
+llm-monitor tokens sync            # import new transcript counters
+llm-monitor tokens sync --all      # no per-run file cap (full backfill)
+llm-monitor tokens sync --help
 ```
 
 The poll loop calls the same importer automatically on a **1-hour** cadence
@@ -983,7 +985,7 @@ for scripting.
 `subagents/agent-*.jsonl` sidechain transcripts, which on a subagent-driven
 host carry a large share of the real spend. Override the root with
 `--root <dir>`, `$CLAUDE_CONFIG_DIR` (Claude Code's own variable), or
-`$CLAUDE_MONITOR_TRANSCRIPT_ROOT`.
+`$LLM_MONITOR_TRANSCRIPT_ROOT`.
 
 **What it stores.** Per message: uuid, timestamp, model name and the four
 token counters. **Never the message content.** Transcripts contain user data
@@ -1008,7 +1010,7 @@ join on `COALESCE(parent_session_id, session_id)` when one exists.
 Query it like any other table:
 
 ```bash
-sqlite3 ~/.claude-monitor/usage.db \
+sqlite3 ~/.llm-monitor/usage.db \
   "SELECT date(timestamp) AS day,
           SUM(input_tokens + output_tokens + cache_creation_tokens) AS billable
      FROM token_usage GROUP BY day ORDER BY day DESC LIMIT 7;"
@@ -1024,11 +1026,11 @@ time and a silent re-pricing of the quota shows up as a step change instead of
 as an unexplained shortfall at the end of a week.
 
 ```bash
-claude-monitor calibrate                      # trailing 14 days, JSON on stdout
-claude-monitor calibrate --days 30 --csv      # CSV instead
-claude-monitor calibrate --scope pool         # pool rows only
-claude-monitor calibrate --no-recompute       # print what is stored, don't rewrite
-claude-monitor calibrate --help
+llm-monitor calibrate                      # trailing 14 days, JSON on stdout
+llm-monitor calibrate --days 30 --csv      # CSV instead
+llm-monitor calibrate --scope pool         # pool rows only
+llm-monitor calibrate --no-recompute       # print what is stored, don't rewrite
+llm-monitor calibrate --help
 ```
 
 Results land in the `quota_calibration_daily` table and are recomputed
@@ -1130,7 +1132,7 @@ them, so the hourly cadence can never accumulate drift. `quota_calibration_daily
 is derived state — deleting it costs nothing but a recompute.
 
 ```bash
-sqlite3 ~/.claude-monitor/usage.db \
+sqlite3 ~/.llm-monitor/usage.db \
   "SELECT day, points_per_account, cost_usd_per_point
      FROM quota_calibration_daily
     WHERE scope = 'pool' ORDER BY day DESC LIMIT 14;"
@@ -1174,16 +1176,16 @@ the calibration recompute above.
 ```bash
 mkdir -p ~/Library/LaunchAgents
 
-cat > ~/Library/LaunchAgents/com.claude-monitor.plist << 'EOF'
+cat > ~/Library/LaunchAgents/com.llm-monitor.plist << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.claude-monitor</string>
+    <string>com.llm-monitor</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/ClaudeMonitor.app/Contents/MacOS/ClaudeMonitor</string>
+        <string>/Applications/LLMMonitor.app/Contents/MacOS/LLMMonitor</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -1193,14 +1195,14 @@ cat > ~/Library/LaunchAgents/com.claude-monitor.plist << 'EOF'
 </plist>
 EOF
 
-launchctl load ~/Library/LaunchAgents/com.claude-monitor.plist
+launchctl load ~/Library/LaunchAgents/com.llm-monitor.plist
 ```
 
 To remove auto-start:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.claude-monitor.plist
-rm ~/Library/LaunchAgents/com.claude-monitor.plist
+launchctl unload ~/Library/LaunchAgents/com.llm-monitor.plist
+rm ~/Library/LaunchAgents/com.llm-monitor.plist
 ```
 
 ## Troubleshooting
@@ -1232,7 +1234,7 @@ token revoked** again. "Couldn't check" means the ping itself failed
 ### Linux: `cannot open shared object file` on startup
 
 ```
-./claude-monitor: error while loading shared libraries:
+./llm-monitor: error while loading shared libraries:
 libswiftSwiftOnoneSupport.so: cannot open shared object file: No such file or directory
 ```
 
@@ -1243,7 +1245,7 @@ toolchain, or uninstalling the toolchain after building, produces exactly this
 loader error. Diagnose it with:
 
 ```bash
-ldd /usr/local/bin/claude-monitor | grep 'not found'
+ldd /usr/local/bin/llm-monitor | grep 'not found'
 ```
 
 Any unresolved `libswift*` / `libFoundation*` / `libdispatch*` entry confirms
@@ -1252,7 +1254,7 @@ it. The cure is to rebuild statically and re-copy — see
 
 ```bash
 swift build -c release --static-swift-stdlib
-sudo cp .build/release/ClaudeMonitor /usr/local/bin/claude-monitor
+sudo cp .build/release/LLMMonitor /usr/local/bin/llm-monitor
 ```
 
 If the deploy host has no Swift toolchain at all, use the
@@ -1263,20 +1265,20 @@ required even for a static build (already present on Ubuntu 24.04).
 ### Logs
 
 ```
-~/.claude-monitor/debug.log
+~/.llm-monitor/debug.log
 ```
 
 ### Database
 
 ```
-~/.claude-monitor/usage.db
+~/.llm-monitor/usage.db
 ```
 
 Query directly:
 
 ```bash
-sqlite3 ~/.claude-monitor/usage.db "SELECT email, last_updated FROM accounts;"
-sqlite3 ~/.claude-monitor/usage.db \
+sqlite3 ~/.llm-monitor/usage.db "SELECT email, last_updated FROM accounts;"
+sqlite3 ~/.llm-monitor/usage.db \
   "SELECT timestamp, primary_percent FROM usage_history ORDER BY timestamp DESC LIMIT 10;"
 ```
 
@@ -1286,7 +1288,7 @@ column shapes the pre-v2.0 native host used, so a host that has been running
 since then keeps its historical rows:
 
 ```bash
-sqlite3 ~/.claude-monitor/usage.db \
+sqlite3 ~/.llm-monitor/usage.db \
   "SELECT COUNT(*), MAX(timestamp) FROM token_usage;"
 ```
 
@@ -1296,7 +1298,7 @@ per scope (`pool` or `account`). It is derived state: every recompute rewrites
 the whole trailing window, so deleting it costs nothing but a recompute.
 
 ```bash
-sqlite3 ~/.claude-monitor/usage.db \
+sqlite3 ~/.llm-monitor/usage.db \
   "SELECT day, accounts_reporting, points_per_account, cost_usd_per_point
      FROM quota_calibration_daily WHERE scope = 'pool'
     ORDER BY day DESC LIMIT 7;"
@@ -1318,14 +1320,49 @@ address for external tooling to recover.
 ## Uninstall
 
 ```bash
-pkill ClaudeMonitor
+pkill LLMMonitor
 
-launchctl unload ~/Library/LaunchAgents/com.claude-monitor.plist 2>/dev/null
-rm ~/Library/LaunchAgents/com.claude-monitor.plist 2>/dev/null
+launchctl unload ~/Library/LaunchAgents/com.llm-monitor.plist 2>/dev/null
+rm ~/Library/LaunchAgents/com.llm-monitor.plist 2>/dev/null
 
-rm -rf ~/.claude-monitor
-rm -rf /Applications/ClaudeMonitor.app
+rm -rf ~/.llm-monitor
+rm -rf /Applications/LLMMonitor.app
 ```
+
+### Upgrading to 2.0 (Claude Monitor → LLM Monitor)
+
+2.0 renames the tool. Most of the rename is automatic, and nothing that reads
+the old names breaks:
+
+| | 1.x | 2.0 | Compatibility |
+|---|---|---|---|
+| Data directory | `~/.claude-monitor/` | `~/.llm-monitor/` | Moved on first launch; `~/.claude-monitor` becomes a symlink to it (loom-daemon and `LOOM_CLAUDE_MONITOR_DIR` keep working) |
+| CLI | `claude-monitor` | `llm-monitor` | `install-linux.sh` keeps `claude-monitor` as a symlink alias; `accounts push` still calls `claude-monitor` on peers |
+| Env overrides | `CLAUDE_MONITOR_*` | `LLM_MONITOR_*` | Old names still honored (new ones win) |
+| systemd unit | `claude-monitor.service` | `llm-monitor.service` | `install-linux.sh` stops and removes the old unit |
+| macOS app | `ClaudeMonitor.app`, `com.claude-monitor.app` | `LLMMonitor.app`, `com.llm-monitor.app` | Manual (below) |
+| Linux release asset | `claude-monitor-linux-x64` | `llm-monitor-linux-x64` | Both are attached to each release |
+
+**Linux:** re-run `install-linux.sh --from-release` (or `--binary`). It handles
+the binary, the alias, the unit, and the data directory.
+
+**macOS:** the app bundle has a new name, so the old one is not replaced:
+
+```bash
+osascript -e 'quit app "Claude Monitor"'; sleep 2
+rm -rf /Applications/ClaudeMonitor.app
+cp -R build/LLMMonitor.app /Applications/LLMMonitor.app
+open /Applications/LLMMonitor.app     # moves ~/.claude-monitor on first launch
+```
+
+If you use the login LaunchAgent, unload `~/Library/LaunchAgents/com.claude-monitor.plist`,
+delete it, and recreate it under the new name ([Auto-Start on Login](#auto-start-on-login-optional)).
+If a CLI symlink points into the old bundle, re-point it at
+`/Applications/LLMMonitor.app/Contents/MacOS/LLMMonitor`.
+
+If the app finds both `~/.claude-monitor` and `~/.llm-monitor` as real
+directories, it moves and merges nothing. It uses `~/.llm-monitor` and logs the
+conflict to stderr, so merge or remove the old directory yourself.
 
 ### Upgrading from pre-1.8
 
@@ -1338,8 +1375,8 @@ rm -rf dist node_modules
 ## Project Structure
 
 ```
-claude-monitor/
-├── menubar-app/ClaudeMonitor/   # Swift Package: macOS menu-bar app + Linux headless daemon
+llm-monitor/
+├── menubar-app/LLMMonitor/   # Swift Package: macOS menu-bar app + Linux headless daemon
 │   ├── Package.swift
 │   ├── Assets/                     # App icon (AppIcon.icns + 1024px master PNG + generation recipe)
 │   ├── CSQLite/                    # System-library shim mapping Linux libsqlite3
@@ -1348,7 +1385,7 @@ claude-monitor/
 │       ├── HeadlessMain.swift      # Linux entry (always headless)
 │       ├── HeadlessRunner.swift    # UI-less poll loop (Linux daemon / --headless on macOS)
 │       ├── AccountSync.swift       # accounts export/import: multi-host record + credential sync
-│       ├── AccountSyncCLI.swift    # `claude-monitor accounts export|import` CLI surface
+│       ├── AccountSyncCLI.swift    # `llm-monitor accounts export|import` CLI surface
 │       ├── CLIArgs.swift           # Shared --db/--help parsing for the subcommand CLIs
 │       ├── UsageStore.swift        # SQLite store, settings, primary-account pin
 │       ├── AccountFreshness.swift  # Single staleness rule shared by display/ranking paths
@@ -1360,30 +1397,30 @@ claude-monitor/
 │       ├── AnthropicAPI.swift      # Anthropic client (ping + rate-limit headers)
 │       ├── OpenAIAPI.swift         # OpenAI/Codex client (wham/usage + token refresh)
 │       ├── CodexAppServer.swift    # Codex app-server JSON-RPC client (usage with no stored credential)
-│       ├── CodexCLI.swift          # `claude-monitor codex provision|add|list|import` CLI surface
+│       ├── CodexCLI.swift          # `llm-monitor codex provision|add|list|import` CLI surface
 │       ├── ZaiAPI.swift            # z.ai GLM Coding Plan quota client + ~/.zai key-file scanner
-│       ├── ZaiCLI.swift            # `claude-monitor zai import|add|list` CLI surface
+│       ├── ZaiCLI.swift            # `llm-monitor zai import|add|list` CLI surface
 │       ├── TranscriptImporter.swift # Incremental Claude Code transcript → token_usage/token_sessions ingest
-│       ├── TokensCLI.swift         # `claude-monitor tokens sync` CLI surface
+│       ├── TokensCLI.swift         # `llm-monitor tokens sync` CLI surface
 │       ├── QuotaCalibration.swift  # Daily tokens/cost per weekly rate-limit point + dated price table
-│       ├── CalibrationCLI.swift    # `claude-monitor calibrate` CLI surface (JSON/CSV export)
+│       ├── CalibrationCLI.swift    # `llm-monitor calibrate` CLI surface (JSON/CSV export)
 │       ├── RateLimitWindow.swift   # Provider-agnostic window/snapshot model
 │       ├── UsageProviderClient.swift # UsageProviderClient protocol + credentials
-│       ├── SelfTest.swift          # `claude-monitor selftest` portable-core assertions
+│       ├── SelfTest.swift          # `llm-monitor selftest` portable-core assertions
 │       ├── RollTokenView.swift     # Roll Token wizard window (rotate long-lived tokens)
 │       ├── TokenRoller.swift       # Revoke-all browser-console script generator
-│       ├── RankingExporter.swift   # Emits ~/.claude-monitor/ranking.json for load balancers
+│       ├── RankingExporter.swift   # Emits ~/.llm-monitor/ranking.json for load balancers
 │       ├── FileLogger.swift        # Debug logging
 │       ├── NaturalSort.swift       # Hybrid lexical/numeric ordering (agent-10 after agent-9)
 │       └── LinuxCompat.swift       # ObservableObject/@Published stand-ins for Linux
 ├── scripts/
 │   ├── build-macos-app.sh          # macOS release build script
-│   └── claude-monitor.service      # Sample systemd user unit for Linux headless mode
+│   └── llm-monitor.service      # Sample systemd user unit for Linux headless mode
 ├── docs/spikes/                 # Investigation write-ups (e.g. the OpenAI usage-endpoint probe)
 ├── docs/window.png, docs/plot_window.png  # README screenshots
 ├── .github/workflows/build.yml  # CI: build + selftest on macOS and Linux
 ├── .github/dependabot.yml       # Weekly grouped GitHub Actions bumps (the only third-party surface)
-├── build/                       # Build output (gitignored): ClaudeMonitor.app + .zip
+├── build/                       # Build output (gitignored): LLMMonitor.app + .zip
 ├── CHANGELOG.md                 # Release history
 ├── CLAUDE.md                    # Development notes (build/install sequence, invariants)
 ├── WORK_LOG.md, WORK_PLAN.md    # Loom-maintained work history and plan (regenerated by the Guide role)
@@ -1399,11 +1436,11 @@ claude-monitor/
 - **[VibePulse](https://github.com/wesm/vibepulse)** — macOS menu-bar app
   built on ccusage, showing real-time token spend.
 
-**How they differ from Claude Monitor:**
+**How they differ from LLM Monitor:**
 
 - ccusage / VibePulse read **local Claude Code logs** → token counts and
   cost estimates.
-- Claude Monitor queries **the Anthropic API via OAuth** → quota %, reset
+- LLM Monitor queries **the Anthropic API via OAuth** → quota %, reset
   times, and headroom across multiple accounts.
 
 ## License

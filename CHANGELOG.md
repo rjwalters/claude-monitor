@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Renamed to LLM Monitor** (was Claude Monitor), now that it tracks Claude,
+  OpenAI Codex, and z.ai accounts. This is a breaking rename, intended to ship
+  as **2.0.0**, with compatibility shims throughout:
+  - The data directory moves to `~/.llm-monitor` on first launch, and
+    `~/.claude-monitor` becomes a symlink so loom-daemon keeps working.
+  - The CLI is `llm-monitor`; `claude-monitor` stays as an alias.
+  - Env overrides are `LLM_MONITOR_*`, and the old `CLAUDE_MONITOR_*` names
+    are still honored.
+  - The systemd unit is `llm-monitor.service` (`install-linux.sh` retires the
+    old one), and the release asset is `llm-monitor-linux-x64`, with the old
+    name still attached.
+  - The macOS app is `LLMMonitor.app` / `com.llm-monitor.app`; the old bundle
+    must be removed by hand.
+
+  See README "Upgrading to 2.0".
+
 ### Added
 
 - **z.ai (GLM Coding Plan) accounts** — a third provider (`provider = zai`).

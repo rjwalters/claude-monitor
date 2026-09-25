@@ -55,7 +55,7 @@ class PopoverHeightManager: ObservableObject {
 }
 
 @main
-enum ClaudeMonitorEntry {
+enum LLMMonitorEntry {
     @MainActor
     static func main() {
         // `accounts export|import` is a one-shot CLI operation, not a launch
@@ -75,9 +75,9 @@ enum ClaudeMonitorEntry {
             SelfTest.main(Array(CommandLine.arguments.dropFirst(2)))
         } else if CommandLine.arguments.contains("--version") {
             // Dispatched at top level (not just inside HeadlessRunner) so
-            // `ClaudeMonitor --version` never falls through to the GUI branch
+            // `LLMMonitor --version` never falls through to the GUI branch
             // below — see #46.
-            print("claude-monitor \(AppVersion.current)")
+            print("llm-monitor \(AppVersion.current)")
             exit(0)
         } else if CommandLine.arguments.contains("--headless") {
             HeadlessRunner.main()
@@ -85,15 +85,15 @@ enum ClaudeMonitorEntry {
             // These are headless-loop flags handled inside HeadlessRunner; bare
             // (without --headless) they must fail fast rather than silently
             // launching a duplicate GUI instance — see #46.
-            FileHandle.standardError.write(Data("--once/--interval require --headless on macOS, e.g. `ClaudeMonitor --headless --once`\n".utf8))
+            FileHandle.standardError.write(Data("--once/--interval require --headless on macOS, e.g. `LLMMonitor --headless --once`\n".utf8))
             exit(2)
         } else {
-            ClaudeMonitorApp.main()
+            LLMMonitorApp.main()
         }
     }
 }
 
-struct ClaudeMonitorApp: App {
+struct LLMMonitorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
 
     var body: some Scene {
@@ -126,7 +126,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
-        flog.info("ClaudeMonitor launched (v\(AppVersion.current))", category: "App")
+        flog.info("LLMMonitor launched (v\(AppVersion.current))", category: "App")
 
         // Ensure database exists (standalone mode without native host)
         usageStore.ensureDatabase()
@@ -191,7 +191,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         syncThenRefreshAll()
     }
 
-    /// Import accounts from ~/.claude-monitor/accounts.env (+ accounts.local.env)
+    /// Import accounts from ~/.llm-monitor/accounts.env (+ accounts.local.env)
     /// additively, then poll everything. Runs once at launch.
     func syncThenRefreshAll() {
         Task {
@@ -217,7 +217,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             await MainActor.run {
                 usageStore.loadFromDatabase()
                 updateStatusButton()
-                // Emit ~/.claude-monitor/ranking.json for external load balancers (#2)
+                // Emit ~/.llm-monitor/ranking.json for external load balancers (#2)
                 RankingExporter.export()
                 flog.info("refreshAll: loaded \(usageStore.accounts.count) account(s)", category: "App")
             }
@@ -243,7 +243,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 await MainActor.run {
                     usageStore.loadFromDatabase()
                     updateStatusButton()
-                    // Emit ~/.claude-monitor/ranking.json for external load balancers (#2)
+                    // Emit ~/.llm-monitor/ranking.json for external load balancers (#2)
                     RankingExporter.export()
                 }
             }

@@ -1,6 +1,6 @@
 import Foundation
 
-/// Emits `~/.claude-monitor/ranking.json` — a small, **non-secret**, email-keyed
+/// Emits `~/.llm-monitor/ranking.json` — a small, **non-secret**, email-keyed
 /// snapshot of per-account utilization / resets / status for external multi-account
 /// load balancers (loom, lean-genius). See issue #2.
 ///
@@ -74,16 +74,14 @@ enum RankingExporter {
     static let schemaVersion = 1
 
     /// Serializes exports so overlapping poll cycles never race on the write.
-    private static let queue = DispatchQueue(label: "com.claude-monitor.ranking-exporter")
+    private static let queue = DispatchQueue(label: "com.llm-monitor.ranking-exporter")
 
     static var defaultDBPath: String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/usage.db").path
+        AppPaths.databasePath
     }
 
     static var defaultOutputPath: String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/ranking.json").path
+        AppPaths.path("ranking.json")
     }
 
     /// Trigger a fresh export. Runs off the caller's thread (DB reads + file IO)

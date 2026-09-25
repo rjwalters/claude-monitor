@@ -34,7 +34,7 @@ struct Account: Identifiable {
     let lastUpdated: Date?
     let latestPercent: Double?
     /// This account's own `CODEX_HOME` (`provider == .openai` only), registered
-    /// by `claude-monitor codex add --home <path>`.
+    /// by `llm-monitor codex add --home <path>`.
     ///
     /// **nil means "the ambient home"** — `$CODEX_HOME` if set, else `~/.codex`
     /// — which is exactly the single-account behaviour every row had before
@@ -395,12 +395,11 @@ class UsageStore: ObservableObject {
 
     private let dbPath: String
 
-    /// `dbPath` defaults to `~/.claude-monitor/usage.db`. An explicit path is
+    /// `dbPath` defaults to `~/.llm-monitor/usage.db`. An explicit path is
     /// used by the self-test to exercise schema migration against a throwaway
     /// database without touching the real one.
     init(dbPath: String? = nil) {
-        self.dbPath = dbPath ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/usage.db").path
+        self.dbPath = dbPath ?? AppPaths.databasePath
     }
 
     /// Creates the database and schema if they don't exist.
@@ -1829,7 +1828,7 @@ class UsageStore: ObservableObject {
 struct AppVersion {
     static let current = "1.20.0"
     static let repoOwner = "rjwalters"
-    static let repoName = "claude-monitor"
+    static let repoName = "llm-monitor"
 }
 
 struct UpdateInfo {

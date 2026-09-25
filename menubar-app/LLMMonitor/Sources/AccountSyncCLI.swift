@@ -1,6 +1,6 @@
 import Foundation
 
-/// `claude-monitor accounts export|import|push|pull` — the CLI surface for
+/// `llm-monitor accounts export|import|push|pull` — the CLI surface for
 /// `AccountSync` (issue #16) and its ssh fan-out (#188). Reachable directly on
 /// both macOS and Linux without requiring `--headless` or any GUI code, so it
 /// works on headless Loom hosts.
@@ -72,7 +72,7 @@ enum AccountSyncCLI {
 
                 Codex/OpenAI accounts are host-local and intentionally \
                 excluded from this export — register one on each host with \
-                `claude-monitor codex add --home <path>` instead of syncing \
+                `llm-monitor codex add --home <path>` instead of syncing \
                 a credential between machines.
 
                 """.utf8))
@@ -191,16 +191,16 @@ enum AccountSyncCLI {
 
     private static func printUsage() {
         print("""
-            claude-monitor accounts — converge account records + OAuth
+            llm-monitor accounts — converge account records + OAuth
             credentials across hosts (see README "Multi-Host Sync").
 
             Usage:
-              claude-monitor accounts push <HOST...> [--dry-run] [--then-loom]
+              llm-monitor accounts push <HOST...> [--dry-run] [--then-loom]
                                           [--remote-bin <path>] [--ssh-option <opt>] [--db <path>]
-              claude-monitor accounts pull <HOST> [--dry-run] [--then-loom]
+              llm-monitor accounts pull <HOST> [--dry-run] [--then-loom]
                                           [--remote-bin <path>] [--ssh-option <opt>] [--db <path>]
-              claude-monitor accounts export [--output <path>] [--compact] [--db <path>]
-              claude-monitor accounts import <path|-> [--dry-run] [--db <path>]
+              llm-monitor accounts export [--output <path>] [--compact] [--db <path>]
+              llm-monitor accounts import <path|-> [--dry-run] [--db <path>]
 
             push is the primary path: it exports this host's bundle in memory
             and streams it over ssh straight into `accounts import -` on each
@@ -214,12 +214,12 @@ enum AccountSyncCLI {
             result here. Exactly one HOST.
 
             --dry-run (push and pull) only checks that each host is reachable
-              and that claude-monitor resolves there, reporting its version.
+              and that llm-monitor resolves there, reporting its version.
               No bundle is transferred and nothing is written anywhere.
             --then-loom runs `loom-daemon tokens import-from-monitor --shared`
               on whichever host received the bundle, after a successful import
               (the remote host for push, this one for pull).
-            --remote-bin <path> names claude-monitor on the far side. Worth
+            --remote-bin <path> names llm-monitor on the far side. Worth
               reaching for first on a "command not found" (exit 127): a
               non-interactive ssh shell does not source the profile that puts
               ~/.local/bin on PATH.
@@ -232,7 +232,7 @@ enum AccountSyncCLI {
             with 0600 permissions). The bundle contains plaintext OAuth
             tokens — treat it as a secret. Codex/OpenAI accounts are
             host-local and are never included — register one on each host
-            with `claude-monitor codex add --home <path>` instead.
+            with `llm-monitor codex add --home <path>` instead.
 
             import upserts accounts by email (falling back to id when email
             is absent), skipping any account whose local last_updated is
@@ -240,11 +240,11 @@ enum AccountSyncCLI {
             A Codex/OpenAI account present in a bundle from an older version
             is skipped (not an error); it never round-tripped safely.
             Reads from stdin when the path is '-'. Creates
-            ~/.claude-monitor/usage.db (and its schema) when the host has
+            ~/.llm-monitor/usage.db (and its schema) when the host has
             none yet, so a fresh worker can be converged before it has ever
             polled.
 
-            --db <path> overrides ~/.claude-monitor/usage.db (mainly for
+            --db <path> overrides ~/.llm-monitor/usage.db (mainly for
             testing/scripting against an alternate database).
             """)
     }

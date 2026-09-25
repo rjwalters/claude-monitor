@@ -154,15 +154,14 @@ class OAuthPoller: ObservableObject {
 
     private let dbPath: String
 
-    /// `dbPath` defaults to `~/.claude-monitor/usage.db`. An explicit path lets
+    /// `dbPath` defaults to `~/.llm-monitor/usage.db`. An explicit path lets
     /// the CLI (and tests) exercise the real add/poll paths against a throwaway
     /// database — the same escape hatch `UsageStore(dbPath:)` provides, and the
     /// only safe one: `homeDirectoryForCurrentUser` ignores a `HOME` override on
     /// macOS, so redirecting via the environment silently hits the live store
     /// (issue #16).
     init(dbPath: String? = nil) {
-        self.dbPath = dbPath ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/usage.db").path
+        self.dbPath = dbPath ?? AppPaths.databasePath
     }
 
     // MARK: - Add Account with Token
@@ -368,7 +367,7 @@ class OAuthPoller: ObservableObject {
 
     // MARK: - Register a Codex home (per-account CODEX_HOME, #103)
 
-    /// One registered Codex account, for `claude-monitor codex list`.
+    /// One registered Codex account, for `llm-monitor codex list`.
     ///
     /// The CLI identifies accounts by the truncated-id convention the rest of
     /// this surface uses — `email` below is carried for internal comparison
@@ -589,7 +588,7 @@ class OAuthPoller: ObservableObject {
         }
     }
 
-    /// Every OpenAI account row, for `claude-monitor codex list`.
+    /// Every OpenAI account row, for `llm-monitor codex list`.
     func codexAccounts() -> [CodexAccountRegistration] {
         guard FileManager.default.fileExists(atPath: dbPath) else { return [] }
         do {
@@ -827,7 +826,7 @@ class OAuthPoller: ObservableObject {
             // absent state, and it is what keeps `loadActiveCredentials` from
             // ever handing this row to the poll loop.
             flog.info(
-                "declared an unprovisioned Codex identity \(accountId.prefix(8))… — run `claude-monitor codex provision <label>` on this host to fill it in",
+                "declared an unprovisioned Codex identity \(accountId.prefix(8))… — run `llm-monitor codex provision <label>` on this host to fill it in",
                 category: fcat
             )
             return (accountId, nil)
@@ -977,9 +976,9 @@ class OAuthPoller: ObservableObject {
             guard n > 0 else { return nil }
 
             let header = """
-                # Claude Monitor accounts — \(credentialed) account(s)\
+                # LLM Monitor accounts — \(credentialed) account(s)\
                 \(identityOnly > 0 ? " + \(identityOnly) Codex identity/identities (no credential)" : "")
-                # Paste into the app (Add Account → Bulk Import) or save as ~/.claude-monitor/accounts.env
+                # Paste into the app (Add Account → Bulk Import) or save as ~/.llm-monitor/accounts.env
 
                 """
             return (header + lines.joined(separator: "\n") + "\n", credentialed, identityOnly)
@@ -1086,14 +1085,12 @@ class OAuthPoller: ObservableObject {
 
     /// Master account list — the shared source of truth.
     private var masterAccountsPath: String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/accounts.env").path
+        AppPaths.path("accounts.env")
     }
 
     /// Local override/additions — never shared; wins over master by email.
     private var localAccountsPath: String {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-monitor/accounts.local.env").path
+        AppPaths.path("accounts.local.env")
     }
 
     /// Load the master account list plus the local override/additions file, merge
@@ -1268,7 +1265,7 @@ class OAuthPoller: ObservableObject {
     ///
     /// 1. A row with a stored `access_token` — every account before #103.
     /// 2. A **token-free** row whose account has a registered `codex_home`
-    ///    (`claude-monitor codex add --home`). Registering an account by its
+    ///    (`llm-monitor codex add --home`). Registering an account by its
     ///    home deliberately never reads or stores a token, so its credential row
     ///    carries `access_token = NULL` and, by convention, `source =
     ///    'codex-home'`; without this clause it would register fine, list fine,
@@ -1362,7 +1359,7 @@ class OAuthPoller: ObservableObject {
     nonisolated static let strandedCodexMessage =
         "No pollable Codex credential on this host: this account has no stored token and "
         + "no registered CODEX_HOME, so its usage stopped updating. Re-register it with "
-        + "`claude-monitor codex add --home <path>` (or `claude-monitor codex provision <label>`)."
+        + "`llm-monitor codex add --home <path>` (or `llm-monitor codex provision <label>`)."
 
     /// What to tell someone whose freshly-imported account cannot survive the
     /// next launch (#194). One literal, shared by `codex import` and the
@@ -1372,7 +1369,7 @@ class OAuthPoller: ObservableObject {
         "This host has more than one OpenAI account and none of them is registered to a "
         + "CODEX_HOME of its own, so no Codex home can speak for this one. Its stored token is "
         + "cleared on the next launch (this app keeps no OpenAI credential) and it will then "
-        + "stop updating. Register a home for it: `claude-monitor codex add --home <path>`."
+        + "stop updating. Register a home for it: `llm-monitor codex add --home <path>`."
 
     /// Whether the account just imported will be stranded once its stored token
     /// is cleared — i.e. no home may speak for it.
@@ -2076,7 +2073,7 @@ class OAuthPoller: ObservableObject {
         if case .ambiguous = home {
             return "No Codex home may speak for this account: this host has more than one "
                 + "OpenAI account and none of them is registered to this one. Register it with "
-                + "`claude-monitor codex add --home <path>`."
+                + "`llm-monitor codex add --home <path>`."
         }
         return "No Codex credential could be read for this account: `codex app-server` is "
             + "unavailable and its Codex home has no readable auth.json. Check that `codex` is "
@@ -2289,7 +2286,7 @@ class OAuthPoller: ObservableObject {
         guard let id = credential.id else { return }
         if loggedAmbiguousCodexHome.insert(id).inserted {
             flog.info(
-                "\(credential.label) has no registered CODEX_HOME and this host has more than one OpenAI account — the ambient home can speak for only one of them, so it is not used here. Register this account's own home with `claude-monitor codex add --home <path>`.",
+                "\(credential.label) has no registered CODEX_HOME and this host has more than one OpenAI account — the ambient home can speak for only one of them, so it is not used here. Register this account's own home with `llm-monitor codex add --home <path>`.",
                 category: fcat
             )
         }
@@ -2475,7 +2472,7 @@ class OAuthPoller: ObservableObject {
         guard let id = credential.id else { return }
         if loggedCodexIdentityConflict.insert(id).inserted {
             flog.info(
-                "codex app-server reports a different account than \(credential.label) — the Codex home it reads belongs to another login. Register this account's own home with `claude-monitor codex add --home <path>`, or run `claude-monitor codex provision <label>`.",
+                "codex app-server reports a different account than \(credential.label) — the Codex home it reads belongs to another login. Register this account's own home with `llm-monitor codex add --home <path>`, or run `llm-monitor codex provision <label>`.",
                 category: fcat
             )
         }
@@ -2598,7 +2595,7 @@ class OAuthPoller: ObservableObject {
             // `codexHomeDrift` itself found nothing conclusive.
             identity = "a different account"
         }
-        return "\(credential.label)'s Codex home\(home) is now logged in as \(identity), not the account this row is registered against. Register this account's own home with `claude-monitor codex add --home <path>`, or run `claude-monitor codex provision <label>`."
+        return "\(credential.label)'s Codex home\(home) is now logged in as \(identity), not the account this row is registered against. Register this account's own home with `llm-monitor codex add --home <path>`, or run `llm-monitor codex provision <label>`."
     }
 
     // MARK: - Import-Time Token Renewal
