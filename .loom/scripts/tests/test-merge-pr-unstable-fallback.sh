@@ -843,8 +843,8 @@ assert_eq "wait" "$result" "#3678: fetch failure ignores stale/empty payload -> 
 
 # --- Test the poll-window env-var wiring in merge-pr.sh (#3664) ---
 # The script reuses LOOM_AUTO_MERGE_POLL_INTERVAL / LOOM_AUTO_MERGE_TIMEOUT with
-# the same defaults as the shell Gitea auto-merge poller (forge_auto_merge in
-# lib/forge-helpers.sh): 30s / 600s. Assert the defaulting expressions the
+# the same defaults as the since-retired (#8427) shell Gitea auto-merge
+# poller: 30s / 600s. Assert the defaulting expressions the
 # script uses resolve as expected.
 echo ""
 echo "Testing poll-window env-var defaults (#3664)..."

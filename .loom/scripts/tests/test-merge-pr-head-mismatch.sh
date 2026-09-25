@@ -2,20 +2,23 @@
 # test-merge-pr-head-mismatch.sh - Unit tests for the merge head-SHA
 # optimistic-concurrency precondition (#5579).
 #
-# Root cause: neither forge_merge_pr() nor forge_auto_merge()
-# (lib/forge-helpers.sh) passed the forge's optional head-SHA precondition
-# (GitHub REST's `sha` field / GraphQL's `expectedHeadOid` input / Gitea's
+# Root cause: neither forge_merge_pr() nor the (since-retired, #8427)
+# forge_auto_merge() (lib/forge-helpers.sh) passed the forge's optional
+# head-SHA precondition (GitHub REST's `sha` field / GraphQL's `expectedHeadOid` input / Gitea's
 # `head_commit_id` field) to the merge API, so Champion (or merge-pr.sh
 # directly) could squash-merge a PR whose branch received new commits after
 # the approving review — silently stranding those commits (squash-merge makes
 # this invisible to an ancestry check afterward).
 #
 # This suite exercises three layers:
-#   1. forge_merge_pr / forge_auto_merge (lib/forge-helpers.sh): the optional
-#      3rd EXPECTED_HEAD_SHA argument is threaded into the right API call
-#      shape for both GitHub (REST `sha` / GraphQL `expectedHeadOid`) and
-#      Gitea (`head_commit_id`), and omitted entirely when not supplied
-#      (backward compatibility for any other caller).
+#   1. forge_merge_pr (lib/forge-helpers.sh): the optional 3rd
+#      EXPECTED_HEAD_SHA argument is threaded into the right API call shape
+#      for both GitHub (REST `sha`) and Gitea (`head_commit_id`), and omitted
+#      entirely when not supplied (backward compatibility for any other
+#      caller). The shell forge_auto_merge arm this part also used to cover
+#      was retired by #8427; the native `loom-daemon forge auto-merge`
+#      verb's `expectedHeadOid` threading is covered by forge_cmd.rs's own
+#      unit tests.
 #   2. The merge-pr.sh classifier (_is_head_mismatch_response) and exit-code
 #      helper (error_head_moved): extracted and unit-tested directly, the
 #      same "extract from source" strategy test-merge-pr-auto-reconcile.sh
@@ -41,7 +44,7 @@
 # Usage:
 #   ./.loom/scripts/tests/test-merge-pr-head-mismatch.sh
 
-# SC2034: FORGE_TYPE (read by the sourced forge_merge_pr/forge_auto_merge) and
+# SC2034: FORGE_TYPE (read by the sourced forge_merge_pr) and
 # YELLOW (read by error_head_moved, extracted+sourced below) are only
 # consumed by code shellcheck can't see is a reader — both look "unused" to
 # the linter.
@@ -77,9 +80,9 @@ assert_eq() {
 }
 
 # ============================================================================
-# Part 1: forge_merge_pr / forge_auto_merge thread the expected head SHA
+# Part 1: forge_merge_pr threads the expected head SHA
 # ============================================================================
-echo "Testing forge_merge_pr / forge_auto_merge head-SHA threading..."
+echo "Testing forge_merge_pr head-SHA threading..."
 
 # shellcheck source=../lib/forge-helpers.sh
 source "$FORGE_HELPERS_SRC"
@@ -126,53 +129,7 @@ else
     echo -e "  ${GREEN}PASS${NC}: forge_merge_pr (GitHub) omits sha= when EXPECTED_HEAD_SHA is not supplied (backward compatible)"
 fi
 
-# --- forge_auto_merge: GitHub GraphQL ---
-: > "$GH_ARGS_FILE"
-GH_ARGS_FILE="$GH_ARGS_FILE" PATH="$STUB_DIR:$PATH" \
-  forge_auto_merge "owner/repo" "42" "feedface456" >/dev/null
-if grep -q -- "expectedHeadOid=feedface456" "$GH_ARGS_FILE"; then
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_auto_merge (GitHub) passes -F expectedHeadOid=<EXPECTED_HEAD_SHA> when supplied"
-else
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_auto_merge (GitHub) did not pass expectedHeadOid= (argv: $(cat "$GH_ARGS_FILE"))"
-fi
-
-: > "$GH_ARGS_FILE"
-GH_ARGS_FILE="$GH_ARGS_FILE" PATH="$STUB_DIR:$PATH" \
-  forge_auto_merge "owner/repo" "42" >/dev/null
-if grep -q -- "expectedHeadOid=" "$GH_ARGS_FILE"; then
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_auto_merge (GitHub) passed expectedHeadOid= even though no EXPECTED_HEAD_SHA was given"
-else
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_auto_merge (GitHub) omits expectedHeadOid= when EXPECTED_HEAD_SHA is not supplied"
-fi
-
-# --- forge_auto_merge: MERGE_METHOD threading (#7754) ---
-: > "$GH_ARGS_FILE"
-GH_ARGS_FILE="$GH_ARGS_FILE" PATH="$STUB_DIR:$PATH" \
-  forge_auto_merge "owner/repo" "42" "" "rebase" >/dev/null
-if grep -q -- "mergeMethod=REBASE" "$GH_ARGS_FILE"; then
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_auto_merge (GitHub) uppercases an explicit non-squash MERGE_METHOD for the GraphQL enum"
-else
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_auto_merge (GitHub) did not send mergeMethod=REBASE (argv: $(cat "$GH_ARGS_FILE"))"
-fi
-
-: > "$GH_ARGS_FILE"
-GH_ARGS_FILE="$GH_ARGS_FILE" PATH="$STUB_DIR:$PATH" \
-  forge_auto_merge "owner/repo" "42" >/dev/null
-if grep -q -- "mergeMethod=SQUASH" "$GH_ARGS_FILE"; then
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_auto_merge (GitHub) still defaults to SQUASH when no method is supplied (backward compatible)"
-else
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_auto_merge (GitHub) default-method behavior regressed (argv: $(cat "$GH_ARGS_FILE"))"
-fi
-
-# --- forge_merge_pr / forge_auto_merge: Gitea ---
+# --- forge_merge_pr: Gitea ---
 echo ""
 echo "Testing Gitea head_commit_id threading..."
 
@@ -210,26 +167,6 @@ if grep -q 'head_commit_id' "$CURL_ARGS_FILE"; then
 else
     TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
     echo -e "  ${GREEN}PASS${NC}: forge_merge_pr (Gitea) omits head_commit_id when EXPECTED_HEAD_SHA is not supplied"
-fi
-
-CURL_ARGS_FILE="$CURL_ARGS_FILE" PATH="$STUB_DIR:$PATH" \
-  forge_auto_merge "owner/repo" "42" "gitea-sha-2" >/dev/null
-if grep -q '"head_commit_id":"gitea-sha-2"' "$CURL_ARGS_FILE"; then
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_auto_merge (Gitea) includes head_commit_id in the POST body when supplied"
-else
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_auto_merge (Gitea) missing head_commit_id (body: $(tr '\n' ' ' < "$CURL_ARGS_FILE"))"
-fi
-
-CURL_ARGS_FILE="$CURL_ARGS_FILE" PATH="$STUB_DIR:$PATH" \
-  forge_auto_merge "owner/repo" "42" "" "merge" >/dev/null
-if grep -q '"Do":"merge"' "$CURL_ARGS_FILE"; then
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_auto_merge (Gitea) sends Do:merge when explicitly requested (#7754)"
-else
-    TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_auto_merge (Gitea) did not send Do:merge (body: $(tr '\n' ' ' < "$CURL_ARGS_FILE"))"
 fi
 
 rm -f "$CURL_ARGS_FILE"

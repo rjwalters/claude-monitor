@@ -229,6 +229,7 @@ issue** — the v0.10.0 set is intentionally frozen.
 | `daemon.drain.aborted`     | Daemon IPC (#4090)             | `{was_draining}` |
 | `daemon.drain.timeout`     | Drain supervisor (#4090)       | `{in_flight, forced, cancelled?, then_exit?, roll_pending?, attempts?, elapsed_secs?}` |
 | `daemon.drain.roll_pending` | Drain supervisor (#6007)      | `{in_flight, attempt, window_secs, budget_secs}` |
+| `daemon.drain.superseded`  | Auto-update loop (#8514)       | `{from, to}` (artifact identities) |
 | `forge.event`               | `forge_events.rs` feed consumer (#8765) | `{source: "forge-event-feed", host_id, count, first_seq, last_seq, types}` |
 
 The four `epic.issue.{N}.*` topics were authorized by **#3873** (epic #3842
@@ -247,7 +248,9 @@ restart). **#6007** adds a fifth, `roll_pending`: a relaunch drain whose deadlin
 passed with work still in flight now **retains** the roll (dispatch stays paused,
 the restart re-arms itself at quiescence) and publishes `roll_pending` per re-arm;
 `timeout` then fires only if the whole paused-dispatch budget is spent and the roll
-is abandoned. See
+is abandoned. **#8514** adds a sixth, `superseded`: the auto-update loop discarded
+a *pending* roll because a newer release artifact had overtaken the one it was
+armed for, and re-armed for that newer artifact instead. See
 [Supervised restart primitive](#supervised-restart-primitive-4054) below.
 They ride the same in-memory bus as the sweep topics and are tailable via
 `subscribe_to_events` / `tail_event_bus`.
@@ -1978,7 +1981,13 @@ failed on the tick is named in `last_work_finder_tick.listing_failed`, and the
 view says the queue is INCOMPLETE rather than empty (`--json`: `complete:
 false`). The `serve`
 dashboard has a matching "Ready queue" panel. The single-workspace tick path does
-not record rows. Exporting the queue to the fleet backend is a follow-up.
+not record rows. Each row also carries daemon-derived `state` and `reason`
+strings, so clients do not keep their own copy of the mapping. With
+observability export on, the queue also reaches SigNoz as
+`loom.queue.issues{state,reason}` gauges and reaches the fleet backend as a
+`queue.snapshot` record (phase 2; see
+[`observability.md` §3c](observability.md#3c-operational-signals-from-daemon-loops-issue-8860)).
+The fleet dashboard view is phase 3.
 
 ## Forge-side pipeline snapshot (`status --pipeline`, #3977)
 
@@ -8936,6 +8945,48 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   skips instead of rebuilding again: the binary is already provisioned and the
   restart is already coming, and a redundant `cargo build` would compete for CPU
   with the very in-flight sweeps the pending roll is waiting on.
+- **…but a superseded pending roll is replaced, not waited out (#8514).** That
+  skip was unconditional, so a release published mid-pause was ignored until the
+  armed roll finished or spent its budget — on a multi-release day a host could
+  sit paused for up to the whole budget converging on a binary that was already
+  stale. A tick now compares the release it resolves against the identity the
+  armed roll was triggered for (its tag + published asset checksum, recorded by
+  `DrainState::set_roll_target`) and **supersedes** a stale one: the roll is
+  discarded through the same `--abort-drain` primitive (flag cleared, generation
+  bumped, #6007's pending bookkeeping reset — dispatch resumes while the new
+  artifact is fetched), then re-armed for the newer artifact, publishing
+  `daemon.drain.superseded`. Deliberately narrow — every other shape still skips
+  exactly as before: a **first-attempt** drain (still inside its own deadline), a
+  **then-exit teardown**, an **untargeted** operator `restart --drain`, and any
+  tick whose resolved artifact is unresolved, already installed, or older
+  (#8513's stale-repo shape).
+- **Worst-case pause, per path — and why the two paths keep sharing one budget
+  (#8514).** The budget constants (`DRAIN_PENDING_BUDGET_MULTIPLIER` = 4,
+  `MAX_DRAIN_PENDING_BUDGET_SECS` = 4h, `MAX_DRAIN_RETRY_WINDOW_SECS` = 2h, all in
+  `loom-daemon/src/ipc/drain_roll.rs`) are deliberately **shared** between the
+  automatic auto-update roll and an operator-issued `restart --drain --timeout`,
+  because the budget is already derived from the *requested* timeout and the two
+  paths request different ones:
+
+  | Path | Requested timeout | Pending budget | Worst case dispatch stays paused |
+  |---|---|---|---|
+  | Auto-update roll (`IpcDrainTrigger::trigger`, `timeout_secs = None`) | `DEFAULT_DRAIN_TIMEOUT_SECS` = 1800s | `4 × 1800s` = **2h** | 2h, then abandon + dispatch resumes |
+  | `restart --drain` (no `--timeout`) | 1800s | 2h | as above |
+  | `restart --drain --timeout 60` | 60s | 240s | 4m |
+  | `restart --drain --timeout 7200` | 7200s | `min(4 × 7200, 4h)` = **4h** | 4h (the absolute cap) |
+
+  A separate, smaller constant for the automatic path was considered and
+  **rejected**: abandoning sooner does not shorten the pause a busy host
+  experiences, it only makes it *repeat* sooner. Abandon resumes dispatch, but the
+  artifact is still not installed, so the next auto-update tick re-arms the roll
+  and re-pauses dispatch — a 30m budget would oscillate pause/resume every 30m
+  instead of every 2h, adding drain-supervisor churn and more `daemon.drain.*`
+  noise for no extra dispatch throughput. The multi-release day the issue actually
+  reported is fixed by the supersede bullet above (the pause now ends when a newer
+  release lands, not when a timer expires), and the previously-invisible pause is
+  fixed by the live `drain.roll` fields in the observability bullet below.
+  Operators who *do* want a shorter automatic bound should shorten the **timeout**
+  (which the budget follows), not the multiplier.
 - **Supervision proof is checked up front (AC5):** on an unsupervised host the
   request is refused **before** dispatch is paused (`accepted: false`), so a caller
   can detect nothing happened and no silent outage is introduced.
@@ -8946,9 +8997,16 @@ loom-daemon restart --abort-drain                 # cancel an in-progress drain,
   of scope (it would require a role registry, #4090's stop-and-split boundary).
 - **Observability:** `loom-daemon status` renders `DRAINING (n sweep(s) remaining,
   deadline …)` while active and the last transition (timeout refusal / abort)
-  afterward; the five `daemon.drain.*` events (above) narrate the transitions on
+  afterward; the `daemon.drain.*` events (above) narrate the transitions on
   the event bus. **Cannot be used for its own first roll** — see the rollout note
-  below.
+  below. Since **#8514** the roll state is also **live and queryable** rather than
+  only a one-shot note: `status --json`'s `drain.roll` object (`null` when no
+  drain is active) carries `roll_pending`, `started_at`, `paused_secs`,
+  `budget_secs`, `refusals`, `in_flight`, `target` and `then_exit`, and the human
+  renderer prints the same under the `Drain: DRAINING …` line as
+  `roll PENDING since T — dispatch paused Dm of a 2h0m budget, N in flight, …`.
+  That is what makes a host idling behind a roll visible from one poll — and, by
+  diffing `paused_secs` across polls, whether the pause is still advancing.
 - **Supervised stop/start vs. a full wait-for-zero drain (#5340).** These are two
   different tools for two different situations, not a strict "drain is always
   safer" hierarchy:

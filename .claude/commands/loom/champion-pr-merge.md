@@ -2100,9 +2100,9 @@ fi
 - **Head-moved guard (#5579)**: `merge-pr.sh` refuses to merge (exit 3, not a
   failure) if the PR's head branch advanced past the SHA it read immediately
   before merging — see "Exit codes 3 and 4" in "Error Handling" below
-- **Stale-check re-date (#8508)**: exit 4, also not a failure — the #8248
-  guard blocked the merge and `--redate-stale-checks` pushed a tree-identical
-  no-op commit so CI re-dates the stale check
+- **Stale-check re-date (#8914/#8508)**: exit 4, not a failure — #8248
+  blocked the merge; `--redate-stale-checks` re-ran checks in place
+  (verdict kept) or pushed a tree-identical no-op commit
 
 ### Step 4: Verify Issue Auto-Close
 

@@ -28,8 +28,8 @@
 # anything: the mutation it rejects is never issued. That is a STRONGER
 # guarantee than the fallbacks were, and it is what this file now pins:
 #
-#   1. The probe helper itself still behaves as specified (it is retained in
-#      forge-helpers.sh for external callers; merge-pr.sh no longer needs it).
+#   1. The probe helper and the shell arm it gated are RETIRED (#8427):
+#      forge-helpers.sh defines neither, and no installed script calls them.
 #   2. merge-pr.sh issues no enable-auto-merge mutation by any route, so the
 #      "Auto merge is not allowed for this repository" rejection is unreachable.
 #   3. `--auto` routes into the bounded wait-then-synchronous-merge path — the
@@ -94,50 +94,31 @@ assert_src_present() {
     fi
 }
 
-# --- 1. The #3820 probe helper still behaves as specified ------------------
-echo "Testing the #3820 forge_check_auto_merge_allowed probe helper..."
+# --- 1. The #3820 probe helper and the shell arm are retired (#8427) -------
+echo "Testing that the shell auto-merge arming helpers are retired (#8427)..."
 
-# shellcheck source=/dev/null
-source "$FORGE_HELPERS_SRC"
-
-# GitHub + setting disabled -> "false".
-FORGE_TYPE="github"
-_stub_gh_false() { echo "false"; }
-assert_eq "false" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_false)" \
-  "#3820: GitHub repo with allow_auto_merge:false -> 'false'"
-
-# GitHub + setting enabled -> "true".
-_stub_gh_true() { echo "true"; }
-assert_eq "true" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_true)" \
-  "#3820: GitHub repo with allow_auto_merge:true -> 'true'"
-
-# GitHub + probe failure (nonzero exit) -> "unknown" (fail-safe).
-_stub_gh_fail() { return 1; }
-assert_eq "unknown" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_fail)" \
-  "#3820: GitHub probe failure -> 'unknown'"
-
-# GitHub + unexpected value (e.g. null) -> "unknown".
-_stub_gh_null() { echo "null"; }
-assert_eq "unknown" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_null)" \
-  "#3820: GitHub probe returns non-boolean -> 'unknown'"
-
-# Gitea -> "unknown" (probe is GitHub-only; Gitea behavior preserved).
-FORGE_TYPE="gitea"
-assert_eq "unknown" "$(forge_check_auto_merge_allowed owner/repo _stub_gh_true)" \
-  "#3820: Gitea repo -> 'unknown' (probe scoped to GitHub, Gitea unperturbed)"
-# FORGE_TYPE is read by the sourced forge-helpers.sh functions (dynamic use).
-# shellcheck disable=SC2034
-FORGE_TYPE="github"
-
-# The probe helper must stay GitHub-scoped so Gitea is unperturbed.
 TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q 'forge_check_auto_merge_allowed()' "$FORGE_HELPERS_SRC" && \
-   awk '/forge_check_auto_merge_allowed\(\)/{f=1} f && /FORGE_TYPE" != "github"/{print; exit}' "$FORGE_HELPERS_SRC" | grep -q github; then
+if grep -Eq '^[[:space:]]*(forge_check_auto_merge_allowed|forge_auto_merge)\(\)' "$FORGE_HELPERS_SRC"; then
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: forge-helpers.sh still defines a retired auto-merge arming helper"
+else
     TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: forge_check_auto_merge_allowed is GitHub-scoped (Gitea returns 'unknown')"
+    echo -e "  ${GREEN}PASS${NC}: forge-helpers.sh defines neither forge_auto_merge nor forge_check_auto_merge_allowed"
+fi
+
+# No installed script (tests excluded) may call either retired helper: a
+# live call would now be a `command not found` at merge time.
+TESTS_RUN=$((TESTS_RUN + 1))
+stray_callers="$(grep -rnE '(^|[^_[:alnum:]])(forge_check_auto_merge_allowed|forge_auto_merge)([[:space:]]|$|\))' \
+    --include='*.sh' "$HELPERS_DIR" 2>/dev/null \
+    | grep -v '/tests/' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
+if [[ -z "$stray_callers" ]]; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: no installed script calls a retired auto-merge arming helper"
 else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: forge_check_auto_merge_allowed must guard on FORGE_TYPE == github"
+    echo -e "  ${RED}FAIL${NC}: retired auto-merge helper still called:"
+    echo "$stray_callers" | sed 's/^/    /'
 fi
 
 # --- 2. The rejection this file is named after is now unreachable (#8410) ---

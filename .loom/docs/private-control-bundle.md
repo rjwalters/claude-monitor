@@ -204,30 +204,102 @@ the 0.146.0 floor" is not by itself evidence of compatibility, so the real
   `codex doctor --json` (20 checks on 0.149.1) still reports no hook check. So
   #5005's finding — trust is operator-attested, per profile, once — holds
   unchanged at 0.149.1, and Loom still neither fabricates nor bypasses it.
-- **0.149.1 does not validate `hooks.json` eagerly.** A malformed or absent
-  registration produces no startup error, no warning, and no `doctor` finding;
-  the CLI simply runs unhooked. This is why readiness has to be proven by Loom
-  *before* dispatch rather than inferred from the CLI starting successfully,
-  and it is the reason the registration and receipt are part of the bound
-  identity.
+- **0.149.1 does not validate `hooks.json` eagerly, and an untrusted hook fails
+  open.** A malformed or absent registration produces no startup error, no
+  warning, and no `doctor` finding; the CLI simply runs unhooked. The same is
+  true of a *present, correct, untrusted* registration — the control turn below
+  drives a real `codex exec` past one and the force-push lands, with no hook
+  invocation and no diagnostic of any kind. This is why readiness has to be
+  proven by Loom *before* dispatch rather than inferred from the CLI starting
+  successfully, and it is the reason the registration and receipt are part of
+  the bound identity.
 
 `docker/session/test-image.sh` re-asserts the version pin, the sealed manifest,
 and the bridge's wire shape against the **real CLI in the shipped image** on
 every image build, so a Codex bump that changes any of this fails the image
 smoke test rather than silently shipping.
 
+### The engine really does dispatch to the hook — measured, not inferred
+
+Everything above establishes that the bridge *would* deny and that the
+registration the CLI *would* read names the image-owned copy. Neither shows the
+engine dispatching to it, and on this CLI that gap is not academic: an
+unregistered or untrusted hook fails **open**, silently. §12 of
+`docker/session/test-image.sh` closes it by running the real `codex exec`
+against a **scripted loopback model provider** — a ~30-line Node server on
+`127.0.0.1` in a `--network none`, `--read-only`, `--cap-drop ALL` container as
+uid 1000, with the profile's three control files bound read-only exactly as a
+session binds them, a local bare repo as the "remote", and no credential
+anywhere. The provider emits one `exec_command` call and then a final message,
+so the turn is deterministic and offline.
+
+**Hook trust is real, not waived.** Codex persists it only through an
+interactive TUI decision, so §12 makes that decision the way an operator does:
+it runs the shipped TUI under `tmux` in a throwaway container with the profile
+still writable — the same pre-session step
+`provision-codex-hooks.sh` tells the operator to take — waits for the
+"Hooks can run outside the sandbox" prompt by its text, and answers it. Nothing
+writes a `trusted_hash` by hand and `--dangerously-bypass-hook-trust` is passed
+nowhere, in this script or in shipped Loom code. What §12 measures is therefore
+the production path exactly as it runs.
+
+Two profiles are provisioned and registered identically and differ **only** in
+the answer to that one prompt — `2` (*Trust all and continue*) versus `3`
+(*Continue without trusting*), asserted by the presence and absence of
+`hooks.state…trusted_hash` in their `config.toml`. The identical probe then runs
+against each:
+
+| Tool call | Hook trust | Asserted outcome |
+|---|---|---|
+| `git push --force origin HEAD:main` | **real** | `Command blocked by PreToolUse hook` carrying the guard's own reason; the bare repo's `main` is **unmoved** |
+| `printf allowed > …/allowed.txt` | **real** | runs to completion — the hook is consulted and *allows*, so the block above is a decision, not a blanket refusal |
+| `git push --force origin HEAD:main` | **none** | no hook event is recorded at all and the force-push **lands**, moving `main` |
+
+The third row is the control that makes the first non-vacuous, and it is also
+the executable form of the fail-open finding above: with no persisted trust the
+CLI runs unhooked and says nothing about it. Because the two profiles differ in
+nothing else, the difference in outcome is attributable to hook trust alone.
+
+A second, always-allow *recorder* hook registered beside Loom's (before the
+trust step, so "trust all" covers it too) captures the payload the engine
+delivers, and the recorded shape is asserted:
+
+| Field | 0.146.0 schema the bridge documents | **What 0.149.1 actually emits** |
+|---|---|---|
+| `tool_name` | `shell` | `Bash` |
+| `tool_input.command` | argv array `["bash","-lc",…]` | a **string** |
+
+`guard-codex-bridge.sh` already classifies `Bash` and already extracts a string
+command, so no bridge change was needed — but until this assertion existed,
+every fixture exercised a shape the shipped CLI does not produce.
+`loom-daemon/tests/private_workspace_docker` now drives **both** shapes through
+the image-owned bridge for the same escalation, so the synthetic layer can no
+longer diverge from the engine's own payload unnoticed. A Codex release that
+renames the tool or restructures `tool_input` fails the image smoke test.
+
+The turns also prove a non-regression nothing else covers: the real CLI runs
+normally with `hooks.json`, `config.toml` and `loom-codex-hooks.json` frozen as
+read-only mount points — it writes its session state into the profile
+*directory* around them.
+
 ## Remaining limitations
 
-- **The hook-invocation step itself is not proven credential-free.** Getting the
-  real CLI to *invoke* a `pre_tool_use` hook requires a model turn, which
-  requires credentials; the tests therefore prove (a) the shipped CLI's own
-  embedded wire contract accepts exactly what the bridge emits, (b) the
-  registration the CLI would read names the image-owned bridge, and (c) the
-  bridge denies the demonstrated escalation when driven with a real
-  `pre_tool_use` event. They do not prove the engine dispatched it. Codex
-  capability stays `hooks: partial` / `worktreeIsolation: partial`
-  ([guardrail-parity-codex.md](guardrail-parity-codex.md)) for this reason,
-  among others.
+- **The model itself is scripted, not real.** The turns above drive the real
+  Codex CLI, the real hook engine, real operator-established trust and the real
+  image-owned bridge; what they do not use is a real model, because that would
+  require credentials. The provider is a loopback Node server emitting a fixed
+  `exec_command` call, so what is proven is the *tool-call → hook → decision*
+  path rather than any property of model behavior. That is the path the control
+  boundary depends on. Codex capability nonetheless stays `hooks: partial` /
+  `worktreeIsolation: partial`
+  ([guardrail-parity-codex.md](guardrail-parity-codex.md)) for the other reasons
+  recorded there.
+- **The TUI trust step is version-shaped.** §12 drives the shipped TUI by
+  waiting for its prompt text, so a Codex release that reworks the hook-trust
+  prompt fails the image smoke test with "could not drive the shipped TUI to the
+  hook-trust prompt" rather than silently degrading. That is the intended
+  signal: Loom's own readiness contract depends on the same prompt, so a change
+  there is something to learn about at image-build time.
 - **Hook trust remains operator-attested per profile** (#5005). The
   registration now names a stable image-owned path, so the operator's one-time
   trust step must be taken against that path. Because `config.toml` is bound
