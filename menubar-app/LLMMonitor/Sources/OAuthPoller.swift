@@ -734,6 +734,28 @@ class OAuthPoller: ObservableObject {
         "No rate-limit snapshot in this Loom Codex profile yet. One Codex turn on the "
         + "account records one; this app never queries a Loom-owned profile directly."
 
+    /// What a snapshot-mode row says once its newest reading has rolled over.
+    nonisolated static let rolledOverCodexSnapshotMessage =
+        "Last Codex snapshot has rolled over; usage is unknown until the account's next Codex turn."
+
+    /// What a snapshot-mode row says when its profile has no login at all —
+    /// the one case where "wait for a Codex turn" is the wrong advice, because
+    /// no turn can run. Names the profile (a label Loom chose, never a path).
+    nonisolated static func codexProfileNotLoggedInMessage(profile: String) -> String {
+        "This Loom Codex profile is not logged in on this host, so it records no usage. "
+            + "Log it in with `loom-daemon accounts reauth codex \(profile)`."
+    }
+
+    /// The diagnostic for a snapshot-mode row that has no current reading.
+    /// A profile with no `tokens.account_id` in its `auth.json` was never
+    /// logged in (or was logged out); that outranks the generic messages.
+    nonisolated static func codexSnapshotDiagnostic(home: String, rolledOver: Bool) -> String {
+        if CodexAuth.accountId(inHome: home) == nil {
+            return codexProfileNotLoggedInMessage(profile: (home as NSString).lastPathComponent)
+        }
+        return rolledOver ? rolledOverCodexSnapshotMessage : noCodexSnapshotMessage
+    }
+
     /// Read one Loom profile's latest rate-limit snapshot. Never spawns
     /// `codex`, never reads a credential (see `CodexProfiles`).
     // Not private: SelfTest drives it directly (it is synchronous, so the
@@ -741,15 +763,26 @@ class OAuthPoller: ObservableObject {
     func pollCodexSnapshot(_ credential: OAuthCredential) {
         guard let accountId = credential.accountId, !accountId.isEmpty,
               let home = credential.codexHome else { return }
+        // A row with no current reading reports why, both in memory and in
+        // `oauth_credentials.last_error`. The stored field matters: without
+        // this write it kept whatever an older transport left there (e.g. a
+        // pre-snapshot "Token refresh failed"), which read as the cause.
+        // `persistCredentialError` deliberately leaves `last_poll_at` alone,
+        // so the staleness backstop still sees an unpolled row (#148).
+        func reportNoReading(rolledOver: Bool) {
+            let message = Self.codexSnapshotDiagnostic(home: home, rolledOver: rolledOver)
+            let loggedOut = CodexAuth.accountId(inHome: home) == nil
+            updateCredentialStatus(credential, status: loggedOut || !rolledOver ? .missing : .valid, error: message)
+            if let id = credential.id { persistCredentialError(id: id, error: message) }
+        }
         guard let snapshot = CodexProfiles.latestSnapshot(home: home) else {
-            updateCredentialStatus(credential, status: .missing, error: Self.noCodexSnapshotMessage)
+            reportNoReading(rolledOver: false)
             return
         }
         guard !snapshot.rateLimit.isEmpty else {
             // Every window in the newest reading has rolled over since: the
             // account's current usage is unknown, not what it was then.
-            updateCredentialStatus(credential, status: .valid, error:
-                "Last Codex snapshot has rolled over; usage is unknown until the account's next Codex turn.")
+            reportNoReading(rolledOver: true)
             return
         }
         writeSnapshotToDB(accountId: accountId, snapshot: ProviderUsageSnapshot(
