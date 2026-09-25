@@ -873,7 +873,7 @@ final class CodexAppServerClient: Sendable {
                 "params": ["clientInfo": ["name": "claude-monitor", "version": AppVersion.current]],
             ])
             let initializeResult = try await self.awaitReply(
-                id: 1, method: "initialize", stream: stream, process: process, stderr: stderrCapture,
+                id: 1, method: "initialize", stream: stream, process: process, stderr: stderrCapture, stderrDrain: stderrDrain,
                 deadline: Self.earliest(Date().addingTimeInterval(timeouts.initialize), overallDeadline)
             )
             Self.logResolvedBinaryVersionOnce(binaryPath: binary, initializeResult: initializeResult)
@@ -888,7 +888,7 @@ final class CodexAppServerClient: Sendable {
             try Self.send(writer, ["jsonrpc": "2.0", "id": 2, "method": "account/read", "params": [:]])
             do {
                 accountResult = try await self.awaitReply(
-                    id: 2, method: "account/read", stream: stream, process: process, stderr: stderrCapture,
+                    id: 2, method: "account/read", stream: stream, process: process, stderr: stderrCapture, stderrDrain: stderrDrain,
                     deadline: Self.earliest(Date().addingTimeInterval(timeouts.method), overallDeadline)
                 )
                 let decoded = accountResult.flatMap { try? CodexWire.decode(CodexWire.AccountRead.self, from: $0) }
@@ -919,7 +919,7 @@ final class CodexAppServerClient: Sendable {
             guard includeRateLimits else { return (accountResult, nil) }
             try Self.send(writer, ["jsonrpc": "2.0", "id": 3, "method": "account/rateLimits/read", "params": [:]])
             let rateLimits = try await self.awaitReply(
-                id: 3, method: "account/rateLimits/read", stream: stream, process: process, stderr: stderrCapture,
+                id: 3, method: "account/rateLimits/read", stream: stream, process: process, stderr: stderrCapture, stderrDrain: stderrDrain,
                 deadline: Self.earliest(Date().addingTimeInterval(timeouts.method), overallDeadline)
             )
 
@@ -939,17 +939,27 @@ final class CodexAppServerClient: Sendable {
     private static func earliest(_ a: Date, _ b: Date) -> Date { a < b ? a : b }
 
     /// Write one newline-terminated JSON object to the child's stdin.
-    private static func send(_ handle: FileHandle, _ message: [String: Any]) throws {
+    ///
+    /// A failed write is **not** thrown (#212). It means the child already
+    /// closed its stdin, which in practice means it exited — the shape of a
+    /// CLI-argument rejection (#184), where the one useful fact is the stderr
+    /// line naming why. Throwing here raced that: whether the error carried the
+    /// stderr depended on whether the child exited before or after the write
+    /// landed, which flipped under host load. Instead the caller's next
+    /// `awaitReply` sees the dead child and throws the per-method failure
+    /// *with* its stderr. (SIGPIPE is ignored process-wide, so the write fails
+    /// with EPIPE rather than killing us.)
+    @discardableResult
+    private static func send(_ handle: FileHandle, _ message: [String: Any]) throws -> Bool {
         guard var data = try? JSONSerialization.data(withJSONObject: message, options: [.sortedKeys]) else {
             throw CodexAppServerError.protocolFailure("could not encode a request")
         }
         data.append(0x0A)
         do {
             try handle.write(contentsOf: data)
+            return true
         } catch {
-            // A closed pipe means the child is already gone; the awaiting read
-            // turns that into the specific per-method failure.
-            throw CodexAppServerError.protocolFailure("child stdin closed early")
+            return false
         }
     }
 
@@ -970,6 +980,7 @@ final class CodexAppServerClient: Sendable {
         stream: CodexLineStream,
         process: Process,
         stderr: CodexStderrCapture,
+        stderrDrain: PipeDrain,
         deadline: Date
     ) async throws -> Data {
         // This reply may already have been read while a previous call was
@@ -995,6 +1006,14 @@ final class CodexAppServerClient: Sendable {
 
             if Date() >= deadline { throw CodexAppServerError.timedOut(method) }
             if stream.isDrained, !process.isRunning {
+                // The stderr drain runs on its own thread and may not have
+                // reached EOF yet, even though the child has exited (#212).
+                // Wait for it, bounded, so the snapshot holds the child's
+                // last line rather than nothing or a truncated prefix.
+                let stderrDeadline = Self.earliest(Date().addingTimeInterval(1), deadline)
+                while !stderrDrain.isFinished, Date() < stderrDeadline {
+                    try await Task.sleep(nanoseconds: 5_000_000)
+                }
                 // Redacted before it can reach `debug.log` or
                 // `oauth_credentials.last_error`: the child runs with
                 // `CODEX_HOME` set to a real home, and a CLI that echoes a path
