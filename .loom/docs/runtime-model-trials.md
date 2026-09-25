@@ -716,6 +716,48 @@ imposed (provider-side hard ceiling first, observability-backend aggregation as 
 scoped fallback) is recorded in
 [`ADR-0020`](https://github.com/rjwalters/loom/blob/main/docs/adr/0020-fleet-metered-spend-ceiling.md).
 
+**Kimi keeps its usage off the stdout stream entirely (issue #8564).** Unlike Pi
+and OpenCode, `kimi --output-format stream-json` carries **no** token counters:
+`PromptJsonWriter` in the shipped `@moonshot-ai/kimi-code@2.0.2` bundle (read
+2026-09-22) emits only `{"role":"assistant",…}`, `{"role":"tool",…}` and
+`{"role":"meta","type":…}` lines. `state.json` has none either — it is session
+metadata (`normalizeSessionMeta`: id/version/cwd/title/titleKind/createdAt/
+updatedAt/archived). The counters live in the durable per-agent event log,
+`<sessionDir>/agents/<agentId>/wire.jsonl`, on two record types:
+
+```jsonc
+// usage.record — the counters. `model` is the model ALIAS, not the provider id.
+{"type":"usage.record","agentId":"main","model":"code",
+ "usage":{"inputOther":1200,"output":340,"inputCacheRead":8000,"inputCacheCreation":500},
+ "usageScope":"turn","time":1790000000000}
+// llm.request — resolves that alias to the provider's own model id + provider.
+{"type":"llm.request","agentId":"main","kind":"loop","provider":"kimi",
+ "model":"kimi-k2.7-code","modelAlias":"code","time":1789999999000}
+```
+
+(Redacted sample: field names and nesting copied from the bundle's
+`usageRecordSchema` / `llmRequestSchema` / `emptyUsage()` / `Event2.serialize()`;
+the *values* are synthetic — no credentialled Kimi session was available, see
+the canary note above.) `usageScope` is `"turn"` or `"session"` and partitions
+the records, so summing all of them is the total rather than a double count;
+`inputTotal()` in the bundle is `inputOther + inputCacheRead +
+inputCacheCreation`; there is no separate reasoning counter. The exact session
+id is available only on stdout, as
+`{"role":"meta","type":"session.resume_hint","session_id":…}`. Sessions are
+found through `$KIMI_CODE_HOME/session_index.jsonl`
+(`{sessionId, sessionDir, workDir}`, absolute `sessionDir`, `{sessionId,
+deleted:true}` tombstones). The reader is
+`loom-daemon/src/kimi_usage.rs`; full write-up in
+[`native-runtime-usage-attribution.md`](native-runtime-usage-attribution.md).
+
+Kimi's API list prices (`defaults/pricing.json`, verified 2026-09-22 against
+<https://platform.moonshot.ai/docs/pricing/chat>) are recorded so a Kimi
+completion gets a cost number at all, but they are an **estimate**: a Kimi Code
+subscription is not billed per token, so on the subscription route the number is
+"what these tokens would have cost on the platform API", not money that changed
+hands — the same distinction retained for OpenCode's reported cost of zero
+below.
+
 For full issues measure cost per independently accepted issue, with identical
 base commits, dependencies, task text and reviewer. Include failed attempts and
 reviewer repairs. A tiny tool-use canary establishes connectivity and basic edit

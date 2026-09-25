@@ -2055,7 +2055,7 @@ echo "Attempting to merge PR #$PR_NUMBER..."
 git checkout main 2>/dev/null || true
 
 # Use merge-pr.sh for worktree-safe merge via GitHub API
-# --auto enables auto-merge if ruleset requires wait
+# --auto waits, merges HERE (not server-side queue, #8410)
 #
 # merge-pr.sh reads the PR's head SHA itself (a fresh, uncached read — see
 # "Cached forge reads" above) immediately before merging, and passes it
@@ -2095,7 +2095,7 @@ fi
 **Merge strategy**:
 - Uses `merge-pr.sh` which merges via GitHub API (worktree-safe)
 - **Squash merge**: Combines all commits into single commit (clean history)
-- **`--auto`**: Enables GitHub's auto-merge if ruleset requires wait
+- **`--auto`**: Waits for checks, merges in-process (#8410)
 - Branch deleted automatically after merge
 - **Head-moved guard (#5579)**: `merge-pr.sh` refuses to merge (exit 3, not a
   failure) if the PR's head branch advanced past the SHA it read immediately

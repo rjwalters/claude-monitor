@@ -18,18 +18,17 @@
 #                          branch via `git branch -d` (refuses on unmerged
 #                          commits — Git's own safety check).
 #   --dry-run              Show what would happen without merging
-#   --auto                 Enable auto-merge instead of immediate merge. On a
-#                          repo with GitHub auto-merge disabled
-#                          (allow_auto_merge:false) this degrades gracefully to
-#                          wait-for-checks-then-merge (immediate if CLEAN)
-#                          instead of failing (#3820). It degrades the same way
-#                          when the parent branch still has open stacked child
-#                          PRs (#8048): the server-side queue would return here
-#                          before the merge lands, and the post-merge
-#                          _auto_reconcile_stacked_children pass would never run
-#                          for those children. Both degradations are bounded by
-#                          LOOM_AUTO_MERGE_TIMEOUT and exit non-zero on timeout
-#                          or a failed required check.
+#   --auto                 Wait for this head's checks to settle, then merge in
+#                          THIS process (immediately if they are already
+#                          settled). It never arms the forge's own server-side
+#                          auto-merge queue (#8410): that queue is gated only by
+#                          the branch ruleset's REQUIRED checks and re-reads
+#                          nothing, so a merge armed at queue time ignored both
+#                          a later loom:pr revocation and every non-required
+#                          test suite. Bounded by LOOM_AUTO_MERGE_TIMEOUT
+#                          (default 600s; raise it on a slow-CI repo); exits
+#                          non-zero on timeout or a failed required check,
+#                          which Champion's next pass retries.
 #   --allow-stacked-children
 #                          Bypass the pre-merge merge-ordering guard's hard-block
 #                          path. That guard's DEFAULT behavior, when the parent
@@ -103,7 +102,7 @@
 # auto-remove) so the operator can re-run with --worktree-path.
 #
 # Exit codes:
-#   0 = merged (or auto-merge enabled)
+#   0 = merged
 #   1 = failed
 #   3 = PR head moved past the SHA this merge attempt gated on (#5579) — a
 #       session pushed new commits to the branch after the approving review
@@ -235,11 +234,11 @@ Options:
                          the matching local branch via 'git branch -d'
                          (Git refuses on unmerged commits).
   --dry-run              Show what would happen without merging
-  --auto                 Enable auto-merge instead of immediate merge. Degrades
-                         to a bounded wait-for-checks-then-merge (immediate if
-                         already CLEAN) when the repo has auto-merge disabled
-                         (#3820), or when this branch has open stacked child
-                         PRs to reconcile once the parent lands (#8048).
+  --auto                 Wait (bounded) for this head's checks to settle, then
+                         merge in THIS process — immediately if they already
+                         are. NEVER arms the forge's server-side auto-merge
+                         queue, which re-reads neither the loom:pr label nor
+                         the non-required test suites once armed (#8410).
   --allow-stacked-children
                          Bypass the pre-merge merge-ordering guard's remaining
                          hard-block path. By default (#7982) the guard pins
@@ -326,7 +325,7 @@ Precedence (highest wins):
   4. default: .loom/worktrees/issue-N or pr-N + sentinel guard
 
 Exit codes:
-  0 = merged (or auto-merge enabled, or --help)
+  0 = merged (or --help)
   1 = failed
   4 = stale required checks were re-dated under --redate-stale-checks (#8508) — not a failure; CI is re-running, retry later
 
@@ -338,8 +337,8 @@ Examples:
     Shows what would happen without merging
 
   ./.loom/scripts/merge-pr.sh 123 --auto
-    Enables auto-merge instead of merging immediately (on a repo with
-    auto-merge disabled, waits for checks then merges synchronously)
+    Waits (bounded by LOOM_AUTO_MERGE_TIMEOUT) for PR #123's checks to
+    settle, then merges it here — never via a server-side merge queue
 
   ./.loom/scripts/merge-pr.sh 123 --no-cleanup-worktree
     Merges PR but leaves the local worktree in place
@@ -1102,11 +1101,13 @@ _check_verdict_label_contradiction
 # leaves the #8248 refusal standing — the feature degrades to exactly today's
 # behaviour instead of failing a merge open, so it is optional by
 # construction. Full rationale, bound and release conditions:
-# defaults/docs/merge-pr-exit-code-exceptions.md. Known residual: on
-# --auto's queued path the server may complete the merge minutes after checks
-# pass, outside this guard's single pre-merge evaluation — that seconds-scale
-# window is the same one every non-ratchet change already runs in, and is not
-# the 22-hour exposure this guard exists to close.
+# defaults/docs/merge-pr-exit-code-exceptions.md. Known residual: this guard
+# is evaluated once, here, and `--auto` may then wait out CI before merging
+# (bounded by LOOM_AUTO_MERGE_TIMEOUT) — #8410 deliberately does NOT re-run it
+# after that wait (see `_revalidate_merge_guards`), leaving the same
+# minutes-scale window the pre-#8410 UNSTABLE wait path always had, not the
+# 22-hour exposure this guard exists to close; #8410 also removed the
+# server-side queued path this note used to describe.
 #
 # PLAN-GATED REPOSITORIES (#8844): on a PRIVATE repo owned by a GitHub Free
 # account or org, `GET /repos/{nwo}/rules/branches/{branch}` answers "HTTP 403:
@@ -1345,7 +1346,22 @@ _check_partial_increment_close_conflict() {
 
   local partial_refs
   partial_refs="$(_partial_increment_refs "$pr_body")"
-  [[ -n "$partial_refs" ]] || return 0
+
+  # Backticked-trailer warning (#5690, ported to Rust #8831 —
+  # cli/merge_pr_refs.rs's `backticks-partial-increment-warnings`, which
+  # recomputes both declaration sets from $pr_body itself and diffs them, so
+  # this call passes nothing but the PR number and dry-run state). Runs BEFORE
+  # the early return below because the case it exists for is precisely the one
+  # where $partial_refs is EMPTY — a trailer the author backticked, which
+  # parses as no declaration at all. Pure text analysis, no forge calls, so
+  # the common (non-partial-increment) path still costs zero extra requests.
+  # (The three statements below share one line deliberately — #8831 pays for
+  # the daemon round trip inside the shell-budget ratchet's portable pool, and
+  # this keeps that cost at net zero. The unquoted $(...) is intentional: it
+  # expands to a single `--dry-run` token or nothing, never anything word
+  # splitting could mis-tokenize.)
+  # shellcheck disable=SC2046
+  local bt_warn="$(printf '%s\n' "$pr_body" | _mp_refs backticks-partial-increment-warnings --pr "$PR_NUMBER" $([[ "${DRY_RUN:-false}" == "true" ]] && echo --dry-run))"; [[ -z "$bt_warn" ]] || warning "$bt_warn"; [[ -n "$partial_refs" ]] || return 0
 
   # Closing references GitHub will honor on merge, from three unioned signals:
   #   1. the body's own closing keywords (quota-free regex);
@@ -1917,26 +1933,46 @@ _recheck_mergeable_before_refusal() {
 }
 
 # ---------------------------------------------------------------------------
-# Repo-level "Allow auto-merge" disabled — proactive wait-then-merge (#3820).
+# `--auto`'s whole implementation: settle this head's checks, then merge HERE
+# (#3820, generalised to every `--auto` invocation by #8410).
 #
-# When the repository's GitHub "Allow auto-merge" setting is OFF
-# (`gh api repos/{nwo} --jq .allow_auto_merge` == false), the server-side
-# auto-merge queue can NEVER be enabled — enablePullRequestAutoMerge is rejected
-# regardless of PR state. The reactive #3763 fallback catches that post-mutation
-# rejection, but only degrades gracefully when the PR is ALREADY immediately
-# mergeable; when auto-merge is disabled AND the PR is not yet CLEAN (checks
-# still running / .mergeable not yet computed), #3763's mergeability recheck sees
-# `.mergeable != true` and preserves the terminal error, so the PR never merges
-# (the reported failure on a repo with allow_auto_merge:false).
+# It polls the head-SHA check-runs (bounded by LOOM_AUTO_MERGE_TIMEOUT) until
+# they settle, then returns 0 so the caller merges synchronously. "Settled"
+# means: nothing queued/in_progress, and nothing failing except checks that are
+# NOT in the base branch's required-context set. An already-settled head costs
+# exactly one check-runs read and returns immediately, so the CLEAN case is not
+# slowed down by the wait existing.
 #
-# This function is entered PROACTIVELY from the repo-setting probe below (so we
-# never attempt the doomed mutation at all) and degrades `--auto` to
-# "wait-for-checks-then-merge, or immediate merge if already CLEAN": it polls the
-# head-SHA check-runs (bounded by LOOM_AUTO_MERGE_TIMEOUT, same knobs as the
-# UNSTABLE fallback) until they settle, then returns 0 so the caller flips to the
-# synchronous-merge path. Unlike the UNSTABLE branch it also handles the
-# already-CLEAN case (nothing failing, nothing pending) by returning 0 for an
-# immediate merge rather than hitting that branch's defensive "unknown gap" error.
+# #8410 — why this is now the ONLY `--auto` path, and the forge's own
+# server-side auto-merge queue is never armed:
+#
+#   Arming that queue (enablePullRequestAutoMerge) hands the merge decision to
+#   the forge, which re-reads NOTHING afterwards except the branch ruleset's
+#   REQUIRED status checks. Two things this script enforces stop being enforced
+#   the moment it is armed:
+#     1. Label state. A later `loom:verdict-stale` revocation (loom:pr ->
+#        loom:review-requested) or a Judge `loom:reviewing` claim cannot disarm
+#        a queued merge.
+#     2. The non-required suites. On this repo every required context is a
+#        structural gate; the test suites (Rust Unit Tests, Shell Test Suites,
+#        Installer Integration Tests, Native Port Suites, Rust OTLP) are NOT
+#        required, so the server was free to merge while they were still
+#        running.
+#   Both fired live on PR #8220 (2026-09-20): armed at 07:08 on a head that was
+#   force-pushed at 07:12, `loom:pr` revoked at 07:13, Judge re-claimed it at
+#   07:18, merged by the queue at 07:21 with five suites still pending.
+#
+#   The UNSTABLE case never had this problem — the forge REFUSES to arm when a
+#   required check is mid-flight, so the script already fell back to this
+#   function (#3486/#3664). The BLOCKED case (no required check has started
+#   yet) is the one where arming succeeds, and it is exactly the case where
+#   waiting matters most. Rather than keep two paths whose safety differs by
+#   which checks happen to be running at the instant of the call, `--auto` now
+#   always takes this one (ci-principles rule 4, one mechanism per behaviour).
+#   The cost, accepted deliberately: the invoking process must stay alive for
+#   up to LOOM_AUTO_MERGE_TIMEOUT, and a slower CI than that budget makes the
+#   run exit non-zero instead of queueing — Champion's next pass retries and
+#   merges immediately once the checks are done.
 #
 # Contract:
 #   - returns 0  → safe to proceed to the synchronous-merge path (caller flips
@@ -1945,11 +1981,17 @@ _recheck_mergeable_before_refusal() {
 #                  no-ops cleanly).
 #   - calls error() (exit 1) → a required status check failed, or the wait timed
 #                  out. A normal recoverable failure Champion's cron retries.
-# GitHub-only by construction (only invoked when the GitHub-only probe returns
-# "false"). Requires LOOM_AUTO_MERGE_POLL_INTERVAL / LOOM_AUTO_MERGE_TIMEOUT set.
+# Requires LOOM_AUTO_MERGE_POLL_INTERVAL / LOOM_AUTO_MERGE_TIMEOUT set.
 _wait_for_checks_then_sync_merge() {
   local head_sha base_ref
-  head_sha="$(echo "$PR_JSON" | jq -r '.head.sha // empty')"
+  # Poll the SHA this run will actually MERGE, not the one the initial
+  # (gh-cached) $PR_JSON fetch reported: $MERGE_PRECONDITION_SHA is the live,
+  # uncached read taken immediately above, and the merge API call is gated on
+  # it. Waiting on a different SHA than the one being merged would settle the
+  # wrong tree's checks — the whole point of #8410. Falls back to $PR_JSON's
+  # head when the live read failed (the two are equal in the common case).
+  head_sha="${MERGE_PRECONDITION_SHA:-}"
+  [[ -n "$head_sha" ]] || head_sha="$(echo "$PR_JSON" | jq -r '.head.sha // empty')"
   base_ref="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"
 
   # Without the head SHA we cannot reason about checks — proceed to the
@@ -2017,7 +2059,7 @@ _wait_for_checks_then_sync_merge() {
         return 0
       fi
       if [[ "$(date +%s)" -ge "$deadline" ]]; then
-        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER (repo has auto-merge disabled). Re-run once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."
+        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER. Re-run once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."
       fi
       warning "Failed to fetch check-runs for PR #$PR_NUMBER (rc=$fetch_rc); treating as still-pending and continuing to poll"
       sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
@@ -2067,10 +2109,10 @@ _wait_for_checks_then_sync_merge() {
     if [[ -n "$pending" ]]; then
       if [[ "$(date +%s)" -ge "$deadline" ]]; then
         local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
-        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${n} pending check(s) on PR #$PR_NUMBER to complete (repo has auto-merge disabled). Re-run once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."
+        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${n} pending check(s) on PR #$PR_NUMBER to complete. Re-run once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."
       fi
       local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
-      info "PR #$PR_NUMBER: ${n} check(s) still running (repo auto-merge disabled); waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for CI (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
+      info "PR #$PR_NUMBER: ${n} check(s) still running; waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for CI (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
       sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
       continue
     fi
@@ -2084,7 +2126,7 @@ _wait_for_checks_then_sync_merge() {
       if [[ "$(date +%s)" -ge "$deadline" ]]; then
         warning "PR #$PR_NUMBER: check-runs rollup remained empty (zero rows) for the entire ${LOOM_AUTO_MERGE_TIMEOUT}s wait; proceeding on the assumption this repo genuinely has no checks configured for this commit"
       else
-        info "PR #$PR_NUMBER: check-runs rollup is empty (zero rows) -- ambiguous between 'no checks configured' and a transient forge read; re-polling before trusting it (repo auto-merge disabled)"
+        info "PR #$PR_NUMBER: check-runs rollup is empty (zero rows) -- ambiguous between 'no checks configured' and a transient forge read; re-polling before trusting it"
         sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
         continue
       fi
@@ -2092,23 +2134,19 @@ _wait_for_checks_then_sync_merge() {
 
     # Nothing failing (or only informational), nothing pending → effectively
     # CLEAN. Proceed to the synchronous merge.
-    info "PR #$PR_NUMBER: checks settled (repo auto-merge disabled); proceeding to synchronous merge"
+    info "PR #$PR_NUMBER: checks settled; proceeding to synchronous merge"
     return 0
   done
 }
 
 # Handle auto-merge mode
 #
-# The auto-merge path now mirrors the sync path's resilience patterns:
-#   - Retry on "Base branch was modified" with the same backoff loop.
-#   - Recheck PR state on failure (concurrent shepherd may have already
-#     merged it).
-#   - Fall through to the shared cleanup block (lines below) instead of
-#     exiting early. Cleanup is gated on `PR.merged == true`; if the
-#     server-side merge is still queued, we skip local cleanup and let
-#     loom-clean handle it.
-#
-# See issue #3279.
+# `--auto` no longer means "hand the merge to the forge's queue" (#8410) — it
+# means "wait for this head's checks to settle, re-validate, then merge here".
+# The two steps live below the head-SHA precondition read, in
+# `_revalidate_merge_guards` and the `if [[ "$AUTO_MERGE" == "true" ]]` block.
+# This line is also the landmark several merge-pr test suites anchor their
+# source-span extractions on; keep it.
 
 # Freshest possible head-SHA read for the merge's optimistic-concurrency
 # precondition (#5579). $PR_HEAD_SHA (set above from the initial $PR_JSON
@@ -2149,573 +2187,83 @@ unset _MPS_JSON _MPS_FRESH_SHA
 # to create.
 [[ "$DRY_RUN" != "true" && "${STACKED_CHILDREN_PIN_WRITTEN:-}" == "true" && "$MERGE_PRECONDITION_SHA" != "$PR_HEAD_SHA" ]] && { git -C "$REPO_ROOT" update-ref "refs/loom/parent/$PR_BRANCH" "$MERGE_PRECONDITION_SHA" 2>/dev/null || true; }
 
+# `--auto` (#8410): settle the checks, re-validate, then merge in this process.
+#
+# `_wait_for_checks_then_sync_merge` above either returns 0 (this head's checks
+# are settled — nothing queued/in_progress, nothing REQUIRED failing) or
+# error()s out terminally. Whatever it waited for took real time, so the guards
+# that ran at the top of this script — loom:pr present, no contradicting
+# verdict label, and the head they were evaluated against — are re-checked
+# against freshly-read state immediately before the merge fires. That re-check
+# is precisely what an armed server-side merge structurally cannot do, and it
+# is the half of this fix that closes the label-revocation gap (the wait itself
+# closes the pending-test-suite gap).
+#
+# Deliberately NOT re-run here: the #8248 required-check freshness guard. Its
+# input is the BASE branch's tip, which moves every few minutes in this fleet,
+# so re-evaluating it after a multi-minute wait would refuse nearly every PR
+# that actually had to wait — with "re-run CI" as the only remedy. Widening
+# that guard to cover the wait window is a separate policy call; the window
+# left here is the same one the pre-#8410 UNSTABLE wait path always had.
+_revalidate_merge_guards() {
+  local fresh fresh_sha
+  fresh="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+  # Merged underneath us while we waited — nothing left to guard.
+  [[ "$(echo "$fresh" | jq -r '.merged // false')" == "true" ]] && return 0
+
+  # Head moved during the wait (PR #8220's 07:12 force-push). The approval and
+  # the check results this run validated describe a tree that is no longer the
+  # head, so this is the #5579 "re-queue, not a failure" signal (exit 3), not a
+  # merge we should complete against the new tree.
+  fresh_sha="$(echo "$fresh" | jq -r '.head.sha // empty')"
+  if [[ -n "$fresh_sha" && -n "$MERGE_PRECONDITION_SHA" && "$fresh_sha" != "$MERGE_PRECONDITION_SHA" ]]; then
+    error_head_moved "PR #$PR_NUMBER: head moved while --auto waited for this head's checks to settle (#8410)" \
+      "$MERGE_PRECONDITION_SHA" "$fresh_sha"
+  fi
+
+  # Re-point the guards' input at the state just read, then re-run them. A
+  # loom:verdict-stale revocation (#5686), a Judge re-claim, or a contradicting
+  # verdict label (#8112) now blocks the merge exactly as it would have at
+  # queue time. --allow-unapproved still overrides the loom:pr block, as it
+  # does on the queue-time evaluation.
+  PR_LABELS="$(echo "$fresh" | jq -r '.labels[]?.name // empty' 2>/dev/null || true)"
+  _check_loom_pr_label
+  _check_verdict_label_contradiction
+}
+
 if [[ "$AUTO_MERGE" == "true" ]]; then
-  # Bounded poll window for the UNSTABLE-because-checks-are-still-running case
-  # (#3664). Reuses the same env-var names/semantics as the shell Gitea
-  # auto-merge poller (forge_auto_merge in lib/forge-helpers.sh) so both forges
-  # share configuration. Defaults: 30s interval, 600s ceiling.
-  # (Also consumed by the #3820 auto-merge-disabled wait path below.)
+  # Bounded poll window (#3664). Reuses the same env-var names/semantics as the
+  # shell Gitea auto-merge poller (forge_auto_merge in lib/forge-helpers.sh) so
+  # both forges share configuration. Defaults: 30s interval, 600s ceiling —
+  # raise LOOM_AUTO_MERGE_TIMEOUT on a repo whose CI runs longer than that.
   LOOM_AUTO_MERGE_POLL_INTERVAL="${LOOM_AUTO_MERGE_POLL_INTERVAL:-30}"
   LOOM_AUTO_MERGE_TIMEOUT="${LOOM_AUTO_MERGE_TIMEOUT:-600}"
   # Consecutive-iteration threshold (#6389) for treating the check-runs
   # endpoint's HTTP 404 as a persistent "no checks configured for this repo"
   # condition rather than a transient blip — see
-  # `_wait_for_checks_then_sync_merge()` and the UNSTABLE fallback below.
+  # `_wait_for_checks_then_sync_merge()`.
   LOOM_CHECK_RUNS_404_STREAK="${LOOM_CHECK_RUNS_404_STREAK:-2}"
 
-  # Proactive repo-level "Allow auto-merge" probe (#3820). Read the setting once
-  # (GitHub only; Gitea and any probe failure return "unknown", preserving
-  # existing behavior fail-safe). When it is explicitly disabled, the server-side
-  # auto-merge queue can never be enabled, so skip the doomed mutation entirely
-  # and degrade `--auto` to wait-for-checks-then-merge (immediate if CLEAN).
-  REPO_AUTO_MERGE_ALLOWED="$(forge_check_auto_merge_allowed "$REPO_NWO" "$GH" 2>/dev/null || echo unknown)"
-
   if [[ "$DRY_RUN" == "true" ]]; then
-    if [[ "$REPO_AUTO_MERGE_ALLOWED" == "false" ]]; then
-      info "[dry-run] Repository 'Allow auto-merge' is disabled; would wait for checks then merge PR #$PR_NUMBER synchronously (immediate if already CLEAN)"
-    else
-      info "[dry-run] Would enable auto-merge for PR #$PR_NUMBER"
-    fi
+    info "[dry-run] Would wait up to ${LOOM_AUTO_MERGE_TIMEOUT}s for PR #$PR_NUMBER's checks to settle, then merge it in-process (immediately if already settled)"
     exit 0
   fi
 
-  MAX_MERGE_RETRIES=3; MERGE_RETRY_DELAY=5
-  AUTO_MERGE_OK=false
-
-  # #3820: repo has auto-merge disabled → wait for checks, then fall through to
-  # the synchronous-merge path instead of attempting the enable mutation. The
-  # wait function either returns 0 (proceed) or error()s out terminally. Setting
-  # AUTO_MERGE_OK=true lets the post-loop "after N attempts" guard pass; the loop
-  # itself is short-circuited by the AUTO_MERGE guard on its first iteration.
-  #
-  # #8048 adds the SECOND trigger for that same degradation: the merge-ordering
-  # guard above found open stacked child PRs and pinned this parent's tip
-  # (STACKED_CHILDREN_PIN_WRITTEN). Server-side auto-merge only ever QUEUES the
-  # merge here, so the script used to exit 0 at the "Auto-merge queued" branch
-  # below — and _auto_reconcile_stacked_children lives AFTER that exit, so it
-  # never ran for this invocation. GitHub completed the merge minutes later,
-  # delete_branch_on_merge dropped the parent branch, and nothing ever
-  # reconciled the children; the refs/loom/parent/<branch> pin (#7982/#7998)
-  # just sat there unread until an operator ran reconcile-stack.sh by hand.
-  # Reusing this already-bounded wait-then-merge path fixes that at the root
-  # rather than bolting a second poll loop onto the queued path: the merge
-  # becomes synchronous in THIS process, so the shared post-merge cleanup block
-  # — and with it the reconcile pass — is actually reached, while the parent
-  # branch still exists (so reconcile-stack.sh resolves it directly, not only
-  # via the pin fallback). A failing required check or the
-  # LOOM_AUTO_MERGE_TIMEOUT ceiling makes _wait_for_checks_then_sync_merge
-  # error() out non-zero, which is #8048's "loud, non-zero-exit signal that the
-  # children were NOT reconciled" alternative — and it fires BEFORE the merge,
-  # so the queued-then-cancelled case (checks fail after queueing) can no
-  # longer strand children behind an already-merged parent.
-  # The cost is confined to stacked parents: with no open children the guard
-  # never writes a pin, this stays unset, and --auto keeps its zero-added-
-  # polling fast path byte-for-byte. The --allow-stacked-children bypass also
-  # leaves it unset (the guard returns before pinning), so an operator who has
-  # already reconciled by hand keeps the fast queued path too. Written as two
-  # separate [[ ]] tests rather than one `||`-joined condition so the #3820
-  # clause survives verbatim as its own testable predicate.
-  if [[ "$REPO_AUTO_MERGE_ALLOWED" == "false" ]] || [[ "${STACKED_CHILDREN_PIN_WRITTEN:-}" == "true" ]]; then
-    info "PR #$PR_NUMBER: --auto degraded to wait-for-checks-then-merge (immediate if already CLEAN) — repo 'Allow auto-merge' allowed=$REPO_AUTO_MERGE_ALLOWED, open stacked children pinned=${STACKED_CHILDREN_PIN_WRITTEN:-false}"
-    _wait_for_checks_then_sync_merge
-    AUTO_MERGE=false
-    AUTO_MERGE_OK=true
-  fi
-
-  for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
-    # #3820: when the repo-level probe already converted --auto to a synchronous
-    # merge (AUTO_MERGE flipped false above), do NOT attempt the enable mutation.
-    [[ "$AUTO_MERGE" == "true" ]] || break
-    AUTO_MERGE_OUTPUT=""
-    # Prefer the native `loom-daemon forge auto-merge` (forge-agnostic; GitHub
-    # via the enablePullRequestAutoMerge GraphQL mutation — a pure API call with
-    # no working-tree checkout). It exits 3 to *decline* Gitea, in which case we
-    # fall through to the shell forge_auto_merge below (which carries the Gitea
-    # curl poll-and-merge). A native GitHub *failure* (exit 1) is NOT a decline:
-    # its gh error is left in AUTO_MERGE_OUTPUT so the disabled/clean/unstable
-    # detection further down fires exactly as it did for loom-auto-merge.
-    #
-    # #5589 (closes the #5579 gap noted here previously): the native path now
-    # carries the same `expectedHeadOid` optimistic-concurrency precondition
-    # as the shell forge_auto_merge/forge_merge_pr below, via
-    # `--expected-head-sha`. A head-SHA mismatch on this path exits 4
-    # (EX_FORGE_HEAD_MISMATCH in loom-daemon/src/forge_cmd.rs) — distinct
-    # from both the Gitea-decline exit (3) and the generic failure exit (1) —
-    # and is routed straight to `error_head_moved()` below, the same
-    # "re-queue, not a failure" signal `_is_head_mismatch_response()` gives
-    # the shell path.
-    #
-    # #6752: the native call is wrapped in `forge_cmd_perm_safe` so a stale or
-    # scope-limited GitHub App installation token — `403 Resource not
-    # accessible by integration`, which killed this exact step on PR #6751 —
-    # escalates through the same force-mint-then-personal-token ladder the
-    # shell `gh` write sites have had since #6074, instead of hard-failing the
-    # merge. `loom-daemon forge` shells out to `gh`, so the ladder's
-    # GH_TOKEN/GH_CONFIG_DIR swap reaches it. The wrapper preserves the exit
-    # code verbatim (0/3/4/other) and escalates ONLY on that one signature.
-    _AM_DECLINED=true
-    if command -v loom-daemon &>/dev/null; then
-      [[ $MERGE_ATTEMPT -eq 1 ]] && info "Using loom-daemon forge auto-merge (native forge-agnostic auto-merge)"
-      # `|| _AM_RC=$?` keeps the failing substitution from tripping `set -e`
-      # and captures the native exit code (0=merged, 3=Gitea decline,
-      # 4=head-SHA mismatch, else fail).
-      _AM_RC=0
-      AUTO_MERGE_OUTPUT=$(forge_cmd_perm_safe loom-daemon forge auto-merge "$PR_NUMBER" --method "$REPO_MERGE_METHOD" --expected-head-sha "$MERGE_PRECONDITION_SHA" 2>&1) || _AM_RC=$?
-      if [[ $_AM_RC -eq 0 ]]; then
-        AUTO_MERGE_OK=true
-        break
-      elif [[ $_AM_RC -eq 4 ]]; then
-        # Native path detected a head-SHA mismatch (#5589) — same "re-queue,
-        # stale approval" signal as the shell path's
-        # _is_head_mismatch_response() check further down; do not fall
-        # through to the generic failure/retry branch.
-        #
-        # Routed through _head_moved_or_resync() (#8164) exactly like the two
-        # text-classified sites: it re-queues via error_head_moved() unless
-        # THIS run's own base-sync is what moved the head, in which case the
-        # merge is retried once against the re-read head. `exit-code` says the
-        # mismatch was established by the native path's exit 4 rather than by
-        # the response text (which is loom-daemon's wording, not a forge
-        # string _is_head_mismatch_response() would recognize).
-        _head_moved_or_resync "$AUTO_MERGE_OUTPUT" exit-code && continue
-      elif [[ $_AM_RC -ne 3 ]]; then
-        # Native attempted and failed (not a Gitea decline) — keep the gh error
-        # in AUTO_MERGE_OUTPUT and fall through to the recheck/retry logic.
-        _AM_DECLINED=false
-      fi
-    fi
-    if [[ "$_AM_DECLINED" == true ]]; then
-      # loom-daemon absent, or it declined (e.g. Gitea) — shell-based
-      # forge_auto_merge carries the poll-and-merge for both forges.
-      if AUTO_MERGE_OUTPUT=$(forge_auto_merge "$REPO_NWO" "$PR_NUMBER" "$MERGE_PRECONDITION_SHA" "$REPO_MERGE_METHOD" 2>&1); then
-        AUTO_MERGE_OK=true
-        break
-      fi
-    fi
-
-    # Check if PR merged despite error (concurrent merge by another shepherd)
-    RECHECK_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
-    RECHECK=$(echo "$RECHECK_JSON" | jq -r '.merged // false')
-    if [[ "$RECHECK" == "true" ]]; then
-      warning "Auto-merge reported error but PR is already merged (race condition)"
-      AUTO_MERGE_OK=true
-      break
-    fi
-
-    # Head-SHA-mismatch (#5579): the PR's OWN head branch moved past
-    # $MERGE_PRECONDITION_SHA — distinct from "Base branch was modified"
-    # below (that means the BASE fell behind; this means the branch we're
-    # trying to merge changed). Do NOT retry-and-merge: exit 3 so the caller
-    # (Champion) re-queues this PR for a fresh pass instead of treating it as
-    # a failure. See error_head_moved()/_is_head_mismatch_response() above.
-    # Since #8164, via _head_moved_or_resync(): still exit 3 for every head
-    # move this run did not cause, but its own base-sync push gets one
-    # re-read-and-retry instead of a spurious re-queue.
-    if _is_head_mismatch_response "$AUTO_MERGE_OUTPUT"; then
-      _head_moved_or_resync "$AUTO_MERGE_OUTPUT" && continue
-    fi
-
-    # Retry on stale-branch race ("Base branch was modified")
-    if echo "$AUTO_MERGE_OUTPUT" | grep -q "Base branch was modified"; then
-      if [[ $MERGE_ATTEMPT -lt $MAX_MERGE_RETRIES ]]; then
-        info "Branch is behind base branch, updating... (attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES)"
-        forge_update_branch "$REPO_NWO" "$PR_NUMBER" 2>/dev/null || \
-          warning "Failed to update branch (continuing anyway)"
-        info "Waiting ${MERGE_RETRY_DELAY}s for branch to sync..."
-        sleep "$MERGE_RETRY_DELAY"
-        # The sync just pushed to the head branch: re-read it, or the retry
-        # below re-gates on a SHA the forge has already superseded (#8164).
-        _refresh_precondition_sha
-        MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))
-        continue
-      fi
-    fi
-
-    # No-required-checks fallback (#3720). When the repo defines ZERO required
-    # status checks, GitHub's enablePullRequestAutoMerge mutation is rejected
-    # outright — there is nothing to queue the merge behind. The rejection
-    # string for that case matches NEITHER the "is in clean status" NOR the
-    # "is in unstable status" grep below, so it previously fell through to the
-    # generic terminal error at the bottom of this loop (issue #3720: docs-only
-    # PRs #4400/#4399 were UNSTABLE from non-required pending jobs and could not
-    # enable auto-merge, yet a plain synchronous merge succeeded because they
-    # were MERGEABLE).
-    #
-    # This fallback is deliberately STRING-INDEPENDENT (it never inspects
-    # AUTO_MERGE_OUTPUT) and self-gating: it fires only when
-    #   (1) the base branch has NO required status check contexts, AND
-    #   (2) the PR is mergeable (.mergeable == true).
-    # In that case an immediate synchronous merge is exactly equivalent to a
-    # server-side auto-merge — there is no required check to wait for. It
-    # preserves the #3664/#3486/#3678 required-check gating BY CONSTRUCTION:
-    # with ANY required check present, the contexts list is non-empty and this
-    # branch is skipped, leaving the UNSTABLE classifier below in charge. A
-    # lookup failure (nonzero exit) fails closed (skip → preserve existing
-    # behavior). We re-fetch PR state fresh because REST `.mergeable` is null
-    # until GitHub computes it — the initial fetch may predate that.
-    _NRC_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-    _NRC_BASE_REF="$(echo "$_NRC_RECHECK_JSON" | jq -r '.base.ref // empty')"
-    _NRC_MERGEABLE="$(echo "$_NRC_RECHECK_JSON" | jq -r '.mergeable // empty')"
-    if [[ -n "$_NRC_BASE_REF" ]] && [[ "$_NRC_MERGEABLE" == "true" ]]; then
-      _NRC_REQUIRED=""
-      _NRC_LOOKUP_RC=0
-      # Stderr is NOT redirected: #8872's plan-gate relaxation warns there.
-      _NRC_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_NRC_BASE_REF" "$GH")" || _NRC_LOOKUP_RC=$?
-      if [[ "$_NRC_LOOKUP_RC" -eq 0 ]] && [[ -z "$_NRC_REQUIRED" ]]; then
-        info "PR #$PR_NUMBER: repo has no required status checks and PR is mergeable; falling back to immediate merge"
-        unset _NRC_RECHECK_JSON _NRC_BASE_REF _NRC_MERGEABLE _NRC_REQUIRED _NRC_LOOKUP_RC 2>/dev/null || true
-        AUTO_MERGE=false      # let the synchronous-merge block below run
-        AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
-        break
-      fi
-    fi
-    unset _NRC_RECHECK_JSON _NRC_BASE_REF _NRC_MERGEABLE _NRC_REQUIRED _NRC_LOOKUP_RC 2>/dev/null || true
-
-    # Repo-level "Allow auto-merge" disabled fallback (#3763). When the
-    # repository's "Allow auto-merge" setting is OFF, GitHub rejects the
-    # enablePullRequestAutoMerge mutation outright with
-    # "Auto merge is not allowed for this repository". Unlike the CLEAN/UNSTABLE
-    # rejections below (which describe the PR's own mergeStateStatus), this is a
-    # STATIC, repo-level condition — no amount of polling or branch-updating will
-    # change it. It also matches NEITHER the "is in clean status" NOR the
-    # "is in unstable status" grep below, so before #3763 it fell through to the
-    # generic terminal error at the bottom of this loop even when the PR was
-    # immediately mergeable (the observed failure: a CLEAN, Judge-approved PR
-    # aborting instead of merging).
-    #
-    # A single re-check of the PR's mergeability decides the outcome: if the PR
-    # is already immediately mergeable (.mergeable == true), a synchronous merge
-    # is exactly equivalent to the server-side auto-merge the caller requested,
-    # so flip to the immediate-merge path. If it is NOT mergeable, preserve the
-    # terminal error rather than silently bypassing a genuine merge blocker. We
-    # re-fetch PR state fresh (uncached) because REST `.mergeable` is null until
-    # GitHub computes it — the initial fetch may predate that. No poll loop is
-    # needed here (unlike the UNSTABLE fallback): the condition is repo-static.
-    if echo "$AUTO_MERGE_OUTPUT" | grep -q "Auto merge is not allowed for this repository"; then
-      _AMD_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-      _AMD_MERGEABLE="$(echo "$_AMD_RECHECK_JSON" | jq -r '.mergeable // empty')"
-      if [[ "$_AMD_MERGEABLE" == "true" ]]; then
-        info "PR #$PR_NUMBER: repo-level auto-merge is disabled but PR is mergeable; falling back to immediate merge"
-        unset _AMD_RECHECK_JSON _AMD_MERGEABLE 2>/dev/null || true
-        AUTO_MERGE=false      # let the synchronous-merge block below run
-        AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
-        break
-      fi
-      unset _AMD_RECHECK_JSON _AMD_MERGEABLE 2>/dev/null || true
-      # Not immediately mergeable — preserve the terminal error (do NOT bypass a
-      # genuine merge blocker just because auto-merge happens to be disabled).
-      error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
-    fi
-
-    # GraphQL-layer unavailability fallback (#4447). GitHub's
-    # enablePullRequestAutoMerge mutation is GraphQL-only; when the shared
-    # credential's GraphQL quota is exhausted (or the native `loom-daemon`
-    # path cannot resolve the repo NWO via `gh repo view`, which is itself a
-    # GraphQL call), the mutation never has a chance to run. Unlike #3763
-    # (a permanent repo-level setting), this is a TRANSIENT environmental
-    # condition — REST (used by `forge_get_pr_nocache`, `forge_get_check_runs`,
-    # `forge_get_required_status_check_contexts`, and the synchronous merge
-    # itself) has a separate quota and typically still has headroom. It
-    # matches NEITHER the "is in clean status" NOR the "is in unstable status"
-    # grep below, so before this fix it fell through to the generic terminal
-    # error even when a plain synchronous REST merge would have succeeded
-    # immediately (the observed failure: `could not resolve repository NWO`
-    # under GraphQL quota exhaustion, 0/5000 remaining while REST had ~4000
-    # left).
-    #
-    # As with #3763, recheck mergeability first (immediate merge if already
-    # mergeable). If not yet mergeable (checks still running / `.mergeable`
-    # not yet computed), degrade to the same #3820 wait-for-checks-then-merge
-    # path used for repo-level auto-merge-disabled — its helpers are REST-only
-    # and do not depend on the exhausted GraphQL quota. Do NOT re-attempt the
-    # native/shell auto-merge mutation itself; it is the same GraphQL call and
-    # will fail identically.
-    if echo "$AUTO_MERGE_OUTPUT" | grep -Eq "API rate limit|rate limit exceeded|RATE_LIMITED|was submitted too quickly|could not resolve repository NWO"; then
-      info "PR #$PR_NUMBER: auto-merge enablement unavailable (GraphQL rate limit) — degrading to immediate/wait merge"
-      _RLF_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-      _RLF_MERGEABLE="$(echo "$_RLF_RECHECK_JSON" | jq -r '.mergeable // empty')"
-      unset _RLF_RECHECK_JSON 2>/dev/null || true
-      if [[ "$_RLF_MERGEABLE" == "true" ]]; then
-        unset _RLF_MERGEABLE 2>/dev/null || true
-        AUTO_MERGE=false      # let the synchronous-merge block below run
-        AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
-        break
-      fi
-      unset _RLF_MERGEABLE 2>/dev/null || true
-      # Not yet mergeable — reuse the #3820 REST-only wait path. It either
-      # returns 0 (safe to proceed to the synchronous merge) or error()s out
-      # terminally (a required check genuinely failed, or the wait timed out).
-      _wait_for_checks_then_sync_merge
-      AUTO_MERGE=false      # let the synchronous-merge block below run
-      AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
-      break
-    fi
-
-    # PR is already CLEAN — GitHub's enablePullRequestAutoMerge mutation rejects
-    # this state with "Pull request Pull request is in clean status" (the
-    # doubled-word prefix is from GitHub's GraphQL error formatter). Match on
-    # the unique substring to stay robust against future normalization. Fall
-    # through to the synchronous-merge path below instead of erroring. See #3371.
-    if echo "$AUTO_MERGE_OUTPUT" | grep -q "is in clean status"; then
-      info "PR #$PR_NUMBER is already CLEAN; falling back to immediate merge"
-      AUTO_MERGE=false      # let the synchronous-merge block at ~line 364 run
-      AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
-      break
-    fi
-
-    # PR is UNSTABLE — GitHub's enablePullRequestAutoMerge mutation rejects this
-    # state with "Pull request Pull request is in unstable status". GitHub emits
-    # the SAME string whether the rollup is red (a check FAILED) or merely yellow
-    # (checks still QUEUED/IN_PROGRESS). We resolve the PR's head-SHA check-runs
-    # and distinguish, in precedence order:
-    #
-    #   (a) A required check has genuinely FAILED  -> refuse (terminal error),
-    #       without waiting out the pending timeout.
-    #   (b) A check is still QUEUED/IN_PROGRESS    -> the merge state will settle
-    #       (conclusion == null, so it never shows    on its own; poll until it
-    #       up as "failing"). This is the #3664       resolves to (a)/(c)/CLEAN,
-    #       "checks still running" case.               bounded by
-    #                                                   LOOM_AUTO_MERGE_TIMEOUT.
-    #   (c) Every FAILED check is informational    -> immediate-merge fallback
-    #       (NOT in branch protection) and nothing     (#3486, unchanged).
-    #       is pending.
-    #   (d) Nothing failed, nothing pending, and   -> genuine "unknown gap"
-    #       we never observed a pending check          (e.g. commit-status, not
-    #       (e.g. commit-status failures the           check-run, failures) ->
-    #       check-runs API omits).                     refuse (terminal),
-    #                                                   preserving the #3486
-    #                                                   defensive hard-error.
-    #
-    # Once the checks we waited on all pass, the PR is effectively CLEAN and we
-    # fall through to immediate merge (mirroring the CLEAN-fallback above).
-    # Sibling of the CLEAN-fallback above. See #3371, #3486, #3664.
-    if echo "$AUTO_MERGE_OUTPUT" | grep -q "is in unstable status"; then
-      _UNSTABLE_HEAD_SHA="$(echo "$PR_JSON" | jq -r '.head.sha // empty')"
-      _UNSTABLE_BASE_REF="$(echo "$PR_JSON" | jq -r '.base.ref // empty')"
-      if [[ -z "$_UNSTABLE_HEAD_SHA" ]] || [[ -z "$_UNSTABLE_BASE_REF" ]]; then
-        # Can't make a safe decision without the head SHA and base ref — fall
-        # through to the existing refusal.
-        error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
-      fi
-
-      _UNSTABLE_FALLBACK_TO_MERGE=false
-      _UNSTABLE_OBSERVED_PENDING=false
-      _UNSTABLE_DEADLINE=$(( $(date +%s) + LOOM_AUTO_MERGE_TIMEOUT ))
-      # Consecutive-iteration counter (#6389) for the persistent-404
-      # detection below — same discipline as
-      # `_wait_for_checks_then_sync_merge()`'s `not_found_streak`.
-      _UNSTABLE_NOT_FOUND_STREAK=0
-
-      while true; do
-        # Fetch the check-runs rollup, capturing the helper's own exit status
-        # separately from the JSON payload. A transient fetch failure (network
-        # blip, 5xx, Gitea `return 1`) must NOT be collapsed into the same
-        # `{"check_runs":[]}` shape a legitimately empty rollup produces —
-        # doing so lets a fetch error masquerade as "no failing, no pending"
-        # and, once a pending check has been observed, take the resolved-green
-        # immediate-merge branch on a commit whose real check state is unknown
-        # (#3678). Retry once to absorb a single blip. If BOTH attempts this
-        # iteration come back as a confirmed HTTP 404
-        # ($FORGE_CHECK_RUNS_RC_NOT_FOUND) for LOOM_CHECK_RUNS_404_STREAK
-        # consecutive iterations (spaced a full poll interval apart), treat
-        # the check-runs API as persistently unavailable for this repo (e.g.
-        # GitHub Actions disabled, #6389) and fall back to the synchronous
-        # merge instead of polling to LOOM_AUTO_MERGE_TIMEOUT. Any other
-        # failure shape resets the streak and routes into the SAME bounded
-        # pending-wait path used by branch (b) below so the
-        # LOOM_AUTO_MERGE_TIMEOUT bound still applies.
-        _UNSTABLE_ATTEMPT1_RC=0
-        _UNSTABLE_ATTEMPT2_RC=0
-        _UNSTABLE_FAILING_RAW="$(forge_get_check_runs "$REPO_NWO" "$_UNSTABLE_HEAD_SHA" 2>/dev/null)" || _UNSTABLE_ATTEMPT1_RC=$?
-        if [[ "$_UNSTABLE_ATTEMPT1_RC" -ne 0 ]]; then
-          _UNSTABLE_FAILING_RAW="$(forge_get_check_runs "$REPO_NWO" "$_UNSTABLE_HEAD_SHA" 2>/dev/null)" || _UNSTABLE_ATTEMPT2_RC=$?
-        fi
-        _UNSTABLE_FETCH_RC="$_UNSTABLE_ATTEMPT1_RC"
-        [[ "$_UNSTABLE_ATTEMPT1_RC" -ne 0 ]] && _UNSTABLE_FETCH_RC="$_UNSTABLE_ATTEMPT2_RC"
-
-        if [[ "$_UNSTABLE_FETCH_RC" -ne 0 ]]; then
-          if [[ "$_UNSTABLE_ATTEMPT1_RC" -eq "$FORGE_CHECK_RUNS_RC_NOT_FOUND" && "$_UNSTABLE_ATTEMPT2_RC" -eq "$FORGE_CHECK_RUNS_RC_NOT_FOUND" ]]; then
-            _UNSTABLE_NOT_FOUND_STREAK=$(( _UNSTABLE_NOT_FOUND_STREAK + 1 ))
-          else
-            _UNSTABLE_NOT_FOUND_STREAK=0
-          fi
-          if [[ "$_UNSTABLE_NOT_FOUND_STREAK" -ge "$LOOM_CHECK_RUNS_404_STREAK" ]]; then
-            info "PR #$PR_NUMBER: check-runs API unavailable for this repo (no checks configured); proceeding to synchronous merge"
-            _UNSTABLE_FALLBACK_TO_MERGE=true
-            break
-          fi
-          # Fetch is failing. Treat as still-pending and keep polling,
-          # reusing the (b) branch's merged-concurrently recheck + deadline
-          # guard so this never bypasses the bounded-wait/timeout semantics.
-          warning "Failed to fetch check-runs for PR #$PR_NUMBER (rc=$_UNSTABLE_FETCH_RC); treating as still-pending and continuing to poll"
-          _UNSTABLE_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-          if [[ "$(echo "$_UNSTABLE_RECHECK_JSON" | jq -r '.merged // false')" == "true" ]]; then
-            warning "PR #$PR_NUMBER merged by another process while waiting for checks"
-            AUTO_MERGE_OK=true
-            break
-          fi
-          if [[ "$(date +%s)" -ge "$_UNSTABLE_DEADLINE" ]]; then
-            error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER (last fetch rc=$_UNSTABLE_FETCH_RC). Re-run the merge once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."
-          fi
-          info "PR #$PR_NUMBER is UNSTABLE: check-runs fetch failing (rc=$_UNSTABLE_FETCH_RC); waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for the forge API (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
-          sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
-          continue
-        fi
-        _UNSTABLE_NOT_FOUND_STREAK=0
-        # Names of failing check runs (terminal non-success conclusions).
-        # Sort + uniq to dedupe re-runs with the same context.
-        _UNSTABLE_FAILING="$(echo "$_UNSTABLE_FAILING_RAW" | \
-          jq -r '[.check_runs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "cancelled" or .conclusion == "action_required") | .name] | unique | .[]' 2>/dev/null || true)"
-        # Names of checks that are still running (queued or in_progress → not
-        # yet completed, conclusion == null). These never appear in
-        # _UNSTABLE_FAILING; they are the #3664 "still running" case.
-        _UNSTABLE_PENDING="$(echo "$_UNSTABLE_FAILING_RAW" | \
-          jq -r '[.check_runs[] | select(.status != "completed") | .name] | unique | .[]' 2>/dev/null || true)"
-
-        if [[ -n "$_UNSTABLE_FAILING" ]]; then
-          # Some check FAILED — classify against branch protection. A nonzero
-          # exit from the helper signals a lookup failure (Gitea 5xx, network
-          # error, missing token, unknown forge) — fail closed and refuse.
-          _UNSTABLE_REQUIRED=""
-          _UNSTABLE_LOOKUP_RC=0
-          # Stderr is NOT redirected: #8872's plan-gate relaxation warns there.
-          _UNSTABLE_REQUIRED="$(forge_get_required_status_check_contexts "$REPO_NWO" "$_UNSTABLE_BASE_REF" "$GH")" || _UNSTABLE_LOOKUP_RC=$?
-          if [[ "$_UNSTABLE_LOOKUP_RC" -ne 0 ]]; then
-            warning "Failed to resolve required status checks for $_UNSTABLE_BASE_REF (rc=$_UNSTABLE_LOOKUP_RC); preserving UNSTABLE refusal"
-            error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
-          fi
-
-          # Set difference: failing_checks \ required_contexts (informational)
-          # and failing_checks ∩ required_contexts (overlap).
-          _UNSTABLE_INFORMATIONAL="$(comm -23 \
-            <(printf '%s\n' "$_UNSTABLE_FAILING" | sort -u) \
-            <(printf '%s\n' "$_UNSTABLE_REQUIRED" | sort -u))"
-          _UNSTABLE_OVERLAP="$(comm -12 \
-            <(printf '%s\n' "$_UNSTABLE_FAILING" | sort -u) \
-            <(printf '%s\n' "$_UNSTABLE_REQUIRED" | sort -u))"
-
-          if [[ -n "$_UNSTABLE_OVERLAP" ]]; then
-            # (a) A branch-protection-required check has failed. The PR can
-            # never merge on this SHA — refuse now, without waiting on any
-            # still-pending checks.
-            error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
-          fi
-
-          if [[ -z "$_UNSTABLE_PENDING" ]]; then
-            # (c) Every failing check is informational and nothing is pending.
-            # Log the names, then fall through to the synchronous-merge path.
-            _UNSTABLE_COUNT="$(printf '%s\n' "$_UNSTABLE_INFORMATIONAL" | wc -l | tr -d ' ')"
-            info "Falling back to immediate merge: ${_UNSTABLE_COUNT} informational check(s) failing (not in branch protection):"
-            printf '%s\n' "$_UNSTABLE_INFORMATIONAL" | while IFS= read -r _ctx; do
-              [[ -n "$_ctx" ]] && info "    - $_ctx"
-            done
-            _UNSTABLE_FALLBACK_TO_MERGE=true
-            break
-          fi
-          # Informational failures but other checks are still running — don't
-          # merge until everything settles. Fall through to the pending wait.
-        fi
-
-        if [[ -n "$_UNSTABLE_PENDING" ]]; then
-          # (b) Checks still running. Wait, bounded by LOOM_AUTO_MERGE_TIMEOUT.
-          _UNSTABLE_OBSERVED_PENDING=true
-
-          # A concurrent merger may have completed the PR while we waited.
-          _UNSTABLE_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
-          if [[ "$(echo "$_UNSTABLE_RECHECK_JSON" | jq -r '.merged // false')" == "true" ]]; then
-            warning "PR #$PR_NUMBER merged by another process while waiting for checks"
-            AUTO_MERGE_OK=true
-            break
-          fi
-
-          if [[ "$(date +%s)" -ge "$_UNSTABLE_DEADLINE" ]]; then
-            _UNSTABLE_PENDING_COUNT="$(printf '%s\n' "$_UNSTABLE_PENDING" | wc -l | tr -d ' ')"
-            error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${_UNSTABLE_PENDING_COUNT} pending check(s) on PR #$PR_NUMBER to complete (still queued/in_progress). Re-run the merge once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."
-          fi
-
-          _UNSTABLE_PENDING_COUNT="$(printf '%s\n' "$_UNSTABLE_PENDING" | wc -l | tr -d ' ')"
-          info "PR #$PR_NUMBER is UNSTABLE: ${_UNSTABLE_PENDING_COUNT} check(s) still running; waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for CI (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
-          sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
-          continue
-        fi
-
-        # Nothing failing, nothing pending.
-        if [[ "$_UNSTABLE_OBSERVED_PENDING" == "true" ]]; then
-          # The checks we waited on all resolved green — the PR is now
-          # effectively CLEAN. Fall through to immediate merge.
-          info "PR #$PR_NUMBER checks resolved green; falling back to immediate merge"
-          _UNSTABLE_FALLBACK_TO_MERGE=true
-          break
-        fi
-        # (d) Never observed a pending check and none failed — a transient API
-        # gap or commit-status (vs check-run) failure the check-runs API omits.
-        # Be safe and keep the existing #3486 defensive error path.
-        error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
-      done
-
-      unset _UNSTABLE_HEAD_SHA _UNSTABLE_BASE_REF _UNSTABLE_FAILING_RAW \
-        _UNSTABLE_FAILING _UNSTABLE_PENDING _UNSTABLE_REQUIRED \
-        _UNSTABLE_INFORMATIONAL _UNSTABLE_OVERLAP _UNSTABLE_COUNT \
-        _UNSTABLE_PENDING_COUNT _UNSTABLE_DEADLINE _UNSTABLE_RECHECK_JSON \
-        _UNSTABLE_LOOKUP_RC _UNSTABLE_FETCH_RC _UNSTABLE_OBSERVED_PENDING \
-        _UNSTABLE_ATTEMPT1_RC _UNSTABLE_ATTEMPT2_RC _UNSTABLE_NOT_FOUND_STREAK 2>/dev/null || true
-
-      if [[ "$_UNSTABLE_FALLBACK_TO_MERGE" == "true" ]]; then
-        unset _UNSTABLE_FALLBACK_TO_MERGE
-        AUTO_MERGE=false      # let the synchronous-merge block below run
-        AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
-        break                 # exit the outer MERGE_ATTEMPT for-loop
-      fi
-      unset _UNSTABLE_FALLBACK_TO_MERGE
-
-      # The wait loop set AUTO_MERGE_OK=true only if the PR merged concurrently;
-      # break the outer loop to reach the shared cleanup block.
-      if [[ "$AUTO_MERGE_OK" == "true" ]]; then
-        break
-      fi
-    fi
-
-    # Other auto-merge errors — fail immediately (no retry would help)
-    error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
-  done
-
-  if [[ "$AUTO_MERGE_OK" != "true" ]]; then
-    error "Failed to enable auto-merge for PR #$PR_NUMBER after $MAX_MERGE_RETRIES attempts"
-  fi
-
-  # If the CLEAN-status fall-through fired above, AUTO_MERGE has been flipped
-  # to false. Skip the "Auto-merge enabled" success message and the post-auto
-  # state poll — let the synchronous-merge block at ~line 376 take over.
-  if [[ "$AUTO_MERGE" == "true" ]]; then
-    success "Auto-merge enabled for PR #$PR_NUMBER"
-
-    # Check whether the server-side merge has already completed. GitHub
-    # auto-merge queues until checks pass, so on most PRs this is still
-    # false right after enabling. If merged, fall through to the shared
-    # cleanup block below. Otherwise skip cleanup — loom-clean will
-    # handle the stale worktree later.
-    POST_AUTO_JSON=$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')
-    POST_AUTO_MERGED=$(echo "$POST_AUTO_JSON" | jq -r '.merged // false')
-    # #8048 backstop. This branch is now UNREACHABLE for a parent with open
-    # stacked children — the degrade above converts --auto to a synchronous
-    # merge before the enable mutation is even attempted — but the gap it
-    # closes was invisible precisely because this path exits 0 silently. So
-    # assert the invariant here too: if a future refactor ever routes a pinned
-    # stacked parent back through the queued exit, it fails loudly and
-    # non-zero instead of silently orphaning the children (the two-line info
-    # below is merged into one to keep this file at its size-ratchet ceiling).
-    if [[ "$POST_AUTO_MERGED" != "true" ]]; then
-      [[ "${STACKED_CHILDREN_PIN_WRITTEN:-}" == "true" ]] && error "Auto-merge for PR #$PR_NUMBER is queued but NOT merged, and its branch '$PR_BRANCH' still has open stacked child PR(s). The post-merge reconcile pass cannot run from this path, so those children were NOT reconciled by this invocation — once GitHub completes the merge, run ./.loom/scripts/reconcile-stack.sh <child-pr> $PR_BRANCH for each of them (#8048)."
-      info "Auto-merge queued (server-side merge pending checks); skipping local cleanup — run loom-clean later to remove the worktree once GitHub completes the merge"
-      exit 0
-    fi
-    info "PR #$PR_NUMBER already merged server-side; running cleanup"
-    # Fall through to the shared cleanup block (branch deletion + worktree).
-  fi
+  info "PR #$PR_NUMBER: --auto waits for this head's checks to settle, then merges in-process — the forge's server-side auto-merge queue is never armed (#8410)"
+  _wait_for_checks_then_sync_merge
+  _revalidate_merge_guards
+  # The synchronous-merge path below is now the ONLY way a --auto run merges,
+  # so the post-merge cleanup block — #3667's partial-increment reset, #6199's
+  # loom:building strip, and #8048's stacked-children reconcile pass — is
+  # always reached. There is no queued early-exit left to bypass it.
+  AUTO_MERGE=false
 fi
 
-# Synchronous-merge path. Skipped when --auto already succeeded server-side
-# (in which case we fall through to the shared cleanup block below).
+# Synchronous-merge path — the only merge path (#8410). `--auto` reaches it
+# with AUTO_MERGE flipped to false above, after its bounded check-settle wait
+# and guard re-validation; a plain invocation reaches it directly. The `if`
+# is kept (rather than unwrapped) so the block's structure, and every anchor
+# the merge-pr test suites match against it, stay stable.
 if [[ "$AUTO_MERGE" != "true" ]]; then
 
 # Check mergeability (#6104). REST `.mergeable` is computed asynchronously and
@@ -2882,9 +2430,9 @@ success "PR #$PR_NUMBER merged successfully"
 
 fi  # end synchronous-merge path (AUTO_MERGE != "true")
 
-# Partial-increment label reset (#3667). Runs only after a confirmed merge (both
-# the synchronous path above and the auto-merge server-side-completed fall-
-# through reach here; the auto-merge-queued and dry-run paths exit earlier).
+# Partial-increment label reset (#3667). Runs only after a confirmed merge —
+# every merge now lands on the synchronous path above (#8410), so this is
+# reached for `--auto` too; only the dry-run path exits earlier.
 # Best-effort — never fails the merge. See the function definitions above.
 _reset_partial_increment_labels || true
 

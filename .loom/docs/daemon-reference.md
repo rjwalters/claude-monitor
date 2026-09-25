@@ -1941,6 +1941,45 @@ queues that drain fast. A permanently-full higher tier **will** starve lower tie
 fairness knobs (per-tier slot reservations) and cross-repo dependency awareness are
 explicit follow-ups, deferred until observed to matter.
 
+**`tier:*` labels do not affect dispatch order.** `tier:goal-advancing` and its
+siblings are triage metadata; no daemon code reads them. Only the four keys above
+order the queue.
+
+### Ready queue view (`loom-daemon queue`, #8852)
+
+Each multi-workspace tick records one row per ready `loom:issue` it listed, ranked
+by `candidate_cmp`, with what the tick did with it:
+
+- **running**: `dispatched`, `in_flight`
+- **ready** (waiting on a limit): `deferred_capacity`, `deferred_ramp_cap`,
+  `deferred_saturation`, `deferred_out_of_slice`
+- **blocked** (held by something specific to the issue or repo): `parked` (with
+  the label), `open_pr` (with the PR number), `dispatch_backoff`,
+  `open_pr_backoff`, `quarantined`, `noop_cooldown`, `declined`,
+  `prless_retry`, `peer_claim`, `recheck_interval`, `hard_exclusion`,
+  `host_constraint`, `workspace_halted` (the whole repo's dispatch is held: red
+  `main`, a gate in flight, a pre-flight or token-pool hold, a drain, or the
+  host-distress breaker; the row does not say which), `workspace_commands_missing`,
+  `dispatch_error` (with the error text)
+
+Each disposition is recorded next to the `TickReport` counter it matches, so the
+rows and the counters agree. Issues dropped before the sort are still ranked by the same
+comparator, so their rank shows where they would sit once unblocked. With repo
+sharding (#6243), an out-of-slice row can be passed over for a lower-ranked
+in-slice one; its disposition says so.
+
+The rows travel on `last_work_finder_tick.queue` in `loom-daemon status --json`,
+`health --json` and `serve`'s `/api/status`, stamped with the tick's `at`.
+`loom-daemon queue [--json]` renders them with a freshness verdict: `fresh`,
+`stale` (no tick for 5 of the daemon's reported `work_finder_interval_secs`,
+never under 5 minutes), `no_tick` (no tick yet in this daemon process, so the
+queue is unknown rather than empty) or `disabled`. A repo whose forge listing
+failed on the tick is named in `last_work_finder_tick.listing_failed`, and the
+view says the queue is INCOMPLETE rather than empty (`--json`: `complete:
+false`). The `serve`
+dashboard has a matching "Ready queue" panel. The single-workspace tick path does
+not record rows. Exporting the queue to the fleet backend is a follow-up.
+
 ## Forge-side pipeline snapshot (`status --pipeline`, #3977)
 
 `loom-daemon status` shows the *dispatch*-side picture (in-flight sweeps, the
@@ -5356,6 +5395,132 @@ single-host installs print neither. `--json` carries the same under
 `decide()` / `owns()` above comes from `(shardIndex, shardCount)` and nothing
 else: killing a host does **not** reassign its slice. The next section is the
 opt-in that makes the ring dynamic.
+
+### Fleet captain (#8848)
+
+A multi-host fleet has two kinds of scheduled job: **per-host** jobs (the
+daemon watchdog, clean, resync, drift) that every host runs unchanged, and
+**singleton** jobs that watch one shared thing — a forge-wide queue check, a
+public-feed staleness check, a token-pool anomaly check — and must run on
+**exactly one** host, because a dedup-sensitive alert filed twice (the #6714
+race class) is a duplicate, not a redundancy win. Before this, an operator
+hand-placed a singleton by installing a timer on a chosen host and documenting
+the choice in prose — nothing enforced "exactly one", so a rebuilt/re-imaged
+worker silently lost the job, or a second host silently duplicated it.
+
+`fleet.captain: "<host id>"` in the **tracked** `.loom/config.json` names the
+one host — by its own `host_identity()` (`loom-daemon/src/sweep_registry/mod.rs`;
+precedence `LOOM_HOST_ID` env var > `$HOSTNAME` > the `hostname` binary >
+`UNKNOWN_HOST` — the same operator-controlled identity issue #5063
+established fleet-wide) — that runs every declared singleton job. This
+follows the `shardCount`/`shardKey`
+"identical fleet-wide, tracked" precedent from the sharding table just above
+(**not** `shardIndex`'s "must differ per host" tier): every host must agree on
+who the captain is, and a committed file is identical fleet-wide by
+construction. There is no election and no lease — the captain is *assigned*,
+not elected — so a lease-based "alert when the captain has been down for N
+hours" extension is deliberately out of scope for this mechanism today; it
+would be a follow-up, not a change to the assignment model.
+
+**The gate**: `loom_daemon::fleet_captain::resolve_gate_for_root(root,
+current_host_id)` compares the declared `fleet.captain` against
+`current_host_id`, mirroring the host-affinity constraint's (#7456,
+`loom-daemon/src/host_affinity.rs`) fail-closed shape (exact string equality
+only, no partial/case-insensitive match) at fleet-config scope rather than
+issue-affinity scope. Three outcomes, each load-bearing:
+
+| Declared captain | This host | Outcome |
+|---|---|---|
+| Absent | — | `NoCaptainDeclared` — refuses. A **defined** outcome, not "whatever falls out": a declared singleton job with no captain assigned must never silently arm everywhere (reopening the exact duplicate-alert race this exists to close) |
+| Set, matches | — | `Armed` — the job may run here |
+| Set, does not match | — | `Refused`, naming the current captain in the message (mirrors `cli/dispatch.rs`'s host-affinity refusal style) |
+
+A successful arm records the job's name in a process-lifetime registry
+(`fleet_captain::armed_singleton_job_names()`); any other outcome clears it,
+so a job that flips from armed to refused across ticks (a `fleet.captain`
+edit, or a host-identity change) self-heals within one tick rather than
+requiring a daemon restart. **Per-host jobs are entirely unaffected** — this
+is opt-in per job (a job simply never calls `arm_singleton_job`), not a
+blanket gate on every cron/timer/tick.
+
+**The shell-facing half**: `loom-daemon fleet-captain <job-name>` resolves the
+same gate for a schedule wrapper — a launchd/systemd timer or a shell script
+installed on every fleet host — so "exactly one host runs this" stops being a
+per-wrapper reimplementation (2AMLogic/2am's `batch-fleet-reconcile-schedule.sh`
+and `loom-wake-pull-schedule.sh` each hand-rolled their own; others simply did
+not, which is how `loom-worker-2` ended up carrying two singleton timers
+`loom-worker-1` lacked):
+
+```sh
+# Refuse on every host that is not the captain:
+loom-daemon fleet-captain forge-queue-check || exit 0
+```
+
+| Exit | Meaning |
+|---|---|
+| `0` | This host IS the declared captain — run the job |
+| `3` | A captain IS declared and it is not this host — routine "not my turn" |
+| `4` | No `fleet.captain` declared at all — a **misconfiguration**, not a turn |
+| `2` | The repo root could not be resolved |
+
+`3` and `4` are separate codes on purpose: collapsing them would make a
+typo'd or never-declared captain indistinguishable from correct behavior,
+i.e. every singleton silently unarmed fleet-wide with no signal. `--repo-root`
+picks the workspace to read `fleet.captain` from, `--host-id` overrides
+`host_identity()` for testing a placement decision from another host's point
+of view, and `--quiet` suppresses the message on the **armed** path only —
+refusals always print, because a silent refusal is exactly how a singleton
+goes missing unnoticed. This subcommand is a gate **check**, not an arm: it
+deliberately does not touch the process-lifetime armed registry, since a CLI
+process exits immediately and would publish a phantom `armed_singleton_jobs`
+entry (durable cross-process arm reporting for shell-driven singletons is
+follow-up work).
+
+**Observability**: `host.health` (`HostHealthRecord`) carries `is_captain` and
+`armed_singleton_jobs`. `is_captain` is **three-valued**, not a bare `bool` —
+`None`/absent when this repo declares no `fleet.captain` at all (the
+mechanism does not apply here, the overwhelmingly common case), `Some(false)`
+when a captain IS declared and it is not this host, `Some(true)` when this
+host is the declared captain. Collapsing "not applicable" into `false` would
+make the dashboard's "no host reports `is_captain: true`" check fire on every
+ordinary repo that has never opted in — the same "unknown != zero" contract
+every other optional field on that struct already follows. The dashboard
+(`dashboard/src/redaction.ts`'s `host.health` allowlist,
+`dashboard/web/src/fleet.ts`'s `singletonsArmedOnNonCaptain`/
+`noCaptainReporting`, rendered in `dashboard/web/src/views/fleetOverview.ts`)
+flags (a) a singleton reported armed on a non-captain host, and (b) a fleet
+that has opted in (some host reports `is_captain` at all) but none of them is
+currently `true` — a typo'd or decommissioned captain id, or one that has
+simply never reported `host.health`, surfaces the same way rather than
+silently leaving every singleton unarmed with no signal.
+
+**Config example**:
+
+```json
+{
+  "fleet": {
+    "captain": "loom-worker-1"
+  }
+}
+```
+
+No `fleet.captain` declared at all leaves today's behavior fully unchanged —
+the config parse degrades gracefully (`None`) on the absent key, same as every
+other soft-fail read in `loom-daemon/src/config_resolver.rs`.
+
+**Deliberately out of scope for #8848 itself** (tracked as follow-ups, not
+half-done here): (a) **#8901** — migrating a real first singleton job onto
+this gate, and giving shell-driven arms a durable cross-process registry so
+they appear in `armed_singleton_jobs` (until then a `fleet-captain` CLI
+invocation deliberately records nothing, since its process exits immediately;
+so the "singleton armed on a non-captain host" dashboard flag can only fire
+for in-daemon jobs); and (b) **#8902** — the lease: an alert when the
+declared captain has not reported `host.health` for N hours. Note that (b) is
+an *alert*, not failover — the captain stays assigned, never elected, because
+a singleton that runs twice is the exact duplicate-alert bug this mechanism
+exists to prevent, while one that is late is merely late. #8848
+shipped the config schema, the gate library, the `fleet-captain` CLI, the
+`host.health` fields, and the dashboard flags as the base mechanism.
 
 ### Role-runner host roster (#6704, phases A and B)
 

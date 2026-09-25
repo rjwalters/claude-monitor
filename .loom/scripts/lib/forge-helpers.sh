@@ -505,7 +505,8 @@ forge_check_auto_delete() {
 #
 # Gitea returns "unknown" (there is no equivalent single repo flag consumed
 # here; Gitea auto-merge goes through forge_auto_merge's own curl poll-and-merge,
-# which this probe must not perturb). A probe failure (network/auth/unexpected value)
+# which this probe must not perturb). NO LOOM CALLER AS OF #8410 — see
+# forge_auto_merge's header below. A probe failure (network/auth/unexpected value)
 # also returns "unknown" so callers preserve their existing behavior fail-safe.
 forge_check_auto_merge_allowed() {
   local nwo="$1"
@@ -545,6 +546,17 @@ forge_delete_branch() {
 }
 
 # Enable auto-merge on a PR.
+#
+# NO LOOM CALLER AS OF #8410. `merge-pr.sh --auto` used to arm the forge's
+# server-side auto-merge here; it now waits for the head's check-runs to settle
+# and merges in-process instead, because an armed merge is gated only by the
+# ruleset's REQUIRED checks and re-reads neither the `loom:pr` label nor the
+# non-required test suites afterwards (PR #8220 merged over a
+# `loom:verdict-stale` revocation with five suites still running). Retiring
+# this helper — and `forge_check_auto_merge_allowed` above, and the
+# `loom-daemon forge auto-merge` verb behind it — is tracked separately; do NOT
+# wire it back into a Loom merge path.
+#
 # Usage: forge_auto_merge NWO PR_NUMBER [EXPECTED_HEAD_SHA] [MERGE_METHOD]
 # GitHub: GraphQL enablePullRequestAutoMerge mutation (pure API, no
 #         working-tree dependency — `gh pr merge --auto` does a local

@@ -37,7 +37,6 @@ test-build-gate-runner.sh
 test-build-gate-timeout.sh
 test-build-rs-watchset.sh
 test-build-slot.sh
-test-cargo-target-dir-reclaim.sh
 test-cargo-test-daemon-guard.sh
 test-champion-ci-checks-no-checks-signal.sh
 test-champion-critical-file-check.sh
@@ -231,8 +230,6 @@ test-worktree-nested-symlinks.sh
 test-worktree-orphan-guard-spaces.sh
 test-worktree-race-rescue.sh
 test-worktree-remote-branch-tracking.sh
-test-worktree-remove-squash-merge.sh
-test-worktree-remove.sh
 test-worktree-root-override.sh
 test-worktree-sentinel-reinvoke.sh
 test-worktree-sentinel.sh

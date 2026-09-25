@@ -26,12 +26,17 @@
 #      means "rebase onto base and retry" — conflating the two would either
 #      retry forever against a moving target or silently merge a different
 #      diff than the one Judge approved).
-#   3. Source-wiring: merge-pr.sh threads $MERGE_PRECONDITION_SHA into both
-#      merge calls, and both retry loops check the new classifier BEFORE the
+#   3. Source-wiring: merge-pr.sh threads $MERGE_PRECONDITION_SHA into the
+#      merge call, and its retry loop checks the new classifier BEFORE the
 #      existing "Base branch was modified" retry branch (ordering matters:
 #      the two matchers must stay mutually exclusive, but a future edit that
 #      accidentally reorders them could still cause the "Base branch was
-#      modified" retry to eat a head-mismatch case first).
+#      modified" retry to eat a head-mismatch case first). Since #8410 there
+#      is only ONE merge call — the server-side auto-merge arm, whose
+#      precondition expired the moment it was armed, is gone — and `--auto`
+#      additionally re-reads the head after its check-settle wait
+#      (_revalidate_merge_guards) so a mid-wait force-push re-queues (exit 3)
+#      instead of being merged over.
 #
 # Usage:
 #   ./.loom/scripts/tests/test-merge-pr-head-mismatch.sh
@@ -332,13 +337,19 @@ else
     echo -e "  ${RED}FAIL${NC}: synchronous forge_merge_pr call does not pass \$MERGE_PRECONDITION_SHA"
 fi
 
+# #8410 removed the server-side auto-merge arm, so there is no second merge
+# call left to thread the precondition into — the synchronous one above is the
+# only one. That is strictly stronger than the old "both call sites pass it"
+# contract: an armed server-side merge honoured the precondition only at ARM
+# time and then merged whatever the head had become (PR #8220: force-push at
+# 07:12, server merge at 07:21). Assert the arm stays gone.
 TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q 'forge_auto_merge "\$REPO_NWO" "\$PR_NUMBER" "\$MERGE_PRECONDITION_SHA"' "$MERGE_PR_SRC"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh threads \$MERGE_PRECONDITION_SHA into the shell forge_auto_merge call"
-else
+if grep -Eq 'forge_auto_merge "\$REPO_NWO"|loom-daemon forge auto-merge' "$MERGE_PR_SRC"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: shell forge_auto_merge call does not pass \$MERGE_PRECONDITION_SHA"
+    echo -e "  ${RED}FAIL${NC}: a server-side auto-merge arm is back — it cannot honour \$MERGE_PRECONDITION_SHA past arm time (#8410)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: no server-side auto-merge arm — forge_merge_pr is the only merge call (#8410)"
 fi
 
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -361,12 +372,22 @@ sync_loop_order=$(awk '
 ' "$MERGE_PR_SRC")
 assert_eq "mismatch" "$sync_loop_order" "synchronous retry loop checks the head-mismatch classifier before 'Base branch was modified'"
 
-auto_loop_order=$(awk '
-  /^  for MERGE_ATTEMPT in \$\(seq 1 \$MAX_MERGE_RETRIES\); do/ { infor=1 }
-  infor && /_is_head_mismatch_response "\$AUTO_MERGE_OUTPUT"/ { print "mismatch"; exit }
-  infor && /grep -q "Base branch was modified"/ { print "base_modified"; exit }
-' "$MERGE_PR_SRC")
-assert_eq "mismatch" "$auto_loop_order" "auto-merge retry loop checks the head-mismatch classifier before 'Base branch was modified'"
+# The `--auto` path no longer has a retry loop of its own (#8410); instead it
+# detects a head that moved DURING its check-settle wait, proactively, before
+# the merge call — a window the armed queue could not see at all. Assert that
+# re-validation exists and routes to the same exit-3 re-queue signal.
+_reval_body="$(awk '/^_revalidate_merge_guards\(\) \{/{f=1} f; f && /^}/{exit}' "$MERGE_PR_SRC")"
+TESTS_RUN=$((TESTS_RUN + 1))
+# Here-strings, never pipes: `grep -q` exits on first match and would SIGPIPE
+# the producer under `set -o pipefail` (#7771 class).
+if grep -qF -- 'fresh_sha" != "$MERGE_PRECONDITION_SHA' <<<"$_reval_body" && \
+   grep -qF -- 'error_head_moved' <<<"$_reval_body"; then
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: --auto re-reads the head after its wait and routes a move to error_head_moved (exit 3, #8410)"
+else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    echo -e "  ${RED}FAIL${NC}: --auto must compare the post-wait head against \$MERGE_PRECONDITION_SHA and call error_head_moved"
+fi
 
 TESTS_RUN=$((TESTS_RUN + 1))
 if grep -q '^#   3 = PR head moved' "$MERGE_PR_SRC"; then
@@ -440,63 +461,32 @@ else
 fi
 
 # ============================================================================
-# Part 5 (#5589): the native `loom-daemon forge auto-merge` call site passes
-# --expected-head-sha and its _AM_RC dispatch routes the new distinct
-# head-mismatch exit code (4) to error_head_moved(), not the generic
-# failure/retry branch. loom-daemon itself is Rust-tested separately
-# (loom-daemon/src/forge_cmd.rs); this only verifies merge-pr.sh's own
-# source-level wiring of the exit code it already knows about (matching this
-# file's existing "source-wiring" grep strategy, not an executable stub —
-# there is no `loom-daemon` binary available in this shell-only test harness).
+# Part 5 (#5589, superseded by #8410): the native `loom-daemon forge
+# auto-merge` call site used to carry the same --expected-head-sha
+# precondition, with exit 4 routed to error_head_moved(). #8410 removed that
+# call site with the rest of the server-side arm, because the precondition it
+# carried only ever guarded the ARM, never the merge the forge performed
+# minutes later. What replaces it is asserted in Part 3: a post-wait head
+# re-read inside _revalidate_merge_guards, which guards the moment that
+# actually matters. loom-daemon's own forge_cmd.rs tests are unaffected.
 # ============================================================================
 echo ""
-echo "Testing native loom-daemon forge auto-merge wiring (#5589)..."
+echo "Testing that the native auto-merge call site is gone (#5589 -> #8410)..."
 
 TESTS_RUN=$((TESTS_RUN + 1))
-if grep -q 'loom-daemon forge auto-merge "\$PR_NUMBER" --method "\$REPO_MERGE_METHOD" --expected-head-sha "\$MERGE_PRECONDITION_SHA"' "$MERGE_PR_SRC"; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: merge-pr.sh passes --expected-head-sha \$MERGE_PRECONDITION_SHA to the native loom-daemon forge auto-merge call"
-else
+if grep -q '_AM_RC' "$MERGE_PR_SRC"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: native loom-daemon forge auto-merge call does not pass --expected-head-sha \$MERGE_PRECONDITION_SHA"
+    echo -e "  ${RED}FAIL${NC}: the native auto-merge dispatch (_AM_RC) is back in merge-pr.sh (#8410)"
+else
+    TESTS_PASSED=$((TESTS_PASSED + 1))
+    echo -e "  ${GREEN}PASS${NC}: no native auto-merge dispatch remains in merge-pr.sh"
 fi
 
-# The native dispatch's `_AM_RC -eq 4` branch must call error_head_moved
-# BEFORE the `_AM_RC -ne 3` (Gitea-decline) check further down, so a 4 never
-# falls through and gets misclassified as a generic native failure.
-#
-# The anchor tolerates the optional `forge_cmd_perm_safe ` prefix the native
-# call carries since #6752 (the App-token 403 escalation ladder): the wrapper
-# preserves the exit code verbatim, so this ordering contract is unchanged.
-native_dispatch_order=$(awk '
-  /AUTO_MERGE_OUTPUT=\$\((forge_cmd_perm_safe )?loom-daemon forge auto-merge/ { indispatch=1 }
-  indispatch && /_AM_RC -eq 4/ { print "mismatch"; exit }
-  indispatch && /_AM_RC -ne 3/ { print "decline_check"; exit }
-' "$MERGE_PR_SRC")
-assert_eq "mismatch" "$native_dispatch_order" "native _AM_RC dispatch checks the head-mismatch exit code (4) before the Gitea-decline check (-ne 3)"
-
-# ANCHOR UPDATED by #8164 (NOT retired — the property is unchanged and still
-# asserted, in two halves instead of one). The branch no longer calls
-# error_head_moved() inline; it calls _head_moved_or_resync(), whose only
-# non-retry exit IS error_head_moved(). Asserting both halves is strictly
-# stronger than the old single grep: the old one could not have noticed a
-# wrapper that forgot to exit 3 on the refusal path, and this one does.
-TESTS_RUN=$((TESTS_RUN + 1))
-if awk '
-  /AUTO_MERGE_OUTPUT=\$\((forge_cmd_perm_safe )?loom-daemon forge auto-merge/ { indispatch=1; next }
-  indispatch && /_AM_RC -eq 4/ { found=1 }
-  found && /_head_moved_or_resync "\$AUTO_MERGE_OUTPUT"/ { print "ok"; exit }
-  indispatch && /^    fi$/ { exit }
-' "$MERGE_PR_SRC" | grep -q ok; then
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: the native _AM_RC -eq 4 branch routes through _head_moved_or_resync() (re-queue, not a generic failure)"
-else
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: could not confirm the native _AM_RC -eq 4 branch routes to the head-moved path"
-fi
-
-# The other half of that property: _head_moved_or_resync()'s refusal path is
-# still error_head_moved() with both SHAs, i.e. exit 3, i.e. a re-queue.
+# _head_moved_or_resync() (#8164) is still live — not on the retired native
+# dispatch site, but on the synchronous-merge path every --auto AND plain
+# invocation now shares (#8410 made that path the ONLY merge path). Assert
+# its refusal half directly: the non-retry exit is still error_head_moved()
+# with both SHAs, i.e. exit 3, i.e. a re-queue, never a silent overwrite.
 TESTS_RUN=$((TESTS_RUN + 1))
 _hmr_refusal_probe=$(awk '
   /^_head_moved_or_resync\(\) \{/ { infn=1 }

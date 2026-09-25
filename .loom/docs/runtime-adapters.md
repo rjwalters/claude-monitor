@@ -376,9 +376,22 @@ runtime's per-session **transcript** (Claude Code writes per-message `usage` +
 OpenCode's equivalent is its own SQLite session store, wired up in #8507 —
 along with first-class `runtime`/`provider`/`profile` fields on every outcome
 record, so a non-Claude completion is identifiable even with no usage numbers
-at all. See [`native-runtime-usage-attribution.md`](native-runtime-usage-attribution.md)
-for the reader, its credential-isolation contract, and the
+at all. Kimi Code CLI's is its per-agent `wire.jsonl` durable event log, wired
+up in #8564. See [`native-runtime-usage-attribution.md`](native-runtime-usage-attribution.md)
+for both readers, their secret-isolation contracts, and the
 `loom-daemon opencode-usage` backfill path.
+
+| Runtime | Store | Selected by |
+|---|---|---|
+| Claude | `~/.claude/projects/<slug>/*.jsonl` transcripts | no launch record (the default) |
+| OpenCode | `opencode.db`, table `session` | `runtime: "opencode"` |
+| Kimi | `$KIMI_CODE_HOME/session_index.jsonl` → `<sessionDir>/agents/<agentId>/wire.jsonl` (`usage.record` + `llm.request`) | `runtime: "kimi"` |
+| Pi, Codex | *(not wired)* — labels but no numbers | falls through to the Claude reader |
+
+Two rules the seam enforces on every one of these, and on any adapter that adds
+the next: **unknown is not zero** (a store with nothing to report returns "no
+totals", never a zeroed breakdown), and **never guess a model id** (an
+unresolved alias is carried verbatim rather than mapped to a plausible name).
 
 An adapter must expose the equivalent for its runtime: a way to attribute a
 session to an account, a limit/exhaustion signal (via the error categories
@@ -2055,7 +2068,7 @@ collaboration:
 | #9 | `spawn-worker.sh` spawn dispatcher | **1. Spawn** — the runtime-neutral dispatch entry point | **landed** (Phase 1) |
 | #6 | Restructured `classify-error.sh` into per-provider pattern tables | **3. Error classification** — the per-runtime pattern-table shape | **landed** (#4190) |
 | #15 | Codex runner | **1. Spawn** — Codex's `spawn-<runtime>.sh` implementation | **landed** as `defaults/scripts/spawn-codex.sh` (#4468). Ported, not cherry-picked: token-pool auth deferred to Phase 4, `--full-auto`/`-a` replaced (absent on `codex exec` 0.146.0), and the skip-permissions → sandbox mapping deliberately diverges (see the parity doc). |
-| #16 | `.codex/` config | **5. Instruction format** — Codex's config/instruction file set | not started (separate issue) |
+| #16 | `.codex/` config | **5. Instruction format** — Codex's config/instruction file set | **landed for the pooled case** (#8672) as `loom-daemon accounts provision`: a pooled `CODEX_HOME` is populated from the operator's own `~/.codex` per a per-provider sharing table (symlink capability/session trees, copy `AGENTS.md`, key-merge `config.toml` under a credential/identity denylist, never touch `auth.json` or per-project trust state), with a `<profile>/.loom-profile.json` ledger so a local edit inside a profile wins forever. See [`codex-profile-provisioning.md`](codex-profile-provisioning.md). Generating a repo's `.codex/` config from single source (the `AGENTS.md` codegen analogue) is still a separate issue. |
 | #20, #40 | `GUARDRAIL-PARITY.md` guardrail parity | **6. Permission / sandbox mapping** — the parity-doc requirement | **landed** as [`guardrail-parity-codex.md`](guardrail-parity-codex.md) (#4468), re-verified against 0.146.0 — several fork claims no longer hold and are corrected there |
 | #8 | `AGENTS.md` codegen | **5. Instruction format** — single-source instruction generation | **landed** (#4479) as a *generator* (`defaults/scripts/generate-agents-md.sh`) that extracts `agents-md:include` ranges from `defaults/.loom/CLAUDE.md` — not the fork's hand-authored static file (that would violate this repo's single-source non-goal). CI `check-agents-md-sync.sh` keeps the checked-in `defaults/.loom/AGENTS.md` in sync; scaffolding installs the root pointer + `.loom/AGENTS.md` full guide. |
 | #12, #17 | Provider-aware account pool (per-account provider, waterfall fill, `CODEX_HOME` rotation) | **4. Usage accounting** — provider-aware selection consuming the pool signals | Phase 4. #4468 ships only single-profile `CODEX_HOME` passthrough — no pool, no rotation, no bad-token marking. |

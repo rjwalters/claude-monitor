@@ -22,7 +22,7 @@ the live production gate and this document does not move it.**
 
 ## What the boundary is
 
-Three properties, each *enforced* rather than configured. All of it is in Rust
+Four properties, each *enforced* rather than configured. All of it is in Rust
 (`loom-daemon/src/tokens_pool/private_workspace/bundle.rs`); the guards
 themselves are unchanged.
 
@@ -76,7 +76,65 @@ into headless denials without protecting anything.
 value is a `CONTROL_VERSION` bump, because an already-bound session identity
 covers the policy map.
 
-### 3. Identity is bound and rechecked
+### 3. The hook registration and the profile's trust state are immutable from inside (control v2)
+
+Guard *code* being image-owned is not enough on its own, because the file that
+tells Codex to run it — `$CODEX_HOME/hooks.json` — lives in the account
+profile, which has to stay writable for authentication refresh. Control v1
+could only *detect* a change to it, at the next recheck. That leaves a real
+window: a worker removes the registration after the pre-exec recheck, every
+remaining turn of that session runs unhooked, and nothing re-reads the file
+until the next admission — long after the unhooked turns happened.
+
+v2 closes it with **mount topology rather than file modes**. The host binds
+each of the three control files **read-only over its own canonical path**:
+
+| File | What it carries |
+|---|---|
+| `hooks.json` | the managed `PreToolUse` registration naming the image-owned bridge |
+| `config.toml` | Codex's own `hooks.state."<id>".trusted_hash` trust state |
+| `loom-codex-hooks.json` | Loom's readiness receipt pinning that registration |
+
+Because each path is now a **mount point**, the kernel refuses every route a
+worker has to a file in a directory it owns:
+
+| Attempt | Result | Why |
+|---|---|---|
+| `open(O_WRONLY)` / truncate / `chmod` | `EROFS` | the bind carries `ro` |
+| `unlink` | `EBUSY` | the path is a mount point |
+| `rename` (away, or over it) | `EBUSY` | ditto, for source and destination |
+| `ln -sf` / `ln -f` over it | `EEXIST` | the mount point cannot be replaced |
+
+File modes alone cannot achieve this: the profile *directory* must stay
+writable so the canonical atomic `auth.json` refresh (write a sibling temp,
+rename over) keeps working, and directory write permission is exactly what
+governs `unlink` and `rename`. A mount point is immune to both while leaving
+every non-mounted sibling — `auth.json` included — completely untouched.
+
+Both halves are enforced independently, so neither side has to be believed:
+
+- **Host**: `docker::validate_settings` checks Docker's own mount inventory on
+  every admission — each control file present, `Type: bind`, `RW: false`, and
+  sourced from the identically-named file in the canonical profile. The mount
+  count is exact, so a *missing* protection is refused as loudly as a wrong one.
+- **Container**: `ProfileImmutability::observe` requires, for every control
+  file, both an entry in the kernel's own `/proc/self/mountinfo` naming that
+  exact path with `ro`, **and** a real open-for-append that actually fails. A
+  boundary that cannot prove both reports `profile-mutable`, binds no identity,
+  and is refused.
+
+**Provisioning therefore moves to the host, before the session exists.**
+`loom-daemon accounts session start` runs the image's own sealed provisioner in
+a throwaway container carrying nothing but the account profile — no workspace
+volume, no forge configuration, no network — and only then creates the session
+with the read-only binds. A profile that is already correctly provisioned is
+left byte-for-byte alone. Inside a session, `private-workspace setup` skips
+hook provisioning entirely once it measures the controls as protected: writing
+them there is `EROFS` by construction, and whether the frozen registration is
+the *right* one is decided by `private-workspace control`, which the host
+consults immediately afterwards and refuses admission on.
+
+### 4. Identity is bound and rechecked
 
 `loom-daemon private-workspace seal-control` writes
 `/opt/loom/private-control/manifest.json` at image build time — protocol,
@@ -101,17 +159,18 @@ That identity is checked three times:
 
 The identity is stored in the account job lease next to the container ID, so a
 replaced container, a replaced image, a stale control version, an altered
-policy or registration, and a lease that carries no identity at all are each
-refused *before* mutable work rather than detected afterwards. A lease written
-before this protocol deserializes with an empty identity, which every recheck
-refuses rather than treating as proven.
+policy or registration, an unprotected mount topology, and a lease that carries
+no identity at all are each refused *before* mutable work rather than detected
+afterwards. A lease written before this protocol deserializes with an empty
+identity, which every recheck refuses rather than treating as proven.
 
 ## Supported combinations
 
 | Component | Supported value | How it is established |
 |---|---|---|
-| Control protocol | `loom-private-control-v1`, `control_version` **1** | Exact-match on both sides; anything else is `Unsupported`. |
+| Control protocol | `loom-private-control-v1`, `control_version` **2** | Exact-match on both sides; anything else is `Unsupported`. A v1 image reports v1 and is refused: its in-container half cannot make the control-file claim at all. |
 | Session image | `ghcr.io/rjwalters/loom-worker-session:<version>` built from `docker/session/Dockerfile` at or after this change | The bundle must be present, sealed, digest-intact and non-writable. |
+| Session mount topology | profile bound read-write; `hooks.json`, `config.toml` and `loom-codex-hooks.json` each bound read-only over their own path | Cross-checked against Docker's mount inventory on the host and `/proc/self/mountinfo` plus a real write probe in the container. |
 | Codex CLI | `0.149.1` as pinned by `CODEX_VERSION`; floor `0.146.0` | `seal-control` records `codex --version` as observed in the image and refuses to seal below the floor. |
 | Codex hook schema | `pre_tool_use`, pinned at `0.146.0` in `guard-codex-bridge.sh` | Evidence below. |
 | Managed hook version | `LOOM_HOOK_VERSION` = 1 in `provision-codex-hooks.sh` | Cross-checked against the receipt at every observation. |
@@ -171,18 +230,23 @@ smoke test rather than silently shipping.
   among others.
 - **Hook trust remains operator-attested per profile** (#5005). The
   registration now names a stable image-owned path, so the operator's one-time
-  trust step must be taken against that path.
-- **Mid-session removal of `$CODEX_HOME/hooks.json` is not blocked by the
-  kernel.** It is blocked by the forced policy (`LOOM_RM_SCOPE=repo` plus Bash
-  write-confinement both deny writes outside the clone), it is re-proven
-  immediately before the model is exec'd, and it makes the **next** admission
-  refuse — but a mount-level immutability for the registration and the profile's
-  trust state is a further hardening step, not something this version claims.
-- **`config.toml` stays worker-writable** so the canonical authentication
-  refresh lifecycle keeps working. Its digest is part of the bound identity, so
-  a change is refused at the next recheck, and a private session audits it for
-  MCP/plugin/alternate-profile routes before every launch
-  (`private_workspace::control`).
+  trust step must be taken against that path. Because `config.toml` is bound
+  **by inode**, a trust step taken on the host while a session is running is not
+  visible inside that session, and the next admission refuses on the profile
+  digest mismatch: **stop and start the session after establishing trust.** That
+  is the fail-closed direction, and it is the same restart the registration's
+  own lifecycle already needs.
+- **The protection is per-file, not per-directory.** A control file that Loom
+  does not know about — a future Codex file carrying policy-relevant state —
+  would be writable until it is added to `PROFILE_CONTROLS` (which is a
+  `CONTROL_VERSION` bump). `private_workspace::control`'s audit of
+  MCP/plugin/alternate-profile routes still runs before every launch, over every
+  documented config layer, so a new *route* is refused even if a new *file* is
+  not yet frozen.
+- **A session created before control v2 is refused, not upgraded.** There is no
+  way to add a mount to a running container, so an existing private session must
+  be stopped and started again to gain the protection. Both halves refuse it in
+  the meantime (`profile-mutable`, and the host's mount-inventory check).
 - **No fleet enablement.** This is a prerequisite for #8787; #4496 remains the
   live production gate, and the shipped Codex manifest still refuses mutable
   lifecycle roles.
@@ -192,9 +256,14 @@ smoke test rather than silently shipping.
 `auth.json` stays writable in the canonical profile bind mount (0700 profile /
 0600 auth, uid 1000), no credential byte enters the bundle, the manifest, the
 clone, exported metadata, host logs or an image layer, and no profile
-permission is loosened. The integration test replaces `auth.json` through the
-canonical write-temp-then-rename path from inside the session and asserts the
-host-side file changed atomically.
+permission is loosened. The control-file binds are deliberately **per file**
+rather than a read-only profile mount for exactly this reason: `auth.json` and
+the directory around it are untouched, so the canonical refresh — write a
+sibling temp, `rename` over — still works byte for byte. The integration test
+performs that refresh from inside the session in the same breath as it proves
+the three control files are frozen, and asserts the host-side file changed
+atomically while none of the three moved. The host-side provisioning step never
+reads, writes or copies `auth.json`, and runs with `--network none`.
 
 ## Rollback
 
@@ -211,11 +280,16 @@ not a code revert:
 2. **Roll the daemon back.** A daemon from before this change ignores the
    bundle entirely and behaves exactly as it did before, including on an image
    that ships one. Leases written by the newer daemon carry one extra
-   `control` field, which the older daemon ignores.
+   `control` field, which the older daemon ignores. A session *created* by the
+   newer daemon carries three extra read-only mounts; an older daemon's
+   `validate_settings` counts mounts exactly and will refuse to reuse it, so
+   **stop the session before rolling the daemon back** — it is refused, never
+   silently reused in a shape the old daemon does not understand.
 3. **Never** work around a refusal by deleting the account volume, resetting a
-   branch, loosening profile permissions, chmod-ing the bundle writable, or
-   passing `--dangerously-bypass-hook-trust`. Every refusal preserves the
-   session, the volume and the profile for inspection.
+   branch, loosening profile permissions, chmod-ing the bundle writable,
+   dropping the control-file binds, or passing
+   `--dangerously-bypass-hook-trust`. Every refusal preserves the session, the
+   volume and the profile for inspection.
 
 Host sessions, shared-mount sessions, the global `hooks` configuration and
 `worktreeIsolation: partial` are all unchanged by this boundary: it applies only
