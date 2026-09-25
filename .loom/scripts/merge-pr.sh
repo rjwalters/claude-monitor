@@ -524,7 +524,16 @@ done
 # decline -- gitea repo-settings probing isn't native yet) degrades to the
 # unvalidated request as-is, same as this script's pre-#8845 posture toward
 # an unverifiable input, with a warning so the gap is visible rather than silent.
-if [[ -n "$MERGE_METHOD_REQUESTED" ]]; then if command -v loom-daemon &>/dev/null; then _MPM_RC=0; _MPM_OUT="$(loom-daemon forge merge-method --repo "$REPO_NWO" --requested "$MERGE_METHOD_REQUESTED" 2>&1)" || _MPM_RC=$?; if [[ $_MPM_RC -eq 0 ]]; then REPO_MERGE_METHOD="$_MPM_OUT"; elif [[ $_MPM_RC -eq 1 ]]; then error "Merge blocked: $_MPM_OUT"; else warning "loom-daemon forge merge-method could not validate --merge-method $MERGE_METHOD_REQUESTED (exit $_MPM_RC: $_MPM_OUT); using it unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; else warning "loom-daemon not found; using --merge-method $MERGE_METHOD_REQUESTED unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; fi
+# #8878: the binary probed and invoked is LOOM_DAEMON_BIN when set (as
+# _check_required_check_freshness already does) -- that override is exactly what
+# _mp_daemon_roll_hint tells operators to export when no released daemon carries
+# `forge merge-method` yet, so probing PATH's older binary instead threw away the
+# validation they had just built and degraded to the unvalidated path anyway.
+# The expansion is repeated inline rather than hoisted into a variable on this
+# same line: check-daemon-subcommand-versions.sh only registers a binary-holding
+# variable from a LINE-LEADING assignment, so a mid-line one would make the
+# requires-daemon marker below read as stale (verified -- it fires).
+if [[ -n "$MERGE_METHOD_REQUESTED" ]]; then if command -v "${LOOM_DAEMON_BIN:-loom-daemon}" &>/dev/null; then _MPM_RC=0; _MPM_OUT="$("${LOOM_DAEMON_BIN:-loom-daemon}" forge merge-method --repo "$REPO_NWO" --requested "$MERGE_METHOD_REQUESTED" 2>&1)" || _MPM_RC=$?; if [[ $_MPM_RC -eq 0 ]]; then REPO_MERGE_METHOD="$_MPM_OUT"; elif [[ $_MPM_RC -eq 1 ]]; then error "Merge blocked: $_MPM_OUT"; else warning "'${LOOM_DAEMON_BIN:-loom-daemon}' forge merge-method could not validate --merge-method $MERGE_METHOD_REQUESTED (exit $_MPM_RC: $_MPM_OUT); using it unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; else warning "loom-daemon not found ('${LOOM_DAEMON_BIN:-loom-daemon}'); using --merge-method $MERGE_METHOD_REQUESTED unvalidated"; REPO_MERGE_METHOD="$MERGE_METHOD_REQUESTED"; fi; fi
 
 # Validate --worktree-path early (before any network calls) so bad input
 # fails fast. The path must be a real directory and must appear in the
