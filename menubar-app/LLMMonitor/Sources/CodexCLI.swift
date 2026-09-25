@@ -364,6 +364,10 @@ enum CodexCLI {
         let store = UsageStore(dbPath: storePath)
         store.ensureDatabase()
         let poller = OAuthPoller(dbPath: storePath)
+        // Loom's profiles are registered here too (read-only, add-only), so a
+        // host that has not relaunched the app since a profile was added
+        // still lists it.
+        poller.syncCodexProfiles()
         let accounts = poller.codexAccounts()
         let unregisteredHomes = discoverUnregisteredHomes(registered: accounts)
 
@@ -389,7 +393,10 @@ enum CodexCLI {
                     // stranger's answer, and remediation pointing at a home this
                     // row does not own.
                     let status: String
-                    if account.isAbsent {
+                    if account.isSnapshotOnly {
+                        // Loom owns this home's refresh chain: never probed.
+                        status = snapshotLabel
+                    } else if account.isAbsent {
                         status = absentLabel
                     } else if account.isStranded {
                         status = strandedLabel
@@ -408,6 +415,9 @@ enum CodexCLI {
                         home = account.codexHome ?? "(default: $CODEX_HOME, else ~/.codex)"
                     }
                     print("\(account.accountId.prefix(8))… \(plan) \(status.padded(to: 18)) \(home)")
+                    if account.isSnapshotOnly, let profileHome = account.codexHome {
+                        print("  → \(snapshotSummary(home: profileHome))")
+                    }
                     if account.isAbsent {
                         let remediation = account.provisionLabel.map {
                             "  → llm-monitor codex provision \($0)"
@@ -462,6 +472,24 @@ enum CodexCLI {
         }
         dispatchMain()
     }
+
+    /// One line describing a Loom profile's latest rate-limit snapshot, read
+    /// from its rollout logs (never by probing the home).
+    static func snapshotSummary(home: String, now: Date = Date()) -> String {
+        guard let snap = CodexProfiles.latestSnapshot(home: home, now: now) else {
+            return "no rate-limit snapshot yet (one Codex turn on this account records one)"
+        }
+        let hours = now.timeIntervalSince(snap.observedAt) / 3600
+        let age = hours < 48 ? String(format: "%.0fh ago", hours) : String(format: "%.1fd ago", hours / 24)
+        guard !snap.rateLimit.isEmpty else { return "last snapshot \(age) has rolled over; usage unknown" }
+        func pct(_ w: RateLimitWindow?) -> String { w.map { String(format: "%.0f%%", $0.usedPercent) } ?? "—" }
+        let reset = snap.rateLimit.weekly?.resetAt.map { " (weekly resets \(ISO8601DateFormatter().string(from: $0)))" } ?? ""
+        return "5h \(pct(snap.rateLimit.session)) · weekly \(pct(snap.rateLimit.weekly)) as of \(age)\(reset)"
+    }
+
+    /// The status word for a Loom Codex profile, which `codex list` reports
+    /// without probing (see `CodexProfiles`).
+    static let snapshotLabel = "loom (snapshot)"
 
     /// The status word for a home whose identity no longer matches its row.
     /// Shared by the row and the footnote so they cannot drift apart.

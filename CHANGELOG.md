@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Loom Codex profiles, read-only.** Every profile in `~/.loom/codex-profiles`
+  is registered as an OpenAI account and read **only** from the rate-limit
+  snapshots Codex writes into its rollout logs. llm-monitor never spawns
+  `codex` against a Loom-owned home and never reads its credential, because
+  Loom's session containers own those refresh chains.
+  - Readings carry the time Codex recorded them, so an idle account shows as
+    stale. A window whose reset has passed is dropped rather than reported.
+  - Pre-existing home-less OpenAI rows are linked to their matching profile,
+    so their history is kept.
+  - `codex list` shows each profile's snapshot and its age.
+
 - **z.ai (GLM Coding Plan) accounts** — a third provider (`provider = zai`).
   Keys in `~/.zai/coding-plan-<label>.env` are registered at launch (and by
   `claude-monitor zai import|add|list`). They are polled via z.ai's read-only
