@@ -4,7 +4,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-09-25
+
+### Summary
+
+Claude Monitor is now **LLM Monitor**. It tracks Claude, OpenAI Codex, and z.ai
+accounts side by side, reading Loom's pooled Codex profiles without touching their
+credentials. This is a major version because of the rename: the data directory, CLI,
+systemd unit, and macOS bundle all have new names. Every name something external
+depends on keeps a compatibility shim, but the old macOS app must be removed by hand
+(README "Upgrading to 2.0"). The release also brings back transcript token ingest,
+adds a quota-calibration series with a step-change alert, and ships a static Linux
+binary and a one-command installer.
 
 ### Changed
 
@@ -24,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   See README "Upgrading to 2.0".
 
+- **Chart-history cutoff and decimation logic deduplicated in `UsageStore`**
+  (internal refactor, no behaviour change) (#182)
+
 ### Added
 
 - **Loom Codex profiles, read-only.** Every profile in `~/.loom/codex-profiles`
@@ -39,13 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **z.ai (GLM Coding Plan) accounts** — a third provider (`provider = zai`).
   Keys in `~/.zai/coding-plan-<label>.env` are registered at launch (and by
-  `claude-monitor zai import|add|list`). They are polled via z.ai's read-only
+  `llm-monitor zai import|add|list`). They are polled via z.ai's read-only
   `/api/monitor/usage/quota/limit` endpoint into the usual 5h / weekly columns,
   and exported to `ranking.json` with `exhausted`/`rate_limited` status when a
   window is spent. z.ai reports errors as HTTP 200 with the code in the body;
   those are treated as auth failures, never as a reading.
 
-- **`claude-monitor calibrate`** — a rolling daily quota-calibration series:
+- **`llm-monitor calibrate`** — a rolling daily quota-calibration series:
   what one weekly rate-limit point actually costs, in tokens, cost-equivalent
   tokens, and dollars. Joins `usage_history.weekly_all_percent` (how much quota
   went) with `token_usage` (how many tokens that was) into one row per UTC day,
@@ -69,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row. Recompute is idempotent by construction — the whole trailing window is
   rewritten in one transaction. (#198)
 
-- **`claude-monitor accounts push HOST...` / `accounts pull HOST`** — converge a
+- **`llm-monitor accounts push HOST...` / `accounts pull HOST`** — converge a
   fleet's account records and OAuth credentials over ssh without ever writing a
   plaintext-token file. The bundle is serialized in memory and streamed into
   `accounts import -` on the destination (or read from a peer's `accounts
@@ -81,10 +95,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--ssh-option` cover a far side that isn't on the non-interactive `PATH`.
   (#188)
 
-### Changed
-
-- **Chart-history cutoff and decimation logic deduplicated in `UsageStore`**
-  (internal refactor, no behaviour change) (#182)
+- **Transcript token ingest: `llm-monitor tokens sync`** (#200). Claude Code
+  transcripts are imported into `token_usage`/`token_sessions` again. The walk
+  is recursive, subagent spend is counted, and the scan is incremental by file
+  mtime, on a 1-hour cadence in the poll loop. No message content is ever
+  decoded or stored.
+- **Quota-calibration chart mode and menu-bar step-change alert** (#205). A
+  Tokens/Point mode in the per-account history window, plus a small menu-bar
+  dot when the pool's tokens-per-weekly-point drops sharply against its
+  14-day baseline. It fires once per step, never for a recovery.
+- **Host-total token chart fallback** (#204). When no token spend is
+  attributed to the account being shown, the Tokens chart shows the host's
+  total instead, labeled "(Host Total)", rather than appearing empty.
+- **One-command Linux install: `scripts/install-linux.sh`** (#191). It
+  acquires a binary (`--from-release`, `--from-source`, or `--binary`),
+  refuses a dynamically linked one, installs the systemd user unit, seeds
+  `accounts.env`, and verifies with `selftest`. Idempotent, so it is also the
+  upgrade path.
+- **Static `llm-monitor-linux-x64` release binary** (#190). CI builds with
+  `--static-swift-stdlib`, asserts via `ldd` that no Swift runtime is needed,
+  and attaches the binary to each GitHub Release.
 
 ### Fixed
 
@@ -124,6 +154,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handshake) now drain each pipe on a dedicated blocking-read thread
   (`SubprocessIO.swift`'s new `PipeDrain`) instead, where `read()` returning 0
   is EOF unconditionally on every platform. (#202)
+
+- **Codex's own error message was sometimes lost when it exited early**
+  (#212, #213). Two races (a stdin write racing the child's exit, and a stderr
+  read not waiting for its drain) could replace codex's diagnostic with a bare
+  "child stdin closed early". Both are fixed and were reproduced
+  deterministically first.
+- **A stranded OpenAI/Codex account went silent** (#194, #195). An account
+  with neither a stored token nor a registered home left the poll set without
+  any status. It now reports why and how to re-register it.
 
 ## [1.20.0] - 2026-08-17
 

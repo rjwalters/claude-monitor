@@ -73,7 +73,7 @@ Examples:
   install-linux.sh --from-release
   install-linux.sh --from-source
   install-linux.sh --binary ./LLMMonitor --prefix /usr/local
-  install-linux.sh --from-release v1.20.0 --accounts-env ~/accounts.env
+  install-linux.sh --from-release v2.0.0 --accounts-env ~/accounts.env
 EOF
 }
 
