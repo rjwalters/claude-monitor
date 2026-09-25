@@ -154,6 +154,29 @@ creates the placeholder if it isn't there and does nothing at all if it is
 (including after the identity has actually been provisioned), so it is safe to
 keep in a shared master list across the whole fleet.
 
+### Loom Codex Profiles (read-only)
+
+If this host runs Loom, every profile in `~/.loom/codex-profiles/<name>`
+(or `$LOOM_CODEX_PROFILE_ROOT`) appears automatically as an OpenAI account.
+There is nothing to register.
+
+These homes belong to Loom's session containers, which serialize OpenAI's
+rotating refresh token. So llm-monitor **never runs `codex` against them and
+never reads their credentials**. It reads only the rate-limit snapshot Codex
+records in each profile's `sessions/**/rollout-*.jsonl` during normal use.
+
+Snapshots have trade-offs:
+
+- **A reading is only as fresh as the account's last Codex turn.** It is
+  stamped with when Codex recorded it, so an idle profile shows as stale
+  rather than current.
+- **Expired windows are dropped.** Once a window's reset time has passed, the
+  reading shows as unknown rather than as its old percentage.
+- **Registration is refused.** `codex add --home` rejects a profile path; a
+  profile needs no registration.
+
+`llm-monitor codex list` shows each profile's latest snapshot and its age.
+
 ### Adding an OpenAI (Codex) Account
 
 ChatGPT subscription accounts (Plus/Pro, the ones Codex CLI uses) are polled
