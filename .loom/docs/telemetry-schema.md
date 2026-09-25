@@ -892,24 +892,28 @@ listing failed on that tick; when it is non-zero, the depth is incomplete, not
 low. Issue numbers and repos are never labels. The per-issue rows travel in
 `queue.snapshot`.
 
-Quota burn and pool state (Issue #8857, `observability/ops/quota.rs`), all on
+Quota burn and pool state (Issues #8857, #8930, `observability/ops/quota.rs`), all on
 the 5-minute snapshot cadence:
 
 | Metric | Kind | Unit | Labels | Meaning |
 |---|---|---|---|---|
 | `loom.llm.tokens.input`, `.output`, `.cache_read`, `.cache_write` | delta `Sum` | `{token}` | `provider`, `model` | tokens spent host-wide since the previous sample |
-| `loom.llm.requests` | delta `Sum` | `{request}` | `provider`, `model` | model API responses (distinct `message.id`s) in the same interval |
-| `loom.pool.accounts` | `Gauge` | `{account}` | `provider`, `state` ∈ `usable`, `exhausted` | enabled accounts in each provider's pool |
+| `loom.llm.requests` | delta `Sum` | `{request}` | `provider`, `model` | model API requests with usage in the same interval (one Claude `message.id`, Codex `token_count` delta, OpenCode step or Kimi `usage.record` each) |
+| `loom.pool.accounts` | `Gauge` | `{account}` | `provider`, `state` ∈ `usable`, `exhausted` | accounts in each state; malformed or unverifiable API-key accounts are in neither, so `usable + exhausted` can be below the enabled count |
 | `loom.pool.exhausted` | `Gauge` | `1` | `provider` | `1` when the pool has an exhausted account and no usable one |
 | `loom.pool.exhaustions` | delta `Sum` | `{account}` | `provider` | accounts newly exhausted since the previous sample |
 | `loom.pool.exhausted_seconds` | delta `Sum` | `s` | `provider` | the interval, credited when the pool read exhausted at its start (sample-and-hold downtime) |
 
-Burn is read from the Claude transcript store only for now (`provider=claude`;
-Codex/OpenCode/Kimi are #8930). A message counts in the window its first record
-falls in, windows end 60 s before the sample and abut, and the first sample
-after daemon start only anchors the window, so TPM/RPM are
-`rate(loom.llm.tokens.*)`/`rate(loom.llm.requests)` with no double count and
-no replayed history. Pool state covers the `tokens.snapshot` accounts (Claude,
+Burn is read incrementally from every subscription store on the host: Claude
+transcripts (`provider=claude`), Codex rollouts including pooled profiles
+(`codex`), OpenCode's `opencode.db` `message` table (the pool namespace, e.g.
+`zai` for `zai-coding-plan`, else OpenCode's provider id) and Kimi
+`wire.jsonl` (`kimi`). Each sample reads only what was written since the last
+one, each event counts once in the window its timestamp falls in (late writes
+count in the current window), windows end 60 s before the sample and are
+stamped at that end so they abut, and the first sample after daemon start only
+anchors, so TPM/RPM are `rate(loom.llm.tokens.*)`/`rate(loom.llm.requests)`
+with no double count and no replayed history. Pool state covers the `tokens.snapshot` accounts (Claude,
 Codex) plus every enabled API-key-pool account (Z.ai, Kimi, …), aggregated per
 provider with no `account` label; delta counters start from the second sample.
 
