@@ -1,0 +1,89 @@
+// Renovate configuration for rjwalters/claude-monitor
+// Docs: https://docs.renovatebot.com/configuration-options/
+// Pipeline docs: docs/ops/dependency-security-pipeline.md
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+
+  // Extend recommended defaults, plus security-focused presets
+  "extends": [
+    "config:recommended",
+    "security:openssf-scorecard",
+    ":dependencyDashboard"
+  ],
+
+  // Override Mend-hosted "silent" default (applied when app is installed on
+  // "All repositories").  "full" lets Renovate create branches, PRs, and the
+  // Dependency Dashboard issue.
+  "mode": "full",
+
+  // --- Supply chain security ---
+
+  // 14-day quarantine: do not propose updates until 14 days after release.
+  // This lets registries catch and yank malicious packages before we see them.
+  // Ref: https://docs.renovatebot.com/key-concepts/minimum-release-age/
+  "minimumReleaseAge": "14 days",
+
+  // Flag known vulnerabilities from the OSV database
+  "osvVulnerabilityAlerts": true,
+
+  // --- Merge policy ---
+
+  // Never auto-merge. Agents review, humans merge.
+  "automerge": false,
+
+  // Create PRs as drafts, not open PRs directly
+  "draftPR": true,
+
+  // --- Schedule ---
+
+  // Weekly on Monday mornings (UTC). Security/vulnerability PRs bypass
+  // both this schedule and minimumReleaseAge (Renovate built-in behavior).
+  // Ref: https://docs.renovatebot.com/key-concepts/minimum-release-age/
+  // "Security updates bypass any minimumReleaseAge checks"
+  "schedule": ["before 10am on monday"],
+  "timezone": "UTC",
+
+  // --- PR behavior ---
+
+  // Limit concurrent PRs to keep review queue manageable
+  "prConcurrentLimit": 5,
+
+  // Add release notes and changelogs to PR body for agent review
+  "fetchReleaseNotes": true,
+
+  // --- Package grouping ---
+
+  "packageRules": [
+    // Group all non-major GitHub Actions updates into one PR.
+    // Actions in this repo are pinned by version tag (e.g. actions/checkout@v7),
+    // not by SHA/digest, so there are no inline version comments to preserve.
+    {
+      "groupName": "github-actions",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch"]
+    },
+
+    // GitHub Actions major updates get individual PRs
+    {
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["major"]
+    }
+
+    // Note: security/vulnerability PRs bypass both schedule and
+    // minimumReleaseAge by default (Renovate built-in behavior).
+    // Ref: https://docs.renovatebot.com/key-concepts/minimum-release-age/
+    // No packageRule needed — vulnerabilityAlerts config below handles it.
+  ],
+
+  // --- Ignored paths ---
+
+  "ignorePaths": [
+    ".claude/**"
+  ],
+
+  // --- Vulnerability alerts ---
+
+  "vulnerabilityAlerts": {
+    "enabled": true
+  }
+}
