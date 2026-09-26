@@ -31,7 +31,7 @@
   // Never auto-merge. Agents review, humans merge.
   "automerge": false,
 
-  // Create PRs as drafts — consistent with AGENTS.md PR policy
+  // Create PRs as drafts, not open PRs directly
   "draftPR": true,
 
   // --- Schedule ---
@@ -42,21 +42,6 @@
   // "Security updates bypass any minimumReleaseAge checks"
   "schedule": ["before 10am on monday"],
   "timezone": "UTC",
-
-  // --- Python (uv) ---
-
-  // Update lockfile without widening pyproject.toml version ranges.
-  // Renovate detects uv.lock natively.
-  "rangeStrategy": "update-lockfile",
-
-  // Refresh uv.lock even when no direct dependency range changes.
-  // This is how Renovate keeps transitive dependencies current.
-  // Match the repo's Monday morning schedule explicitly; Renovate otherwise
-  // applies a separate lock-file-maintenance default schedule.
-  "lockFileMaintenance": {
-    "enabled": true,
-    "schedule": ["before 10am on monday"]
-  },
 
   // --- PR behavior ---
 
@@ -69,26 +54,13 @@
   // --- Package grouping ---
 
   "packageRules": [
-    // Group all non-major Python dependency updates into one PR
-    {
-      "groupName": "python minor/patch dependencies",
-      "matchManagers": ["pep621", "uv"],
-      "matchUpdateTypes": ["minor", "patch"]
-    },
-
-    // Python major updates get individual PRs (more risk, need individual review)
-    {
-      "matchManagers": ["pep621", "uv"],
-      "matchUpdateTypes": ["major"]
-    },
-
-    // Group all GitHub Actions SHA updates into one PR
-    // AGENTS.md mandates SHA pinning with inline version comments (# vX.Y.Z)
-    // Renovate preserves these comments natively when updating digests
+    // Group all non-major GitHub Actions updates into one PR.
+    // Actions in this repo are pinned by version tag (e.g. actions/checkout@v7),
+    // not by SHA/digest, so there are no inline version comments to preserve.
     {
       "groupName": "github-actions",
       "matchManagers": ["github-actions"],
-      "matchUpdateTypes": ["minor", "patch", "digest"]
+      "matchUpdateTypes": ["minor", "patch"]
     },
 
     // GitHub Actions major updates get individual PRs
@@ -105,11 +77,8 @@
 
   // --- Ignored paths ---
 
-  // Don't touch vendored dependencies (submodules)
   "ignorePaths": [
-    "vendor/**",
-    ".claude/**",
-    "infra/pulumi/**"
+    ".claude/**"
   ],
 
   // --- Vulnerability alerts ---
